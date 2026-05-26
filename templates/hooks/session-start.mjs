@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const { getClaudeConfigDir } = await import(pathToFileURL(join(__dirname, 'lib', 'config-dir.mjs')).href);
+const { getClaudeConfigDir, getUpdateCheckCachePath } = await import(pathToFileURL(join(__dirname, 'lib', 'config-dir.mjs')).href);
 const configDir = getClaudeConfigDir();
 const { resolveSessionStatePathsForHook, resolveOmcStateRoot } = await import(pathToFileURL(join(__dirname, '..', '..', 'scripts', 'lib', 'state-root.mjs')).href);
 
@@ -80,7 +80,7 @@ async function shouldRestoreModeState(directory, mode, state, sessionId) {
 }
 
 async function checkForUpdates(currentVersion) {
-  const cacheFile = join(homedir(), '.omc', 'update-check.json');
+  const cacheFile = getUpdateCheckCachePath();
   const now = Date.now();
   const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
 

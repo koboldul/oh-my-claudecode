@@ -173,7 +173,7 @@ describe('runtime v2 startup inbox dispatch', () => {
     afterEach(async () => {
         process.chdir(originalCwd);
         if (cwd)
-            await rm(cwd, { recursive: true, force: true });
+            await rm(cwd, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     });
     it('writes durable inbox dispatch evidence when startup worker notification succeeds', async () => {
         cwd = await mkdtemp(join(tmpdir(), 'omc-runtime-v2-dispatch-'));

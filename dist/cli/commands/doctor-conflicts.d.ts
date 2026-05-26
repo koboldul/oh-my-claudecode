@@ -36,6 +36,11 @@ export interface ConflictReport {
     configIssues: {
         unknownFields: string[];
     };
+    windowsUnsafePluginHooks: {
+        pluginRoot: string;
+        event: string;
+        command: string;
+    }[];
     mcpRegistrySync: ReturnType<typeof inspectUnifiedMcpRegistrySync>;
     workspaceMarker: WorkspaceMarkerStatus;
     hasConflicts: boolean;
@@ -48,6 +53,12 @@ export interface ConflictReport {
  * We check both levels so the diagnostic is complete.
  */
 export declare function checkHookConflicts(): ConflictReport['hookConflicts'];
+/**
+ * Native Windows cannot execute plugin hooks that still route through sh/find-node.
+ * Detect stale cache manifests so doctor can point users at setup/update repair
+ * instead of reporting a generic hook conflict.
+ */
+export declare function checkWindowsUnsafePluginHooks(): ConflictReport['windowsUnsafePluginHooks'];
 /**
  * Check CLAUDE.md for OMC markers and user content.
  * Also checks companion files (CLAUDE-omc.md, etc.) for the file-split pattern

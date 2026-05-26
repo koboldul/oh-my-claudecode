@@ -66,6 +66,7 @@ import {
   checkConfigIssues,
   checkLegacySkills,
   checkWorkspaceMarker,
+  checkWindowsUnsafePluginHooks,
   runConflictCheck,
 } from '../cli/commands/doctor-conflicts.js';
 
@@ -82,6 +83,8 @@ describe('doctor-conflicts: hook ownership classification', () => {
     mkdirSync(TEST_PROJECT_CLAUDE_DIR, { recursive: true });
     process.env.CLAUDE_CONFIG_DIR = TEST_CLAUDE_DIR;
     process.env.CLAUDE_MCP_CONFIG_PATH = join(TEST_CLAUDE_DIR, '..', '.claude.json');
+    process.env.OMC_HOME = join(TEST_PROJECT_DIR, '.omc-home');
+    process.env.CODEX_HOME = join(TEST_PROJECT_DIR, '.codex');
     cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(TEST_PROJECT_DIR);
   });
 
@@ -162,6 +165,124 @@ describe('doctor-conflicts: hook ownership classification', () => {
 
     expect(conflicts).toHaveLength(1);
     expect(conflicts[0].isOmc).toBe(true);
+  });
+
+  it('warns on native Windows when a plugin cache hooks manifest still contains sh/find-node commands', () => {
+    const pluginRoot = mkdtempSync(join(tmpdir(), 'omc-doctor-win-plugin-'));
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+
+    try {
+      mkdirSync(join(pluginRoot, 'hooks'), { recursive: true });
+      writeFileSync(join(pluginRoot, 'hooks', 'hooks.json'), JSON.stringify({
+        hooks: {
+          Stop: [{
+            hooks: [{
+              type: 'command',
+              command: 'sh "$CLAUDE_PLUGIN_ROOT"/scripts/find-node.sh "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/persistent-mode.mjs',
+            }],
+          }],
+          SessionEnd: [{
+            hooks: [{
+              type: 'command',
+              command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/session-end.mjs',
+            }],
+          }],
+        },
+      }));
+      process.env.CLAUDE_PLUGIN_ROOT = pluginRoot;
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+      const unsafe = checkWindowsUnsafePluginHooks();
+
+      expect(unsafe).toHaveLength(1);
+      expect(unsafe[0]).toMatchObject({ pluginRoot, event: 'Stop' });
+      expect(unsafe[0].command).toContain('find-node.sh');
+      expect(runConflictCheck().hasConflicts).toBe(true);
+    } finally {
+      delete process.env.CLAUDE_PLUGIN_ROOT;
+      if (originalPlatform) {
+        Object.defineProperty(process, 'platform', originalPlatform);
+      }
+      rmSync(pluginRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('warns on native Windows for stale installed plugin manifest even when settings hooks are clean', () => {
+    const pluginRoot = mkdtempSync(join(tmpdir(), 'omc-doctor-win-installed-plugin-'));
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+
+    try {
+      mkdirSync(join(pluginRoot, 'hooks'), { recursive: true });
+      writeFileSync(join(pluginRoot, 'hooks', 'hooks.json'), JSON.stringify({
+        hooks: {
+          PostToolUse: [{
+            hooks: [{
+              type: 'command',
+              command: 'sh "$CLAUDE_PLUGIN_ROOT"/scripts/find-node.sh "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/post-tool-verifier.mjs',
+            }],
+          }],
+        },
+      }));
+      writeFileSync(join(TEST_CLAUDE_DIR, 'settings.json'), JSON.stringify({
+        hooks: {
+          PostToolUse: [{
+            hooks: [{
+              type: 'command',
+              command: 'node "$HOME/.claude/hooks/post-tool-use.mjs"',
+            }],
+          }],
+        },
+      }));
+      mkdirSync(join(TEST_CLAUDE_DIR, 'plugins'), { recursive: true });
+      writeFileSync(join(TEST_CLAUDE_DIR, 'plugins', 'installed_plugins.json'), JSON.stringify({
+        plugins: {
+          'oh-my-claudecode': [{ installPath: pluginRoot }],
+        },
+      }));
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+      const unsafe = checkWindowsUnsafePluginHooks();
+
+      expect(unsafe).toHaveLength(1);
+      expect(unsafe[0]).toMatchObject({ pluginRoot, event: 'PostToolUse' });
+      expect(unsafe[0].command).toContain('find-node.sh');
+      expect(runConflictCheck().windowsUnsafePluginHooks).toHaveLength(1);
+      expect(runConflictCheck().hasConflicts).toBe(true);
+    } finally {
+      if (originalPlatform) {
+        Object.defineProperty(process, 'platform', originalPlatform);
+      }
+      rmSync(pluginRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not warn on native Windows when plugin hooks already use direct node run.cjs commands', () => {
+    const pluginRoot = mkdtempSync(join(tmpdir(), 'omc-doctor-win-plugin-clean-'));
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+
+    try {
+      mkdirSync(join(pluginRoot, 'hooks'), { recursive: true });
+      writeFileSync(join(pluginRoot, 'hooks', 'hooks.json'), JSON.stringify({
+        hooks: {
+          Stop: [{
+            hooks: [{
+              type: 'command',
+              command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/persistent-mode.mjs',
+            }],
+          }],
+        },
+      }));
+      process.env.CLAUDE_PLUGIN_ROOT = pluginRoot;
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+      expect(checkWindowsUnsafePluginHooks()).toEqual([]);
+    } finally {
+      delete process.env.CLAUDE_PLUGIN_ROOT;
+      if (originalPlatform) {
+        Object.defineProperty(process, 'platform', originalPlatform);
+      }
+      rmSync(pluginRoot, { recursive: true, force: true });
+    }
   });
 
   it('classifies non-OMC hooks as not OMC-owned', () => {
@@ -533,6 +654,7 @@ describe('doctor-conflicts: legacy skills collision check (issue #1101)', () => 
 
   it('does NOT flag setup-installed omc-reference fallback when it matches the bundled skill (issue #2992)', () => {
     const canonicalContent = writeCanonicalOmcReferenceSkill();
+    process.env.OMC_MCP_REGISTRY_PATH = join(TEST_PROJECT_DIR, 'no-mcp-registry.json');
     const skillsDir = join(TEST_CLAUDE_DIR, 'skills');
     mkdirSync(join(skillsDir, 'omc-reference'), { recursive: true });
     writeFileSync(join(skillsDir, 'omc-reference', 'SKILL.md'), canonicalContent);

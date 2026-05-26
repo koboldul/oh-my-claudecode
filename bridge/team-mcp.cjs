@@ -2982,7 +2982,7 @@ var require_compile = __commonJS({
       const schOrFunc = root.refs[ref];
       if (schOrFunc)
         return schOrFunc;
-      let _sch = resolve4.call(this, root, ref);
+      let _sch = resolve5.call(this, root, ref);
       if (_sch === void 0) {
         const schema = (_a = root.localRefs) === null || _a === void 0 ? void 0 : _a[ref];
         const { schemaId } = this.opts;
@@ -3009,7 +3009,7 @@ var require_compile = __commonJS({
     function sameSchemaEnv(s1, s2) {
       return s1.schema === s2.schema && s1.root === s2.root && s1.baseId === s2.baseId;
     }
-    function resolve4(root, ref) {
+    function resolve5(root, ref) {
       let sch;
       while (typeof (sch = this.refs[ref]) == "string")
         ref = sch;
@@ -3577,62 +3577,62 @@ var require_fast_uri = __commonJS({
     function normalize3(uri, options) {
       if (typeof uri === "string") {
         uri = /** @type {T} */
-        serialize(parse5(uri, options), options);
+        serialize(parse6(uri, options), options);
       } else if (typeof uri === "object") {
         uri = /** @type {T} */
-        parse5(serialize(uri, options), options);
+        parse6(serialize(uri, options), options);
       }
       return uri;
     }
-    function resolve4(baseURI, relativeURI, options) {
+    function resolve5(baseURI, relativeURI, options) {
       const schemelessOptions = options ? Object.assign({ scheme: "null" }, options) : { scheme: "null" };
-      const resolved = resolveComponent(parse5(baseURI, schemelessOptions), parse5(relativeURI, schemelessOptions), schemelessOptions, true);
+      const resolved = resolveComponent(parse6(baseURI, schemelessOptions), parse6(relativeURI, schemelessOptions), schemelessOptions, true);
       schemelessOptions.skipEscape = true;
       return serialize(resolved, schemelessOptions);
     }
-    function resolveComponent(base, relative3, options, skipNormalization) {
+    function resolveComponent(base, relative4, options, skipNormalization) {
       const target = {};
       if (!skipNormalization) {
-        base = parse5(serialize(base, options), options);
-        relative3 = parse5(serialize(relative3, options), options);
+        base = parse6(serialize(base, options), options);
+        relative4 = parse6(serialize(relative4, options), options);
       }
       options = options || {};
-      if (!options.tolerant && relative3.scheme) {
-        target.scheme = relative3.scheme;
-        target.userinfo = relative3.userinfo;
-        target.host = relative3.host;
-        target.port = relative3.port;
-        target.path = removeDotSegments(relative3.path || "");
-        target.query = relative3.query;
+      if (!options.tolerant && relative4.scheme) {
+        target.scheme = relative4.scheme;
+        target.userinfo = relative4.userinfo;
+        target.host = relative4.host;
+        target.port = relative4.port;
+        target.path = removeDotSegments(relative4.path || "");
+        target.query = relative4.query;
       } else {
-        if (relative3.userinfo !== void 0 || relative3.host !== void 0 || relative3.port !== void 0) {
-          target.userinfo = relative3.userinfo;
-          target.host = relative3.host;
-          target.port = relative3.port;
-          target.path = removeDotSegments(relative3.path || "");
-          target.query = relative3.query;
+        if (relative4.userinfo !== void 0 || relative4.host !== void 0 || relative4.port !== void 0) {
+          target.userinfo = relative4.userinfo;
+          target.host = relative4.host;
+          target.port = relative4.port;
+          target.path = removeDotSegments(relative4.path || "");
+          target.query = relative4.query;
         } else {
-          if (!relative3.path) {
+          if (!relative4.path) {
             target.path = base.path;
-            if (relative3.query !== void 0) {
-              target.query = relative3.query;
+            if (relative4.query !== void 0) {
+              target.query = relative4.query;
             } else {
               target.query = base.query;
             }
           } else {
-            if (relative3.path[0] === "/") {
-              target.path = removeDotSegments(relative3.path);
+            if (relative4.path[0] === "/") {
+              target.path = removeDotSegments(relative4.path);
             } else {
               if ((base.userinfo !== void 0 || base.host !== void 0 || base.port !== void 0) && !base.path) {
-                target.path = "/" + relative3.path;
+                target.path = "/" + relative4.path;
               } else if (!base.path) {
-                target.path = relative3.path;
+                target.path = relative4.path;
               } else {
-                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative3.path;
+                target.path = base.path.slice(0, base.path.lastIndexOf("/") + 1) + relative4.path;
               }
               target.path = removeDotSegments(target.path);
             }
-            target.query = relative3.query;
+            target.query = relative4.query;
           }
           target.userinfo = base.userinfo;
           target.host = base.host;
@@ -3640,19 +3640,19 @@ var require_fast_uri = __commonJS({
         }
         target.scheme = base.scheme;
       }
-      target.fragment = relative3.fragment;
+      target.fragment = relative4.fragment;
       return target;
     }
     function equal(uriA, uriB, options) {
       if (typeof uriA === "string") {
         uriA = unescape(uriA);
-        uriA = serialize(normalizeComponentEncoding(parse5(uriA, options), true), { ...options, skipEscape: true });
+        uriA = serialize(normalizeComponentEncoding(parse6(uriA, options), true), { ...options, skipEscape: true });
       } else if (typeof uriA === "object") {
         uriA = serialize(normalizeComponentEncoding(uriA, true), { ...options, skipEscape: true });
       }
       if (typeof uriB === "string") {
         uriB = unescape(uriB);
-        uriB = serialize(normalizeComponentEncoding(parse5(uriB, options), true), { ...options, skipEscape: true });
+        uriB = serialize(normalizeComponentEncoding(parse6(uriB, options), true), { ...options, skipEscape: true });
       } else if (typeof uriB === "object") {
         uriB = serialize(normalizeComponentEncoding(uriB, true), { ...options, skipEscape: true });
       }
@@ -3721,7 +3721,7 @@ var require_fast_uri = __commonJS({
       return uriTokens.join("");
     }
     var URI_PARSE = /^(?:([^#/:?]+):)?(?:\/\/((?:([^#/?@]*)@)?(\[[^#/?\]]+\]|[^#/:?]*)(?::(\d*))?))?([^#?]*)(?:\?([^#]*))?(?:#((?:.|[\n\r])*))?/u;
-    function parse5(uri, opts) {
+    function parse6(uri, opts) {
       const options = Object.assign({}, opts);
       const parsed = {
         scheme: void 0,
@@ -3811,11 +3811,11 @@ var require_fast_uri = __commonJS({
     var fastUri = {
       SCHEMES,
       normalize: normalize3,
-      resolve: resolve4,
+      resolve: resolve5,
       resolveComponent,
       equal,
       serialize,
-      parse: parse5
+      parse: parse6
     };
     module2.exports = fastUri;
     module2.exports.default = fastUri;
@@ -16673,7 +16673,7 @@ var Protocol = class {
           return;
         }
         const pollInterval = task2.pollInterval ?? this._options?.defaultTaskPollInterval ?? 1e3;
-        await new Promise((resolve4) => setTimeout(resolve4, pollInterval));
+        await new Promise((resolve5) => setTimeout(resolve5, pollInterval));
         options?.signal?.throwIfAborted();
       }
     } catch (error2) {
@@ -16690,7 +16690,7 @@ var Protocol = class {
    */
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken, task, relatedTask } = options ?? {};
-    return new Promise((resolve4, reject) => {
+    return new Promise((resolve5, reject) => {
       const earlyReject = (error2) => {
         reject(error2);
       };
@@ -16768,7 +16768,7 @@ var Protocol = class {
           if (!parseResult.success) {
             reject(parseResult.error);
           } else {
-            resolve4(parseResult.data);
+            resolve5(parseResult.data);
           }
         } catch (error2) {
           reject(error2);
@@ -17029,12 +17029,12 @@ var Protocol = class {
       }
     } catch {
     }
-    return new Promise((resolve4, reject) => {
+    return new Promise((resolve5, reject) => {
       if (signal.aborted) {
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
         return;
       }
-      const timeoutId = setTimeout(resolve4, interval);
+      const timeoutId = setTimeout(resolve5, interval);
       signal.addEventListener("abort", () => {
         clearTimeout(timeoutId);
         reject(new McpError(ErrorCode.InvalidRequest, "Request cancelled"));
@@ -17763,12 +17763,12 @@ var StdioServerTransport = class {
     this.onclose?.();
   }
   send(message) {
-    return new Promise((resolve4) => {
+    return new Promise((resolve5) => {
       const json = serializeMessage(message);
       if (this._stdout.write(json)) {
-        resolve4();
+        resolve5();
       } else {
-        this._stdout.once("drain", resolve4);
+        this._stdout.once("drain", resolve5);
       }
     });
   }
@@ -18718,8 +18718,8 @@ var import_fs7 = require("fs");
 var import_path8 = require("path");
 
 // src/team/git-worktree.ts
-var import_node_fs = require("node:fs");
-var import_node_path = require("node:path");
+var import_node_fs2 = require("node:fs");
+var import_node_path2 = require("node:path");
 var import_node_child_process = require("node:child_process");
 
 // src/team/fs-utils.ts
@@ -18761,6 +18761,90 @@ function validateResolvedPath(resolvedPath, expectedBase) {
   if (rel.startsWith("..") || (0, import_path7.resolve)(absBase, rel) !== absResolved) {
     throw new Error(`Path traversal detected: "${resolvedPath}" escapes base "${expectedBase}"`);
   }
+}
+
+// src/lib/worktree-cleanup-safety.ts
+var import_node_fs = require("node:fs");
+var import_node_os = require("node:os");
+var import_node_path = require("node:path");
+function realpathOrResolve(path4) {
+  try {
+    return (0, import_node_fs.realpathSync)(path4);
+  } catch {
+    return (0, import_node_path.resolve)(path4);
+  }
+}
+function assertSafeBoundary(path4, label) {
+  const trimmed = path4.trim();
+  if (trimmed.length === 0) {
+    throw new Error(`${label}_empty`);
+  }
+  if (trimmed.includes("\0")) {
+    throw new Error(`${label}_contains_nul`);
+  }
+  const resolved = realpathOrResolve(trimmed);
+  const root = (0, import_node_path.parse)(resolved).root;
+  const home = realpathOrResolve((0, import_node_os.homedir)());
+  if (resolved === root) {
+    throw new Error(`${label}_is_filesystem_root:${resolved}`);
+  }
+  if (resolved === home) {
+    throw new Error(`${label}_is_home_directory:${resolved}`);
+  }
+  return resolved;
+}
+function isInside(parent, child) {
+  const rel = (0, import_node_path.relative)(parent, child);
+  return rel.length > 0 && !rel.startsWith("..") && !(0, import_node_path.isAbsolute)(rel);
+}
+function validateWorktreeRemovalTarget(options) {
+  const { candidatePath, expectedRoots, mainRepoRoots = [], requireExisting = true } = options;
+  if (expectedRoots.length === 0) {
+    throw new Error("expected_worktree_roots_empty");
+  }
+  const rawCandidate = candidatePath.trim();
+  if (rawCandidate.length === 0) {
+    throw new Error("worktree_path_empty");
+  }
+  if (rawCandidate.includes("\0")) {
+    throw new Error("worktree_path_contains_nul");
+  }
+  if (rawCandidate === "." || rawCandidate === ".." || rawCandidate === "~") {
+    throw new Error(`worktree_path_suspicious:${rawCandidate}`);
+  }
+  const lexicalPath = (0, import_node_path.resolve)(rawCandidate);
+  if (!(0, import_node_fs.existsSync)(lexicalPath)) {
+    if (requireExisting) {
+      throw new Error(`worktree_path_missing:${lexicalPath}`);
+    }
+  } else {
+    const stat = (0, import_node_fs.lstatSync)(lexicalPath);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`worktree_path_is_symlink:${lexicalPath}`);
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(`worktree_path_not_directory:${lexicalPath}`);
+    }
+  }
+  const resolvedPath = assertSafeBoundary(candidatePath, "worktree_path");
+  const matchedRoot = expectedRoots.map((root) => assertSafeBoundary(root, "worktree_root")).find((root) => isInside(root, resolvedPath));
+  if (!matchedRoot) {
+    throw new Error(`worktree_path_outside_expected_roots:${resolvedPath}`);
+  }
+  for (const repoRoot of mainRepoRoots) {
+    if (repoRoot.trim().length === 0) continue;
+    const resolvedRepoRoot = realpathOrResolve(repoRoot);
+    if (resolvedPath === resolvedRepoRoot) {
+      throw new Error(`worktree_path_is_main_repo:${resolvedPath}`);
+    }
+  }
+  if ((0, import_node_fs.existsSync)((0, import_node_path.join)(resolvedPath, ".git"))) {
+    const gitStat = (0, import_node_fs.lstatSync)((0, import_node_path.join)(resolvedPath, ".git"));
+    if (gitStat.isDirectory()) {
+      throw new Error(`worktree_path_is_main_repo:${resolvedPath}`);
+    }
+  }
+  return { resolvedPath, matchedRoot };
 }
 
 // src/lib/file-lock.ts
@@ -18937,7 +19021,7 @@ function withFileLockSync(lockPath, fn, opts) {
 
 // src/team/git-worktree.ts
 function getWorktreePath(repoRoot, teamName, workerName) {
-  return (0, import_node_path.join)(getOmcRoot(repoRoot), "team", sanitizeName(teamName), "worktrees", sanitizeName(workerName));
+  return (0, import_node_path2.join)(getOmcRoot(repoRoot), "team", sanitizeName(teamName), "worktrees", sanitizeName(workerName));
 }
 function getBranchName(teamName, workerName) {
   return `omc-team/${sanitizeName(teamName)}/${sanitizeName(workerName)}`;
@@ -18947,9 +19031,9 @@ function git(repoRoot, args, cwd = repoRoot) {
 }
 function canonicalPathForComparison(path4) {
   try {
-    return (0, import_node_fs.realpathSync)(path4);
+    return (0, import_node_fs2.realpathSync)(path4);
   } catch {
-    return (0, import_node_path.resolve)(path4);
+    return (0, import_node_path2.resolve)(path4);
   }
 }
 function isRegisteredWorktreePath(repoRoot, wtPath) {
@@ -18989,22 +19073,22 @@ function isWorktreeDirtyExcept(wtPath, ignoredRootPaths = []) {
   }
 }
 function getMetadataPath(repoRoot, teamName) {
-  return (0, import_node_path.join)(getOmcRoot(repoRoot), "state", "team", sanitizeName(teamName), "worktrees.json");
+  return (0, import_node_path2.join)(getOmcRoot(repoRoot), "state", "team", sanitizeName(teamName), "worktrees.json");
 }
 function getLegacyMetadataPath(repoRoot, teamName) {
-  return (0, import_node_path.join)(getOmcRoot(repoRoot), "state", "team-bridge", sanitizeName(teamName), "worktrees.json");
+  return (0, import_node_path2.join)(getOmcRoot(repoRoot), "state", "team-bridge", sanitizeName(teamName), "worktrees.json");
 }
 function getWorkerStateDir(repoRoot, teamName, workerName) {
-  return (0, import_node_path.join)(getOmcRoot(repoRoot), "state", "team", sanitizeName(teamName), "workers", sanitizeName(workerName));
+  return (0, import_node_path2.join)(getOmcRoot(repoRoot), "state", "team", sanitizeName(teamName), "workers", sanitizeName(workerName));
 }
 function getRootAgentsBackupPath(repoRoot, teamName, workerName) {
-  return (0, import_node_path.join)(getWorkerStateDir(repoRoot, teamName, workerName), "worktree-root-agents.json");
+  return (0, import_node_path2.join)(getWorkerStateDir(repoRoot, teamName, workerName), "worktree-root-agents.json");
 }
 function readRootAgentsBackup(repoRoot, teamName, workerName) {
   const backupPath = getRootAgentsBackupPath(repoRoot, teamName, workerName);
-  if (!(0, import_node_fs.existsSync)(backupPath)) return null;
+  if (!(0, import_node_fs2.existsSync)(backupPath)) return null;
   try {
-    return JSON.parse((0, import_node_fs.readFileSync)(backupPath, "utf-8"));
+    return JSON.parse((0, import_node_fs2.readFileSync)(backupPath, "utf-8"));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     process.stderr.write(`[omc] warning: worktree root AGENTS backup parse error: ${msg}
@@ -19021,27 +19105,27 @@ function restoreWorktreeRootAgents(teamName, workerName, repoRoot, worktreePath)
   if (!backup) return { restored: false, reason: "no_backup" };
   const resolvedWorktreePath = worktreePath ?? backup.worktreePath;
   validateResolvedPath(resolvedWorktreePath, repoRoot);
-  if (!(0, import_node_fs.existsSync)(resolvedWorktreePath)) {
+  if (!(0, import_node_fs2.existsSync)(resolvedWorktreePath)) {
     try {
-      (0, import_node_fs.unlinkSync)(backupPath);
+      (0, import_node_fs2.unlinkSync)(backupPath);
     } catch {
     }
     return { restored: false, reason: "worktree_missing" };
   }
-  const agentsPath = (0, import_node_path.join)(resolvedWorktreePath, "AGENTS.md");
+  const agentsPath = (0, import_node_path2.join)(resolvedWorktreePath, "AGENTS.md");
   validateResolvedPath(agentsPath, repoRoot);
-  const currentContent = (0, import_node_fs.existsSync)(agentsPath) ? (0, import_node_fs.readFileSync)(agentsPath, "utf-8") : void 0;
+  const currentContent = (0, import_node_fs2.existsSync)(agentsPath) ? (0, import_node_fs2.readFileSync)(agentsPath, "utf-8") : void 0;
   const isPartialInstallOriginal = backup.hadOriginal && currentContent === (backup.originalContent ?? "");
   if (currentContent !== void 0 && currentContent !== backup.installedContent && !isPartialInstallOriginal) {
     return { restored: false, reason: "agents_dirty" };
   }
   if (backup.hadOriginal) {
-    (0, import_node_fs.writeFileSync)(agentsPath, backup.originalContent ?? "", "utf-8");
-  } else if ((0, import_node_fs.existsSync)(agentsPath)) {
-    (0, import_node_fs.unlinkSync)(agentsPath);
+    (0, import_node_fs2.writeFileSync)(agentsPath, backup.originalContent ?? "", "utf-8");
+  } else if ((0, import_node_fs2.existsSync)(agentsPath)) {
+    (0, import_node_fs2.unlinkSync)(agentsPath);
   }
   try {
-    (0, import_node_fs.unlinkSync)(backupPath);
+    (0, import_node_fs2.unlinkSync)(backupPath);
   } catch {
   }
   return { restored: true };
@@ -19051,9 +19135,9 @@ function readMetadataResult(repoRoot, teamName) {
   const byWorker = /* @__PURE__ */ new Map();
   const issues = [];
   for (const metaPath of paths) {
-    if (!(0, import_node_fs.existsSync)(metaPath)) continue;
+    if (!(0, import_node_fs2.existsSync)(metaPath)) continue;
     try {
-      const entries = JSON.parse((0, import_node_fs.readFileSync)(metaPath, "utf-8"));
+      const entries = JSON.parse((0, import_node_fs2.readFileSync)(metaPath, "utf-8"));
       for (const entry of entries) byWorker.set(entry.workerName, entry);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -19068,15 +19152,15 @@ function readMetadata(repoRoot, teamName) {
   return readMetadataResult(repoRoot, teamName).entries;
 }
 function listRootAgentsBackupIssues(repoRoot, teamName, entries) {
-  const workersDir = (0, import_node_path.join)(getOmcRoot(repoRoot), "state", "team", sanitizeName(teamName), "workers");
-  if (!(0, import_node_fs.existsSync)(workersDir)) return [];
+  const workersDir = (0, import_node_path2.join)(getOmcRoot(repoRoot), "state", "team", sanitizeName(teamName), "workers");
+  if (!(0, import_node_fs2.existsSync)(workersDir)) return [];
   const knownWorkers = new Set(entries.map((entry) => sanitizeName(entry.workerName)));
   const issues = [];
-  for (const workerName of (0, import_node_fs.readdirSync)(workersDir)) {
-    const backupPath = (0, import_node_path.join)(workersDir, workerName, "worktree-root-agents.json");
-    if (!(0, import_node_fs.existsSync)(backupPath)) continue;
+  for (const workerName of (0, import_node_fs2.readdirSync)(workersDir)) {
+    const backupPath = (0, import_node_path2.join)(workersDir, workerName, "worktree-root-agents.json");
+    if (!(0, import_node_fs2.existsSync)(backupPath)) continue;
     try {
-      JSON.parse((0, import_node_fs.readFileSync)(backupPath, "utf-8"));
+      JSON.parse((0, import_node_fs2.readFileSync)(backupPath, "utf-8"));
     } catch (error2) {
       const message = error2 instanceof Error ? error2.message : String(error2);
       issues.push({ path: backupPath, message: `worktree_root_agents_backup_unreadable:${workerName}:${message}` });
@@ -19094,7 +19178,7 @@ function listRootAgentsBackupIssues(repoRoot, teamName, entries) {
 function writeMetadata(repoRoot, teamName, entries) {
   const metaPath = getMetadataPath(repoRoot, teamName);
   validateResolvedPath(metaPath, repoRoot);
-  ensureDirWithMode((0, import_node_path.join)(getOmcRoot(repoRoot), "state", "team", sanitizeName(teamName)));
+  ensureDirWithMode((0, import_node_path2.join)(getOmcRoot(repoRoot), "state", "team", sanitizeName(teamName)));
   atomicWriteJson(metaPath, entries);
 }
 function forgetMetadataUnlocked(repoRoot, teamName, workerName) {
@@ -19104,12 +19188,17 @@ function forgetMetadataUnlocked(repoRoot, teamName, workerName) {
 function checkWorkerWorktreeRemovalSafety(teamName, workerName, repoRoot, worktreePath) {
   const wtPath = worktreePath ?? getWorktreePath(repoRoot, teamName, workerName);
   const backup = readRootAgentsBackup(repoRoot, teamName, workerName);
-  if (!(0, import_node_fs.existsSync)(wtPath)) return;
+  if (!(0, import_node_fs2.existsSync)(wtPath)) return;
+  validateWorktreeRemovalTarget({
+    candidatePath: wtPath,
+    expectedRoots: [(0, import_node_path2.join)(repoRoot, ".omc", "team", sanitizeName(teamName), "worktrees")],
+    mainRepoRoots: [repoRoot]
+  });
   let ignoreRootAgents = false;
   if (backup) {
-    const agentsPath = (0, import_node_path.join)(wtPath, "AGENTS.md");
+    const agentsPath = (0, import_node_path2.join)(wtPath, "AGENTS.md");
     validateResolvedPath(agentsPath, repoRoot);
-    const currentContent = (0, import_node_fs.existsSync)(agentsPath) ? (0, import_node_fs.readFileSync)(agentsPath, "utf-8") : void 0;
+    const currentContent = (0, import_node_fs2.existsSync)(agentsPath) ? (0, import_node_fs2.readFileSync)(agentsPath, "utf-8") : void 0;
     const isPartialInstallOriginal = backup.hadOriginal && currentContent === (backup.originalContent ?? "");
     if (currentContent !== void 0 && currentContent !== backup.installedContent && !isPartialInstallOriginal) {
       const error2 = new Error(`agents_dirty: preserving modified worktree root AGENTS.md at ${agentsPath}`);
@@ -19130,7 +19219,7 @@ function prepareWorkerWorktreeForRemoval(teamName, workerName, repoRoot, worktre
   checkWorkerWorktreeRemovalSafety(teamName, workerName, repoRoot, wtPath);
   const agentsRestore = restoreWorktreeRootAgents(teamName, workerName, repoRoot, wtPath);
   if (agentsRestore.reason === "agents_dirty") {
-    const error2 = new Error(`agents_dirty: preserving modified worktree root AGENTS.md at ${(0, import_node_path.join)(wtPath, "AGENTS.md")}`);
+    const error2 = new Error(`agents_dirty: preserving modified worktree root AGENTS.md at ${(0, import_node_path2.join)(wtPath, "AGENTS.md")}`);
     error2.code = "agents_dirty";
     throw error2;
   }
@@ -19160,8 +19249,13 @@ function removeWorkerWorktree(teamName, workerName, repoRoot) {
       (0, import_node_child_process.execFileSync)("git", ["branch", "-D", branch], { cwd: repoRoot, stdio: "pipe" });
     } catch {
     }
-    if ((0, import_node_fs.existsSync)(wtPath) && !isRegisteredWorktreePath(repoRoot, wtPath)) {
-      (0, import_node_fs.rmSync)(wtPath, { recursive: true, force: true });
+    if ((0, import_node_fs2.existsSync)(wtPath) && !isRegisteredWorktreePath(repoRoot, wtPath)) {
+      validateWorktreeRemovalTarget({
+        candidatePath: wtPath,
+        expectedRoots: [(0, import_node_path2.join)(repoRoot, ".omc", "team", sanitizeName(teamName), "worktrees")],
+        mainRepoRoots: [repoRoot]
+      });
+      (0, import_node_fs2.rmSync)(wtPath, { recursive: true, force: true });
     }
     forgetMetadataUnlocked(repoRoot, teamName, workerName);
   });

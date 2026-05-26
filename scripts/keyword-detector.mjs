@@ -37,6 +37,57 @@ const _omcRoot = process.env.CLAUDE_PLUGIN_ROOT ||
   join(dirname(fileURLToPath(import.meta.url)), '..');
 const SKILL_INVOCATION_USER_REQUEST_MAX = 1200;
 
+const RALPLAN_FOLLOWUP_TERMINAL_PHASES = new Set([
+  'completed',
+  'complete',
+  'failed',
+  'cancelled',
+  'canceled',
+  'aborted',
+  'terminated',
+  'done',
+  'handoff',
+  'pending approval',
+  'pending-approval',
+  'pending_approval',
+  'awaiting approval',
+  'awaiting-approval',
+  'awaiting_approval',
+  'approval-required',
+  'approval_required',
+]);
+
+function normalizeRalplanFollowupPhase(state) {
+  if (!state || typeof state !== 'object') return null;
+  const raw = state.current_phase ?? state.phase ?? state.status;
+  if (typeof raw !== 'string') return null;
+  const phase = raw.trim().toLowerCase();
+  if (!phase) return null;
+  if (phase === 'handoff' || phase.startsWith('handoff:') || phase.startsWith('handoff-')) return 'handoff';
+  return phase;
+}
+
+function readRalplanFollowupState(statePaths, sessionId) {
+  const safeSessionId = sessionId && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(sessionId) ? sessionId : '';
+  for (const statePath of statePaths) {
+    try {
+      if (!existsSync(statePath)) continue;
+      const state = JSON.parse(readFileSync(statePath, 'utf-8'));
+      if (!state || typeof state !== 'object') continue;
+      if (safeSessionId && typeof state.session_id === 'string' && state.session_id !== safeSessionId) continue;
+      return state;
+    } catch { /* ignore malformed state */ }
+  }
+  return null;
+}
+
+function isRalplanFollowupTerminal(state) {
+  if (!state || typeof state !== 'object') return false;
+  if (state.active === true) return false;
+  const phase = normalizeRalplanFollowupPhase(state);
+  return Boolean(phase && RALPLAN_FOLLOWUP_TERMINAL_PHASES.has(phase));
+}
+
 function compactHookText(text, maxChars = SKILL_INVOCATION_USER_REQUEST_MAX) {
   const notice = '\n...[truncated; original user prompt remains available in the conversation]';
   if (!text || text.length <= maxChars) return text || '';
@@ -474,7 +525,7 @@ function sanitizePromptForState(prompt) {
     : base;
 }
 const MODE_REFERENCE_PATTERN =
-  /\b(?:ralph|autopilot|auto[\s-]?pilot|ultrawork|ulw|ralplan|ultrathink|deepsearch|deep[\s-]?analyze|deepanalyze|deep[\s-]interview|ouroboros|ccg|claude-codex-gemini|deerflow)\b/gi;
+  /\b(?:ralph|autopilot|auto[\s-]?pilot|ultragoal|ultrawork|ulw|ralplan|ultrathink|deepsearch|deep[\s-]?analyze|deepanalyze|deep[\s-]interview|ouroboros|ccg|claude-codex-gemini|deerflow)\b/gi;
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -631,6 +682,45 @@ function hasActionableKeyword(text, pattern) {
   return false;
 }
 
+function hasExplicitWorkflowInvocationContext(text, position, keywordLength, keywordText) {
+  const prefix = text.slice(0, position);
+  if (/^\s*(?:[$/!]\s*|force:\s*|oh-my-(?:claudecode|codex):\s*)$/i.test(prefix)) {
+    return true;
+  }
+
+  const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
+  const end = Math.min(text.length, position + keywordLength + INFORMATIONAL_CONTEXT_WINDOW);
+  const context = text.slice(start, end);
+  return hasActivationIntentNearKeyword(context, keywordText);
+}
+
+function hasExplicitActionableKeyword(text, pattern) {
+  const searchText = looksLikeSystemEcho(text)
+    ? stripSystemEchoes(text)
+    : text;
+
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  const globalPattern = new RegExp(pattern.source, flags);
+
+  for (const match of searchText.matchAll(globalPattern)) {
+    if (match.index === undefined) {
+      continue;
+    }
+
+    if (isInformationalKeywordContext(searchText, match.index, match[0].length, match[0])) {
+      continue;
+    }
+
+    if (!hasExplicitWorkflowInvocationContext(searchText, match.index, match[0].length, match[0])) {
+      continue;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
 function hasActionableRalplanKeyword(text, pattern) {
   // Same echo guard as hasActionableKeyword.
   const searchText = looksLikeSystemEcho(text)
@@ -692,6 +782,21 @@ function activateState(directory, prompt, stateName, sessionId, omcRoot) {
       started_at: now,
       session_id: sessionId || undefined,
       project_path: directory,
+      awaiting_confirmation: true,
+      awaiting_confirmation_set_at: now,
+      last_checked_at: now
+    };
+  } else if (stateName === 'ultragoal') {
+    // Ultragoal persists a durable goal workflow and requires Claude /goal parity.
+    state = {
+      active: true,
+      started_at: now,
+      current_phase: 'executing',
+      original_prompt: safePrompt,
+      session_id: sessionId || undefined,
+      project_path: directory,
+      reinforcement_count: 0,
+      max_reinforcements: 50,
       awaiting_confirmation: true,
       awaiting_confirmation_set_at: now,
       last_checked_at: now
@@ -925,11 +1030,10 @@ function resolveConflicts(matches) {
 
   let resolved = [...matches];
 
-
   // Team keyword detection removed — team is now explicit-only via /team skill.
 
   // Sort by priority order
-  const priorityOrder = ['cancel','ralph','autopilot','ultrawork',
+  const priorityOrder = ['cancel','ralph','ultragoal','autopilot','ultrawork',
     'ccg','ralplan','deep-interview','ai-slop-cleaner','tdd','code-review','security-review','ultrathink','deepsearch','analyze'];
   resolved.sort((a, b) => priorityOrder.indexOf(a.name) - priorityOrder.indexOf(b.name));
 
@@ -1041,6 +1145,11 @@ async function main() {
       matches.push({ name: 'autopilot', args: '' });
     }
 
+    // Ultragoal keywords
+    if (hasExplicitActionableKeyword(cleanPrompt, /\b(ultragoal)\b/i)) {
+      matches.push({ name: 'ultragoal', args: '' });
+    }
+
     // Ultrapilot keywords removed — routed to team which is now explicit-only (/team).
 
     // Ultrawork keywords
@@ -1048,10 +1157,8 @@ async function main() {
       matches.push({ name: 'ultrawork', args: '' });
     }
 
-
     // Team keyword detection removed — team mode is now explicit-only via /team skill.
     // This prevents infinite spawning when Claude workers receive prompts containing "team".
-
 
     // CCG keywords (Claude-Codex-Gemini tri-model orchestration)
     if (hasActionableKeyword(cleanPrompt, /\b(ccg|claude-codex-gemini)\b|(씨씨지)/i)) {
@@ -1152,15 +1259,27 @@ async function main() {
             join(omcRoot, 'state', 'ralplan-state.json'),
             join(directory, '.omx', 'state', 'ralplan-state.json'),
           ];
-      const ralplanWasActive = ralplanStatePaths.some(statePath => existsSync(statePath));
+      const ralplanState = readRalplanFollowupState(ralplanStatePaths, sessionId);
+      const ralplanTerminal = isRalplanFollowupTerminal(ralplanState);
 
-      if (ralplanWasActive) {
+      if (ralplanState) {
         const artifacts = planningArtifacts.readPlanningArtifacts(directory);
         const planningComplete = planningArtifacts.isPlanningComplete(artifacts);
-        const context = { planningComplete, priorSkill: 'ralplan' };
+        const teamHint = planningArtifacts.readApprovedExecutionLaunchHint?.(directory, 'team');
+        const ralphHint = planningArtifacts.readApprovedExecutionLaunchHint?.(directory, 'ralph');
 
-        const isTeamFollowup = followupPlanner.isApprovedExecutionFollowupShortcut('team', prompt, context);
-        const isRalphFollowup = followupPlanner.isApprovedExecutionFollowupShortcut('ralph', prompt, context);
+        const isTeamFollowup = followupPlanner.isApprovedExecutionFollowupShortcut('team', prompt, {
+          planningComplete,
+          priorSkill: 'ralplan',
+          ralplanTerminal,
+          approvedExecutionLaunchHint: Boolean(teamHint),
+        });
+        const isRalphFollowup = followupPlanner.isApprovedExecutionFollowupShortcut('ralph', prompt, {
+          planningComplete,
+          priorSkill: 'ralplan',
+          ralplanTerminal,
+          approvedExecutionLaunchHint: Boolean(ralphHint),
+        });
 
         if (isTeamFollowup) {
           console.log(JSON.stringify(createHookOutput(createSkillInvocation('team', prompt))));
@@ -1168,6 +1287,16 @@ async function main() {
         }
         if (isRalphFollowup) {
           console.log(JSON.stringify(createHookOutput(createSkillInvocation('ralph', prompt))));
+          return;
+        }
+
+        const isShortTeamRequest = followupPlanner.isShortTeamFollowupRequest?.(prompt) === true;
+        const isShortRalphRequest = followupPlanner.isShortRalphFollowupRequest?.(prompt) === true;
+        if (isShortTeamRequest || isShortRalphRequest) {
+          // A compact continuation can echo the saved plan and a terse lane hint.
+          // Unless the ralplan state is terminal and a launch hint is present,
+          // keep ralplan read-only instead of falling through to generic ralph.
+          console.log(JSON.stringify({ continue: true, suppressOutput: true }));
           return;
         }
       }
@@ -1191,13 +1320,13 @@ async function main() {
 
     // Handle cancel specially - clear states and emit
     if (resolved.length > 0 && resolved[0].name === 'cancel') {
-      clearStateFiles(directory, ['ralph', 'autopilot', 'ultrawork', 'swarm', 'ralplan'], sessionId, omcRoot);
+      clearStateFiles(directory, ['ralph', 'ultragoal', 'autopilot', 'ultrawork', 'swarm', 'ralplan'], sessionId, omcRoot);
       console.log(JSON.stringify(createHookOutput(createSkillInvocation('cancel', prompt))));
       return;
     }
 
     // Activate states for modes that need them (team removed — explicit-only via /team skill)
-    const stateModes = resolved.filter(m => ['ralph', 'autopilot', 'ultrawork', 'ralplan'].includes(m.name));
+    const stateModes = resolved.filter(m => ['ralph', 'ultragoal', 'autopilot', 'ultrawork', 'ralplan'].includes(m.name));
     for (const mode of stateModes) {
       activateState(directory, prompt, mode.name, sessionId, omcRoot);
     }

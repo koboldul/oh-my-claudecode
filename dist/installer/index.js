@@ -834,6 +834,7 @@ const PLUGIN_SYNC_PAYLOAD = [
     'scripts',
     'skills',
     'agents',
+    'commands',
     'templates',
     'docs',
     '.claude-plugin',

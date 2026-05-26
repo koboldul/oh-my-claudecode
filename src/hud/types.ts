@@ -7,6 +7,7 @@
 import type { AutopilotStateForHud } from './elements/autopilot.js';
 import type { ApiKeySource } from './elements/api-key-source.js';
 import type { SessionSummaryState } from './elements/session-summary.js';
+import type { PayloadEstimate } from './payload-estimate.js';
 import type { MissionBoardConfig, MissionBoardState } from './mission-board.js';
 import { DEFAULT_MISSION_BOARD_CONFIG } from './mission-board.js';
 
@@ -412,6 +413,9 @@ export interface HudRenderContext {
 
   /** Name of the last tool called in this session */
   lastToolName?: string | null;
+
+  /** Best-effort local transcript-backed request payload pressure estimate. */
+  payloadEstimate?: PayloadEstimate | null;
 }
 
 // ============================================================================
@@ -560,6 +564,7 @@ export interface HudElementConfig {
   model: boolean;            // Show current model name
   modelFormat: ModelFormat;   // Model name verbosity level
   omcLabel: boolean;
+  updateNotification?: boolean; // Show available-update prompt text in the OMC label
   rateLimits: boolean;  // Show 5h and weekly rate limits
   ralph: boolean;
   autopilot: boolean;
@@ -646,7 +651,7 @@ export const DEFAULT_ELEMENT_ORDER: Required<LayoutConfig> = {
     'skills', 'lastSkill', 'contextBar', 'agents', 'background',
     'callCounts', 'lastTool', 'sessionSummary',
   ],
-  detail: ['missionBoard', 'agents', 'contextWarning', 'todos'],
+  detail: ['missionBoard', 'agents', 'contextWarning', 'payloadWarning', 'todos'],
 };
 
 export interface HudConfig {
@@ -692,6 +697,7 @@ export const DEFAULT_HUD_CONFIG: HudConfig = {
     model: true,              // Show only when Claude Code statusline stdin provides a model
     modelFormat: 'versioned', // Preserve model version by default
     omcLabel: true,
+    updateNotification: true, // Preserve existing update prompt behavior by default
     rateLimits: true,  // Show rate limits by default
     ralph: true,
     autopilot: true,
@@ -752,6 +758,7 @@ export const PRESET_CONFIGS: Record<HudPreset, Partial<HudElementConfig>> = {
     model: true,
     modelFormat: 'versioned',
     omcLabel: true,
+    updateNotification: true,
     rateLimits: true,
     ralph: true,
     autopilot: true,
@@ -794,6 +801,7 @@ export const PRESET_CONFIGS: Record<HudPreset, Partial<HudElementConfig>> = {
     model: true,
     modelFormat: 'versioned',
     omcLabel: true,
+    updateNotification: true,
     rateLimits: true,
     ralph: true,
     autopilot: true,
@@ -836,6 +844,7 @@ export const PRESET_CONFIGS: Record<HudPreset, Partial<HudElementConfig>> = {
     model: true,
     modelFormat: 'versioned',
     omcLabel: true,
+    updateNotification: true,
     rateLimits: true,
     ralph: true,
     autopilot: true,
@@ -878,6 +887,7 @@ export const PRESET_CONFIGS: Record<HudPreset, Partial<HudElementConfig>> = {
     model: true,
     modelFormat: 'versioned',
     omcLabel: true,
+    updateNotification: true,
     rateLimits: false,
     ralph: true,
     autopilot: true,
@@ -920,6 +930,7 @@ export const PRESET_CONFIGS: Record<HudPreset, Partial<HudElementConfig>> = {
     model: true,
     modelFormat: 'versioned',
     omcLabel: true,
+    updateNotification: true,
     rateLimits: true,
     ralph: true,
     autopilot: true,
