@@ -53,9 +53,50 @@ jobs:
 
       # ── 3. Install omc@4.9.3 via npm ────────────────────────────────────────
       # Establishes the "old version" baseline before `omc update` is run.
+      #
+      # ENOTEMPTY hardening: the global node_modules dir is reused across runs on
+      # self-hosted runners (and within the GitHub-hosted tool cache). A
+      # previously interrupted `npm install -g` can leave behind the resolved
+      # package dir and/or npm's staging temp dirs (`.oh-my-claude-sisyphus-*`),
+      # which makes the next install fail with
+      #   npm ERR! ENOTEMPTY: directory not empty, rename '.../oh-my-claude-sisyphus'
+      #     -> '.../.oh-my-claude-sisyphus-XXXXXXXX'
+      # and, on rerun, appear to hang. Remove any stale global package + npm
+      # staging dirs before installing, then retry the install a few times so a
+      # transient rename race does not fail the run. Persistent install failures
+      # still surface as a non-zero exit (we never swallow the final failure).
 
       - name: Install omc v4.9.3 via npm
-        run: npm install -g oh-my-claude-sisyphus@4.9.3
+        run: |
+          set -euo pipefail
+
+          PKG=oh-my-claude-sisyphus
+          GLOBAL_ROOT="$(npm root -g)"
+
+          clean_stale_global_pkg() {
+            # Remove the resolved global package dir plus any npm staging temp
+            # dirs left over from an interrupted global install. `:?` guards
+            # against an empty GLOBAL_ROOT so we never rm -rf "/".
+            rm -rf "${GLOBAL_ROOT:?}/$PKG" 2>/dev/null || true
+            find "$GLOBAL_ROOT" -maxdepth 1 -name ".$PKG-*" -exec rm -rf {} + 2>/dev/null || true
+          }
+
+          clean_stale_global_pkg
+
+          ATTEMPTS=3
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            echo "Installing $PKG@4.9.3 (attempt $attempt/$ATTEMPTS)"
+            if npm install -g "$PKG@4.9.3" --no-audit --no-fund; then
+              echo "Installed $PKG@4.9.3"
+              exit 0
+            fi
+            echo "Install attempt $attempt failed; cleaning stale global state and retrying."
+            clean_stale_global_pkg
+            sleep 2
+          done
+
+          echo "FAIL: npm install -g $PKG@4.9.3 failed after $ATTEMPTS attempts"
+          exit 1
 
       - name: Verify omc version is 4.9.3
         run: |
