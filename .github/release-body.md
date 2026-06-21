@@ -2,7 +2,7 @@
 
 ## Release Notes
 
-Release with **1 new feature**, **8 bug fixes**, **2 documentation updates**, and **8 maintenance / CI improvements** across the post-`v4.14.7` dev line.
+Release with **1 new feature**, **9 bug fixes**, **2 documentation updates**, and **8 maintenance / CI improvements** across the post-`v4.14.7` dev line.
 
 ### Highlights
 
@@ -28,6 +28,7 @@ Release with **1 new feature**, **8 bug fixes**, **2 documentation updates**, an
 - **fix(team): verify cursor worker start submission** (#3296)
 - **fix(post-tool-rules-injector): honor existing skip guards** (#3297)
 - **fix(jsonc): tolerate trailing commas in JSONC config files** (#3299)
+- **fix(hooks): encode project paths in transcript resolution** (#3300)
 
 ### Documentation
 
@@ -45,9 +46,9 @@ Release with **1 new feature**, **8 bug fixes**, **2 documentation updates**, an
 
 ### Stats
 
-- **19 commits since v4.14.7**
+- **20 non-release commits since v4.14.7**
 - **1 HUD/user-facing feature**
-- **8+ fixes across Windows paths, team workers, JSONC, cleanup, and persistent mode**
+- **9+ fixes across Windows paths, team workers, JSONC, cleanup, hooks, and persistent mode**
 - **Latest dev CI + Upgrade Test are green**
 
 ### Install / Update
