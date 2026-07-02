@@ -51,6 +51,19 @@ omc setup
 
 The npm package exposes both `oh-my-claudecode` and `omc`; examples prefer `omc` unless troubleshooting needs the long alias. The CLI does not make in-session slash skills available by itself; install the plugin for `/autopilot`, `/ralph`, `/team`, and other interactive skills.
 
+### GitHub Copilot CLI
+
+OMC also runs as a plugin under [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli). Copilot CLI loads the same Claude Code plugin format, so skills, `agents/*.md` (surfaced as `oh-my-claudecode:*` custom agents), the `t` MCP server, and the `hooks/hooks.json` manifest all work without a separate build.
+
+Install from Copilot's `/plugin` command — the marketplace name (`omc`) and plugin name (`oh-my-claudecode`) come from the repo's `marketplace.json`, so the commands match the Claude Code flow:
+
+```text
+/plugin marketplace add https://github.com/Yeachan-Heo/oh-my-claudecode
+/plugin install oh-my-claudecode
+```
+
+Restart Copilot CLI after installing — hook configuration is loaded at CLI startup. Run `/env` to confirm OMC's skills, agents, MCP server, and hooks are loaded. Copilot recognizes Claude's hook event names as aliases, so keyword auto-detection and the ralph/ultrawork/autopilot persistence loop work the same as under Claude Code; see [GitHub Copilot CLI compatibility](#github-copilot-cli-compatibility) for the full event mapping and the one known limitation. Claude-Code-specific setup surfaces (`/omc-setup`, HUD statusline) target `~/.claude` and are not required to use OMC under Copilot.
+
 ### Requirements
 
 - [Claude Code](https://docs.anthropic.com/claude-code) installed
@@ -943,6 +956,32 @@ For each UserPromptSubmit command, 30s is the outer host fuse, including any lau
 The `workflow-drift-guard` blocks only supported source-associated local selection forks with a known minimum of two live alternatives—including exact binary questions and cardinality templates; explicit open input and every unsupported or ambiguous form fail open.
 
 > **Note**: autopilot, ralph, ultrawork, and ultraqa are **skills** (activated via keyword-detector), not hooks. The `persistent-mode.mjs` hook enforces their continuation by blocking the Stop event. A fresh unconfirmed ultragoal does not enforce matching `/goal`; confirmed runs remain fail-closed.
+
+### GitHub Copilot CLI compatibility
+
+`hooks/hooks.json` is written in Claude Code's format, but the same plugin also runs under **GitHub Copilot CLI**. When OMC is installed as a Copilot plugin, Copilot loads the manifest (`Loaded N hook(s) from 1 plugin(s)`) and treats Claude's PascalCase event names as aliases for its own events:
+
+| OMC / Claude event   | Copilot CLI event                | Status under Copilot CLI                                             |
+| -------------------- | -------------------------------- | ------------------------------------------------------------------- |
+| `UserPromptSubmit`   | `userPromptSubmitted`            | ✅ Fires — keyword detection + skill injection                      |
+| `Stop`               | `agentStop`                      | ✅ Fires — ralph/ultrawork/autopilot persistence loop (`decision: "block"`) |
+| `SessionStart`       | `sessionStart`                   | ✅ Fires — session restore + update check                           |
+| `SessionEnd`         | `sessionEnd`                     | ✅ Fires                                                             |
+| `PreToolUse`         | `preToolUse`                     | ✅ Fires (Claude matcher semantics)                                 |
+| `PostToolUse`        | `postToolUse`                    | ✅ Fires                                                             |
+| `PostToolUseFailure` | `postToolUseFailure`             | ✅ Fires                                                             |
+| `PermissionRequest`  | `permissionRequest`              | ✅ Fires (Claude matcher semantics)                                 |
+| `PreCompact`         | `preCompact`                     | ✅ Fires                                                             |
+| `SubagentStop`       | `subagentStop`                   | ✅ Fires                                                             |
+| `SubagentStart`      | `subagentStart` (camelCase only) | ⚠️ Does not fire — see limitation below                             |
+
+For the PascalCase form, Copilot delivers the VS Code compatible **snake_case** payload (`hook_event_name`, `session_id`, `prompt`, `stop_reason`, ...) that OMC's hook scripts already parse, and honors the Claude output protocol (`hookSpecificOutput.additionalContext`, `decision: "block"`, `continue`, `suppressOutput`). No separate Copilot manifest is required.
+
+> **Do not add camelCase mirror events** (e.g. a `userPromptSubmitted` block alongside `UserPromptSubmit`). Copilot runs every entry for an event across all sources, so a duplicate key would **double-fire** the hook (double iteration increments, double continuation blocks).
+
+**Known limitation:** Copilot exposes the subagent-start event only as camelCase `subagentStart` with a camelCase payload, so `subagent-tracker.mjs start` (trace-only) does not fire under Copilot CLI. The completion-side work runs on `SubagentStop`, which Copilot does recognize, so verification and deliverable checks are unaffected.
+
+The compatibility contract is locked by `src/__tests__/copilot-hook-compat.test.ts`, which fails if `hooks/hooks.json` ever introduces an event name Copilot CLI does not recognize. Reference: [GitHub Copilot hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference).
 
 ### Code Simplifier Hook
 

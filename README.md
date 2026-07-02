@@ -64,6 +64,8 @@ Then:
 /plugin install oh-my-claudecode
 ```
 
+> **GitHub Copilot CLI users:** OMC runs under [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli) too — the same two `/plugin` commands above work in Copilot's `/plugin` interface (the marketplace name `omc` and plugin name `oh-my-claudecode` come from `marketplace.json`). Skills, `oh-my-claudecode:*` agents, the `t` MCP server, and the hooks — including keyword auto-detection and the ralph/ultrawork/autopilot persistence loop — all work, because Copilot recognizes Claude's hook event names as aliases. Restart Copilot after installing (hooks load at startup), then run `/env` to confirm. See [Installation → GitHub Copilot CLI](docs/REFERENCE.md#github-copilot-cli) and the [hook compatibility notes](docs/REFERENCE.md#github-copilot-cli-compatibility).
+
 If you prefer the npm CLI/runtime path instead of the marketplace flow:
 
 ```bash

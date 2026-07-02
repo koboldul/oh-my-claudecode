@@ -44,3 +44,37 @@ describe('omc-doctor skill package version diagnostic (issue #2981)', () => {
     expect(content).not.toContain('npm view oh-my-claudecode version');
   });
 });
+
+describe('omc-doctor skill GitHub Copilot CLI awareness', () => {
+  const skillPath = join(process.cwd(), 'skills', 'omc-doctor', 'SKILL.md');
+  const content = readFileSync(skillPath, 'utf8');
+
+  it('detects both Claude Code and Copilot CLI hosts before host-specific checks', () => {
+    expect(content).toContain('Detect Host Environment');
+    expect(content).toContain('Claude Code install:');
+    expect(content).toContain('Copilot CLI install:');
+    // Copilot plugins live under ~/.copilot/installed-plugins, honoring COPILOT_HOME.
+    expect(content).toContain('installed-plugins');
+    expect(content).toContain('COPILOT_HOME');
+  });
+
+  it('has a dedicated Copilot CLI checks section with install/enabled detection', () => {
+    expect(content).toContain('## GitHub Copilot CLI checks');
+    expect(content).toContain('oh-my-claudecode@omc');
+    expect(content).toContain('/plugin install oh-my-claudecode');
+    // Copilot recognizes Claude event names; never add camelCase mirrors (double-fire).
+    expect(content).toContain('camelCase mirror events');
+  });
+
+  it('does not flag Claude-only artifacts for a Copilot-only install', () => {
+    expect(content).toContain('do **not** report a missing');
+    // Restart guidance must cover Copilot CLI, not just Claude Code.
+    expect(content).toContain('restart Copilot CLI');
+  });
+
+  it('keeps the skill free of strict-inequality tokens the doctor test guards against', () => {
+    // The existing drift-check test asserts no '!==' in the file; the Copilot
+    // additions must preserve that (JSONC reads use full-line comment stripping).
+    expect(content).not.toContain('!==');
+  });
+});

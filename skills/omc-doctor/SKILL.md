@@ -12,7 +12,23 @@ Note: All `~/.claude/...` paths in this guide respect `CLAUDE_CONFIG_DIR` when t
 
 You are the OMC Doctor - diagnose and fix installation issues.
 
+### Step 0: Detect Host Environment (Claude Code vs GitHub Copilot CLI)
+
+OMC runs as a plugin under **both** Claude Code and **GitHub Copilot CLI**. Detect which host(s) have OMC installed before running host-specific checks — otherwise a Copilot-only user sees false CRITICALs for `~/.claude` paths that do not apply to them.
+
+```bash
+node -e "const p=require('path'),f=require('fs'),h=require('os').homedir();const ccd=process.env.CLAUDE_CONFIG_DIR||p.join(h,'.claude');const cb=p.join(ccd,'plugins','cache','omc','oh-my-claudecode');let claude='(not installed)';try{const v=f.readdirSync(cb).filter(x=>/^\d/.test(x)).sort((a,c)=>a.localeCompare(c,void 0,{numeric:true}));if(v.length)claude=v[v.length-1]}catch{};const cop=process.env.COPILOT_HOME||p.join(h,'.copilot');const cd=p.join(cop,'installed-plugins','omc','oh-my-claudecode');let copilot='(not installed)';try{if(f.existsSync(cd))copilot=JSON.parse(f.readFileSync(p.join(cd,'package.json'),'utf8')).version||'(installed)'}catch{copilot='(installed)'};console.log('Claude Code install:',claude);console.log('Copilot CLI install:',copilot)"
+```
+
+**Diagnosis**:
+- **Claude Code install present** (version shown): run Steps 1–7 (they target `~/.claude`).
+- **Copilot CLI install present** (version shown): run the **GitHub Copilot CLI checks** section below, and **skip** the Claude-only steps (Step 2 legacy settings hooks, Step 3 legacy bash scripts, Step 4 CLAUDE.md, Step 7 legacy curl content) unless a Claude Code install is also present. Copilot does not read `~/.claude/CLAUDE.md` or `~/.claude/settings.json`, so those are not issues for a Copilot-only install.
+- **Both present**: run every section and report per host.
+- **Neither present**: CRITICAL - OMC is not installed for any detected host.
+
 ### Step 1: Check Plugin Version
+
+_(Claude Code install. For a Copilot-only install, use the GitHub Copilot CLI checks section instead.)_
 
 ```bash
 # Get installed and latest versions (cross-platform)
@@ -135,6 +151,49 @@ ls -la "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/skills/ 2>/dev/null
 
 ---
 
+## GitHub Copilot CLI checks
+
+Run these when the Copilot CLI install was detected in Step 0. All commands are cross-platform (Node), since Copilot CLI users are often on native Windows. Copilot loads the plugin's `.claude-plugin/plugin.json` skills, `agents/*.md`, `.mcp.json` (`t` MCP server), and `hooks/hooks.json` directly from `${COPILOT_HOME:-~/.copilot}/installed-plugins/omc/oh-my-claudecode`.
+
+### C1: Plugin installed and enabled
+
+```bash
+node -e "const p=require('path'),f=require('fs'),h=require('os').homedir();const jr=s=>s.split(/\r?\n/).filter(l=>!/^\s*\/\//.test(l)).join('\n');const cop=process.env.COPILOT_HOME||p.join(h,'.copilot');const dir=p.join(cop,'installed-plugins','omc','oh-my-claudecode');const exists=f.existsSync(dir);let pkgV='(unknown)';try{pkgV=JSON.parse(f.readFileSync(p.join(dir,'package.json'),'utf8')).version}catch{};let cfgV='',en='(unknown)';try{const c=JSON.parse(jr(f.readFileSync(p.join(cop,'config.json'),'utf8')));const ip=(c.installedPlugins||[]).find(x=>x&&x.name==='oh-my-claudecode');if(ip){cfgV=ip.version||'';en=(ip.enabled===false)?false:true}}catch{};let se='(unknown)';try{const s=JSON.parse(jr(f.readFileSync(p.join(cop,'settings.json'),'utf8')));const ep=(s.enabledPlugins||{});if(Object.prototype.hasOwnProperty.call(ep,'oh-my-claudecode@omc'))se=!!ep['oh-my-claudecode@omc']}catch{};if(!exists){console.log('Copilot OMC plugin: (not installed) - checked '+dir)}else{const cfgNote=cfgV?(cfgV===pkgV?'':' (config records '+cfgV+')'):'';console.log('Copilot OMC plugin dir:',dir);console.log('Copilot plugin version:',pkgV+cfgNote);console.log('Copilot plugin enabled (config.json):',en);console.log('Copilot plugin enabled (settings.json):',se)}"
+npm view oh-my-claude-sisyphus version 2>/dev/null || echo "Latest: (unavailable)"
+```
+
+> The `config.json` read strips full-line `//` comments only (the file is JSONC), which preserves `https://` URLs inside string values. `settings.json` is strict JSON but is read the same way for safety.
+
+**Diagnosis**:
+- If plugin dir missing: CRITICAL - install with Copilot's `/plugin` command: `/plugin marketplace add https://github.com/Yeachan-Heo/oh-my-claudecode` then `/plugin install oh-my-claudecode`.
+- If `enabled` (config.json) or the settings.json flag is `false`: WARN - plugin installed but disabled; re-enable it via Copilot's `/plugin` command.
+- If plugin version is behind the latest npm version: WARN - outdated; update via Copilot's `/plugin` command, then restart Copilot CLI.
+
+### C2: Confirm skills, agents, MCP server, and hooks loaded
+
+Ask the user to run Copilot's `/env` command (it lists loaded instructions, MCP servers, skills, agents, hooks, and plugins) and confirm OMC appears.
+
+**Diagnosis**:
+- If `/env` shows the OMC skills, `oh-my-claudecode:*` agents, the `t` MCP server, and `Loaded N hook(s) from 1 plugin(s)`: OK.
+- If skills/agents/hooks are missing: WARN - restart Copilot CLI (plugins and hooks are loaded at startup).
+- If the `t` MCP server errors: ensure Node.js is on PATH (the server runs `node <plugin>/bridge/mcp-server.cjs`).
+
+### C3: Hook event compatibility (informational)
+
+Copilot recognizes Claude's PascalCase hook event names as aliases (`UserPromptSubmit`, `Stop`, `PreToolUse`, ...), so keyword auto-detection and the ralph/ultrawork/autopilot persistence loop work the same as under Claude Code. The only unsupported event is `SubagentStart` (trace-only). See docs/REFERENCE.md#github-copilot-cli-compatibility.
+
+**Diagnosis**:
+- Informational - no action needed. Do **not** add camelCase mirror events to `hooks/hooks.json`; Copilot runs every entry per event, so a duplicate would double-fire the hook.
+
+### C4: CLAUDE.md / `omc setup` NOT required under Copilot
+
+Copilot CLI does not read `~/.claude/CLAUDE.md`. It uses `AGENTS.md`, `.github/copilot-instructions.md`, and `~/.copilot/copilot-instructions.md`. The Claude-only Steps 2–4 and the `omc setup` / HUD statusline flow are **not** required to use OMC under Copilot.
+
+**Diagnosis**:
+- For a Copilot-only install, do **not** report a missing `~/.claude/CLAUDE.md` or missing `omc setup` as an issue.
+
+---
+
 ## Report Format
 
 After running all checks, output a report:
@@ -147,17 +206,22 @@ After running all checks, output a report:
 
 ### Checks
 
+Report rows for the host(s) detected in Step 0. Rows marked _(Claude only)_ / _(Copilot only)_ apply to that host; omit rows for a host that is not installed.
+
 | Check | Status | Details |
 |-------|--------|---------|
-| Plugin Version | OK/WARN/CRITICAL | ... |
-| Legacy Hooks (settings.json) | OK/CRITICAL | ... |
-| Legacy Scripts (~/.claude/hooks/) | OK/WARN | ... |
-| CLAUDE.md | OK/WARN/CRITICAL | ... |
-| Ralph Ruby Dependency | OK/WARN | ... |
-| Plugin Cache | OK/WARN | ... |
-| Legacy Agents (~/.claude/agents/) | OK/WARN | ... |
-| Legacy Commands (~/.claude/commands/) | OK/WARN | ... |
-| Legacy Skills (~/.claude/skills/) | OK/WARN | ... |
+| Host(s) Detected | Claude Code / Copilot CLI / both | from Step 0 |
+| Plugin Version _(Claude only)_ | OK/WARN/CRITICAL | ... |
+| Legacy Hooks (settings.json) _(Claude only)_ | OK/CRITICAL | ... |
+| Legacy Scripts (~/.claude/hooks/) _(Claude only)_ | OK/WARN | ... |
+| CLAUDE.md _(Claude only)_ | OK/WARN/CRITICAL | ... |
+| Ralph Ruby Dependency | OK/WARN | applies to both hosts |
+| Plugin Cache _(Claude only)_ | OK/WARN | ... |
+| Legacy Agents (~/.claude/agents/) _(Claude only)_ | OK/WARN | ... |
+| Legacy Commands (~/.claude/commands/) _(Claude only)_ | OK/WARN | ... |
+| Legacy Skills (~/.claude/skills/) _(Claude only)_ | OK/WARN | ... |
+| Copilot Plugin (installed + enabled) _(Copilot only)_ | OK/WARN/CRITICAL | C1 |
+| Copilot Skills/Agents/MCP/Hooks (`/env`) _(Copilot only)_ | OK/WARN | C2 |
 
 ### Issues Found
 1. [Issue description]
@@ -222,9 +286,19 @@ rm -rf "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/skills
 
 **Note**: Only remove if these contain oh-my-claudecode-related files. If user has custom agents/commands/skills, warn them and ask before removing.
 
+### Fix: GitHub Copilot CLI plugin (install / enable / update)
+
+These are **user-run** Copilot slash commands (there is no `~/.claude` cache to clear for Copilot). Guide the user to run them in their Copilot CLI session:
+
+- **Not installed** → `/plugin marketplace add https://github.com/Yeachan-Heo/oh-my-claudecode` then `/plugin install oh-my-claudecode`
+- **Installed but disabled** → re-enable via Copilot's `/plugin` command
+- **Outdated** → update via Copilot's `/plugin` command
+
+Then **restart Copilot CLI** so plugins and hooks reload (they are read at startup). Do not delete `${COPILOT_HOME:-~/.copilot}/installed-plugins/...` by hand unless the user asks — let Copilot's `/plugin` manager own that directory.
+
 ---
 
 ## Post-Fix
 
-After applying fixes, inform user:
-> Fixes applied. **Restart Claude Code** for changes to take effect.
+After applying fixes, inform the user based on the host:
+> Fixes applied. **Restart Claude Code** (or **restart Copilot CLI** if you use OMC under GitHub Copilot CLI) for changes to take effect.
