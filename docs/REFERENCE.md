@@ -53,16 +53,38 @@ The npm package exposes both `oh-my-claudecode` and `omc`; examples prefer `omc`
 
 ### GitHub Copilot CLI
 
-OMC also runs as a plugin under [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli). Copilot CLI loads the same Claude Code plugin format, so skills, `agents/*.md` (surfaced as `oh-my-claudecode:*` custom agents), the `t` MCP server, and the `hooks/hooks.json` manifest all work without a separate build.
+OMC also runs as a plugin under [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli). Copilot loads the same Claude Code plugin format, so skills, `agents/*.md` (surfaced as `oh-my-claudecode:*` custom agents), the `t` MCP server, and the `hooks/hooks.json` manifest all work without a separate build.
 
-Install from Copilot's `/plugin` command — the marketplace name (`omc`) and plugin name (`oh-my-claudecode`) come from the repo's `marketplace.json`, so the commands match the Claude Code flow:
+**Prerequisites**
 
-```text
-/plugin marketplace add https://github.com/Yeachan-Heo/oh-my-claudecode
-/plugin install oh-my-claudecode
+- [Copilot CLI](https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli): `npm install -g @github/copilot` (needs Node.js 22+), or `winget install GitHub.Copilot`, or `brew install --cask copilot-cli`
+- Git, and Node.js on `PATH` (the hooks and the `t` MCP server run via `node`)
+- Windows: PowerShell 6+ (the hooks use it)
+- An active Copilot subscription; authenticate with `copilot` then `/login` (or set `COPILOT_GITHUB_TOKEN` / `GH_TOKEN`)
+
+**Install (marketplace method — recommended)**
+
+The marketplace name (`omc`) and plugin name (`oh-my-claudecode`) come from the repo's `marketplace.json`:
+
+```bash
+copilot plugin marketplace add Yeachan-Heo/oh-my-claudecode
+copilot plugin install oh-my-claudecode@omc
 ```
 
-Restart Copilot CLI after installing — hook configuration is loaded at CLI startup. Run `/env` to confirm OMC's skills, agents, MCP server, and hooks are loaded. Copilot recognizes Claude's hook event names as aliases, so keyword auto-detection and the ralph/ultrawork/autopilot persistence loop work the same as under Claude Code; see [GitHub Copilot CLI compatibility](#github-copilot-cli-compatibility) for the full event mapping and the one known limitation. Claude-Code-specific setup surfaces (`/omc-setup`, HUD statusline) target `~/.claude` and are not required to use OMC under Copilot.
+Equivalent in-session slash commands: `/plugin marketplace add Yeachan-Heo/oh-my-claudecode` then `/plugin install oh-my-claudecode@omc`.
+
+> **Installing a fork:** substitute the fork's `owner/repo` in `marketplace add` (for example `koboldul/oh-my-claudecode`). The plugin is still installed as `oh-my-claudecode@omc` because the marketplace name is defined in the fork's `marketplace.json`.
+
+A direct install also works today — `copilot plugin install Yeachan-Heo/oh-my-claudecode` — but Copilot warns that direct repo/URL/local installs are deprecated in favor of `plugin@marketplace`, so prefer the marketplace method.
+
+**After install**
+
+- Copilot clones the plugin to `~/.copilot/installed-plugins/omc/oh-my-claudecode`, rewrites the hooks' `$CLAUDE_PLUGIN_ROOT` to absolute paths (Copilot does not expand that variable at hook-run time), and enables the plugin. No `npm install` or build is needed — the repo ships a prebuilt `dist/` and bundled `bridge/*.cjs`, and the plugin needs no `node_modules` at runtime.
+- **Restart Copilot CLI** — plugins, hooks, and MCP servers are loaded at startup.
+- Verify with `copilot plugin list`, or run `/env` in a session (it lists loaded skills, agents, MCP servers, and hooks). Copilot recognizes Claude's hook event names as aliases, so keyword auto-detection and the ralph/ultrawork/autopilot persistence loop work the same as under Claude Code; see [GitHub Copilot CLI compatibility](#github-copilot-cli-compatibility) for the full event mapping and the one known limitation.
+- Update later with `copilot plugin update oh-my-claudecode`.
+
+Claude-Code-specific surfaces (`/omc-setup`, HUD statusline, `~/.claude/CLAUDE.md`) target `~/.claude` and are not required to use OMC under Copilot.
 
 ### Requirements
 
