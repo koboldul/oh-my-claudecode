@@ -1003,7 +1003,23 @@ For the PascalCase form, Copilot delivers the VS Code compatible **snake_case** 
 
 **Known limitation:** Copilot exposes the subagent-start event only as camelCase `subagentStart` with a camelCase payload, so `subagent-tracker.mjs start` (trace-only) does not fire under Copilot CLI. The completion-side work runs on `SubagentStop`, which Copilot does recognize, so verification and deliverable checks are unaffected.
 
-The compatibility contract is locked by `src/__tests__/copilot-hook-compat.test.ts`, which fails if `hooks/hooks.json` ever introduces an event name Copilot CLI does not recognize. Reference: [GitHub Copilot hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference).
+#### Windows PowerShell hook variants
+
+Each hook entry carries `bash` and `powershell` command variants alongside the Claude-style `command`:
+
+```jsonc
+{
+  "type": "command",
+  "command":    "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/keyword-detector.mjs",
+  "bash":       "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/keyword-detector.mjs\"",
+  "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/keyword-detector.mjs\"",
+  "timeout": 10
+}
+```
+
+Why: Copilot's hook executor selects a shell per entry — on Windows it runs the `powershell` variant, elsewhere `bash` — and it substitutes only the **braced** `${CLAUDE_PLUGIN_ROOT}` placeholder with the absolute plugin root at load time. Claude Code keeps using `command`, where bash expands the bare `$CLAUDE_PLUGIN_ROOT` at runtime. The bare `command` form is unsafe under PowerShell (a bare `$CLAUDE_PLUGIN_ROOT` is an unset PowerShell variable, and `"$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs` splits into two arguments), which made Copilot fail-closed with `Denied by preToolUse hook … (hook errored)`. The variants use the braced, fully path-quoted form so the substituted absolute path stays a single argument under both PowerShell and bash, including plugin roots that contain spaces.
+
+The compatibility contract is locked by two tests: `src/__tests__/copilot-hook-compat.test.ts` fails if `hooks/hooks.json` introduces an event name Copilot CLI does not recognize, and `src/__tests__/copilot-hook-shell-variants.test.ts` fails if any `command` hook loses its Copilot-safe `bash`/`powershell` variant. Reference: [GitHub Copilot hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference).
 
 ### Code Simplifier Hook
 
