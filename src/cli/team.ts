@@ -30,6 +30,9 @@ const SUPPORTED_API_OPERATIONS = new Set([
   'read-config',
   'get-summary',
   'orphan-cleanup',
+  'recover-worker',
+  'write-task-checkpoint',
+  'read-recovery-result',
 ] as const);
 const TEAM_API_USAGE = `
 Usage:
@@ -49,7 +52,10 @@ type SupportedApiOperation =
   | 'read-task'
   | 'read-config'
   | 'get-summary'
-  | 'orphan-cleanup';
+  | 'orphan-cleanup'
+  | 'recover-worker'
+  | 'write-task-checkpoint'
+  | 'read-recovery-result';
 
 interface TeamApiEnvelope {
   ok: boolean;
@@ -734,7 +740,7 @@ export async function executeTeamApiOperation(
     };
   }
 
-  const normalizedInput = {
+  const normalizedInput: Record<string, unknown> = {
     ...input,
     ...(typeof input.teamName === 'string' && input.teamName.trim() !== '' && typeof input.team_name !== 'string'
       ? { team_name: input.teamName }
@@ -754,7 +760,26 @@ export async function executeTeamApiOperation(
     ...(typeof input.messageId === 'string' && input.messageId.trim() !== '' && typeof input.message_id !== 'string'
       ? { message_id: input.messageId }
       : {}),
+    ...(typeof input.claimToken === 'string' && input.claimToken.trim() !== '' && typeof input.claim_token !== 'string'
+      ? { claim_token: input.claimToken }
+      : {}),
+    ...(typeof input.taskVersion === 'number' && input.task_version === undefined
+      ? { task_version: input.taskVersion }
+      : {}),
+    ...(typeof input.resumePayload !== 'undefined' && input.resume_payload === undefined
+      ? { resume_payload: input.resumePayload }
+      : {}),
+    ...(typeof input.requestId === 'string' && input.requestId.trim() !== '' && typeof input.request_id !== 'string'
+      ? { request_id: input.requestId }
+      : {}),
+    ...(typeof input.timeoutMs === 'number' && input.timeout_ms === undefined
+      ? { timeout_ms: input.timeoutMs }
+      : {}),
   };
+  for (const alias of ['teamName', 'taskId', 'workerName', 'fromWorker', 'toWorker', 'messageId',
+    'claimToken', 'taskVersion', 'resumePayload', 'requestId', 'timeoutMs']) {
+    delete normalizedInput[alias];
+  }
 
   const result = await executeCanonicalTeamApiOperation(canonicalOperation, normalizedInput, cwd);
   return result;
