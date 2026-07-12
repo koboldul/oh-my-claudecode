@@ -3,7 +3,11 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -20,12 +24,24 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: "20"
+          cache: "npm"
+          registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Assert release trigger and npm availability
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node scripts/release-boundary.mjs assert-trigger --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA"
+          node scripts/release-boundary.mjs assert-npm-absent --package oh-my-claude-sisyphus --version "$VERSION"
+
+      - name: Validate release notes
+        run: |
+          git cat-file -e HEAD:.github/release-body.md
+          test -s .github/release-body.md
+          cp .github/release-body.md release-notes.md
 
       - name: Build
         run: npm run build
@@ -45,55 +61,72 @@ jobs:
       - name: Restore hooks.json before publish
         run: git checkout -- hooks/hooks.json
 
-      - name: Publish to npm
+      - name: Create staged release archive
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          if npm view oh-my-claude-sisyphus@$VERSION version 2>/dev/null; then
-            echo "::warning::Version $VERSION already published to npm, skipping publish"
-          else
-            set -o pipefail
-            if npm publish --access public --provenance 2>&1 | tee npm-publish.log; then
-              echo "Published to npm with provenance"
-            elif grep -Eiq 'TLOG_CREATE_ENTRY_ERROR|tlog|rekor|transparency log' npm-publish.log; then
-              echo "::warning::npm provenance publish failed due to Sigstore/Rekor transparency log outage; retrying without provenance"
-              npm publish --access public
-            else
+          VERSION="${GITHUB_REF_NAME#v}"
+          SEED_DIR="$RUNNER_TEMP/seed"
+          STAGE="$RUNNER_TEMP/release-stage"
+          FINAL_DIR="$RUNNER_TEMP/final"
+          EVIDENCE_JSON="$RUNNER_TEMP/release-evidence.json"
+          mkdir -p "$SEED_DIR" "$FINAL_DIR"
+          SEED_NAME=$(npm pack --ignore-scripts --pack-destination "$SEED_DIR" --silent)
+          SEED_TARBALL="$SEED_DIR/$SEED_NAME"
+          node scripts/release-boundary.mjs prepare-stage --seed-tarball "$SEED_TARBALL" --stage "$STAGE" --git-head "$GITHUB_SHA"
+          FINAL_NAME=$(npm pack "$STAGE/package" --ignore-scripts --pack-destination "$FINAL_DIR" --silent)
+          FINAL_TARBALL="$FINAL_DIR/$FINAL_NAME"
+          node scripts/release-boundary.mjs assert-archive --tarball "$FINAL_TARBALL" --version "$VERSION" --git-head "$GITHUB_SHA"
+          node scripts/release-boundary.mjs write-evidence --tarball "$FINAL_TARBALL" --output "$EVIDENCE_JSON"
+          printf 'FINAL_TARBALL=%s\n' "$FINAL_TARBALL" >> "$GITHUB_ENV"
+          printf 'EVIDENCE_JSON=%s\n' "$EVIDENCE_JSON" >> "$GITHUB_ENV"
+
+      - name: Smoke test staged archive
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          SMOKE_PREFIX="$RUNNER_TEMP/release-smoke"
+          npm install --ignore-scripts --prefix "$SMOKE_PREFIX" "$FINAL_TARBALL"
+          test "$("$SMOKE_PREFIX/node_modules/.bin/omc" --version)" = "$VERSION"
+          "$SMOKE_PREFIX/node_modules/.bin/omc" --help
+          API_HELP=$("$SMOKE_PREFIX/node_modules/.bin/omc-cli" team api --help)
+          case "$API_HELP" in
+            *recover-worker*write-task-checkpoint*read-recovery-result*) ;;
+            *)
+              echo "omc-cli team api help is missing required recovery commands" >&2
               exit 1
-            fi
+              ;;
+          esac
+
+      - name: Upload release archive evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-release-boundary-${{ github.ref_name }}
+          path: |
+            ${{ runner.temp }}/final/*.tgz
+            ${{ runner.temp }}/release-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish exact archive and verify registry
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          set -o pipefail
+          if npm publish "$FINAL_TARBALL" --ignore-scripts --access public --provenance 2>&1 | tee npm-publish.log; then
+            node scripts/release-boundary.mjs verify-registry --package oh-my-claude-sisyphus --version "$VERSION" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" --evidence "$EVIDENCE_JSON" --tarball "$FINAL_TARBALL" --provenance required
+          else
+            node scripts/release-boundary.mjs assert-sigstore-fallback --publish-log npm-publish.log
+            node scripts/release-boundary.mjs assert-evidence --tarball "$FINAL_TARBALL" --evidence "$EVIDENCE_JSON"
+            npm publish "$FINAL_TARBALL" --ignore-scripts --access public
+            node scripts/release-boundary.mjs verify-registry --package oh-my-claude-sisyphus --version "$VERSION" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" --evidence "$EVIDENCE_JSON" --tarball "$FINAL_TARBALL" --provenance sigstore-fallback --publish-log npm-publish.log
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Prepare release notes
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          # Use the pre-committed .github/release-body.md when available and non-empty.
-          # Do NOT regenerate via release.ts here: the tag points to the release commit
-          # so git log v{prev}..HEAD returns zero commits, producing an empty body.
-          # The release script is meant to run *before* tagging and commit the result.
-          if [ -s .github/release-body.md ]; then
-            echo "Using committed release-body.md"
-            cp .github/release-body.md release-notes.md
-          else
-            echo "Falling back to minimal release notes"
-            echo "## oh-my-claudecode v${VERSION}" > release-notes.md
-            echo "" >> release-notes.md
-            echo "### Install / Update" >> release-notes.md
-            echo "" >> release-notes.md
-            echo 'The npm CLI and the Claude Code marketplace/plugin are separate install tracks, not either/or replacements. Update whichever track you use; if you have both installed, update both. CLI-dependent skill paths such as `ask`, `ccg`, and CLI-backed `team` require the `omc` CLI from the npm package.' >> release-notes.md
-            echo "" >> release-notes.md
-            echo "**CLI / runtime:**" >> release-notes.md
-            echo "" >> release-notes.md
-            echo '```bash' >> release-notes.md
-            echo "npm install -g oh-my-claude-sisyphus@${VERSION}" >> release-notes.md
-            echo '```' >> release-notes.md
-            echo "" >> release-notes.md
-            echo "**Claude Code plugin:**" >> release-notes.md
-            echo "" >> release-notes.md
-            echo '```text' >> release-notes.md
-            echo "/plugin marketplace update omc" >> release-notes.md
-            echo '```' >> release-notes.md
-          fi
+      - name: Upload finalized release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-release-boundary-final-${{ github.ref_name }}
+          path: ${{ runner.temp }}/release-evidence.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1

@@ -133,14 +133,167 @@ describe('release generation', () => {
     expect(body.match(/## Contributors/g)).toHaveLength(1);
   });
 
-  it('configures the workflow to use one custom release body source with github auth', () => {
+  it('enforces the release publication boundary around one exact archive', () => {
     const workflow = readFileSync(
       resolve(process.cwd(), '.github/workflows/release.yml'),
       'utf-8',
     );
+    const stepIndex = (name: string): number => {
+      const index = workflow.indexOf(`- name: ${name}`);
+      expect(index, `missing workflow step: ${name}`).toBeGreaterThanOrEqual(0);
+      return index;
+    };
 
+    expect(workflow).toContain('group: release-${{ github.ref_name }}');
+    expect(workflow).toContain('cancel-in-progress: false');
     expect(workflow).toContain('body_path: release-notes.md');
     expect(workflow).toContain('GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}');
     expect(workflow).not.toContain('generate_release_notes: true');
+    expect(workflow).not.toContain('grep');
+
+    const install = stepIndex('Install dependencies');
+    const trigger = stepIndex('Assert release trigger and npm availability');
+    const notes = stepIndex('Validate release notes');
+    const build = stepIndex('Build');
+    const functional = stepIndex('Run functional tests');
+    const performance = stepIndex('Run subagent-lock performance test');
+    const hooks = stepIndex('Restore hooks.json before publish');
+    const archive = stepIndex('Create staged release archive');
+    const smoke = stepIndex('Smoke test staged archive');
+    const evidence = stepIndex('Upload release archive evidence');
+    const publish = stepIndex('Publish exact archive and verify registry');
+    const finalizedEvidence = stepIndex('Upload finalized release evidence');
+    const githubRelease = stepIndex('Create GitHub Release');
+
+    expect(install).toBeLessThan(trigger);
+    expect(trigger).toBeLessThan(notes);
+    expect(notes).toBeLessThan(build);
+    expect(build).toBeLessThan(functional);
+    expect(functional).toBeLessThan(performance);
+    expect(performance).toBeLessThan(hooks);
+    expect(hooks).toBeLessThan(archive);
+    expect(archive).toBeLessThan(smoke);
+    expect(smoke).toBeLessThan(evidence);
+    expect(evidence).toBeLessThan(publish);
+    expect(publish).toBeLessThan(finalizedEvidence);
+    expect(finalizedEvidence).toBeLessThan(githubRelease);
+
+    expect(workflow).toContain(
+      'node scripts/release-boundary.mjs assert-trigger --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA"',
+    );
+    expect(workflow).toContain(
+      'node scripts/release-boundary.mjs assert-npm-absent --package oh-my-claude-sisyphus --version "$VERSION"',
+    );
+    expect(workflow).toContain(
+      'git cat-file -e HEAD:.github/release-body.md',
+    );
+    expect(workflow).toContain('test -s .github/release-body.md');
+    expect(workflow).toContain('cp .github/release-body.md release-notes.md');
+    expect(workflow).not.toContain('Falling back to minimal release notes');
+    expect(workflow).not.toContain('npm view');
+    expect(workflow).not.toContain('skipping publish');
+    expect(workflow).toContain('npm run build');
+    expect(workflow).toContain('npm test -- --run');
+    expect(workflow).toContain(
+      'npm exec vitest -- run tests/perf/subagent-lock.bench.ts --fileParallelism=false --maxWorkers=1',
+    );
+    expect(workflow).toContain('git checkout -- hooks/hooks.json');
+
+    expect(workflow).toContain(
+      'npm pack --ignore-scripts --pack-destination "$SEED_DIR" --silent',
+    );
+    expect(workflow).toContain(
+      'node scripts/release-boundary.mjs prepare-stage --seed-tarball "$SEED_TARBALL" --stage "$STAGE" --git-head "$GITHUB_SHA"',
+    );
+    expect(workflow).toContain(
+      'npm pack "$STAGE/package" --ignore-scripts --pack-destination "$FINAL_DIR" --silent',
+    );
+    expect(workflow).toContain(
+      'node scripts/release-boundary.mjs assert-archive --tarball "$FINAL_TARBALL" --version "$VERSION" --git-head "$GITHUB_SHA"',
+    );
+    expect(workflow).toContain(
+      'node scripts/release-boundary.mjs write-evidence --tarball "$FINAL_TARBALL" --output "$EVIDENCE_JSON"',
+    );
+    expect(workflow).toContain(
+      'npm install --ignore-scripts --prefix "$SMOKE_PREFIX" "$FINAL_TARBALL"',
+    );
+    expect(workflow).toContain('"$SMOKE_PREFIX/node_modules/.bin/omc" --help');
+    expect(workflow).toContain(
+      '"$SMOKE_PREFIX/node_modules/.bin/omc-cli" team api --help',
+    );
+    expect(workflow).toContain('*recover-worker*write-task-checkpoint*read-recovery-result*');
+    expect(workflow).toContain('uses: actions/upload-artifact@v4');
+    expect(workflow).toContain('${{ runner.temp }}/final/*.tgz');
+    expect(workflow).toContain('${{ runner.temp }}/release-evidence.json');
+    expect(workflow).toContain('name: npm-release-boundary-final-${{ github.ref_name }}');
+
+    const seedPack = workflow.indexOf(
+      'npm pack --ignore-scripts --pack-destination "$SEED_DIR" --silent',
+    );
+    const stagePreparation = workflow.indexOf(
+      'node scripts/release-boundary.mjs prepare-stage',
+    );
+    const finalPack = workflow.indexOf(
+      'npm pack "$STAGE/package" --ignore-scripts --pack-destination "$FINAL_DIR" --silent',
+    );
+    const archiveAssertion = workflow.indexOf(
+      'node scripts/release-boundary.mjs assert-archive',
+    );
+    const evidenceWrite = workflow.indexOf(
+      'node scripts/release-boundary.mjs write-evidence',
+    );
+    expect(seedPack).toBeLessThan(stagePreparation);
+    expect(stagePreparation).toBeLessThan(finalPack);
+    expect(finalPack).toBeLessThan(archiveAssertion);
+    expect(archiveAssertion).toBeLessThan(evidenceWrite);
+    expect(evidenceWrite).toBeLessThan(smoke);
+
+
+    const publishCommands = [...workflow.matchAll(/npm publish [^\n]+/g)].map(
+      (match) => match[0],
+    );
+    expect(publishCommands).toHaveLength(2);
+    expect(publishCommands[0]).toContain(
+      'npm publish "$FINAL_TARBALL" --ignore-scripts --access public --provenance',
+    );
+    expect(publishCommands[1]).toBe(
+      'npm publish "$FINAL_TARBALL" --ignore-scripts --access public',
+    );
+    expect(workflow).not.toMatch(/npm publish\s+\.(?:\s|$)/);
+    expect(workflow).not.toMatch(/npm publish\s+--/);
+
+    expect(workflow).toContain(
+      'node scripts/release-boundary.mjs assert-sigstore-fallback --publish-log npm-publish.log',
+    );
+    expect(workflow).toContain(
+      'node scripts/release-boundary.mjs assert-evidence --tarball "$FINAL_TARBALL" --evidence "$EVIDENCE_JSON"',
+    );
+    expect(workflow).toContain(
+      'node scripts/release-boundary.mjs verify-registry --package oh-my-claude-sisyphus --version "$VERSION" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" --evidence "$EVIDENCE_JSON" --tarball "$FINAL_TARBALL" --provenance required',
+    );
+    expect(workflow).toContain(
+      'node scripts/release-boundary.mjs verify-registry --package oh-my-claude-sisyphus --version "$VERSION" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" --evidence "$EVIDENCE_JSON" --tarball "$FINAL_TARBALL" --provenance sigstore-fallback --publish-log npm-publish.log',
+    );
+
+    const provenancePublish = workflow.indexOf(
+      'npm publish "$FINAL_TARBALL" --ignore-scripts --access public --provenance',
+    );
+    const fallbackClassification = workflow.indexOf(
+      'node scripts/release-boundary.mjs assert-sigstore-fallback',
+    );
+    const evidenceAssertion = workflow.indexOf(
+      'node scripts/release-boundary.mjs assert-evidence',
+    );
+    const fallbackPublish = workflow.indexOf(
+      'npm publish "$FINAL_TARBALL" --ignore-scripts --access public',
+      fallbackClassification,
+    );
+    const fallbackVerification = workflow.indexOf(
+      'node scripts/release-boundary.mjs verify-registry --package oh-my-claude-sisyphus --version "$VERSION" --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" --evidence "$EVIDENCE_JSON" --tarball "$FINAL_TARBALL" --provenance sigstore-fallback',
+    );
+    expect(provenancePublish).toBeLessThan(fallbackClassification);
+    expect(fallbackClassification).toBeLessThan(evidenceAssertion);
+    expect(evidenceAssertion).toBeLessThan(fallbackPublish);
+    expect(fallbackPublish).toBeLessThan(fallbackVerification);
   });
 });
