@@ -124,7 +124,7 @@ function isWorkerInfo(value: unknown): boolean {
   if (!isRecord(value) || typeof value.name !== 'string' || !WORKER_NAME_SAFE_PATTERN.test(value.name) || !isSafeCounter(value.index) || value.index < 1) return false;
   return (value.role === undefined || typeof value.role === 'string')
     && (value.assigned_tasks === undefined || isStringArray(value.assigned_tasks))
-    && (value.worker_cli === undefined || ['claude', 'codex', 'gemini', 'cursor', 'grok', 'antigravity'].includes(value.worker_cli as string))
+    && (value.worker_cli === undefined || ['claude', 'codex', 'gemini', 'cursor', 'grok', 'antigravity', 'copilot'].includes(value.worker_cli as string))
     && (value.pid === undefined || (isSafeCounter(value.pid) && value.pid > 0))
     && (value.pane_id === undefined || typeof value.pane_id === 'string')
     && (value.working_dir === undefined || typeof value.working_dir === 'string')
@@ -144,7 +144,7 @@ function isWorkerInfo(value: unknown): boolean {
 
 function isLaunchDescriptor(value: unknown): boolean {
   return isRecord(value) && value.schema_version === 1
-    && ['claude', 'codex', 'gemini', 'cursor', 'grok', 'antigravity'].includes(value.provider as string)
+    && ['claude', 'codex', 'gemini', 'cursor', 'grok', 'antigravity', 'copilot'].includes(value.provider as string)
     && (value.model === null || typeof value.model === 'string')
     && isNonEmptyString(value.binary) && isStringArray(value.args);
 }
@@ -196,6 +196,23 @@ function isAllDeadRecovery(value: unknown): boolean {
   return isRecord(value) && isTimestamp(value.detected_at) && isTimestamp(value.deadline_at) && isSafeCounter(value.state_revision);
 }
 
+function isOptionalConfiguredRoutingRoles(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!Array.isArray(value)) return false;
+  const canonicalRoles = new Set<string>(CANONICAL_TEAM_ROLES as readonly string[]);
+  return value.every(role => typeof role === 'string' && canonicalRoles.has(role))
+    && new Set(value).size === value.length;
+}
+
+function isOptionalCopilotDefaults(value: unknown): boolean {
+  if (value === undefined) return true;
+  return isRecord(value)
+    && isNonEmptyString(value.model)
+    && ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(
+      value.reasoning_effort as string,
+    );
+}
+
 function isTeamConfig(value: unknown, requireRevision: boolean, expectedTeamName?: string): value is TeamConfig {
   if (!isRecord(value) || !isNonEmptyString(value.name) || (expectedTeamName !== undefined && value.name !== expectedTeamName)
     || !isNonEmptyString(value.agent_type)
@@ -209,7 +226,9 @@ function isTeamConfig(value: unknown, requireRevision: boolean, expectedTeamName
     || (value.next_task_id !== undefined && !isSafeCounter(value.next_task_id))
     || !isOptionalPolicy(value.policy) || !isOptionalGovernance(value.governance)
     || !isOptionalWorkspaceShape(value) || !isOptionalPaneShape(value)
-    || !isOptionalRouting(value.resolved_routing)) return false;
+    || !isOptionalRouting(value.resolved_routing)
+    || !isOptionalConfiguredRoutingRoles(value.configured_routing_roles)
+    || !isOptionalCopilotDefaults(value.copilot_defaults)) return false;
   if (requireRevision ? !isSafeCounter(value.state_revision) : value.state_revision !== undefined && !isSafeCounter(value.state_revision)) return false;
   if (!requireRevision && Object.hasOwn(value, 'state_revision')) return false;
   return (value.lifecycle_state === undefined || ['active', 'shutting_down', 'stopped'].includes(value.lifecycle_state as string))
@@ -281,8 +300,10 @@ function isResolvedRoleRoute(value: unknown): value is { primary: RoleAssignment
 
 function isRoleAssignment(value: unknown): value is RoleAssignment {
   return isRecord(value)
-    && ['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity'].includes(value.provider as string)
+    && ['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity', 'copilot'].includes(value.provider as string)
     && isNonEmptyString(value.model)
+    && (value.reasoningEffort === undefined
+      || ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value.reasoningEffort as string))
     && KNOWN_AGENT_NAMES.some(agent => agent === value.agent);
 }
 

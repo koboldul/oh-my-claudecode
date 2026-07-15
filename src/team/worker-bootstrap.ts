@@ -138,6 +138,13 @@ function agentTypeGuidance(agentType: CliAgentType): string {
         '- Keep commit-sized changes scoped to assigned files only; no broad refactors.',
         `- CRITICAL: You MUST run \`${claimTaskCommand}\` before starting work and \`${transitionTaskStatusCommand}\` when done. Do not exit without transitioning the task status.`,
       ].join('\n');
+    case 'copilot':
+      return [
+        '### Agent-Type Guidance (copilot)',
+        '- You are running in autonomous one-shot prompt mode. Complete the assigned task in this process; do not wait for interactive approval or another prompt.',
+        '- Keep edits scoped, run focused verification, and preserve unrelated worktree changes.',
+        `- CRITICAL: Run \`${claimTaskCommand}\` before work and \`${transitionTaskStatusCommand}\` before exit. Reviewer roles must also write the required structured verdict file.`,
+      ].join('\n');
     case 'claude':
     default:
       return [

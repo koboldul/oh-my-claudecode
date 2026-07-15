@@ -7,21 +7,60 @@
  * hook scripts, respecting the OMC_STATE_DIR environment variable.
  *
  * Delegates to getOmcRoot() from dist/lib/worktree-paths.js (the canonical
- * implementation) when CLAUDE_PLUGIN_ROOT is available. Falls back to inline
- * logic when dist is not built — this should never happen in production, but
- * provides a safe fallback during development or first-run scenarios.
+ * implementation) whenever a canonical root can be located — either via
+ * CLAUDE_PLUGIN_ROOT or a validated script-relative package root (see
+ * resolveCanonicalRoot() below). Falls back to inline logic when dist is not
+ * built — this should never happen in production, but provides a safe
+ * fallback during development or first-run scenarios.
  *
  * Inline fallback notes:
  *   - Uses directory path as hash source (not git remote URL). Matches
  *     canonical behavior for local-only repos; may differ for remote-backed
  *     repos when dist is missing — acceptable since dist is always present
- *     in production (CLAUDE_PLUGIN_ROOT is always set).
+ *     in production (a canonical root is always resolvable).
  */
 
-import { join, basename } from 'path';
+import { join, basename, dirname } from 'path';
 import { existsSync } from 'fs';
 import { createHash } from 'crypto';
-import { pathToFileURL } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function canonicalDistPath(root) {
+  return join(root, 'dist', 'lib', 'worktree-paths.js');
+}
+
+/**
+ * Locate a root directory that has a built dist/lib/worktree-paths.js.
+ *
+ * Copilot CLI hook children do not reliably export CLAUDE_PLUGIN_ROOT (unlike
+ * Claude Code), so when that env var is absent this also tries a
+ * script-relative package root. This file ships as a standalone template
+ * copied to e.g. ~/.claude/hooks/lib/state-root.mjs, so the script-relative
+ * candidate is only trusted when it looks like the real OMC package root
+ * (has package.json AND .claude-plugin/plugin.json) — a plain standalone
+ * install never has those two levels up and safely falls through to the
+ * inline fallback below.
+ *
+ * @returns {string|null} Root directory with a built dist/, or null.
+ */
+function resolveCanonicalRoot() {
+  const envRoot = process.env.CLAUDE_PLUGIN_ROOT;
+  if (envRoot && existsSync(canonicalDistPath(envRoot))) {
+    return envRoot;
+  }
+
+  const scriptRoot = join(__dirname, '..', '..');
+  const looksLikePackageRoot =
+    existsSync(join(scriptRoot, 'package.json')) &&
+    existsSync(join(scriptRoot, '.claude-plugin', 'plugin.json'));
+  if (looksLikePackageRoot && existsSync(canonicalDistPath(scriptRoot))) {
+    return scriptRoot;
+  }
+
+  return null;
+}
 
 /**
  * Resolve the .omc root directory, respecting OMC_STATE_DIR.
@@ -30,11 +69,11 @@ import { pathToFileURL } from 'url';
  * @returns {Promise<string>} Absolute path to the .omc root
  */
 export async function resolveOmcStateRoot(directory) {
-  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
-  if (pluginRoot) {
+  const canonicalRoot = resolveCanonicalRoot();
+  if (canonicalRoot) {
     try {
       const { getOmcRoot } = await import(
-        pathToFileURL(join(pluginRoot, 'dist', 'lib', 'worktree-paths.js')).href
+        pathToFileURL(canonicalDistPath(canonicalRoot)).href
       );
       return getOmcRoot(directory);
     } catch {
@@ -62,11 +101,11 @@ export async function resolveOmcStateRoot(directory) {
  * @returns {Promise<{readPath: string, writePath: string}>} Unbranded path pair
  */
 export async function resolveSessionStatePathsForHook(directory, stateName, sessionId) {
-  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
-  if (pluginRoot) {
+  const canonicalRoot = resolveCanonicalRoot();
+  if (canonicalRoot) {
     try {
       const { resolveSessionStatePaths } = await import(
-        pathToFileURL(join(pluginRoot, 'dist', 'lib', 'worktree-paths.js')).href
+        pathToFileURL(canonicalDistPath(canonicalRoot)).href
       );
       const result = resolveSessionStatePaths(stateName, sessionId, directory);
       return { readPath: result.effectiveRead, writePath: result.effectiveWrite };

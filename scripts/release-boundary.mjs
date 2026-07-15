@@ -363,6 +363,15 @@ export function assertArchiveEntries(entries, { version, gitHead, packageName = 
   if (!isPlainObject(pluginJson) || pluginJson.name !== PLUGIN_NAME || pluginJson.version !== expectedVersion) {
     fail('archive plugin manifest has an unexpected name or version');
   }
+  const copilotPluginJson = parseArchiveJson(entriesByPath, 'plugin.json');
+  if (
+    !isPlainObject(copilotPluginJson)
+    || copilotPluginJson.name !== PLUGIN_NAME
+    || copilotPluginJson.version !== expectedVersion
+    || copilotPluginJson.agents !== './agents-copilot/'
+  ) {
+    fail('archive Copilot plugin manifest has an unexpected name, version, or agents path');
+  }
   const marketplaceJson = parseArchiveJson(entriesByPath, '.claude-plugin/marketplace.json');
   if (!isPlainObject(marketplaceJson) || marketplaceJson.version !== expectedVersion || !Array.isArray(marketplaceJson.plugins)) {
     fail('archive marketplace manifest has an unexpected version or plugins list');
@@ -621,9 +630,14 @@ export function assertTrigger({ tag, sha, cwd = process.cwd() }) {
 
   const packageJson = readJsonFile(join(cwd, 'package.json'), 'package.json');
   const pluginJson = readJsonFile(join(cwd, '.claude-plugin', 'plugin.json'), '.claude-plugin/plugin.json');
+  const copilotPluginJson = readJsonFile(join(cwd, 'plugin.json'), 'plugin.json');
   const marketplaceJson = readJsonFile(join(cwd, '.claude-plugin', 'marketplace.json'), '.claude-plugin/marketplace.json');
   assertVersionedManifest(packageJson, 'package.json', version);
   assertVersionedManifest(pluginJson, '.claude-plugin/plugin.json', version);
+  assertVersionedManifest(copilotPluginJson, 'plugin.json', version);
+  if (copilotPluginJson.agents !== './agents-copilot/') {
+    fail('plugin.json must route Copilot to ./agents-copilot/');
+  }
   assertVersionedManifest(marketplaceJson, '.claude-plugin/marketplace.json', version);
   if (!Array.isArray(marketplaceJson.plugins) || !marketplaceJson.plugins.some(plugin =>
     isPlainObject(plugin) && plugin.name === PLUGIN_NAME && plugin.version === version,
@@ -633,6 +647,16 @@ export function assertTrigger({ tag, sha, cwd = process.cwd() }) {
   const docsClaude = readFileSync(join(cwd, 'docs', 'CLAUDE.md'), 'utf8');
   if (!docsClaude.includes(`<!-- OMC:VERSION:${version} -->`)) {
     fail(`docs/CLAUDE.md does not advertise ${version}`);
+  }
+  // Root CLAUDE.md must stay byte-identical to docs/CLAUDE.md (the canonical
+  // guidance source) — a stale root copy silently diverges from the guidance
+  // agents actually load from the repo root, so fail the release closed.
+  // (docsClaude already passed the version-marker check above, so requiring
+  // byte-identical content transitively guarantees rootClaude advertises the
+  // same version — no separate marker check is needed here.)
+  const rootClaude = readFileSync(join(cwd, 'CLAUDE.md'), 'utf8');
+  if (rootClaude !== docsClaude) {
+    fail('CLAUDE.md must be byte-identical to docs/CLAUDE.md');
   }
   const changelog = readFileSync(join(cwd, 'CHANGELOG.md'), 'utf8');
   if (!new RegExp(`^# .+ v${escapeRegExp(version)}(?:[:\\s]|$)`, 'm').test(changelog)) {

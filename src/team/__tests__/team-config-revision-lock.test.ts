@@ -275,6 +275,8 @@ describe('team config revision transaction', () => {
     ['malformed workspace', { ...initialConfig(), workspace_mode: 'outside' }],
     ['malformed pane', { ...initialConfig(), leader_pane_id: 7 }],
     ['malformed routing', { ...initialConfig(), resolved_routing: { executor: { primary: {}, fallback: {} } } }],
+    ['malformed configured routing roles', { ...initialConfig(), configured_routing_roles: ['reviewer'] }],
+    ['malformed Copilot defaults', { ...initialConfig(), copilot_defaults: { model: 'gpt-5.6-sol', reasoning_effort: 'extreme' } }],
     ['mismatched active fence revision', { ...initialConfig(), active_recovery: { ...initialConfig().active_recovery!, state_revision: 2 } }],
     ['mismatched active scale-up fence revision', { ...initialConfig(), active_scale_up: { operation_id: 'up', phase: 'reserved', pid: 1, process_started_at: 'linux:1', state_revision: 2, created_at: new Date().toISOString(), updated_at: new Date().toISOString() } }],
     ['mismatched active scale-down fence revision', { ...initialConfig(), active_scale_down: { operation_id: 'down', phase: 'draining', pid: 1, process_started_at: 'linux:1', workers: [], state_revision: 2, created_at: new Date().toISOString(), updated_at: new Date().toISOString() } }],

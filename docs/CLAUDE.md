@@ -3,7 +3,7 @@
 
 # oh-my-claudecode - Intelligent Multi-Agent Orchestration
 
-You are running with oh-my-claudecode (OMC), a multi-agent orchestration layer for Claude Code.
+You are running with oh-my-claudecode (OMC), a multi-agent orchestration layer built for Claude Code and also compatible with GitHub Copilot CLI.
 Coordinate specialized agents, tools, and skills so work is completed accurately and efficiently.
 
 <operating_principles>
@@ -16,11 +16,11 @@ Coordinate specialized agents, tools, and skills so work is completed accurately
 <delegation_rules>
 Delegate for: multi-file changes, refactors, debugging, reviews, planning, research, verification.
 Work directly for: trivial ops, small clarifications, single commands.
-Route code to `executor` (use `model=opus` for complex work). Uncertain SDK usage → `document-specialist` (repo docs first; Context Hub / `chub` when available, graceful web fallback otherwise).
+Route code to `executor`. Under Claude Code, use `model=opus` for complex work; under Copilot, keep the Copilot-native default unless the user explicitly selects another model. Uncertain SDK usage → `document-specialist` (repo docs first; Context Hub / `chub` when available, graceful web fallback otherwise).
 </delegation_rules>
 
 <model_routing>
-`haiku` (quick lookups), `sonnet` (standard), `opus` (architecture, deep analysis).
+Claude Code profiles use `haiku` (quick lookups), `sonnet` (standard), and `opus` (architecture, deep analysis). Copilot profiles use `gpt-5.6-sol` with `max` reasoning by default.
 Direct writes OK for: `~/.claude/**`, `.omc/**`, `.claude/**`, `CLAUDE.md`, `AGENTS.md`.
 </model_routing>
 
@@ -33,7 +33,7 @@ Detailed agent catalog, tools, team pipeline, commit protocol, and full skills r
 </skills>
 
 <verification>
-Verify before claiming completion. Size appropriately: small→haiku, standard→sonnet, large/security→opus.
+Verify before claiming completion. Under Claude Code, size appropriately: small→haiku, standard→sonnet, large/security→opus. Under Copilot, use the `gpt-5.6-sol`/`max` default.
 If verification fails, keep iterating.
 </verification>
 
@@ -60,12 +60,17 @@ Kill switches: `DISABLE_OMC`, `OMC_SKIP_HOOKS` (comma-separated).
 `/oh-my-claudecode:cancel` ends execution modes. Cancel when done+verified or blocked. Don't cancel if work incomplete.
 </cancellation>
 
+<host_isolation>
+Under GitHub Copilot CLI (`OMC_HOST=copilot`, or `COPILOT_CLI`/`COPILOT_AGENT_SESSION_ID` set), do not require or diagnose `~/.claude`, HUD/statusLine, or `/omc-setup` unless the user explicitly asks to configure Claude Code too. Bundled `oh-my-claudecode:*` agents use Copilot-specific profiles pinned to `gpt-5.6-sol` with `max` reasoning; delegated Task/Agent calls receive the same defaults while preserving explicit per-call choices. Use Copilot's plugin manager (`copilot plugin update oh-my-claudecode`) and `/env` to verify/update instead.
+</host_isolation>
+
 <worktree_paths>
 State root: `.omc/` by default, or `$OMC_STATE_DIR/{project-id}/` when `OMC_STATE_DIR` is set, or the parent `.omc/` when a `.omc-workspace` marker anchors a multi-repo workspace. Runtime state includes `.omc/state/`, `.omc/state/sessions/{sessionId}/`, `.omc/notepad.md`, `.omc/project-memory.json`, `.omc/plans/`, `.omc/research/`, `.omc/logs/`, `.omc/artifacts/`, `.omc/handoffs/`, and `.omc/ultragoal/`. These are ignored operational artifacts by default; `.omc/skills/**` is the intentional committable exception for project-scoped skills. In linked git worktrees, local `.omc/` state is removed with the worktree unless centralized via `OMC_STATE_DIR`.
 </worktree_paths>
 
 ## Setup
 
-Say "setup omc" or run `/oh-my-claudecode:omc-setup`.
+- Claude Code: say "setup omc" or run `/oh-my-claudecode:omc-setup`.
+- GitHub Copilot CLI: plugin installation is sufficient; verify with `/env` and do not run the Claude setup flow unless explicitly configuring Claude Code too.
 
 <!-- OMC:END -->

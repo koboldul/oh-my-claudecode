@@ -158,6 +158,14 @@ describe('worker-bootstrap', () => {
       expect(geminiOverlay).toContain('Agent-Type Guidance (gemini)');
       expect(geminiOverlay).toContain('milestone');
     });
+
+    it('injects autonomous one-shot and reviewer verdict guidance for Copilot', () => {
+      const overlay = generateWorkerOverlay({ ...baseParams, agentType: 'copilot' });
+      expect(overlay).toContain('Agent-Type Guidance (copilot)');
+      expect(overlay).toContain('autonomous one-shot prompt mode');
+      expect(overlay).toContain('structured verdict file');
+      expect(overlay).toContain('transition-task-status');
+    });
     it('documents CLI lifecycle examples that match the active team api contract', () => {
       const overlay = generateWorkerOverlay(baseParams);
       expect(overlay).toContain('team api read-task');

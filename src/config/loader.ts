@@ -26,6 +26,8 @@ import { parseJsonc } from "../utils/jsonc.js";
 import {
   getDefaultTierModels,
   BUILTIN_EXTERNAL_MODEL_DEFAULTS,
+  resolveCopilotModel,
+  resolveCopilotReasoningEffort,
   shouldAutoForceInherit,
 } from "./models.js";
 import { normalizeDelegationRole } from "../features/delegation-routing/types.js";
@@ -150,6 +152,8 @@ export function buildDefaultConfig(): PluginConfig {
         codexModel: BUILTIN_EXTERNAL_MODEL_DEFAULTS.codexModel,
         geminiModel: BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel,
         antigravityModel: BUILTIN_EXTERNAL_MODEL_DEFAULTS.antigravityModel,
+        copilotModel: BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotModel,
+        copilotReasoningEffort: BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotReasoningEffort,
       },
       fallbackPolicy: {
         onModelFailure: "provider_chain",
@@ -366,7 +370,7 @@ export function loadEnvConfig(): Partial<PluginConfig> {
 
   if (process.env.OMC_EXTERNAL_MODELS_DEFAULT_PROVIDER) {
     const provider = process.env.OMC_EXTERNAL_MODELS_DEFAULT_PROVIDER;
-    if (provider === "codex" || provider === "gemini" || provider === "antigravity") {
+    if (provider === "codex" || provider === "gemini" || provider === "antigravity" || provider === "copilot") {
       externalModelsDefaults.provider = provider;
     }
   }
@@ -401,6 +405,17 @@ export function loadEnvConfig(): Partial<PluginConfig> {
   } else if (process.env.OMC_ANTIGRAVITY_DEFAULT_MODEL) {
     // Legacy fallback
     externalModelsDefaults.antigravityModel = process.env.OMC_ANTIGRAVITY_DEFAULT_MODEL;
+  }
+
+  if (
+    process.env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL ||
+    process.env.OMC_COPILOT_DEFAULT_MODEL
+  ) {
+    externalModelsDefaults.copilotModel = resolveCopilotModel();
+  }
+
+  if (process.env.OMC_COPILOT_REASONING_EFFORT) {
+    externalModelsDefaults.copilotReasoningEffort = resolveCopilotReasoningEffort();
   }
 
   const externalModelsFallback: ExternalModelsConfig["fallbackPolicy"] = {
@@ -499,8 +514,8 @@ function warnOnDeprecatedDelegationRouting(config: PluginConfig): void {
 const CANONICAL_TEAM_ROLE_SET = new Set<string>(CANONICAL_TEAM_ROLES);
 const CURSOR_EXECUTOR_TEAM_ROLE_SET = new Set<string>(CURSOR_EXECUTOR_TEAM_ROLES);
 const KNOWN_AGENT_NAME_SET = new Set<string>(KNOWN_AGENT_NAMES);
-// /team CLI workers — codex/gemini/grok/cursor here are CLI integrations, NOT the deprecated MCP delegationRouting providers.
-const TEAM_ROLE_PROVIDERS = new Set(["claude", "codex", "gemini", "grok", "cursor", "antigravity"]);
+// /team external providers here are CLI integrations, not deprecated MCP delegation routes.
+const TEAM_ROLE_PROVIDERS = new Set(["claude", "codex", "gemini", "grok", "cursor", "antigravity", "copilot"]);
 const TEAM_ROLE_TIERS = new Set(["HIGH", "MEDIUM", "LOW"]);
 
 export function validateTeamConfig(config: PluginConfig): void {
@@ -604,6 +619,7 @@ const AUTOPILOT_TEAM_AGENT_TYPES = new Set([
   "grok",
   "cursor",
   "antigravity",
+  "copilot",
 ]);
 
 const AUTOPILOT_WORKFLOW_NAME = /^[a-z][a-z0-9-]{0,62}$/;
@@ -826,6 +842,14 @@ export function loadConfig(): PluginConfig {
   // profile inputs and therefore cannot define or replace profiles.
   const envConfig = loadEnvConfig();
   config = deepMerge(config, envConfig);
+
+  const externalDefaults = config.externalModels?.defaults;
+  if (externalDefaults) {
+    externalDefaults.copilotModel = resolveCopilotModel(externalDefaults.copilotModel);
+    externalDefaults.copilotReasoningEffort = resolveCopilotReasoningEffort(
+      externalDefaults.copilotReasoningEffort,
+    );
+  }
 
   // Auto-enable forceInherit for non-standard providers (issues #1201, #1025)
   // Only auto-enable if user hasn't explicitly set it via config or env var.
@@ -1185,7 +1209,7 @@ export function generateConfigSchema(): object {
       },
       externalModels: {
         type: "object",
-        description: "External model provider configuration (Codex, Gemini, Grok, Antigravity)",
+        description: "External model provider configuration (Codex, Gemini, Grok, Antigravity, Copilot)",
         properties: {
           defaults: {
             type: "object",
@@ -1193,7 +1217,7 @@ export function generateConfigSchema(): object {
             properties: {
               provider: {
                 type: "string",
-                enum: ["codex", "gemini", "antigravity"],
+                enum: ["codex", "gemini", "antigravity", "copilot"],
                 description: "Default external provider",
               },
               codexModel: {
@@ -1215,6 +1239,17 @@ export function generateConfigSchema(): object {
                 default: BUILTIN_EXTERNAL_MODEL_DEFAULTS.antigravityModel,
                 description: "Default Antigravity model",
               },
+              copilotModel: {
+                type: "string",
+                default: BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotModel,
+                description: "Default GitHub Copilot CLI model",
+              },
+              copilotReasoningEffort: {
+                type: "string",
+                enum: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                default: BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotReasoningEffort,
+                description: "Default GitHub Copilot CLI reasoning effort",
+              },
             },
           },
           rolePreferences: {
@@ -1223,7 +1258,7 @@ export function generateConfigSchema(): object {
             additionalProperties: {
               type: "object",
               properties: {
-                provider: { type: "string", enum: ["codex", "gemini", "antigravity"] },
+                provider: { type: "string", enum: ["codex", "gemini", "antigravity", "copilot"] },
                 model: { type: "string" },
               },
               required: ["provider", "model"],
@@ -1235,7 +1270,7 @@ export function generateConfigSchema(): object {
             additionalProperties: {
               type: "object",
               properties: {
-                provider: { type: "string", enum: ["codex", "gemini", "antigravity"] },
+                provider: { type: "string", enum: ["codex", "gemini", "antigravity", "copilot"] },
                 model: { type: "string" },
               },
               required: ["provider", "model"],
@@ -1258,7 +1293,7 @@ export function generateConfigSchema(): object {
               },
               crossProviderOrder: {
                 type: "array",
-                items: { type: "string", enum: ["codex", "gemini", "antigravity"] },
+                items: { type: "string", enum: ["codex", "gemini", "antigravity", "copilot"] },
                 default: ["codex", "gemini"],
                 description: "Order of providers for cross-provider fallback",
               },
@@ -1374,7 +1409,7 @@ export function generateConfigSchema(): object {
                 type: "array",
                 items: {
                   type: "string",
-                  enum: ["claude", "codex", "gemini", "grok", "cursor", "antigravity"],
+                  enum: ["claude", "codex", "gemini", "grok", "cursor", "antigravity", "copilot"],
                 },
                 description:
                   "Preferred CLI worker types for executor-style autopilot team execution tasks",
@@ -1393,7 +1428,7 @@ export function generateConfigSchema(): object {
               maxAgents: { type: "integer", minimum: 1 },
               defaultAgentType: {
                 type: "string",
-                enum: ["claude", "codex", "gemini", "grok", "cursor", "antigravity"],
+                enum: ["claude", "codex", "gemini", "grok", "cursor", "antigravity", "copilot"],
                 default: "claude",
               },
               monitorIntervalMs: { type: "integer", minimum: 1 },
@@ -1407,7 +1442,7 @@ export function generateConfigSchema(): object {
             additionalProperties: {
               type: "object",
               properties: {
-                provider: { type: "string", enum: ["claude", "codex", "gemini", "grok", "cursor", "antigravity"] },
+                provider: { type: "string", enum: ["claude", "codex", "gemini", "grok", "cursor", "antigravity", "copilot"] },
                 model: { type: "string" },
                 agent: { type: "string" },
               },

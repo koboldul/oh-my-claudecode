@@ -456,6 +456,22 @@ function isTruthyProviderFlag(value) {
   return value === '1' || value === 'true';
 }
 
+/**
+ * Detect whether this session is running under GitHub Copilot CLI rather
+ * than Claude Code. Copilot loads the same plugin format but does not read
+ * ~/.claude/CLAUDE.md, HUD/statusLine, or /omc-setup, so Claude-only
+ * diagnostics and remediation guidance must be suppressed under Copilot.
+ *
+ * Prefers the explicit OMC_HOST signal (set by scripts/run.cjs when it can
+ * infer the host) and falls back to direct Copilot env vars when OMC_HOST is
+ * absent (e.g. this script invoked without going through run.cjs).
+ */
+function isCopilotHost() {
+  if (process.env.OMC_HOST === 'copilot') return true;
+  if (process.env.OMC_HOST === 'claude') return false;
+  return Boolean(process.env.COPILOT_CLI || process.env.COPILOT_AGENT_SESSION_ID);
+}
+
 function getSessionModelId() {
   return process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || '';
 }
@@ -522,6 +538,11 @@ function compactBudgetedText(text, maxChars) {
 function formatUpdateNoticeForUser(updateInfo, options = {}) {
   const latestVersion = updateInfo?.latestVersion || 'latest';
   const currentVersion = updateInfo?.currentVersion || 'unknown';
+  if (options.isCopilotHost) {
+    // Copilot has its own plugin manager and no /omc-setup, HUD, or
+    // Claude Code restart flow — point at the Copilot-specific update path.
+    return `[OMC UPDATE AVAILABLE] oh-my-claudecode v${latestVersion} is available (current: v${currentVersion}). Run: copilot plugin update oh-my-claudecode, then restart Copilot CLI.`;
+  }
   const action = updateInfo?.source === 'marketplace'
     ? 'To update the plugin channel, run: /plugin marketplace update omc && /omc-setup'
     : (options.autoUpgradePrompt === false
@@ -683,10 +704,13 @@ function getClaudeMdVersion() {
 }
 
 // Detect version drift between components
-function detectVersionDrift() {
+function detectVersionDrift(options = {}) {
+  const { excludeClaudeMd = false } = options;
   const pluginVersion = getPluginVersion();
   const npmVersion = getNpmVersion();
-  const claudeMdVersion = getClaudeMdVersion();
+  // Under Copilot, ~/.claude/CLAUDE.md is not read by the host, so it is not
+  // a real drift signal there — skip reading/checking it entirely.
+  const claudeMdVersion = excludeClaudeMd ? null : getClaudeMdVersion();
   const marketplaceChannel = getPluginUpdateChannelVersion();
 
   // Need at least plugin version to detect drift
@@ -700,18 +724,20 @@ function detectVersionDrift() {
     drift.push({ component: 'npm package (omc CLI)', current: npmVersion, expected: pluginVersion });
   }
 
-  if (claudeMdVersion === 'unknown') {
-    drift.push({
-      component: 'CLAUDE.md instructions',
-      current: 'unknown (needs migration)',
-      expected: pluginVersion
-    });
-  } else if (claudeMdVersion && claudeMdVersion !== pluginVersion) {
-    drift.push({
-      component: 'CLAUDE.md instructions',
-      current: claudeMdVersion,
-      expected: pluginVersion
-    });
+  if (!excludeClaudeMd) {
+    if (claudeMdVersion === 'unknown') {
+      drift.push({
+        component: 'CLAUDE.md instructions',
+        current: 'unknown (needs migration)',
+        expected: pluginVersion
+      });
+    } else if (claudeMdVersion && claudeMdVersion !== pluginVersion) {
+      drift.push({
+        component: 'CLAUDE.md instructions',
+        current: claudeMdVersion,
+        expected: pluginVersion
+      });
+    }
   }
 
   if (drift.length === 0) return null;
@@ -921,8 +947,10 @@ async function main() {
     reconcileAbandonedSessionStarts(omcRoot, sessionId);
     reconcileSessionEndJobsInBackground(getRuntimeBaseDir(), directory);
 
-    // Check for version drift between components
-    const driftInfo = detectVersionDrift();
+    // Check for version drift between components. Under Copilot, exclude
+    // ~/.claude/CLAUDE.md — Copilot does not read that file, so it is not a
+    // real drift signal there (host-isolation guard).
+    const driftInfo = detectVersionDrift({ excludeClaudeMd: isCopilotHost() });
     if (driftInfo && shouldNotifyDrift(driftInfo)) {
       let driftMsg = `[OMC VERSION DRIFT DETECTED]\n\nPlugin version: ${driftInfo.pluginVersion}\n`;
       for (const d of driftInfo.drift) {
@@ -942,13 +970,17 @@ async function main() {
         const updateInfo = await checkNpmUpdate(pluginVersion);
         if (updateInfo) {
           const omcConfig = readJsonFile(join(configDir, '.omc-config.json')) || {};
-          userMessages.push(formatUpdateNoticeForUser(updateInfo, { autoUpgradePrompt: omcConfig.autoUpgradePrompt !== false }));
+          userMessages.push(formatUpdateNoticeForUser(updateInfo, {
+            autoUpgradePrompt: omcConfig.autoUpgradePrompt !== false,
+            isCopilotHost: isCopilotHost(),
+          }));
         }
       }
     } catch {}
 
-    // Warn if silentAutoUpdate is enabled but running in plugin mode (#1773)
-    if (process.env.CLAUDE_PLUGIN_ROOT) {
+    // Warn if silentAutoUpdate is enabled but running in plugin mode (#1773).
+    // This guidance references /omc-setup, which is Claude-only — skip under Copilot.
+    if (process.env.CLAUDE_PLUGIN_ROOT && !isCopilotHost()) {
       try {
         const omcConfigPath = join(configDir, '.omc-config.json');
         const omcConfig = readJsonFile(omcConfigPath);
@@ -958,12 +990,16 @@ async function main() {
       } catch {}
     }
 
-    // Check HUD installation (one-time setup guidance)
-    const hudCheck = await checkHudInstallation();
-    if (!hudCheck.installed) {
-      messages.push(`<system-reminder>
+    // Check HUD installation (one-time setup guidance). HUD/statusLine is a
+    // Claude Code-only surface — Copilot has no statusLine equivalent, so
+    // skip this check entirely under Copilot (host-isolation guard).
+    if (!isCopilotHost()) {
+      const hudCheck = await checkHudInstallation();
+      if (!hudCheck.installed) {
+        messages.push(`<system-reminder>
 [OMC] HUD not configured (${hudCheck.reason}). Run /hud setup then restart Claude Code.
 </system-reminder>`);
+      }
     }
 
     if (shouldEmitModelRoutingOverride(directory)) {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,7 +28,57 @@ const ALL_KEYS = [
   "ANTHROPIC_DEFAULT_HAIKU_MODEL",
   "OMC_DELEGATION_ROUTING_ENABLED",
   "OMC_DELEGATION_ROUTING_DEFAULT_PROVIDER",
+  "OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL",
+  "OMC_COPILOT_DEFAULT_MODEL",
+  "OMC_COPILOT_REASONING_EFFORT",
 ] as const;
+
+describe("loadConfig() — GitHub Copilot external defaults", () => {
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    saved = saveAndClear(ALL_KEYS);
+  });
+  afterEach(() => {
+    restore(saved);
+  });
+
+  it("uses gpt-5.6-sol with max effort by default", () => {
+    const config = loadConfig();
+    expect(config.externalModels?.defaults?.copilotModel).toBe("gpt-5.6-sol");
+    expect(config.externalModels?.defaults?.copilotReasoningEffort).toBe("max");
+  });
+
+  it("prefers the canonical Copilot model env over the legacy env and validates effort", () => {
+    process.env.OMC_COPILOT_DEFAULT_MODEL = "legacy-model";
+    process.env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL = "canonical-model";
+    process.env.OMC_COPILOT_REASONING_EFFORT = "xhigh";
+    const config = loadConfig();
+    expect(config.externalModels?.defaults?.copilotModel).toBe("canonical-model");
+    expect(config.externalModels?.defaults?.copilotReasoningEffort).toBe("xhigh");
+  });
+
+  it("rejects invalid Copilot reasoning effort values", () => {
+    process.env.OMC_COPILOT_REASONING_EFFORT = "ultra";
+    expect(() => loadConfig()).toThrow(
+      "Allowed: none, minimal, low, medium, high, xhigh, max",
+    );
+  });
+
+  it("advertises Copilot defaults and provider routing in the generated schema", () => {
+    const schema = generateConfigSchema() as any;
+    const defaults = schema.properties.externalModels.properties.defaults.properties;
+    expect(defaults.copilotModel.default).toBe("gpt-5.6-sol");
+    expect(defaults.copilotReasoningEffort.enum).toEqual([
+      "none", "minimal", "low", "medium", "high", "xhigh", "max",
+    ]);
+    expect(defaults.provider.enum).toContain("copilot");
+    expect(schema.properties.team.properties.ops.properties.defaultAgentType.enum)
+      .toContain("copilot");
+    expect(schema.properties.autopilot.properties.team.properties.agentTypes.items.enum)
+      .toContain("copilot");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Auto-forceInherit for Bedrock / Vertex (issues #1201, #1025)
@@ -327,7 +377,7 @@ describe("plan output configuration", () => {
 
     try {
       const claudeDir = join(tempDir, ".claude");
-      require("node:fs").mkdirSync(claudeDir, { recursive: true });
+      mkdirSync(claudeDir, { recursive: true });
       writeFileSync(
         join(claudeDir, "omc.jsonc"),
         JSON.stringify({
@@ -483,6 +533,33 @@ describe("team.roleRouting (Option E)", () => {
       expect(config.team?.ops?.defaultAgentType).toBe("cursor");
       expect(config.team?.roleRouting?.executor).toEqual({ provider: "cursor" });
     } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts Copilot as team defaultAgentType and reviewer roleRouting provider", () => {
+    const tempDir = mkdtempSync(join(tmpdir(), "omc-team-routing-copilot-"));
+    const originalCwd = process.cwd();
+    try {
+      const claudeDir = join(tempDir, ".claude");
+      require("node:fs").mkdirSync(claudeDir, { recursive: true });
+      writeFileSync(
+        join(claudeDir, "omc.jsonc"),
+        JSON.stringify({
+          team: {
+            ops: { defaultAgentType: "copilot" },
+            roleRouting: {
+              "code-reviewer": { provider: "copilot" },
+            },
+          },
+        }),
+      );
+      process.chdir(tempDir);
+      const config = loadConfig();
+      expect(config.team?.ops?.defaultAgentType).toBe("copilot");
+      expect(config.team?.roleRouting?.["code-reviewer"]).toEqual({ provider: "copilot" });
+    } finally {
+      process.chdir(originalCwd);
       rmSync(tempDir, { recursive: true, force: true });
     }
   });

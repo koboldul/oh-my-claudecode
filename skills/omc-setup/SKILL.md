@@ -20,6 +20,25 @@ Choose this setup flow when the user wants to **install, refresh, or repair OMC 
 - npm users should land here after `npm i -g oh-my-claude-sisyphus@latest`
 - local-dev and worktree users should land here after updating the checked-out repo and rerunning setup
 
+## Copilot Host Guard
+
+**Before flag parsing or any mutation**, detect whether this session is running under **GitHub Copilot CLI** rather than Claude Code: check `OMC_HOST=copilot`, or `COPILOT_CLI`/`COPILOT_AGENT_SESSION_ID` present in the environment (these are the same signals `scripts/run.cjs` and `scripts/session-start.mjs` use for host isolation).
+
+In any **GitHub Copilot CLI session**, do **not**:
+- Touch `.claude`, `~/.claude`, or any `CLAUDE.md` file (local or global)
+- Configure HUD/statusLine
+- Run any of the Claude-only setup phases below (Phase 1 CLAUDE.md install, Phase 2's HUD/statusLine step, etc.)
+
+...unless the user **explicitly asks to configure Claude Code too** (e.g. "also set up Claude Code", "configure both hosts"). In that case, run the normal flow below for Claude Code in addition to the Copilot-only guidance.
+
+For a Copilot session, instead tell the user:
+- **Plugin installation is sufficient.** Copilot loads skills, `agents/*.md`, the `t` MCP server, and `hooks/hooks.json` directly from the installed plugin — no separate setup script is required.
+- **Verify** with `/env` (lists loaded skills, agents, MCP servers, and hooks).
+- **Diagnose** with `/oh-my-claudecode:setup doctor` (routes to `/oh-my-claudecode:omc-doctor`).
+- **Update** with Copilot's plugin manager: `copilot plugin update oh-my-claudecode`, then restart Copilot CLI (plugins/hooks reload at startup).
+
+Then stop for the Copilot session — do not proceed to Flag Parsing or Phase Execution below.
+
 ## Flag Parsing
 
 Check for flags in the user's invocation:

@@ -24,7 +24,8 @@ export type AutopilotTeamAgentType =
   | "gemini"
   | "grok"
   | "cursor"
-  | "antigravity";
+  | "antigravity"
+  | "copilot";
 
 /** Built-in stages admitted by version 1 named autopilot workflows. */
 export type AutopilotWorkflowStage = "ralplan" | "execution" | "ralph" | "qa";
@@ -336,7 +337,16 @@ export interface HookResult {
 /**
  * External model provider type
  */
-export type ExternalModelProvider = "codex" | "gemini" | "antigravity";
+export type ExternalModelProvider = "codex" | "gemini" | "antigravity" | "copilot";
+
+export type CopilotReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
 
 /**
  * External model configuration for a specific role or task
@@ -355,6 +365,8 @@ export interface ExternalModelsDefaults {
   geminiModel?: string;
   grokModel?: string;
   antigravityModel?: string;
+  copilotModel?: string;
+  copilotReasoningEffort?: CopilotReasoningEffort;
 }
 
 /**
@@ -479,7 +491,7 @@ export type CanonicalTeamRole = typeof CANONICAL_TEAM_ROLES[number];
 export const CURSOR_EXECUTOR_TEAM_ROLES = ["executor"] as const;
 
 /** Provider for /team role routing. */
-export type TeamRoleProvider = 'claude' | 'codex' | 'gemini' | 'grok' | 'cursor' | 'antigravity';
+export type TeamRoleProvider = 'claude' | 'codex' | 'gemini' | 'grok' | 'cursor' | 'antigravity' | 'copilot';
 
 /** Tier name accepted in role-assignment `model` field. */
 export type TeamRoleTier = 'HIGH' | 'MEDIUM' | 'LOW';
@@ -548,5 +560,7 @@ export interface RoleAssignment {
   provider: TeamRoleProvider;
   /** Resolved model ID (tier names expanded to explicit model strings). */
   model: string;
+  /** Copilot-only reasoning effort resolved from config/environment. */
+  reasoningEffort?: CopilotReasoningEffort;
   agent: KnownAgentName;
 }

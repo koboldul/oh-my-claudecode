@@ -23,7 +23,7 @@ The `swarm` compatibility alias was removed in #1131.
 ### Parameters
 
 - **N** - Number of teammate agents (1-20). Optional; defaults to auto-sizing based on task decomposition.
-- **agent-type** - OMC agent to spawn for the `team-exec` stage (e.g., executor, debugger, designer, codex, gemini, antigravity). Optional; defaults to stage-aware routing. Use `codex` to spawn Codex CLI workers, `gemini` for Gemini CLI workers (enterprise/API-key tier), or `antigravity` for Antigravity CLI (`agy`) workers (Google's successor to the Gemini CLI; requires respective CLIs installed). See Stage Agent Routing below.
+- **agent-type** - OMC agent to spawn for the `team-exec` stage (e.g., executor, debugger, designer, codex, gemini, antigravity, copilot). Optional; defaults to stage-aware routing. External CLI provider names launch through `omc team`; they are not native Agent/Task subtypes. See Stage Agent Routing below.
 - **task** - High-level task to decompose and distribute among teammates
 - **ralph** - Optional modifier. When present, wraps the team pipeline in Ralph's persistence loop (retry on failure, architect verification before completion). See Team + Ralph Composition below.
 
@@ -41,8 +41,14 @@ The `swarm` compatibility alias was removed in #1131.
 /team 2:gemini "redesign the UI components"
 # With Antigravity CLI workers (requires: install per https://antigravity.google)
 /team 2:antigravity "redesign the UI components"
+# With GitHub Copilot CLI workers
+/team 2:copilot "implement and review the requested change"
 # Mixed: Codex for backend analysis, Gemini/Antigravity for frontend (use /ccg instead for this)
 ```
+
+**External routing rule:** `N:copilot` MUST invoke `omc team N:copilot "<task>"` (or the
+equivalent `/omc-teams` surface). Never pass `copilot` as an Agent/Task `subagent_type`;
+no native Copilot teammate type exists.
 
 ## Architecture
 
@@ -483,6 +489,7 @@ When composing teammate prompts, append a short addendum based on worker type:
 - `codex_worker`: Emphasize CLI API lifecycle (`omc team api ... --json`) and explicit failure ACKs with stderr.
 - `gemini_worker`: Emphasize bounded file ownership and milestone ACKs after each completed sub-step.
 - `antigravity_worker`: Same expectations as `gemini_worker`; emphasize bounded file ownership and milestone ACKs after each completed sub-step.
+- `copilot_worker`: Emphasize autonomous one-shot execution, focused verification, required task lifecycle transitions, and structured verdict output for reviewer roles.
 
 This addendum must preserve the core rule: **worker = executor only, never leader/orchestrator**.
 
@@ -595,6 +602,7 @@ Tasks are tagged with an execution mode during decomposition:
 | `codex_worker`  | Codex CLI (tmux pane)  | Full filesystem access in working_directory. Runs autonomously via tmux pane. Best for code review, security analysis, refactoring, architecture. Requires `npm install -g @openai/codex`. |
 | `gemini_worker`      | Gemini CLI (tmux pane)      | Full filesystem access in working_directory. Runs autonomously via tmux pane. Best for UI/design work, documentation, large-context tasks. Requires `npm install -g @google/gemini-cli` (enterprise/API-key tier). |
 | `antigravity_worker` | Antigravity CLI (tmux pane) | Full filesystem access in working_directory. Runs autonomously via tmux pane. Same strengths as gemini_worker; Google's successor to the Gemini CLI. Install per the [official instructions](https://antigravity.google) (`agy` binary). |
+| `copilot_worker` | GitHub Copilot CLI (tmux pane) | Autonomous prompt-mode worker using `gpt-5.6-sol` and max effort by default. Supports executor and structured reviewer roles. |
 
 ### How CLI Workers Operate
 
@@ -883,7 +891,7 @@ Optional settings live in `.claude/omc.jsonc` (project) or `~/.config/claude-omc
 ```
 
 - **ops.maxAgents** - Maximum teammates (default: 20)
-- **ops.defaultAgentType** - CLI provider when a `/team` invocation does not specify one (`claude` | `codex` | `gemini` | `antigravity` | `grok` | `cursor`, default: `claude`)
+- **ops.defaultAgentType** - CLI provider when a `/team` invocation does not specify one (`claude` | `codex` | `gemini` | `antigravity` | `grok` | `cursor` | `copilot`, default: `claude`)
 - **ops.monitorIntervalMs** - How often to review TodoWrite or the active task-list surface (default: 30s)
 - **ops.shutdownTimeoutMs** - How long to wait for shutdown responses (default: 15s)
 
@@ -893,7 +901,7 @@ Optional settings live in `.claude/omc.jsonc` (project) or `~/.config/claude-omc
 
 > **Scope:** Applies to `/team` only. Task-based delegation uses `delegationRouting` (see separate docs). The two systems coexist by design.
 
-Declare which provider (`claude`, `codex`, `gemini`, `antigravity`, `grok`, `cursor`) and which model tier should back each canonical role. Routing is resolved **once** at team creation and persisted in `TeamConfig.resolved_routing` — spawn, scale-up, and restart all read from the snapshot, so a role's worker CLI and model are stable for the lifetime of the team.
+Declare which provider (`claude`, `codex`, `gemini`, `antigravity`, `grok`, `cursor`, `copilot`) and which model tier should back each canonical role. Routing is resolved **once** at team creation and persisted in `TeamConfig.resolved_routing` — spawn, scale-up, and restart all read from the snapshot, so a role's worker CLI and model are stable for the lifetime of the team.
 
 ### Example — user target mapping
 
@@ -908,7 +916,7 @@ Declare which provider (`claude`, `codex`, `gemini`, `antigravity`, `grok`, `cur
       "executor": { "provider": "claude", "model": "MEDIUM" },
       "debugger": { "provider": "cursor" },
       "critic": { "provider": "codex" },
-      "code-reviewer": { "provider": "gemini" },
+      "code-reviewer": { "provider": "copilot" },
       "test-engineer": { "provider": "gemini", "model": "MEDIUM" },
     },
   },
@@ -923,7 +931,7 @@ Declare which provider (`claude`, `codex`, `gemini`, `antigravity`, `grok`, `cur
 | `executor`      | claude          | `MEDIUM` (sonnet)         |
 | `debugger`      | cursor          | cursor-agent default      |
 | `critic`        | codex           | codex default             |
-| `code-reviewer` | gemini          | gemini default            |
+| `code-reviewer` | copilot         | `gpt-5.6-sol` / max effort |
 | `test-engineer` | antigravity     | antigravity default       |
 
 ### Canonical roles
@@ -934,7 +942,7 @@ User-friendly aliases normalize via `normalizeDelegationRole()` — e.g. `review
 
 ### Spec fields (`TeamRoleAssignmentSpec`)
 
-- **provider** — `"claude" | "codex" | "gemini" | "antigravity" | "grok" | "cursor"`. Omitted → defaults to `claude`.
+- **provider** — `"claude" | "codex" | "gemini" | "antigravity" | "grok" | "cursor" | "copilot"`. Omitted → defaults to `claude`.
 - **model** — tier name (`"HIGH" | "MEDIUM" | "LOW"`) or an explicit model ID. Tiers resolve through `routing.tierModels`.
 - **agent** — optional Claude agent name (e.g. `"critic"`, `"executor"`). Only honored when the resolved provider is `claude`.
 

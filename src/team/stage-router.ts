@@ -25,6 +25,8 @@ import { normalizeDelegationRole } from '../features/delegation-routing/types.js
 import {
   BUILTIN_EXTERNAL_MODEL_DEFAULTS,
   getDefaultTierModels,
+  resolveCopilotModel,
+  resolveCopilotReasoningEffort,
 } from '../config/models.js';
 
 /** Map canonical team role → KnownAgentName key (matches PluginConfig.agents.*). */
@@ -128,12 +130,12 @@ function resolveClaudeModel(
 /**
  * Resolve a user-supplied `model` value for an external provider worker.
  *
- * Tier names are Claude-centric and not meaningful for codex/gemini/grok/cursor/antigravity,
+ * Tier names are Claude-centric and not meaningful for external CLI providers,
  * so tier input (or absent input) maps to the provider's builtin default. Only
  * an explicit non-tier model ID is passed through.
  */
 function resolveExternalModel(
-  provider: 'codex' | 'gemini' | 'grok' | 'cursor' | 'antigravity',
+  provider: 'codex' | 'gemini' | 'grok' | 'cursor' | 'antigravity' | 'copilot',
   raw: string | undefined,
   cfg: PluginConfig,
 ): string {
@@ -152,6 +154,9 @@ function resolveExternalModel(
   }
   if (provider === 'antigravity') {
     return defaults?.antigravityModel ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.antigravityModel;
+  }
+  if (provider === 'copilot') {
+    return resolveCopilotModel(defaults?.copilotModel);
   }
   return defaults?.geminiModel ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel;
 }
@@ -193,9 +198,17 @@ export function resolveRoleAssignment(
   const model = provider === 'claude'
     ? resolveClaudeModel(canonical, spec?.model, cfg)
     : resolveExternalModel(provider, spec?.model, cfg);
+  const reasoningEffort = provider === 'copilot'
+    ? resolveCopilotReasoningEffort(cfg.externalModels?.defaults?.copilotReasoningEffort)
+    : undefined;
   const agent: KnownAgentName = spec?.agent ?? ROLE_TO_AGENT[canonical];
 
-  return { provider, model, agent };
+  return {
+    provider,
+    model,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    agent,
+  };
 }
 
 function isCanonicalRole(value: string): value is CanonicalTeamRole {

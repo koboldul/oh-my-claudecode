@@ -233,13 +233,15 @@ function bumpVersionFiles(newVersion: string, dryRun: boolean): string[] {
     changes.push(`package.json: ${pkg.version} → ${newVersion}`);
   }
 
-  const pluginPath = join(ROOT, '.claude-plugin/plugin.json');
-  if (existsSync(pluginPath)) {
-    const content = readFileSync(pluginPath, 'utf-8');
-    const updated = content.replace(/"version":\s*"[^"]*"/, `"version": "${newVersion}"`);
-    if (content !== updated) {
-      if (!dryRun) writeFileSync(pluginPath, updated, 'utf-8');
-      changes.push(`plugin.json: bumped to ${newVersion}`);
+  for (const relativePath of ['.claude-plugin/plugin.json', 'plugin.json']) {
+    const pluginPath = join(ROOT, relativePath);
+    if (existsSync(pluginPath)) {
+      const content = readFileSync(pluginPath, 'utf-8');
+      const updated = content.replace(/"version":\s*"[^"]*"/, `"version": "${newVersion}"`);
+      if (content !== updated) {
+        if (!dryRun) writeFileSync(pluginPath, updated, 'utf-8');
+        changes.push(`${relativePath}: bumped to ${newVersion}`);
+      }
     }
   }
 
@@ -254,12 +256,26 @@ function bumpVersionFiles(newVersion: string, dryRun: boolean): string[] {
   }
 
   const claudeMdPath = join(ROOT, 'docs/CLAUDE.md');
+  let claudeMdFinalContent: string | null = null;
   if (existsSync(claudeMdPath)) {
     const content = readFileSync(claudeMdPath, 'utf-8');
     const updated = content.replace(/<!-- OMC:VERSION:[^\s]*? -->/, `<!-- OMC:VERSION:${newVersion} -->`);
+    claudeMdFinalContent = updated;
     if (content !== updated) {
       if (!dryRun) writeFileSync(claudeMdPath, updated, 'utf-8');
       changes.push(`docs/CLAUDE.md: version marker → ${newVersion}`);
+    }
+  }
+
+  // Root CLAUDE.md must stay byte-identical to docs/CLAUDE.md (the canonical
+  // guidance source). Sync it on every release so root never drifts stale
+  // between releases, independent of scripts/sync-version.sh.
+  const rootClaudeMdPath = join(ROOT, 'CLAUDE.md');
+  if (claudeMdFinalContent !== null) {
+    const existingRootContent = existsSync(rootClaudeMdPath) ? readFileSync(rootClaudeMdPath, 'utf-8') : null;
+    if (existingRootContent !== claudeMdFinalContent) {
+      if (!dryRun) writeFileSync(rootClaudeMdPath, claudeMdFinalContent, 'utf-8');
+      changes.push(`CLAUDE.md: synchronized from docs/CLAUDE.md → ${newVersion}`);
     }
   }
 
@@ -332,7 +348,7 @@ ${clr('Examples:', c.cyan)}
   npm run release -- patch --dry-run    # Preview without writing
 
 ${clr('What it does:', c.cyan)}
-  1. Bumps version in all 5 files (package.json, plugin.json, marketplace.json, docs/CLAUDE.md, lockfile)
+  1. Bumps version in all 7 files (package.json, both plugin manifests, marketplace.json, docs/CLAUDE.md, CLAUDE.md, lockfile) — CLAUDE.md is synchronized byte-for-byte from docs/CLAUDE.md
   2. Generates CHANGELOG.md from the merged PR set when metadata is available
   3. Generates .github/release-body.md with contributor @mentions
   4. Runs sync-metadata to update doc badges

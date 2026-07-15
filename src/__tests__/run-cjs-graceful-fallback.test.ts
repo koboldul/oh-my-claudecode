@@ -607,3 +607,171 @@ describe('run.cjs trusted UserPromptSubmit Worker selection', () => {
     expect(readFileSync(startedMarker, 'utf-8')).toBe('async');
   });
 });
+
+/**
+ * Regression tests for GitHub Copilot CLI host isolation: Copilot rewrites
+ * hook manifest commands to absolute paths but does not reliably export
+ * CLAUDE_PLUGIN_ROOT to hook children (unlike Claude Code). run.cjs must
+ * infer the plugin root from the resolved target and set OMC_HOST=copilot
+ * when a Copilot signal is present, without changing standalone/stale-target
+ * behavior when no plugin markers exist near the target.
+ */
+describe('run.cjs — Copilot host normalization (CLAUDE_PLUGIN_ROOT + OMC_HOST)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'omc-run-cjs-copilot-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Create a fake plugin root with the markers run.cjs requires to trust an inferred root. */
+  function createFakePluginRoot(root: string): string {
+    mkdirSync(join(root, 'scripts'), { recursive: true });
+    mkdirSync(join(root, '.claude-plugin'), { recursive: true });
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'oh-my-claudecode', version: '0.0.0' }));
+    writeFileSync(join(root, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'oh-my-claudecode', version: '0.0.0' }));
+    return root;
+  }
+
+  /** Write a hook script under <root>/scripts that dumps CLAUDE_PLUGIN_ROOT/OMC_HOST to markerPath. */
+  function writeEnvEchoHook(root: string, name: string, markerPath: string): string {
+    const target = join(root, 'scripts', name);
+    writeFileSync(
+      target,
+      `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify({ pluginRoot: process.env.CLAUDE_PLUGIN_ROOT || null, omcHost: process.env.OMC_HOST || null })); process.exit(0);`,
+    );
+    return target;
+  }
+
+  /**
+   * Spawn run.cjs with an env that explicitly has no CLAUDE_PLUGIN_ROOT,
+   * OMC_HOST, or Copilot signal unless overridden by `env`. This test suite
+   * itself may run inside a Copilot CLI session (COPILOT_CLI/
+   * COPILOT_AGENT_SESSION_ID ambient in process.env), so those must be
+   * stripped by default to keep "no signal" scenarios deterministic.
+   */
+  function runCjsWithoutPluginRoot(target: string, env: Record<string, string> = {}): { status: number; stdout: string; stderr: string } {
+    const childEnv: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined) childEnv[key] = value;
+    }
+    delete childEnv.CLAUDE_PLUGIN_ROOT;
+    delete childEnv.OMC_HOST;
+    delete childEnv.COPILOT_CLI;
+    delete childEnv.COPILOT_AGENT_SESSION_ID;
+    Object.assign(childEnv, env);
+
+    const result = spawnSync(NODE, [RUN_CJS_PATH, target], {
+      encoding: 'utf-8',
+      env: childEnv,
+      timeout: 30000,
+      input: '{}',
+    });
+
+    return {
+      status: result.status ?? (result.error || result.signal ? 1 : 0),
+      stdout: result.stdout || '',
+      stderr: result.stderr || '',
+    };
+  }
+
+  it('infers CLAUDE_PLUGIN_ROOT and sets OMC_HOST=copilot when COPILOT_CLI is present without CLAUDE_PLUGIN_ROOT', () => {
+    const pluginRoot = createFakePluginRoot(join(tmpDir, 'copilot-plugin-root'));
+    const markerPath = join(tmpDir, 'copilot-env.json');
+    const target = writeEnvEchoHook(pluginRoot, 'echo-env.cjs', markerPath);
+
+    const result = runCjsWithoutPluginRoot(target, { COPILOT_CLI: '1' });
+
+    expect(result.status).toBe(0);
+    const written = JSON.parse(readFileSync(markerPath, 'utf-8'));
+    expect(written.pluginRoot).toBe(pluginRoot);
+    expect(written.omcHost).toBe('copilot');
+  });
+
+  it('infers CLAUDE_PLUGIN_ROOT and sets OMC_HOST=copilot when COPILOT_AGENT_SESSION_ID is present without CLAUDE_PLUGIN_ROOT', () => {
+    const pluginRoot = createFakePluginRoot(join(tmpDir, 'copilot-agent-plugin-root'));
+    const markerPath = join(tmpDir, 'copilot-agent-env.json');
+    const target = writeEnvEchoHook(pluginRoot, 'echo-env.cjs', markerPath);
+
+    const result = runCjsWithoutPluginRoot(target, { COPILOT_AGENT_SESSION_ID: 'abc123' });
+
+    expect(result.status).toBe(0);
+    const written = JSON.parse(readFileSync(markerPath, 'utf-8'));
+    expect(written.pluginRoot).toBe(pluginRoot);
+    expect(written.omcHost).toBe('copilot');
+  });
+
+  it('sets OMC_HOST=copilot from an inferred root under .copilot/installed-plugins even without explicit Copilot env vars', () => {
+    const pluginRoot = createFakePluginRoot(join(tmpDir, '.copilot', 'installed-plugins', 'omc', 'oh-my-claudecode'));
+    const markerPath = join(tmpDir, 'copilot-path-env.json');
+    const target = writeEnvEchoHook(pluginRoot, 'echo-env.cjs', markerPath);
+
+    const result = runCjsWithoutPluginRoot(target, {});
+
+    expect(result.status).toBe(0);
+    const written = JSON.parse(readFileSync(markerPath, 'utf-8'));
+    expect(written.pluginRoot).toBe(pluginRoot);
+    expect(written.omcHost).toBe('copilot');
+  });
+
+  it('preserves an already-set OMC_HOST instead of overwriting it', () => {
+    const pluginRoot = createFakePluginRoot(join(tmpDir, 'preset-host-plugin-root'));
+    const markerPath = join(tmpDir, 'preset-host-env.json');
+    const target = writeEnvEchoHook(pluginRoot, 'echo-env.cjs', markerPath);
+
+    const result = runCjsWithoutPluginRoot(target, { COPILOT_CLI: '1', OMC_HOST: 'custom-host' });
+
+    expect(result.status).toBe(0);
+    const written = JSON.parse(readFileSync(markerPath, 'utf-8'));
+    expect(written.omcHost).toBe('custom-host');
+  });
+
+  it('does not infer a plugin root or set OMC_HOST when no plugin markers exist near the resolved target (standalone behavior unchanged)', () => {
+    const scriptsDir = join(tmpDir, 'standalone', 'scripts');
+    mkdirSync(scriptsDir, { recursive: true });
+    const markerPath = join(tmpDir, 'standalone-env.json');
+    const target = join(scriptsDir, 'echo-env.cjs');
+    writeFileSync(
+      target,
+      `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify({ pluginRoot: process.env.CLAUDE_PLUGIN_ROOT || null, omcHost: process.env.OMC_HOST || null })); process.exit(0);`,
+    );
+
+    const result = runCjsWithoutPluginRoot(target, {});
+
+    expect(result.status).toBe(0);
+    const written = JSON.parse(readFileSync(markerPath, 'utf-8'));
+    expect(written.pluginRoot).toBeNull();
+    expect(written.omcHost).toBeNull();
+  });
+
+  it('leaves CLAUDE_PLUGIN_ROOT and OMC_HOST behavior unchanged for the existing direct-hit fast path', () => {
+    const pluginRoot = createFakePluginRoot(join(tmpDir, 'explicit-root-plugin-root'));
+    const markerPath = join(tmpDir, 'explicit-root-env.json');
+    const target = writeEnvEchoHook(pluginRoot, 'echo-env.cjs', markerPath);
+
+    const result = runCjsWithoutPluginRoot(target, { CLAUDE_PLUGIN_ROOT: pluginRoot });
+
+    expect(result.status).toBe(0);
+    const written = JSON.parse(readFileSync(markerPath, 'utf-8'));
+    expect(written.pluginRoot).toBe(pluginRoot);
+    expect(written.omcHost).toBe('claude');
+  });
+
+  it('detects Copilot from an explicit plugin root under .copilot/installed-plugins', () => {
+    const pluginRoot = createFakePluginRoot(
+      join(tmpDir, '.copilot', 'installed-plugins', 'omc', 'oh-my-claudecode'),
+    );
+    const markerPath = join(tmpDir, 'explicit-copilot-root-env.json');
+    const target = writeEnvEchoHook(pluginRoot, 'echo-env.cjs', markerPath);
+
+    const result = runCjsWithoutPluginRoot(target, { CLAUDE_PLUGIN_ROOT: pluginRoot });
+
+    expect(result.status).toBe(0);
+    const written = JSON.parse(readFileSync(markerPath, 'utf-8'));
+    expect(written.pluginRoot).toBe(pluginRoot);
+    expect(written.omcHost).toBe('copilot');
+  });
+});

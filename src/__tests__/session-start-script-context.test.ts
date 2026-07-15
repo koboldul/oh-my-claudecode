@@ -47,6 +47,11 @@ describe('session-start.mjs regression #1386', () => {
         ...process.env,
         HOME: fakeHome,
         USERPROFILE: fakeHome,
+        // Pin the Claude Code host explicitly so these default-behavior
+        // assertions are deterministic even when the test suite itself runs
+        // inside a Copilot CLI session (ambient COPILOT_CLI/
+        // COPILOT_AGENT_SESSION_ID would otherwise leak through).
+        OMC_HOST: 'claude',
       },
       timeout: 15000,
     }).trim();
@@ -134,6 +139,9 @@ describe('session-start.mjs regression #1386', () => {
         ...process.env,
         HOME: fakeHome,
         USERPROFILE: fakeHome,
+        // See earlier note: pin the host so this test is deterministic
+        // regardless of the ambient environment running the suite.
+        OMC_HOST: 'claude',
       },
       timeout: 15000,
     }).trim();
@@ -179,6 +187,9 @@ ${'- oversized startup guidance\n'.repeat(700)}
         HOME: fakeHome,
         USERPROFILE: fakeHome,
         CLAUDE_CODE_USE_BEDROCK: '1',
+        // See earlier note: pin the host so this test is deterministic
+        // regardless of the ambient environment running the suite.
+        OMC_HOST: 'claude',
       },
       timeout: 15000,
     }).trim();
@@ -230,6 +241,9 @@ ${'- oversized startup guidance\n'.repeat(700)}
         USERPROFILE: fakeHome,
         CLAUDE_PLUGIN_ROOT: pluginRoot,
         OMC_NOTIFY: '0',
+        // See earlier note: pin the host so this test is deterministic
+        // regardless of the ambient environment running the suite.
+        OMC_HOST: 'claude',
       },
       timeout: 15000,
     });
@@ -284,6 +298,9 @@ ${'- oversized startup guidance\n'.repeat(700)}
         USERPROFILE: fakeHome,
         CLAUDE_PLUGIN_ROOT: stalePluginRoot,
         OMC_NOTIFY: '0',
+        // See earlier note: pin the host so this test is deterministic
+        // regardless of the ambient environment running the suite.
+        OMC_HOST: 'claude',
       },
       timeout: 15000,
     });
@@ -560,4 +577,112 @@ ${'- oversized startup guidance\n'.repeat(700)}
     expect(combined).not.toContain('4.15.5');
   });
 
+});
+
+describe('session-start.mjs — GitHub Copilot CLI host isolation', () => {
+  let tempDir: string;
+  let fakeHome: string;
+  let fakeProject: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'omc-session-start-copilot-'));
+    fakeHome = join(tempDir, 'home');
+    fakeProject = join(tempDir, 'project');
+    mkdirSync(join(fakeProject, '.omc', 'state', 'sessions', 'session-copilot'), { recursive: true });
+    mkdirSync(join(fakeProject, '.git'), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function runCopilotSessionStart(extraEnv: Record<string, string> = {}) {
+    return spawnSync(NODE, [SCRIPT_PATH], {
+      input: JSON.stringify({
+        hook_event_name: 'SessionStart',
+        session_id: 'session-copilot',
+        cwd: fakeProject,
+      }),
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        HOME: fakeHome,
+        USERPROFILE: fakeHome,
+        OMC_NOTIFY: '0',
+        // Explicit Copilot host signal — never falls back to ambient env.
+        OMC_HOST: 'copilot',
+        ...extraEnv,
+      },
+      timeout: 15000,
+    });
+  }
+
+  it('does not emit HUD guidance or a Claude Code restart instruction under Copilot', () => {
+    const claudeDir = join(fakeHome, '.claude');
+    mkdirSync(claudeDir, { recursive: true });
+    // Deliberately do NOT create claudeDir/hud or settings.json, which would
+    // trigger the HUD-missing message under Claude Code.
+
+    const result = runCopilotSessionStart();
+
+    expect(result.status).toBe(0);
+    const output = JSON.parse(result.stdout) as {
+      hookSpecificOutput?: { additionalContext?: string };
+    };
+    const context = output.hookSpecificOutput?.additionalContext ?? '';
+    expect(context).not.toContain('HUD not configured');
+    expect(context).not.toContain('restart Claude Code');
+  });
+
+  it('does not emit /omc-setup guidance or CLAUDE.md drift messages under Copilot', () => {
+    const claudeDir = join(fakeHome, '.claude');
+    const pluginRoot = join(tempDir, 'plugin-copilot-drift');
+    mkdirSync(claudeDir, { recursive: true });
+    mkdirSync(pluginRoot, { recursive: true });
+    writeFileSync(join(pluginRoot, 'package.json'), JSON.stringify({ version: '2.0.0', type: 'module' }));
+    // Stale CLAUDE.md marker — would trigger "CLAUDE.md instructions" drift
+    // under Claude Code, but Copilot never reads this file.
+    writeFileSync(join(claudeDir, 'CLAUDE.md'), '<!-- OMC:VERSION:1.0.0 -->\n');
+    writeFileSync(join(claudeDir, '.omc-config.json'), JSON.stringify({ silentAutoUpdate: true }));
+
+    const result = runCopilotSessionStart({ CLAUDE_PLUGIN_ROOT: pluginRoot });
+
+    expect(result.status).toBe(0);
+    const output = JSON.parse(result.stdout) as {
+      systemMessage?: string;
+      hookSpecificOutput?: { additionalContext?: string };
+    };
+    const context = output.hookSpecificOutput?.additionalContext ?? '';
+    const combined = `${output.systemMessage ?? ''}\n${context}`;
+    expect(combined).not.toContain('CLAUDE.md instructions');
+    expect(combined).not.toContain('/omc-setup');
+    expect(combined).not.toContain('silentAutoUpdate is enabled in .omc-config.json');
+  });
+
+  it('uses Copilot-specific update guidance instead of Claude Code /update or /plugin install text', () => {
+    const claudeDir = join(fakeHome, '.claude');
+    const pluginRoot = join(tempDir, 'plugin-copilot-update');
+    mkdirSync(join(claudeDir, '.omc'), { recursive: true });
+    mkdirSync(pluginRoot, { recursive: true });
+    writeFileSync(join(pluginRoot, 'package.json'), JSON.stringify({ version: '1.0.0', type: 'module' }));
+    writeFileSync(
+      join(claudeDir, '.omc', 'update-check.json'),
+      JSON.stringify({
+        timestamp: Date.now(),
+        latestVersion: '999.0.0',
+        currentVersion: '1.0.0',
+        updateAvailable: true,
+      }),
+    );
+
+    const result = runCopilotSessionStart({ CLAUDE_PLUGIN_ROOT: pluginRoot });
+
+    expect(result.status).toBe(0);
+    const output = JSON.parse(result.stdout) as { systemMessage?: string };
+    expect(output.systemMessage).toContain('[OMC UPDATE AVAILABLE]');
+    expect(output.systemMessage).toContain('copilot plugin update oh-my-claudecode');
+    expect(output.systemMessage).toContain('restart Copilot CLI');
+    expect(output.systemMessage).not.toContain('/update');
+    expect(output.systemMessage).not.toContain('/plugin install oh-my-claudecode');
+  });
 });

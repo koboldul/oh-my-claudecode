@@ -15,6 +15,40 @@ const { join, basename } = require('path');
 const { existsSync } = require('fs');
 const { createHash } = require('crypto');
 
+function canonicalDistPath(root) {
+  return join(root, 'dist', 'lib', 'worktree-paths.js');
+}
+
+/**
+ * Locate a root directory that has a built dist/lib/worktree-paths.js.
+ *
+ * Copilot CLI hook children do not reliably export CLAUDE_PLUGIN_ROOT (unlike
+ * Claude Code), so when that env var is absent this also tries a
+ * script-relative package root — this file lives at
+ * `<pluginRoot>/scripts/lib/state-root.cjs`. That candidate is only trusted
+ * when it looks like the real OMC package root (has package.json AND
+ * .claude-plugin/plugin.json), so a standalone copy of this file never picks
+ * up an unrelated dist/.
+ *
+ * @returns {string|null} Root directory with a built dist/, or null.
+ */
+function resolveCanonicalRoot() {
+  const envRoot = process.env.CLAUDE_PLUGIN_ROOT;
+  if (envRoot && existsSync(canonicalDistPath(envRoot))) {
+    return envRoot;
+  }
+
+  const scriptRoot = join(__dirname, '..', '..');
+  const looksLikePackageRoot =
+    existsSync(join(scriptRoot, 'package.json')) &&
+    existsSync(join(scriptRoot, '.claude-plugin', 'plugin.json'));
+  if (looksLikePackageRoot && existsSync(canonicalDistPath(scriptRoot))) {
+    return scriptRoot;
+  }
+
+  return null;
+}
+
 /**
  * Resolve the .omc root directory, respecting OMC_STATE_DIR.
  *
@@ -22,12 +56,12 @@ const { createHash } = require('crypto');
  * @returns {Promise<string>} Absolute path to the .omc root
  */
 async function resolveOmcStateRoot(directory) {
-  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
-  if (pluginRoot) {
+  const canonicalRoot = resolveCanonicalRoot();
+  if (canonicalRoot) {
     try {
       const { pathToFileURL } = require('url');
       const { getOmcRoot } = await import(
-        pathToFileURL(join(pluginRoot, 'dist', 'lib', 'worktree-paths.js')).href
+        pathToFileURL(canonicalDistPath(canonicalRoot)).href
       );
       return getOmcRoot(directory);
     } catch {
@@ -55,12 +89,12 @@ async function resolveOmcStateRoot(directory) {
  * @returns {Promise<{readPath: string, writePath: string}>} Unbranded path pair
  */
 async function resolveSessionStatePathsForHook(directory, stateName, sessionId) {
-  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
-  if (pluginRoot) {
+  const canonicalRoot = resolveCanonicalRoot();
+  if (canonicalRoot) {
     try {
       const { pathToFileURL } = require('url');
       const { resolveSessionStatePaths } = await import(
-        pathToFileURL(join(pluginRoot, 'dist', 'lib', 'worktree-paths.js')).href
+        pathToFileURL(canonicalDistPath(canonicalRoot)).href
       );
       const result = resolveSessionStatePaths(stateName, sessionId, directory);
       return { readPath: result.effectiveRead, writePath: result.effectiveWrite };

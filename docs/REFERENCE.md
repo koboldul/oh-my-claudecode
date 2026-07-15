@@ -53,13 +53,16 @@ The npm package exposes both `oh-my-claudecode` and `omc`; examples prefer `omc`
 
 ### GitHub Copilot CLI
 
-OMC also runs as a plugin under [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli). Copilot loads the same Claude Code plugin format, so skills, `agents/*.md` (surfaced as `oh-my-claudecode:*` custom agents), the `t` MCP server, and the `hooks/hooks.json` manifest all work without a separate build.
+OMC also runs as a first-class plugin under [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli). The root `plugin.json` routes Copilot to `agents-copilot/*.agent.md`, while `.claude-plugin/plugin.json` keeps Claude Code on `agents/*.md`. Both hosts expose the same `oh-my-claudecode:*` agent names, skills, `t` MCP server, commands, and hooks without sharing incompatible model metadata.
+
+Copilot agent profiles default to **`gpt-5.6-sol` with `max` reasoning**. Delegated Task/Agent calls receive the same defaults through `PreToolUse.updatedInput`; an explicit per-call model or reasoning effort remains authoritative. This prevents Claude-only `haiku`/`sonnet`/`opus` aliases from leaking into Copilot agent launches.
 
 **Prerequisites**
 
 - [Copilot CLI](https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli): `npm install -g @github/copilot` (needs Node.js 22+), or `winget install GitHub.Copilot`, or `brew install --cask copilot-cli`
+- Copilot CLI 1.0.66 or newer for custom-agent reasoning-effort profiles; use the current release
 - Git, and Node.js on `PATH` (the hooks and the `t` MCP server run via `node`)
-- Windows: PowerShell 6+ (the hooks use it)
+- Windows: PowerShell 7+ (the hooks and npm-installed Copilot CLI shim use it)
 - An active Copilot subscription; authenticate with `copilot` then `/login` (or set `COPILOT_GITHUB_TOKEN` / `GH_TOKEN`)
 
 **Install (marketplace method — recommended)**
@@ -79,14 +82,14 @@ A direct install also works today — `copilot plugin install Yeachan-Heo/oh-my-
 
 **After install**
 
-- Copilot clones the plugin to `~/.copilot/installed-plugins/omc/oh-my-claudecode`, rewrites the hooks' `$CLAUDE_PLUGIN_ROOT` to absolute paths (Copilot does not expand that variable at hook-run time), and enables the plugin. No `npm install` or build is needed — the repo ships a prebuilt `dist/` and bundled `bridge/*.cjs`, and the plugin needs no `node_modules` at runtime.
+- Copilot clones the plugin to `~/.copilot/installed-plugins/omc/oh-my-claudecode`, selects the root `plugin.json`, rewrites the hooks' `$CLAUDE_PLUGIN_ROOT` to absolute paths (Copilot does not expand that variable at hook-run time), and enables the plugin. No `npm install` or build is needed — the repo ships generated Copilot profiles, prebuilt `dist/`, and bundled `bridge/*.cjs`.
 - **Restart Copilot CLI** — plugins, hooks, and MCP servers are loaded at startup.
 - Verify with `copilot plugin list`, or run `/env` in a session (it lists loaded skills, agents, MCP servers, and hooks). Copilot recognizes Claude's hook event names as aliases, so keyword auto-detection and the ralph/ultrawork/autopilot persistence loop work the same as under Claude Code; see [GitHub Copilot CLI compatibility](#github-copilot-cli-compatibility) for the full event mapping and the one known limitation.
 - Update later with `copilot plugin update oh-my-claudecode`.
 
-Claude-Code-specific surfaces (`/omc-setup`, HUD statusline, `~/.claude/CLAUDE.md`) target `~/.claude` and are not required to use OMC under Copilot.
+Claude-Code-specific surfaces (`/omc-setup`, HUD statusline, `~/.claude/CLAUDE.md`) target `~/.claude` and are not required to use OMC under Copilot. `scripts/run.cjs` infers `CLAUDE_PLUGIN_ROOT` from the resolved hook path when Copilot does not export it, and sets `OMC_HOST=copilot` for hook children; `scripts/session-start.mjs` uses that signal to suppress Claude-only diagnostics under Copilot — it excludes `~/.claude/CLAUDE.md` from version-drift checks, skips the HUD/statusLine check entirely, and never emits `/omc-setup` or "restart Claude Code" guidance. Update notices are host-specific too: under Copilot they point at `copilot plugin update oh-my-claudecode` followed by a Copilot CLI restart, never `/update` or `/plugin install`. No separate setup script is required for a Copilot-only install — plugin installation alone is sufficient; see [Copilot CLI checks](#github-copilot-cli-compatibility) and the `omc-setup` skill's Copilot Host Guard for the full guard behavior.
 
-### Requirements
+### Claude Code requirements
 
 - [Claude Code](https://docs.anthropic.com/claude-code) installed
 - One of:
@@ -152,6 +155,9 @@ If both configurations exist, **project-scoped takes precedence** over global:
 | `OMC_GEMINI_DEFAULT_MODEL`       | _(provider default)_ | Default model for Gemini CLI workers                                                                                                                                                                                                                                    |
 | `OMC_ANTIGRAVITY_DEFAULT_MODEL`  | _(provider default)_ | Default model for Antigravity CLI (`agy`) workers                                                                                                                                                                                                                       |
 | `OMC_GROK_DEFAULT_MODEL`         | _(provider default)_ | Default model for Grok Build CLI workers                                                                                                                                                                                                                                |
+| `OMC_COPILOT_DEFAULT_MODEL`      | `gpt-5.6-sol`        | Legacy/short override for Copilot advisor, Team workers, and Copilot-hosted OMC subagents                                                                                                                                                                                |
+| `OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL` | `gpt-5.6-sol` | Canonical Copilot model override; takes precedence over `OMC_COPILOT_DEFAULT_MODEL`                                                                                                                                                                                       |
+| `OMC_COPILOT_REASONING_EFFORT`   | `max`                | Copilot reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`                                                                                                                                                                                  |
 | `OMC_LSP_TIMEOUT_MS`       | `15000`              | Timeout (ms) for LSP requests. Increase for large repos or slow language servers                                                                                                                                                                                            |
 | `OMC_MIGRATE_LEGACY_STATE` | _(unset)_            | Set to `1` to enable one-shot legacy→session-scoped state migration on next read. See [Legacy state migration](#legacy-state-migration-omc_migrate_legacy_state) below.                                                                                                      |
 | `OMC_DISABLE_MULTIREPO`    | _(unset)_            | Set to `1` to disable workspace-marker resolution and fall back to git-root + cwd resolution order. `OMC_STATE_DIR` is still honoured. See [Rollback / disable multi-repo](#rollback--disable-multi-repo-omc_disable_multirepo) below.                                       |
@@ -559,6 +565,7 @@ claude --plugin-dir /path/to/oh-my-claudecode
 
 ```bash
 omc ask claude "review this patch"
+omc ask copilot "review this patch with GPT-5.6 Sol"
 omc ask codex "review this patch from a security perspective"
 omc ask gemini --prompt "suggest UX improvements"
 omc ask antigravity --prompt "suggest UX improvements"
@@ -566,16 +573,17 @@ omc ask cursor --prompt "apply this implementation plan"
 omc ask claude --agent-prompt executor --prompt "create an implementation plan"
 ```
 
-- Provider matrix: `claude | codex | gemini | antigravity | grok | cursor`
+- Provider matrix: `claude | copilot | codex | gemini | antigravity | grok | cursor`
 - Artifacts: `.omc/artifacts/ask/{provider}-{slug}-{timestamp}.md`
 - Canonical env vars: `OMC_ASK_ADVISOR_SCRIPT`, `OMC_ASK_ORIGINAL_TASK`
 - Phase-1 aliases (deprecated warning): `OMX_ASK_ADVISOR_SCRIPT`, `OMX_ASK_ORIGINAL_TASK`
-- Skill entrypoint: `/oh-my-claudecode:ask <claude|codex|gemini|antigravity|grok|cursor> <prompt>` routes to this command
+- Skill entrypoint: `/oh-my-claudecode:ask <claude|copilot|codex|gemini|antigravity|grok|cursor> <prompt>` routes to this command
 
 ### `omc team` (CLI runtime surface)
 
 ```bash
 omc team 2:codex "review auth flow"
+omc team 2:copilot "implement and verify the auth flow"
 omc team status review-auth-flow
 omc team shutdown review-auth-flow --force
 omc team api claim-task --input '{"team_name":"auth-review","task_id":"1","worker":"worker-1"}' --json
@@ -621,7 +629,7 @@ omc session friction report --project all --json
 Use OMC's terminal and library surfaces in non-interactive environments:
 
 - Run CLI commands that have deterministic exit codes, for example `omc setup`, `omc ask ...`, `omc session search ... --json`, or repo-owned verification scripts such as `npm run sync-metadata:verify`.
-- Provide authentication through runner environment variables (`ANTHROPIC_API_KEY`) or pre-authenticated provider CLIs for `codex`, `gemini`, `antigravity`, `grok`, or `cursor` when using `omc ask` / `omc team`.
+- Provide authentication through runner environment variables or pre-authenticated provider CLIs for `copilot`, `codex`, `gemini`, `antigravity`, `grok`, or `cursor` when using `omc ask` / `omc team`.
 - Keep state explicit for ephemeral runners by setting `OMC_STATE_DIR` when state must survive worktree deletion or checkout replacement.
 - Avoid interactive slash skills (`/autopilot`, `/ralph`, `/ultrawork`, `/deep-interview`, `/team`) in CI jobs; they require an active Claude Code session and user-visible conversation loop.
 - OMC does not currently provide a VS Code extension or VS Code-specific automation contract. The documented IDE path is to use Claude Code's own integrations, then install OMC through the Claude Code plugin surface.
@@ -846,7 +854,7 @@ Marketplace/plugin installs compact the native plugin `skills/*/SKILL.md` files 
 | Skill                     | Description                                                      | Manual Command                              |
 | ------------------------- | ---------------------------------------------------------------- | ------------------------------------------- |
 | `ai-slop-cleaner`         | Anti-slop cleanup workflow with optional reviewer-only `--review` pass | `/oh-my-claudecode:ai-slop-cleaner`         |
-| `ask`                     | Ask Claude, Codex, Gemini, Antigravity, or Grok via local CLI and capture a reusable artifact | `/oh-my-claudecode:ask`               |
+| `ask`                     | Ask Claude, Copilot, Codex, Gemini, Antigravity, Grok, or Cursor via local CLI and capture a reusable artifact | `/oh-my-claudecode:ask` |
 | `autoresearch`            | Stateful single-mission evaluator-driven improvement loop           | `/oh-my-claudecode:autoresearch`            |
 | `autopilot`               | Full autonomous execution from idea to working code              | `/oh-my-claudecode:autopilot`               |
 | `cancel`                  | Unified cancellation for active modes                            | `/oh-my-claudecode:cancel`                  |
@@ -997,7 +1005,7 @@ The `workflow-drift-guard` blocks only supported source-associated local selecti
 | `SubagentStop`       | `subagentStop`                   | ✅ Fires                                                             |
 | `SubagentStart`      | `subagentStart` (camelCase only) | ⚠️ Does not fire — see limitation below                             |
 
-For the PascalCase form, Copilot delivers the VS Code compatible **snake_case** payload (`hook_event_name`, `session_id`, `prompt`, `stop_reason`, ...) that OMC's hook scripts already parse, and honors the Claude output protocol (`hookSpecificOutput.additionalContext`, `decision: "block"`, `continue`, `suppressOutput`). No separate Copilot manifest is required.
+For the PascalCase form, Copilot delivers the VS Code compatible **snake_case** payload (`hook_event_name`, `session_id`, `prompt`, `stop_reason`, ...) that OMC's hook scripts already parse, and honors the Claude output protocol (`hookSpecificOutput.additionalContext`, `hookSpecificOutput.updatedInput`, `decision: "block"`, `continue`, `suppressOutput`). OMC uses `updatedInput` to default bundled delegated agents to `gpt-5.6-sol`/`max`; direct custom-agent selection uses the Copilot-specific profiles declared by the root manifest.
 
 > **Do not add camelCase mirror events** (e.g. a `userPromptSubmitted` block alongside `UserPromptSubmit`). Copilot runs every entry for an event across all sources, so a duplicate key would **double-fire** the hook (double iteration increments, double continuation blocks).
 
@@ -1019,7 +1027,7 @@ Each hook entry carries `bash` and `powershell` command variants alongside the C
 
 Why: Copilot's hook executor selects a shell per entry — on Windows it runs the `powershell` variant, elsewhere `bash` — and it substitutes only the **braced** `${CLAUDE_PLUGIN_ROOT}` placeholder with the absolute plugin root at load time. Claude Code keeps using `command`, where bash expands the bare `$CLAUDE_PLUGIN_ROOT` at runtime. The bare `command` form is unsafe under PowerShell (a bare `$CLAUDE_PLUGIN_ROOT` is an unset PowerShell variable, and `"$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs` splits into two arguments), which made Copilot fail-closed with `Denied by preToolUse hook … (hook errored)`. The variants use the braced, fully path-quoted form so the substituted absolute path stays a single argument under both PowerShell and bash, including plugin roots that contain spaces.
 
-The compatibility contract is locked by two tests: `src/__tests__/copilot-hook-compat.test.ts` fails if `hooks/hooks.json` introduces an event name Copilot CLI does not recognize, and `src/__tests__/copilot-hook-shell-variants.test.ts` fails if any `command` hook loses its Copilot-safe `bash`/`powershell` variant. Reference: [GitHub Copilot hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference).
+The compatibility contract is locked by dedicated tests: `src/__tests__/copilot-hook-compat.test.ts` checks event names, `src/__tests__/copilot-hook-shell-variants.test.ts` checks cross-platform commands, and `src/__tests__/copilot-agent-profiles.test.ts` checks manifest separation plus generated Sol/max profiles. Reference: [GitHub Copilot hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference).
 
 ### Code Simplifier Hook
 

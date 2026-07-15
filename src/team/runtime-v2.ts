@@ -96,6 +96,7 @@ import { createSwallowedErrorLogger } from '../lib/swallowed-error.js';
 import type { CanonicalTeamRole, PluginConfig, RoleAssignment, TeamRoleAssignmentSpec } from '../shared/types.js';
 import { CANONICAL_TEAM_ROLES, CURSOR_EXECUTOR_TEAM_ROLES } from '../shared/types.js';
 import { loadConfig } from '../config/loader.js';
+import { resolveCopilotModel, resolveCopilotReasoningEffort } from '../config/models.js';
 import { buildResolvedRoutingSnapshot, getRoleRoutingSpec } from './stage-router.js';
 import { inferLaneIntent, routeTaskToRole, type LaneIntent } from './role-router.js';
 import { normalizeDelegationRole } from '../features/delegation-routing/types.js';
@@ -526,7 +527,12 @@ export function resolveTaskAssignment(
   roleRoutingConfig: Partial<Record<CanonicalTeamRole, TeamRoleAssignmentSpec>> | undefined,
   resolvedBinaryPaths: Partial<Record<CliAgentType, string>>,
   fallbackAgent: CliAgentType,
-): { agentType: CliAgentType; model: string; role: CanonicalTeamRole | null } {
+): {
+  agentType: CliAgentType;
+  model: string;
+  reasoningEffort?: RoleAssignment['reasoningEffort'];
+  role: CanonicalTeamRole | null;
+} {
   const canonicalRoles = new Set<string>(CANONICAL_TEAM_ROLES as readonly string[]);
   const hasExplicitRole = typeof task.role === 'string' && task.role.length > 0;
   const rawRole = hasExplicitRole
@@ -588,6 +594,7 @@ export function resolveTaskAssignment(
   return {
     agentType: chosen.provider as CliAgentType,
     model: chosen.model,
+    ...(chosen.reasoningEffort ? { reasoningEffort: chosen.reasoningEffort } : {}),
     role: canonical,
   };
 }
@@ -894,7 +901,7 @@ async function spawnV2Worker(opts: SpawnV2WorkerOptions): Promise<SpawnV2WorkerR
   const usePromptMode = isPromptModeAgent(opts.agentType);
 
   // AC-7: render the CLI-worker output contract when a reviewer-style role
-  // is routed to an external provider (codex/gemini/grok). Claude workers speak
+  // is routed to a prompt-mode external provider (including Copilot). Claude workers speak
   // through the team messaging API and do not use the verdict-file contract.
   const injectContract = shouldInjectContract(opts.role ?? null, opts.agentType);
   const outputFile = injectContract && opts.role
@@ -2540,24 +2547,43 @@ export async function startTeamV2(config: StartTeamV2Config): Promise<TeamRuntim
 
   const startupByWorker = new Map(startupAllocations.map(item => [item.workerName, item.taskIndex]));
   const preparedLaunches = new Map<string, { agentType: CliAgentType; role?: CanonicalTeamRole; descriptor: WorkerLaunchDescriptor }>();
+  const roleRoutingConfig = pluginCfg.team?.roleRouting as
+    Partial<Record<CanonicalTeamRole, TeamRoleAssignmentSpec>> | undefined;
+  const configuredRoutingRoles = CANONICAL_TEAM_ROLES.filter(role =>
+    !!getRoleRoutingSpec(
+      roleRoutingConfig as Record<string, TeamRoleAssignmentSpec | undefined> | undefined,
+      role,
+    ));
   const resolveDefaultModel = (agentType: CliAgentType): string | undefined => {
     if (agentType === 'codex') return process.env.OMC_EXTERNAL_MODELS_DEFAULT_CODEX_MODEL || process.env.OMC_CODEX_DEFAULT_MODEL || undefined;
     if (agentType === 'gemini') return process.env.OMC_EXTERNAL_MODELS_DEFAULT_GEMINI_MODEL || process.env.OMC_GEMINI_DEFAULT_MODEL || undefined;
     if (agentType === 'antigravity') return process.env.OMC_EXTERNAL_MODELS_DEFAULT_ANTIGRAVITY_MODEL || process.env.OMC_ANTIGRAVITY_DEFAULT_MODEL || undefined;
     if (agentType === 'grok') return process.env.OMC_EXTERNAL_MODELS_DEFAULT_GROK_MODEL || process.env.OMC_GROK_DEFAULT_MODEL || undefined;
+    if (agentType === 'copilot') return resolveCopilotModel(pluginCfg.externalModels?.defaults?.copilotModel);
     if (agentType === 'cursor') return undefined;
     return resolveClaudeWorkerModel();
   };
+  const resolveDefaultReasoningEffort = (agentType: CliAgentType): RoleAssignment['reasoningEffort'] | undefined =>
+    agentType === 'copilot'
+      ? resolveCopilotReasoningEffort(pluginCfg.externalModels?.defaults?.copilotReasoningEffort)
+      : undefined;
   for (let i = 0; i < workerNames.length; i++) {
     const workerName = workerNames[i]!;
     const taskIndex = startupByWorker.get(workerName);
     const fallbackAgent = (agentTypes[i % agentTypes.length] ?? agentTypes[0] ?? 'claude') as CliAgentType;
     const assignment = taskIndex === undefined
-      ? { agentType: fallbackAgent, model: resolveDefaultModel(fallbackAgent), role: undefined }
+      ? {
+          agentType: fallbackAgent,
+          model: resolveDefaultModel(fallbackAgent),
+          reasoningEffort: resolveDefaultReasoningEffort(fallbackAgent),
+          role: undefined,
+        }
       : resolveTaskAssignment(config.tasks[taskIndex]!, resolvedRouting,
-        pluginCfg.team?.roleRouting as Partial<Record<CanonicalTeamRole, TeamRoleAssignmentSpec>> | undefined,
+        roleRoutingConfig,
         resolvedBinaryPaths, fallbackAgent);
     const effectiveModel = assignment.model || resolveDefaultModel(assignment.agentType);
+    const effectiveReasoningEffort = assignment.reasoningEffort
+      ?? resolveDefaultReasoningEffort(assignment.agentType);
     const worktree = workerWorktrees.get(workerName);
     const outputFile = taskIndex !== undefined && assignment.role && shouldInjectContract(assignment.role, assignment.agentType)
       ? cliWorkerOutputFilePath(teamStateRoot(leaderCwd, sanitized), workerName) : undefined;
@@ -2570,6 +2596,7 @@ export async function startTeamV2(config: StartTeamV2Config): Promise<TeamRuntim
     const descriptor = buildValidatedWorkerLaunchDescriptor(assignment.agentType, {
       teamName: sanitized, workerName, cwd: worktree?.path ?? leaderCwd, resolvedBinaryPath: binary,
       model: effectiveModel,
+      reasoningEffort: effectiveReasoningEffort,
     }, promptArgs);
     preparedLaunches.set(workerName, { agentType: assignment.agentType,
       ...(assignment.role ? { role: assignment.role } : {}), descriptor });
@@ -2579,7 +2606,7 @@ export async function startTeamV2(config: StartTeamV2Config): Promise<TeamRuntim
   try {
     for (let i = 0; i < workerNames.length; i++) {
       const wName = workerNames[i];
-      const agentType = (agentTypes[i % agentTypes.length] ?? agentTypes[0] ?? 'claude') as CliAgentType;
+      const agentType = preparedLaunches.get(wName)!.agentType;
       await ensureWorkerStateDir(sanitized, wName, leaderCwd);
       const overlayPath = await writeWorkerOverlay({
         teamName: sanitized, workerName: wName, agentType,
@@ -2638,6 +2665,12 @@ export async function startTeamV2(config: StartTeamV2Config): Promise<TeamRuntim
       } : {}),
     };
   });
+  const copilotDefaults = {
+    model: resolveCopilotModel(pluginCfg.externalModels?.defaults?.copilotModel),
+    reasoning_effort: resolveCopilotReasoningEffort(
+      pluginCfg.externalModels?.defaults?.copilotReasoningEffort,
+    ),
+  };
 
   // Write initial v2 config
   const teamConfig: TeamConfig = {
@@ -2662,6 +2695,8 @@ export async function startTeamV2(config: StartTeamV2Config): Promise<TeamRuntim
     resize_hook_name: null,
     resize_hook_target: null,
     resolved_routing: resolvedRouting,
+    configured_routing_roles: configuredRoutingRoles,
+    copilot_defaults: copilotDefaults,
     workspace_mode: workspaceMode,
     worktree_mode: worktreeMode,
     service_descriptor: config.autoMerge

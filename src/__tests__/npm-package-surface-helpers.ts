@@ -189,6 +189,7 @@ export function listSourceControlledPackageFiles(): string[] {
     '.mcp.json',
     'commands/omc-setup.md',
     'hooks/hooks.json',
+    'plugin.json',
   ]);
 
   for (const entryRelPath of listHookScriptEntries()) {

@@ -298,6 +298,31 @@ describe('team cli', () => {
     logSpy.mockRestore();
   });
 
+  it('teamCommand start --agent copilot expands Copilot worker types', async () => {
+    const write = vi.fn();
+    const end = vi.fn();
+    const unref = vi.fn();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const cwd = mkdtempSync(join(tmpdir(), 'omc-team-cli-copilot-'));
+    mocks.spawn.mockReturnValue({ pid: 9292, stdin: { write, end }, unref });
+
+    const { teamCommand } = await import('../team.js');
+    await teamCommand([
+      'start', '--agent', 'copilot', '--count', '2',
+      '--task', 'review the implementation', '--name', 'copilot-team', '--cwd', cwd, '--json',
+    ]);
+
+    const stdinPayload = JSON.parse(write.mock.calls[0][0] as string) as {
+      teamName: string;
+      agentTypes: string[];
+    };
+    expect(stdinPayload.teamName).toBe('copilot-team');
+    expect(stdinPayload.agentTypes).toEqual(['copilot', 'copilot']);
+
+    rmSync(cwd, { recursive: true, force: true });
+    logSpy.mockRestore();
+  });
+
   it('teamCommand start rejects an unsupported --agent value', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'omc-team-cli-bad-agent-'));
     const { teamCommand } = await import('../team.js');

@@ -570,6 +570,17 @@ describe('parseTeamArgs comma-separated multi-type specs', () => {
     expect(parsed.agentTypes).toEqual(['antigravity', 'antigravity', 'antigravity']);
   });
 
+  it('parses Copilot in single, mixed, role-qualified, and configured-default specs', () => {
+    expect(parseTeamArgs(['2:copilot', 'implement']).agentTypes)
+      .toEqual(['copilot', 'copilot']);
+    expect(parseTeamArgs(['1:copilot,1:codex', 'compare']).agentTypes)
+      .toEqual(['copilot', 'codex']);
+    expect(parseTeamArgs(['1:copilot:code-reviewer', 'review']).workerSpecs)
+      .toEqual([{ agentType: 'copilot', role: 'code-reviewer' }]);
+    expect(parseTeamArgs(['run all tests'], 'copilot').agentTypes)
+      .toEqual(['copilot', 'copilot', 'copilot']);
+  });
+
   it('defaults to 3 claude workers when no spec is given', () => {
     const parsed = parseTeamArgs(['run all tests']);
     expect(parsed.workerCount).toBe(3);

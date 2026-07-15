@@ -379,6 +379,26 @@ describe('keyword-detector.mjs mode-message dispatch', () => {
     }
   });
 
+  it('does not activate modes from a delegated /ask copilot payload', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'keyword-detector-ask-copilot-'));
+
+    try {
+      const sessionId = 'ask-copilot-session';
+      const output = runKeywordDetector(
+        '/ask copilot use ralph and ultrawork to review this',
+        tempDir,
+        sessionId,
+      );
+
+      expect(output.continue).toBe(true);
+      expect(output.suppressOutput).toBe(true);
+      expect(output.hookSpecificOutput).toBeUndefined();
+      expect(existsSync(join(tempDir, '.omc', 'state', 'sessions', sessionId, 'ralph-state.json'))).toBe(false);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('does not activate a magic keyword from a delegated /ask antigravity payload', () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'keyword-detector-ask-antigravity-'));
 

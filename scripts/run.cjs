@@ -171,6 +171,49 @@ function resolveHookTimeoutMs(targetPath, extraArgs) {
   return resolveHookTimeoutMsFromRoot(dirname(dirname(targetPath)), targetPath, extraArgs);
 }
 
+/**
+ * Infer the plugin root from a resolved hook script path when the host did not
+ * export CLAUDE_PLUGIN_ROOT. Copilot CLI invokes manifest hooks by absolute
+ * path, so accept only a scripts/ child of a package carrying both plugin
+ * manifest markers.
+ */
+function inferPluginRootFromTarget(targetPath) {
+  const scriptsDir = dirname(targetPath);
+  if (basename(scriptsDir) !== 'scripts') return null;
+  const candidateRoot = dirname(scriptsDir);
+  if (!existsSync(join(candidateRoot, 'package.json'))) return null;
+  if (!existsSync(join(candidateRoot, '.claude-plugin', 'plugin.json'))) return null;
+  return candidateRoot;
+}
+
+function resolveChildEnv(targetPath) {
+  const originalPluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
+  const inferredPluginRoot = originalPluginRoot ? null : inferPluginRootFromTarget(targetPath);
+  const effectivePluginRoot = originalPluginRoot || inferredPluginRoot;
+  const childEnv = { ...process.env };
+
+  if (!originalPluginRoot && inferredPluginRoot) {
+    childEnv.CLAUDE_PLUGIN_ROOT = inferredPluginRoot;
+  }
+
+  if (!childEnv.OMC_HOST) {
+    const hasCopilotEnvSignal = Boolean(
+      process.env.COPILOT_CLI || process.env.COPILOT_AGENT_SESSION_ID
+    );
+    const pluginRootUnderCopilot = Boolean(
+      effectivePluginRoot &&
+      /[\\/]\.copilot[\\/]installed-plugins[\\/]/i.test(effectivePluginRoot)
+    );
+    if (hasCopilotEnvSignal || pluginRootUnderCopilot) {
+      childEnv.OMC_HOST = 'copilot';
+    } else if (originalPluginRoot) {
+      childEnv.OMC_HOST = 'claude';
+    }
+  }
+
+  return childEnv;
+}
+
 function normalizedComparisonPath(value) {
   const canonical = path.resolve(realpathSync(value));
   return process.platform === 'win32'
@@ -250,7 +293,7 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook) {
     let timer;
     const child = spawn(process.execPath, [targetPath, ...extraArgs], {
       stdio: 'inherit',
-      env: process.env,
+      env: resolveChildEnv(targetPath),
       windowsHide: true,
       detached: process.platform !== 'win32',
     });
@@ -371,7 +414,7 @@ async function runWorker(targetPath, manifestHook, timeoutMs) {
           stdin: true,
           stdout: true,
           stderr: true,
-          env: process.env,
+          env: resolveChildEnv(targetPath),
         });
         if (process.stdin.readableEnded) worker.stdin.end();
         else process.stdin.pipe(worker.stdin);

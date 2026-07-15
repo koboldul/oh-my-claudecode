@@ -143,3 +143,26 @@ export function resolveConfiguredAgentModel(subagentType, cwd) {
   }
   return null;
 }
+
+/**
+ * Resolve Copilot-specific defaults from the same user/project JSONC config.
+ * Each field is resolved independently so a project override for one field
+ * still inherits the other field from user config, matching deep-merge behavior.
+ */
+export function resolveConfiguredCopilotDefaults(cwd) {
+  const paths = getConfigPaths(cwd);
+  const configs = [loadJsoncFile(paths.project), loadJsoncFile(paths.user)];
+
+  const resolveString = (key) => {
+    for (const config of configs) {
+      const value = config?.externalModels?.defaults?.[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return null;
+  };
+
+  return {
+    model: resolveString('copilotModel'),
+    reasoningEffort: resolveString('copilotReasoningEffort'),
+  };
+}

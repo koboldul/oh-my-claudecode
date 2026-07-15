@@ -10,6 +10,7 @@ const binaries: Partial<Record<CliAgentType, string>> = {
   gemini: '/usr/bin/gemini',
   codex: '/usr/bin/codex',
   antigravity: '/usr/bin/agy',
+  copilot: '/usr/bin/copilot',
 };
 
 describe('runtime-v2 explicit provider + role preservation', () => {
@@ -49,5 +50,49 @@ describe('runtime-v2 explicit provider + role preservation', () => {
     );
     expect(assignment.agentType).toBe('claude');
     expect(assignment.role).toBe('executor');
+  });
+
+  it('preserves an explicit Copilot reviewer provider without native-agent fallback', () => {
+    const assignment = resolveTaskAssignment(
+      { subject: 'Review', description: 'review the change', role: 'code-reviewer' },
+      resolvedRouting,
+      undefined,
+      binaries,
+      'copilot',
+    );
+    expect(assignment).toEqual({
+      agentType: 'copilot',
+      model: '',
+      role: 'code-reviewer',
+    });
+  });
+
+  it('propagates routed Copilot effort and falls back to the immutable Claude tuple when unavailable', () => {
+    const routed = buildResolvedRoutingSnapshot({
+      team: { roleRouting: { critic: { provider: 'copilot' } } },
+    });
+    const available = resolveTaskAssignment(
+      { subject: 'Critique', description: 'challenge the plan', role: 'critic' },
+      routed,
+      { critic: { provider: 'copilot' } },
+      binaries,
+      'claude',
+    );
+    expect(available).toMatchObject({
+      agentType: 'copilot',
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'max',
+      role: 'critic',
+    });
+
+    const unavailable = resolveTaskAssignment(
+      { subject: 'Critique', description: 'challenge the plan', role: 'critic' },
+      routed,
+      { critic: { provider: 'copilot' } },
+      { claude: '/usr/bin/claude' },
+      'claude',
+    );
+    expect(unavailable.agentType).toBe('claude');
+    expect(unavailable.reasoningEffort).toBeUndefined();
   });
 });

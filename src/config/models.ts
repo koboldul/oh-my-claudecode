@@ -1,4 +1,5 @@
 import { validateAnthropicBaseUrl } from '../utils/ssrf-guard.js';
+import type { CopilotReasoningEffort } from '../shared/types.js';
 
 export type ModelTier = 'LOW' | 'MEDIUM' | 'HIGH';
 export type ClaudeModelFamily = 'HAIKU' | 'SONNET' | 'OPUS' | 'FABLE';
@@ -56,7 +57,54 @@ export const BUILTIN_EXTERNAL_MODEL_DEFAULTS = {
   codexModel: 'gpt-5.3-codex',
   geminiModel: 'gemini-3.1-pro-preview',
   antigravityModel: 'Gemini 3.1 Pro (High)',
+  copilotModel: 'gpt-5.6-sol',
+  copilotReasoningEffort: 'max' as CopilotReasoningEffort,
 } as const;
+
+export const COPILOT_REASONING_EFFORTS = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const satisfies readonly CopilotReasoningEffort[];
+
+function nonEmpty(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
+}
+
+export function resolveCopilotModel(
+  configured?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return nonEmpty(env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL)
+    ?? nonEmpty(env.OMC_COPILOT_DEFAULT_MODEL)
+    ?? nonEmpty(configured)
+    ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotModel;
+}
+
+export function resolveCopilotReasoningEffort(
+  configured?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): CopilotReasoningEffort {
+  const raw = nonEmpty(env.OMC_COPILOT_REASONING_EFFORT)
+    ?? nonEmpty(configured)
+    ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotReasoningEffort;
+  return validateCopilotReasoningEffort(raw);
+}
+
+export function validateCopilotReasoningEffort(raw: string): CopilotReasoningEffort {
+  const normalized = raw.toLowerCase();
+  if (!(COPILOT_REASONING_EFFORTS as readonly string[]).includes(normalized)) {
+    throw new Error(
+      `[OMC] Copilot reasoning effort: invalid value "${raw}". Allowed: ${COPILOT_REASONING_EFFORTS.join(', ')}`,
+    );
+  }
+  return normalized as CopilotReasoningEffort;
+}
 
 /**
  * Centralized Model ID Constants

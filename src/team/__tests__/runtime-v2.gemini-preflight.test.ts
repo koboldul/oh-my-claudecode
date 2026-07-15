@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, readFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -21,8 +21,8 @@ const modelContractMocks = vi.hoisted(() => ({
   }),
   getContract: vi.fn((agentType?: string) => ({ binary: agentType ?? 'claude' })),
   getWorkerEnv: vi.fn(() => ({ OMC_TEAM_WORKER: 'issue2675-team/worker-1' })),
-  isPromptModeAgent: vi.fn(() => false),
-  getPromptModeArgs: vi.fn(() => []),
+  isPromptModeAgent: vi.fn((_agentType?: string) => false),
+  getPromptModeArgs: vi.fn((_agentType?: string, _instruction?: string): string[] => []),
   resolveClaudeWorkerModel: vi.fn(() => undefined),
   buildValidatedWorkerLaunchDescriptor: vi.fn((agentType: string, config: { model?: string; resolvedBinaryPath?: string }, appendedArgs: string[] = []) => {
     const [binary, ...args] = modelContractMocks.buildWorkerArgv(agentType, config);
@@ -116,5 +116,58 @@ describe('runtime-v2 Gemini preflight routing', () => {
         resolvedBinaryPath: 'gemini',
       }),
     );
+  });
+
+  it('persists routed Copilot prompt descriptors and writes Copilot-specific worker guidance', async () => {
+    cwd = await mkdtemp(join(tmpdir(), 'copilot-routing-'));
+    modelContractMocks.isPromptModeAgent.mockImplementation(agentType => agentType === 'copilot');
+    modelContractMocks.getPromptModeArgs.mockImplementation((_agentType, instruction) => ['-p', instruction ?? '']);
+    const { startTeamV2 } = await import('../runtime-v2.js');
+
+    const runtime = await startTeamV2({
+      teamName: 'copilot-routing-team',
+      workerCount: 1,
+      agentTypes: ['claude'],
+      tasks: [{
+        subject: 'Review code',
+        description: 'Review code and write a verdict',
+        role: 'code-reviewer',
+      }],
+      cwd,
+      pluginConfig: {
+        externalModels: {
+          defaults: {
+            copilotModel: 'gpt-5.5',
+            copilotReasoningEffort: 'high',
+          },
+        },
+        team: { roleRouting: { 'code-reviewer': { provider: 'copilot' } } },
+      } as any,
+    });
+
+    const worker = runtime.config.workers[0]!;
+    expect(worker.worker_cli).toBe('copilot');
+    expect(worker.launch_descriptor).toMatchObject({
+      provider: 'copilot',
+      model: 'gpt-5.5',
+      args: expect.arrayContaining(['-p']),
+    });
+    expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith(
+      'copilot',
+      expect.objectContaining({
+        model: 'gpt-5.5',
+        reasoningEffort: 'high',
+      }),
+    );
+    expect(runtime.config.configured_routing_roles).toContain('code-reviewer');
+    expect(runtime.config.copilot_defaults).toEqual({
+      model: 'gpt-5.5',
+      reasoning_effort: 'high',
+    });
+    const overlay = await readFile(
+      join(cwd, '.omc', 'state', 'team', 'copilot-routing-team', 'workers', 'worker-1', 'AGENTS.md'),
+      'utf-8',
+    );
+    expect(overlay).toContain('Agent-Type Guidance (copilot)');
   });
 });

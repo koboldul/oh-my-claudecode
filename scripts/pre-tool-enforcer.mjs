@@ -18,8 +18,64 @@ import { evaluateAgentHeavyPreflight } from './lib/pre-tool-enforcer-preflight.m
 import { evaluateForceAgentDelegation } from './lib/force-agent-delegation-preflight.mjs';
 import { resolveOmcStateRoot } from './lib/state-root.mjs';
 import { readStdin } from './lib/stdin.mjs';
-import { resolveConfiguredAgentModel } from './lib/agent-model-config.mjs';
+import {
+  resolveConfiguredAgentModel,
+  resolveConfiguredCopilotDefaults,
+} from './lib/agent-model-config.mjs';
 import { BOUNDED_GIT_TIMEOUT_MS } from './lib/bounded-git-timeout.mjs';
+
+const COPILOT_DEFAULT_MODEL = 'gpt-5.6-sol';
+const COPILOT_DEFAULT_REASONING_EFFORT = 'max';
+const COPILOT_REASONING_EFFORTS = new Set([
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+]);
+
+function isCopilotHost() {
+  const explicitHost = process.env.OMC_HOST?.trim().toLowerCase();
+  if (explicitHost) return explicitHost === 'copilot';
+  return Boolean(process.env.COPILOT_CLI || process.env.COPILOT_AGENT_SESSION_ID);
+}
+
+function isBundledOmcSubagent(subagentType) {
+  return typeof subagentType === 'string'
+    && /^oh-my-claudecode:[a-zA-Z0-9_-]+$/.test(subagentType);
+}
+
+function getAgentType(toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return '';
+  // Claude uses subagent_type; Copilot's compatible Task tool uses agent_type.
+  return toolInput.subagent_type || toolInput.agent_type || '';
+}
+
+function resolveCopilotSubagentDefaults(cwd) {
+  const configured = resolveConfiguredCopilotDefaults(cwd);
+  const model = process.env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL?.trim()
+    || process.env.OMC_COPILOT_DEFAULT_MODEL?.trim()
+    || configured.model
+    || COPILOT_DEFAULT_MODEL;
+  const configuredEffort = process.env.OMC_COPILOT_REASONING_EFFORT?.trim()
+    || configured.reasoningEffort
+    || COPILOT_DEFAULT_REASONING_EFFORT;
+  const normalizedEffort = configuredEffort.toLowerCase();
+
+  if (COPILOT_REASONING_EFFORTS.has(normalizedEffort)) {
+    return { model, reasoningEffort: normalizedEffort, warning: '' };
+  }
+
+  return {
+    model,
+    reasoningEffort: COPILOT_DEFAULT_REASONING_EFFORT,
+    warning: `[COPILOT MODEL] Ignoring invalid reasoning effort "${configuredEffort}". `
+      + `Expected one of: ${[...COPILOT_REASONING_EFFORTS].join(', ')}. `
+      + `Using "${COPILOT_DEFAULT_REASONING_EFFORT}".`,
+  };
+}
 
 // Inlined from src/config/models.ts — avoids a dist/ import so the hook works
 // before a build and stays consistent with the TypeScript source.
@@ -1092,10 +1148,10 @@ function generateAgentSpawnMessage(toolInput, stateDir, todoStatus, sessionId) {
     return `${todoStatus}Launch multiple agents in parallel when tasks are independent. Use run_in_background for long operations.`;
   }
 
-  const agentType = toolInput.subagent_type || 'unknown';
+  const agentType = getAgentType(toolInput) || 'unknown';
   const model = toolInput.model || 'inherit';
   const desc = toolInput.description || '';
-  const bg = toolInput.run_in_background ? ' [BACKGROUND]' : '';
+  const bg = toolInput.run_in_background || toolInput.mode === 'background' ? ' [BACKGROUND]' : '';
   const tracking = getAgentTrackingInfo(stateDir);
 
   // Team-routing guidance:
@@ -1421,6 +1477,7 @@ async function main() {
     // When set, replaces the Task/Agent tool input via hookSpecificOutput.updatedInput
     // so a configured per-agent model (agents.<name>.model) is applied (issue #3242).
     let updatedToolInput = null;
+    let modelRoutingWarning = '';
 
     // Force-inherit check: deny Task/Agent calls with invalid model param when forceInherit is
     // enabled (Bedrock, Vertex, CC Switch, etc.) - issues #1135, #1201, #1767, #1868
@@ -1432,7 +1489,34 @@ async function main() {
     if (toolName === 'Task' || toolName === 'Agent') {
       const toolInput = data.toolInput || data.tool_input || {};
       const toolModel = toolInput.model;
-      if (isForceInheritEnabled()) {
+      const agentType = getAgentType(toolInput);
+      if (isCopilotHost() && isBundledOmcSubagent(agentType)) {
+        const defaults = resolveCopilotSubagentDefaults(directory);
+        const hasExplicitModel = Object.prototype.hasOwnProperty.call(toolInput, 'model')
+          && toolInput.model !== undefined
+          && toolInput.model !== null;
+        const hasExplicitReasoningEffort = (
+          Object.prototype.hasOwnProperty.call(toolInput, 'reasoning_effort')
+          && toolInput.reasoning_effort !== undefined
+          && toolInput.reasoning_effort !== null
+        ) || (
+          Object.prototype.hasOwnProperty.call(toolInput, 'reasoningEffort')
+          && toolInput.reasoningEffort !== undefined
+          && toolInput.reasoningEffort !== null
+        );
+        const nextInput = { ...toolInput };
+
+        if (!hasExplicitModel) {
+          nextInput.model = defaults.model;
+        }
+        if (!hasExplicitReasoningEffort) {
+          nextInput.reasoning_effort = defaults.reasoningEffort;
+        }
+        if (!hasExplicitModel || !hasExplicitReasoningEffort) {
+          updatedToolInput = nextInput;
+        }
+        modelRoutingWarning = hasExplicitReasoningEffort ? '' : defaults.warning;
+      } else if (isForceInheritEnabled()) {
         // Check both vars: if either carries [1m] the session model is unsafe for sub-agents.
         // Avoids a split-brain between the hook and runtime code that may read the vars in
         // different orders (e.g. model-contract.ts uses ANTHROPIC_MODEL first).
@@ -1616,7 +1700,7 @@ async function main() {
     } else {
       message = generateMessage(toolName, todoStatus, modeActive);
     }
-    message = combineHookMessages(slopWarning, message);
+    message = combineHookMessages(modelRoutingWarning, slopWarning, message);
 
     // Carry any per-agent model injection (issue #3242) even when the advisory
     // message is empty or throttled, so the configured model is always applied.

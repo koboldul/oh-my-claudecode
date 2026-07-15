@@ -18,13 +18,16 @@ import { tmuxExec, tmuxSpawn } from '../cli/tmux-utils.js';
 import {
   buildWorkerArgv,
   getWorkerEnv as getModelWorkerEnv,
+  getPromptModeArgs,
+  isPromptModeAgent,
   resolveClaudeWorkerModel,
+  resolveValidatedBinaryPath,
   assertHeadlessSupported,
   validateWorkerLaunchDescriptor,
   type CliAgentType,
 } from './model-contract.js';
 import { CANONICAL_TEAM_ROLES } from '../shared/types.js';
-import type { CanonicalTeamRole } from '../shared/types.js';
+import type { CanonicalTeamRole, CopilotReasoningEffort } from '../shared/types.js';
 import { normalizeDelegationRole } from '../features/delegation-routing/types.js';
 import { routeTaskToRole } from './role-router.js';
 import {
@@ -46,7 +49,17 @@ import {
   waitForPaneReady,
 } from './tmux-session.js';
 import { TeamPaths, absPath } from './state-paths.js';
-import { writeWorkerOverlay } from './worker-bootstrap.js';
+import {
+  composeInitialInbox,
+  generatePromptModeStartupPrompt,
+  writeWorkerOverlay,
+} from './worker-bootstrap.js';
+import {
+  cliWorkerOutputFilePath,
+  renderCliWorkerOutputContract,
+  shouldInjectContract,
+} from './cli-worker-contract.js';
+import { resolveCopilotModel, resolveCopilotReasoningEffort } from '../config/models.js';
 import {
   ensureWorkerWorktree,
   installWorktreeRootAgents,
@@ -62,7 +75,7 @@ import { currentProcessStartIdentity, isProcessIdentityDead } from './team-owner
 // ── Environment gate ──────────────────────────────────────────────────────────
 
 const OMC_TEAM_SCALING_ENABLED_ENV = 'OMC_TEAM_SCALING_ENABLED';
-const CLI_AGENT_TYPES = new Set<CliAgentType>(['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity']);
+const CLI_AGENT_TYPES = new Set<CliAgentType>(['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity', 'copilot']);
 
 export function isScalingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[OMC_TEAM_SCALING_ENABLED_ENV];
@@ -482,11 +495,16 @@ export async function scaleUpOwned(
 
       let workerAgentType: CliAgentType = cliAgentType;
       let workerModel: string | undefined;
+      let workerReasoningEffort: CopilotReasoningEffort | undefined;
       // Only override caller's agentType when the worker's inferred role came
       // from an explicit `task.role` (user opt-in). Pre-patch semantics: callers
       // passing `--agent-type codex` stay on codex regardless of task text.
       const hasExplicitOwnedRole = ownedRoles.length === 1;
+      const hasConfiguredRoute = canonical
+        && (config.configured_routing_roles?.includes(canonical)
+          ?? config.resolved_routing?.[canonical]?.primary.provider !== 'claude');
       const routedPair = hasExplicitOwnedRole && canonical
+        && (cliAgentType === 'claude' || hasConfiguredRoute)
         ? config.resolved_routing?.[canonical]
         : undefined;
       if (routedPair) {
@@ -495,10 +513,15 @@ export async function scaleUpOwned(
         if (CLI_AGENT_TYPES.has(primaryProvider)) {
           workerAgentType = primaryProvider;
           workerModel = primary.model;
+          workerReasoningEffort = primary.reasoningEffort;
         }
       } else if (cliAgentType === 'claude') {
         // Honor Bedrock/Vertex default-model resolution for non-routed claude workers.
         workerModel = resolveClaudeWorkerModel(env);
+      } else if (cliAgentType === 'copilot') {
+        workerModel = config.copilot_defaults?.model ?? resolveCopilotModel(undefined, env);
+        workerReasoningEffort = config.copilot_defaults?.reasoning_effort
+          ?? resolveCopilotReasoningEffort(undefined, env);
       }
 
       // AC-8: try the resolved provider first; on trust-path / not-found
@@ -508,16 +531,20 @@ export async function scaleUpOwned(
       const tryBuildLaunch = (
         agentType: CliAgentType,
         model: string | undefined,
+        reasoningEffort: CopilotReasoningEffort | undefined,
       ): { launchBinary: string; launchArgs: string[] } => {
         // Platform guard (parity with startTeamV2 preflight): a headless-unsupported
         // provider (e.g. antigravity on Windows) throws here so scale-up falls back
         // to the routed Claude fallback instead of spawning an unusable primary.
         assertHeadlessSupported(agentType);
+        const resolvedBinaryPath = resolveValidatedBinaryPath(agentType);
         const [launchBinary, ...launchArgs] = buildWorkerArgv(agentType, {
           teamName: sanitized,
           workerName,
           cwd: workerCwd,
+          resolvedBinaryPath,
           ...(model ? { model } : {}),
+          ...(reasoningEffort ? { reasoningEffort } : {}),
         });
         return { launchBinary, launchArgs };
       };
@@ -525,13 +552,20 @@ export async function scaleUpOwned(
       let launchBinary: string;
       let launchArgs: string[];
       try {
-        ({ launchBinary, launchArgs } = tryBuildLaunch(workerAgentType, workerModel));
+        ({ launchBinary, launchArgs } = tryBuildLaunch(
+          workerAgentType,
+          workerModel,
+          workerReasoningEffort,
+        ));
       } catch (primaryError) {
         const primaryReason = primaryError instanceof Error ? primaryError.message : String(primaryError);
         const fallbackPair = routedPair?.fallback;
-        const fallbackProvider = fallbackPair
-          ? (fallbackPair.provider as CliAgentType)
-          : ('claude' as CliAgentType);
+        if (!fallbackPair) {
+          return await rollbackScaleUp(
+            `Failed to resolve explicit worker launch config for ${workerName} (provider=${workerAgentType}: ${primaryReason}; no routed fallback)`,
+          );
+        }
+        const fallbackProvider = fallbackPair.provider as CliAgentType;
         const fallbackModel = fallbackPair?.model;
 
         process.stderr.write(
@@ -544,9 +578,14 @@ export async function scaleUpOwned(
         }, leaderCwd);
 
         try {
-          ({ launchBinary, launchArgs } = tryBuildLaunch(fallbackProvider, fallbackModel));
+          ({ launchBinary, launchArgs } = tryBuildLaunch(
+            fallbackProvider,
+            fallbackModel,
+            fallbackPair?.reasoningEffort,
+          ));
           workerAgentType = fallbackProvider;
           workerModel = fallbackModel;
+          workerReasoningEffort = fallbackPair?.reasoningEffort;
         } catch (fallbackError) {
           const fallbackReason = fallbackError instanceof Error
             ? fallbackError.message
@@ -556,20 +595,90 @@ export async function scaleUpOwned(
           );
         }
       }
-      let launchDescriptor;
-      try {
-        launchDescriptor = validateWorkerLaunchDescriptor({ schema_version: 1, provider: workerAgentType,
-          model: workerModel ?? null, binary: launchBinary, args: [...launchArgs] });
-      } catch (error) {
-        return await rollbackScaleUp(`Invalid worker launch descriptor for ${workerName}: ${error instanceof Error ? error.message : String(error)}`);
-      }
       const workerTaskRoles = tasks.filter(t => t.owner === workerName).map(t => t.role).filter(Boolean) as string[];
       const uniqueTaskRoles = new Set(workerTaskRoles);
       const workerRole = workerTaskRoles.length > 0 && uniqueTaskRoles.size === 1 ? workerTaskRoles[0]! : agentType;
+      const outputFile = canonical && shouldInjectContract(canonical, workerAgentType)
+        ? cliWorkerOutputFilePath(teamStateRoot, workerName)
+        : undefined;
+      const outputContract = outputFile && canonical
+        ? renderCliWorkerOutputContract(canonical, outputFile)
+        : undefined;
+
+      let overlayPath: string;
+      try {
+        overlayPath = await writeWorkerOverlay({
+          teamName: sanitized,
+          workerName,
+          agentType: workerAgentType,
+          tasks: tasks.map((t, idx) => ({
+            id: String(idx + 1),
+            subject: t.subject,
+            description: t.description,
+          })),
+          cwd: leaderCwd,
+          ...(worktree ? { instructionStateRoot: '$OMC_TEAM_STATE_ROOT' } : {}),
+        });
+        const assignedWork = workerTasks.length > 0
+          ? workerTasks.map(task => `- ${task.subject}: ${task.description}`).join('\n')
+          : '- No task is preassigned. Inspect the team task list and claim suitable work.';
+        await composeInitialInbox(
+          sanitized,
+          workerName,
+          [
+            `You are ${workerName} on team ${sanitized}.`,
+            `Read and follow the worker guidance at ${overlayPath}.`,
+            'Assigned work:',
+            assignedWork,
+          ].join('\n\n'),
+          leaderCwd,
+          outputContract,
+        );
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        return await rollbackScaleUp(`Failed to bootstrap worker guidance for ${workerName}: ${reason}`);
+      }
+      if (worktree) {
+        try {
+          const overlayContent = await readFile(overlayPath, 'utf-8');
+          installWorktreeRootAgents(sanitized, workerName, leaderCwd, worktree.path, overlayContent);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          return await rollbackScaleUp(`Failed to install worker overlay for ${workerName}: ${reason}`);
+        }
+      }
+
+      if (isPromptModeAgent(workerAgentType)) {
+        launchArgs.push(...getPromptModeArgs(
+          workerAgentType,
+          generatePromptModeStartupPrompt(
+            sanitized,
+            workerName,
+            worktree ? '$OMC_TEAM_STATE_ROOT' : undefined,
+            outputContract,
+          ),
+        ));
+      }
+
+      let launchDescriptor;
+      try {
+        launchDescriptor = validateWorkerLaunchDescriptor({
+          schema_version: 1,
+          provider: workerAgentType,
+          model: workerAgentType === 'copilot'
+            ? workerModel ?? resolveCopilotModel(undefined, env)
+            : workerModel ?? null,
+          binary: launchBinary,
+          args: [...launchArgs],
+        });
+      } catch (error) {
+        return await rollbackScaleUp(`Invalid worker launch descriptor for ${workerName}: ${error instanceof Error ? error.message : String(error)}`);
+      }
       const reservedWorker: WorkerInfo = {
         name: workerName, index: workerIndex, role: workerRole, assigned_tasks: [],
         worker_cli: launchDescriptor.provider, launch_descriptor: launchDescriptor, operational_state: 'starting',
         working_dir: workerCwd, team_state_root: teamStateRoot,
+        ...(outputFile ? { output_file: outputFile } : {}),
         ...(worktree ? { worktree_repo_root: leaderCwd, worktree_path: worktree.path, worktree_branch: worktree.branch,
           worktree_detached: worktree.detached, worktree_created: worktree.created } : {}),
       };
@@ -590,29 +699,6 @@ export async function scaleUpOwned(
         OMC_TEAM_LEADER_CWD: leaderCwd,
         ...(worktree ? { OMC_TEAM_WORKTREE_PATH: worktree.path, OMC_TEAM_WORKER_CWD: workerCwd } : {}),
       };
-
-      if (worktree) {
-        try {
-          const workerOverlayParams = {
-            teamName: sanitized,
-            workerName,
-            agentType: workerAgentType,
-            tasks: tasks.map((t, idx) => ({
-              id: String(idx + 1),
-              subject: t.subject,
-              description: t.description,
-            })),
-            cwd: leaderCwd,
-            instructionStateRoot: '$OMC_TEAM_STATE_ROOT',
-          };
-          const overlayPath = await writeWorkerOverlay(workerOverlayParams);
-          const overlayContent = await readFile(overlayPath, 'utf-8');
-          installWorktreeRootAgents(sanitized, workerName, leaderCwd, worktree.path, overlayContent);
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error);
-          return await rollbackScaleUp(`Failed to install worker overlay for ${workerName}: ${reason}`);
-        }
-      }
 
       let cmd: string;
       try {
@@ -669,6 +755,7 @@ export async function scaleUpOwned(
         pane_id: paneId,
         working_dir: workerCwd,
         team_state_root: teamStateRoot,
+        ...(outputFile ? { output_file: outputFile } : {}),
         ...(worktree ? {
           worktree_repo_root: leaderCwd,
           worktree_path: worktree.path,

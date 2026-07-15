@@ -56,6 +56,12 @@ function runPreToolEnforcerWithEnv(
       ANTHROPIC_DEFAULT_OPUS_MODEL: '',
       CLAUDE_CODE_BEDROCK_FABLE_MODEL: '',
       ANTHROPIC_DEFAULT_FABLE_MODEL: '',
+      OMC_HOST: '',
+      COPILOT_CLI: '',
+      COPILOT_AGENT_SESSION_ID: '',
+      OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL: '',
+      OMC_COPILOT_DEFAULT_MODEL: '',
+      OMC_COPILOT_REASONING_EFFORT: '',
       ...env,
     },
   });
@@ -2323,7 +2329,12 @@ describe('pre-tool-enforcer agents.<name>.model injection (issue #3242)', () => 
   function run(input: Record<string, unknown>, env: Record<string, string> = {}): Record<string, unknown> {
     return runPreToolEnforcerWithEnv(
       { cwd: tempDir, ...input },
-      { XDG_CONFIG_HOME: xdgConfigHome, OMC_ROUTING_FORCE_INHERIT: 'false', ...env },
+      {
+        APPDATA: xdgConfigHome,
+        XDG_CONFIG_HOME: xdgConfigHome,
+        OMC_ROUTING_FORCE_INHERIT: 'false',
+        ...env,
+      },
     );
   }
 
@@ -2430,5 +2441,261 @@ describe('pre-tool-enforcer agents.<name>.model injection (issue #3242)', () => 
     expect(throttled.suppressOutput).toBe(true);
     expect(throttled.hookSpecificOutput).toBeDefined();
     expect(updatedModel(throttled)).toBe('sonnet');
+  });
+});
+
+describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
+  let tempDir: string;
+  let xdgConfigHome: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'pre-tool-enforcer-copilot-model-'));
+    xdgConfigHome = join(tempDir, 'xdg-config');
+    mkdirSync(join(xdgConfigHome, 'claude-omc'), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function run(input: Record<string, unknown>, env: Record<string, string> = {}): Record<string, unknown> {
+    return runPreToolEnforcerWithEnv(
+      { cwd: tempDir, ...input },
+      {
+        APPDATA: xdgConfigHome,
+        XDG_CONFIG_HOME: xdgConfigHome,
+        OMC_HOST: 'copilot',
+        ...env,
+      },
+    );
+  }
+
+  function updatedInput(output: Record<string, unknown>): Record<string, unknown> | undefined {
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown> | undefined;
+    return hookOutput?.updatedInput as Record<string, unknown> | undefined;
+  }
+
+  it('defaults bundled OMC subagents to GPT-5.6 Sol with max reasoning', () => {
+    const output = run({
+      tool_name: 'Task',
+      toolInput: {
+        subagent_type: 'oh-my-claudecode:executor',
+        prompt: 'Implement the change',
+        description: 'Implement change',
+      },
+      session_id: 'copilot-defaults',
+    });
+
+    expect(updatedInput(output)).toMatchObject({
+      model: 'gpt-5.6-sol',
+      reasoning_effort: 'max',
+    });
+  });
+
+  it('supports Copilot Agent tool payloads that use agent_type', () => {
+    const output = run({
+      tool_name: 'Agent',
+      toolInput: {
+        agent_type: 'oh-my-claudecode:explore',
+        prompt: 'Find the symbol',
+        description: 'Find symbol',
+        mode: 'background',
+      },
+      session_id: 'copilot-agent-type',
+    });
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(updatedInput(output)).toMatchObject({
+      agent_type: 'oh-my-claudecode:explore',
+      model: 'gpt-5.6-sol',
+      reasoning_effort: 'max',
+    });
+    expect(hookOutput.additionalContext).toContain(
+      'Spawning agent: oh-my-claudecode:explore (gpt-5.6-sol) [BACKGROUND]',
+    );
+  });
+
+  it('preserves explicit per-call model and reasoning effort', () => {
+    const output = run({
+      tool_name: 'Agent',
+      toolInput: {
+        agent_type: 'oh-my-claudecode:architect',
+        model: 'gpt-5.5',
+        reasoning_effort: 'high',
+        prompt: 'Review the design',
+        description: 'Review design',
+      },
+      session_id: 'copilot-explicit',
+    });
+
+    expect(updatedInput(output)).toBeUndefined();
+  });
+
+  it('fills only the missing field when one explicit choice is present', () => {
+    const modelExplicit = run({
+      tool_name: 'Task',
+      toolInput: {
+        subagent_type: 'oh-my-claudecode:executor',
+        model: 'gpt-5.5',
+        prompt: 'Implement',
+        description: 'Implement',
+      },
+      session_id: 'copilot-model-explicit',
+    });
+    const effortExplicit = run({
+      tool_name: 'Task',
+      toolInput: {
+        subagent_type: 'oh-my-claudecode:executor',
+        reasoning_effort: 'high',
+        prompt: 'Implement',
+        description: 'Implement',
+      },
+      session_id: 'copilot-effort-explicit',
+    });
+
+    expect(updatedInput(modelExplicit)).toMatchObject({
+      model: 'gpt-5.5',
+      reasoning_effort: 'max',
+    });
+    expect(updatedInput(effortExplicit)).toMatchObject({
+      model: 'gpt-5.6-sol',
+      reasoning_effort: 'high',
+    });
+  });
+
+  it('uses Copilot-specific environment overrides', () => {
+    const output = run(
+      {
+        tool_name: 'Task',
+        toolInput: {
+          subagent_type: 'oh-my-claudecode:verifier',
+          prompt: 'Verify',
+          description: 'Verify',
+        },
+        session_id: 'copilot-env-override',
+      },
+      {
+        OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL: 'gpt-5.6-terra',
+        OMC_COPILOT_REASONING_EFFORT: 'xhigh',
+      },
+    );
+
+    expect(updatedInput(output)).toMatchObject({
+      model: 'gpt-5.6-terra',
+      reasoning_effort: 'xhigh',
+    });
+  });
+
+  it('uses project Copilot defaults over user defaults', () => {
+    writeFileSync(
+      join(xdgConfigHome, 'claude-omc', 'config.jsonc'),
+      '{ "externalModels": { "defaults": { "copilotModel": "gpt-5.5", "copilotReasoningEffort": "high" } } }',
+    );
+    mkdirSync(join(tempDir, '.claude'), { recursive: true });
+    writeFileSync(
+      join(tempDir, '.claude', 'omc.jsonc'),
+      '{ "externalModels": { "defaults": { "copilotModel": "gpt-5.6-sol" } } }',
+    );
+
+    const output = run({
+      tool_name: 'Task',
+      toolInput: {
+        subagent_type: 'oh-my-claudecode:critic',
+        prompt: 'Critique',
+        description: 'Critique',
+      },
+      session_id: 'copilot-config-override',
+    });
+
+    expect(updatedInput(output)).toMatchObject({
+      model: 'gpt-5.6-sol',
+      reasoning_effort: 'high',
+    });
+  });
+
+  it('falls back to max and emits a warning for invalid configured effort', () => {
+    const output = run(
+      {
+        tool_name: 'Task',
+        toolInput: {
+          subagent_type: 'oh-my-claudecode:executor',
+          prompt: 'Implement',
+          description: 'Implement',
+        },
+        session_id: 'copilot-invalid-effort',
+      },
+      { OMC_COPILOT_REASONING_EFFORT: 'extreme' },
+    );
+    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
+
+    expect(updatedInput(output)?.reasoning_effort).toBe('max');
+    expect(hookOutput.additionalContext).toContain('Ignoring invalid reasoning effort "extreme"');
+  });
+
+  it('does not modify non-OMC agents or Claude-hosted calls', () => {
+    const externalAgent = run({
+      tool_name: 'Task',
+      toolInput: {
+        subagent_type: 'custom-agent',
+        prompt: 'Run',
+        description: 'Run',
+      },
+      session_id: 'copilot-non-omc',
+    });
+    const claudeHost = runPreToolEnforcerWithEnv({
+      tool_name: 'Task',
+      toolInput: {
+        subagent_type: 'oh-my-claudecode:executor',
+        prompt: 'Run',
+        description: 'Run',
+      },
+      cwd: tempDir,
+      session_id: 'claude-host',
+    });
+
+    expect(updatedInput(externalAgent)).toBeUndefined();
+    expect(updatedInput(claudeHost)).toBeUndefined();
+  });
+
+  it('lets an explicit non-Copilot host override ambient Copilot markers', () => {
+    const output = runPreToolEnforcerWithEnv(
+      {
+        tool_name: 'Task',
+        toolInput: {
+          subagent_type: 'oh-my-claudecode:executor',
+          prompt: 'Run',
+          description: 'Run',
+        },
+        cwd: tempDir,
+        session_id: 'explicit-claude-host',
+      },
+      {
+        OMC_HOST: 'claude',
+        COPILOT_CLI: '1',
+        COPILOT_AGENT_SESSION_ID: 'parent-session',
+      },
+    );
+
+    expect(updatedInput(output)).toBeUndefined();
+  });
+
+  it('applies Copilot defaults even when Claude force-inherit is enabled', () => {
+    const output = run(
+      {
+        tool_name: 'Task',
+        toolInput: {
+          subagent_type: 'oh-my-claudecode:executor',
+          prompt: 'Implement',
+          description: 'Implement',
+        },
+        session_id: 'copilot-force-inherit',
+      },
+      { OMC_ROUTING_FORCE_INHERIT: 'true' },
+    );
+
+    expect(updatedInput(output)).toMatchObject({
+      model: 'gpt-5.6-sol',
+      reasoning_effort: 'max',
+    });
   });
 });

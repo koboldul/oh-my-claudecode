@@ -686,6 +686,26 @@ describe("autopilot team CLI worker configuration", () => {
     expect(prompt).not.toContain("test-engineer` with");
   });
 
+  it("routes Copilot autopilot workers through external omc team with reviewer support", () => {
+    const config = resolvePipelineConfig({
+      execution: "team",
+      team: { agentTypes: ["copilot"] },
+    });
+    expect(config.team?.agentTypes).toEqual(["copilot"]);
+
+    const prompt = executionAdapter.getPrompt({
+      idea: "test",
+      directory: "/tmp",
+      planPath: ".omc/plans/autopilot-impl.md",
+      config,
+    });
+    expect(prompt).toContain("omc team 1:copilot");
+    expect(prompt).toContain("/omc-teams 1:copilot");
+    expect(prompt).toContain("Copilot");
+    expect(prompt).toContain("structured verdict-file contract");
+    expect(prompt).not.toContain("subagent_type");
+  });
+
   it("uses implicit-team guidance for Claude-only team execution", () => {
     const prompt = executionAdapter.getPrompt({
       idea: "test",

@@ -112,6 +112,14 @@ function releaseTarball(gitHead = SHA, extraEntries: TarEntry[] = [], readme = '
       content: JSON.stringify({ name: 'oh-my-claudecode', version: VERSION }),
     },
     {
+      path: 'package/plugin.json',
+      content: JSON.stringify({
+        name: 'oh-my-claudecode',
+        version: VERSION,
+        agents: './agents-copilot/',
+      }),
+    },
+    {
       path: 'package/.claude-plugin/marketplace.json',
       content: JSON.stringify({
         version: VERSION,
@@ -249,11 +257,18 @@ function createTriggerRepository(): { root: string; sha: string } {
   mkdirSync(join(root, 'docs'), { recursive: true });
   writeFileSync(join(root, 'package.json'), JSON.stringify(packageManifest(), null, 2));
   writeFileSync(join(root, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'oh-my-claudecode', version: VERSION }));
+  writeFileSync(join(root, 'plugin.json'), JSON.stringify({
+    name: 'oh-my-claudecode',
+    version: VERSION,
+    agents: './agents-copilot/',
+  }));
   writeFileSync(join(root, '.claude-plugin', 'marketplace.json'), JSON.stringify({
     version: VERSION,
     plugins: [{ name: 'oh-my-claudecode', version: VERSION }],
   }));
   writeFileSync(join(root, 'docs', 'CLAUDE.md'), `<!-- OMC:VERSION:${VERSION} -->\n`);
+  // Root CLAUDE.md must stay byte-identical to docs/CLAUDE.md (host-isolation fix).
+  writeFileSync(join(root, 'CLAUDE.md'), `<!-- OMC:VERSION:${VERSION} -->\n`);
   writeFileSync(join(root, 'CHANGELOG.md'), `# oh-my-claudecode v${VERSION}: fixture\n`);
   writeFileSync(join(root, '.github', 'release-body.md'), '# Release notes\n');
   execFileSync('git', ['init'], { cwd: root, stdio: 'ignore' });
@@ -329,6 +344,10 @@ describe('release-boundary.mjs', () => {
     expect(() => assertTrigger({ tag: TAG, sha, cwd: root })).toThrow('does not advertise');
 
     writeFileSync(join(root, 'docs', 'CLAUDE.md'), `<!-- OMC:VERSION:${VERSION} -->\n`);
+    writeFileSync(join(root, 'CLAUDE.md'), '<!-- OMC:VERSION:4.15.4 -->\nstale root content\n');
+    expect(() => assertTrigger({ tag: TAG, sha, cwd: root })).toThrow('byte-identical');
+
+    writeFileSync(join(root, 'CLAUDE.md'), `<!-- OMC:VERSION:${VERSION} -->\n`);
     writeFileSync(join(root, '.github', 'release-body.md'), ' \n');
     expect(() => assertTrigger({ tag: TAG, sha, cwd: root })).toThrow('must be non-empty');
     writeFileSync(join(root, '.github', 'release-body.md'), '# Changed release notes\n');
@@ -400,6 +419,7 @@ describe('release-boundary.mjs', () => {
       'package/bridge/runtime-cli.cjs',
       'package/bridge/team.js',
       'package/package.json',
+      'package/plugin.json',
     ]);
 
     const forbiddenPath = writeTarball(root, 'forbidden.tgz', releaseTarball(SHA, [

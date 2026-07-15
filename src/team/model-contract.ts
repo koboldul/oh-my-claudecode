@@ -2,17 +2,25 @@ import { spawnSync } from 'child_process';
 import { isAbsolute, normalize, sep, win32 as win32Path } from 'path';
 import { validateTeamName } from './team-name.js';
 import { normalizeToCcAlias } from '../features/delegation-enforcer.js';
-import { isBedrock, isVertexAI, isProviderSpecificModelId } from '../config/models.js';
+import {
+  isBedrock,
+  isVertexAI,
+  isProviderSpecificModelId,
+  resolveCopilotModel,
+  resolveCopilotReasoningEffort,
+  validateCopilotReasoningEffort,
+} from '../config/models.js';
 import { isExternalLLMDisabled } from '../lib/security-config.js';
 import type { WorkerLaunchDescriptor } from './types.js';
+import type { CopilotReasoningEffort } from '../shared/types.js';
 
-export type CliAgentType = 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity';
+export type CliAgentType = 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity' | 'copilot';
 
 export interface CliAgentContract {
   agentType: CliAgentType;
   binary: string;
   installInstructions: string;
-  buildLaunchArgs(model?: string, extraFlags?: string[]): string[];
+  buildLaunchArgs(model?: string, extraFlags?: string[], reasoningEffort?: CopilotReasoningEffort): string[];
   parseOutput(rawOutput: string): string;
   /** Whether this agent supports a prompt/headless mode that bypasses TUI input */
   supportsPromptMode?: boolean;
@@ -24,6 +32,7 @@ export interface WorkerLaunchConfig {
   teamName: string;
   workerName: string;
   model?: string;
+  reasoningEffort?: CopilotReasoningEffort;
   cwd: string;
   extraFlags?: string[];
   /**
@@ -48,6 +57,13 @@ export interface CliBinaryValidation {
 }
 
 const resolvedPathCache = new Map<string, string>();
+
+function selectResolvedBinaryPath(stdout: string): string | undefined {
+  const candidates = stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (process.platform !== 'win32') return candidates[0];
+  return candidates.find(candidate => /\.(exe|com)$/i.test(candidate))
+    ?? candidates.find(candidate => /\.(cmd|bat)$/i.test(candidate));
+}
 
 const UNTRUSTED_PATH_PATTERNS: RegExp[] = [
   /^\/tmp(\/|$)/,
@@ -123,13 +139,18 @@ export function resolveCliBinaryPath(binary: string): string {
   }
 
   const stdout = result.stdout?.toString().trim() ?? '';
-  const firstLine = stdout.split('\n').map(line => line.trim()).find(Boolean) ?? '';
+  const firstLine = selectResolvedBinaryPath(stdout) ?? '';
   if (!firstLine) {
     throw new Error(`CLI binary '${binary}' not found in PATH`);
   }
 
-  const resolvedPath = normalize(firstLine);
-  if (!isAbsolute(resolvedPath)) {
+  const resolvedPath = process.platform === 'win32'
+    ? win32Path.normalize(firstLine)
+    : normalize(firstLine);
+  const isResolvedAbsolute = process.platform === 'win32'
+    ? win32Path.isAbsolute(resolvedPath)
+    : isAbsolute(resolvedPath);
+  if (!isResolvedAbsolute) {
     throw new Error(`Resolved CLI binary '${binary}' to relative path`);
   }
 
@@ -287,6 +308,33 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
       return rawOutput.trim();
     },
   },
+  copilot: {
+    agentType: 'copilot',
+    binary: 'copilot',
+    installInstructions: 'Install GitHub Copilot CLI, then verify with `copilot --version`.',
+    supportsPromptMode: true,
+    promptModeFlag: '-p',
+    buildLaunchArgs(
+      model?: string,
+      extraFlags: string[] = [],
+      reasoningEffort?: CopilotReasoningEffort,
+    ): string[] {
+      return [
+        '--model', model?.trim() || resolveCopilotModel(),
+        '--effort', reasoningEffort
+          ? validateCopilotReasoningEffort(reasoningEffort)
+          : resolveCopilotReasoningEffort(),
+        '--allow-all',
+        '--no-ask-user',
+        '--silent',
+        '--stream=off',
+        ...extraFlags,
+      ];
+    },
+    parseOutput(rawOutput: string): string {
+      return rawOutput.trim();
+    },
+  },
   cursor: {
     agentType: 'cursor',
     binary: 'cursor-agent',
@@ -336,12 +384,7 @@ function resolveBinaryPath(binary: string): string {
     const result = spawnSync(resolver, [binary], { timeout: 5000, encoding: 'utf8' });
     if (result.status !== 0) return binary;
 
-    const lines = result.stdout
-      ?.split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean) ?? [];
-
-    const firstPath = lines[0];
+    const firstPath = selectResolvedBinaryPath(result.stdout ?? '');
     const isResolvedAbsolute = !!firstPath && (isAbsolute(firstPath) || win32Path.isAbsolute(firstPath));
     return isResolvedAbsolute ? firstPath : binary;
   } catch {
@@ -361,7 +404,7 @@ export function isCliAvailable(agentType: CliAgentType): boolean {
 
     const result = spawnSync(resolvedBinary, ['--version'], {
       timeout: 5000,
-      shell: process.platform === 'win32',
+      shell: process.platform === 'win32' && agentType !== 'copilot',
     });
     return result.status === 0;
   } catch {
@@ -388,7 +431,11 @@ export function resolveValidatedBinaryPath(agentType: CliAgentType): string {
 }
 
 export function buildLaunchArgs(agentType: CliAgentType, config: WorkerLaunchConfig): string[] {
-  return getContract(agentType).buildLaunchArgs(config.model, config.extraFlags);
+  return getContract(agentType).buildLaunchArgs(
+    config.model,
+    config.extraFlags,
+    config.reasoningEffort,
+  );
 }
 
 export function buildWorkerArgv(agentType: CliAgentType, config: WorkerLaunchConfig): string[] {
@@ -434,7 +481,9 @@ export function buildValidatedWorkerLaunchDescriptor(
   return validateWorkerLaunchDescriptor({
     schema_version: 1,
     provider: agentType,
-    model: config.model ?? null,
+    model: agentType === 'copilot'
+      ? config.model?.trim() || resolveCopilotModel()
+      : config.model ?? null,
     binary,
     args: [...args, ...appendedArgs],
   });
@@ -469,6 +518,9 @@ const WORKER_MODEL_ENV_ALLOWLIST = [
   'OMC_GROK_DEFAULT_MODEL',
   'OMC_EXTERNAL_MODELS_DEFAULT_ANTIGRAVITY_MODEL',
   'OMC_ANTIGRAVITY_DEFAULT_MODEL',
+  'OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL',
+  'OMC_COPILOT_DEFAULT_MODEL',
+  'OMC_COPILOT_REASONING_EFFORT',
 ] as const;
 
 export function getWorkerEnv(
@@ -483,6 +535,18 @@ export function getWorkerEnv(
     OMC_TEAM_NAME: teamName,
     OMC_WORKER_AGENT_TYPE: agentType,
   };
+
+  if (agentType === 'copilot') {
+    Object.assign(workerEnv, {
+      CLAUDECODE: '',
+      CLAUDE_SESSION_ID: '',
+      CLAUDECODE_SESSION_ID: '',
+      CLAUDE_CODE_ENTRYPOINT: '',
+      COPILOT_CLI: '',
+      COPILOT_AGENT_SESSION_ID: '',
+      OMC_HOST: '',
+    });
+  }
 
   for (const key of WORKER_MODEL_ENV_ALLOWLIST) {
     const value = env[key];

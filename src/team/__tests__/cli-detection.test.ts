@@ -51,4 +51,89 @@ describe('cli-detection', () => {
     expect(mockSpawnSync).toHaveBeenCalledWith('agy', ['--version'], expect.objectContaining({ timeout: 5000 }));
     mockSpawnSync.mockRestore();
   });
+
+  it('detects Copilot with `copilot --version` and avoids a Windows shell', () => {
+    const mockSpawnSync = vi.mocked(spawnSync);
+    const restorePlatform = setProcessPlatform('win32');
+    mockSpawnSync
+      .mockReturnValueOnce({ status: 0, stdout: 'GitHub Copilot CLI 1.0.71-3', stderr: '', pid: 0, output: [], signal: null } as any)
+      .mockReturnValueOnce({ status: 0, stdout: 'C:\\Tools\\copilot.exe', stderr: '', pid: 0, output: [], signal: null } as any);
+
+    expect(detectCli('copilot')).toEqual({
+      available: true,
+      version: 'GitHub Copilot CLI 1.0.71-3',
+      path: 'C:\\Tools\\copilot.exe',
+    });
+    expect(mockSpawnSync).toHaveBeenNthCalledWith(
+      1,
+      'copilot',
+      ['--version'],
+      { timeout: 5000, shell: false },
+    );
+    restorePlatform();
+    mockSpawnSync.mockRestore();
+  });
+
+  it('detects an npm-installed Copilot .cmd shim through COMSPEC on Windows', () => {
+    const mockSpawnSync = vi.mocked(spawnSync);
+    const restorePlatform = setProcessPlatform('win32');
+    const originalComspec = process.env.COMSPEC;
+    process.env.COMSPEC = 'C:\\Windows\\System32\\cmd.exe';
+    mockSpawnSync
+      .mockReturnValueOnce({
+        status: null,
+        stdout: '',
+        stderr: '',
+        error: Object.assign(new Error('spawnSync copilot ENOENT'), { code: 'ENOENT' }),
+        pid: 0,
+        output: [],
+        signal: null,
+      } as any)
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: 'C:\\Users\\me\\AppData\\Roaming\\npm\\copilot\r\nC:\\Users\\me\\AppData\\Roaming\\npm\\copilot.cmd\r\n',
+        stderr: '',
+        pid: 0,
+        output: [],
+        signal: null,
+      } as any)
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: 'GitHub Copilot CLI 1.0.71-3',
+        stderr: '',
+        pid: 0,
+        output: [],
+        signal: null,
+      } as any);
+
+    expect(detectCli('copilot')).toEqual({
+      available: true,
+      version: 'GitHub Copilot CLI 1.0.71-3',
+      path: 'C:\\Users\\me\\AppData\\Roaming\\npm\\copilot.cmd',
+    });
+    expect(mockSpawnSync).toHaveBeenNthCalledWith(
+      3,
+      'C:\\Windows\\System32\\cmd.exe',
+      ['/d', '/s', '/c', '"C:\\Users\\me\\AppData\\Roaming\\npm\\copilot.cmd" --version'],
+      { timeout: 5000 },
+    );
+
+    if (originalComspec === undefined) delete process.env.COMSPEC;
+    else process.env.COMSPEC = originalComspec;
+    restorePlatform();
+    mockSpawnSync.mockRestore();
+  });
+
+  it('includes Copilot in all-provider detection', () => {
+    const mockSpawnSync = vi.mocked(spawnSync);
+    mockSpawnSync.mockReturnValue({ status: 1, stdout: '', stderr: '', pid: 0, output: [], signal: null } as any);
+    const result = detectAllClis();
+    expect(result.copilot).toEqual({ available: false });
+    expect(mockSpawnSync).toHaveBeenCalledWith(
+      'copilot',
+      ['--version'],
+      expect.objectContaining({ timeout: 5000 }),
+    );
+    mockSpawnSync.mockRestore();
+  });
 });

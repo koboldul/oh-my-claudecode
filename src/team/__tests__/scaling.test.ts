@@ -12,7 +12,10 @@ const tmuxUtilsMocks = vi.hoisted(() => ({
 const modelContractMocks = vi.hoisted(() => ({
   buildWorkerArgv: vi.fn(),
   getWorkerEnv: vi.fn(),
+  getPromptModeArgs: vi.fn(),
+  isPromptModeAgent: vi.fn(),
   resolveClaudeWorkerModel: vi.fn(),
+  resolveValidatedBinaryPath: vi.fn(),
   validateWorkerLaunchDescriptor: vi.fn((value: unknown) => value),
 }));
 
@@ -75,7 +78,10 @@ vi.mock('../../cli/tmux-utils.js', () => ({
 vi.mock('../model-contract.js', () => ({
   buildWorkerArgv: modelContractMocks.buildWorkerArgv,
   getWorkerEnv: modelContractMocks.getWorkerEnv,
+  getPromptModeArgs: modelContractMocks.getPromptModeArgs,
+  isPromptModeAgent: modelContractMocks.isPromptModeAgent,
   resolveClaudeWorkerModel: modelContractMocks.resolveClaudeWorkerModel,
+  resolveValidatedBinaryPath: modelContractMocks.resolveValidatedBinaryPath,
   validateWorkerLaunchDescriptor: modelContractMocks.validateWorkerLaunchDescriptor,
   assertHeadlessSupported: () => {},
   isHeadlessSupportedOnPlatform: () => true,
@@ -182,6 +188,9 @@ describe('scaleUp duplicate worker guard', () => {
     teamOpsMocks.teamAppendEvent.mockResolvedValue(undefined);
 
     modelContractMocks.buildWorkerArgv.mockReturnValue(['/usr/bin/claude']);
+    modelContractMocks.isPromptModeAgent.mockReturnValue(false);
+    modelContractMocks.getPromptModeArgs.mockReturnValue([]);
+    modelContractMocks.resolveValidatedBinaryPath.mockReturnValue('/usr/bin/claude');
     modelContractMocks.getWorkerEnv.mockImplementation((teamName: string, workerName: string, agentType: string) => ({
       OMC_TEAM_WORKER: `${teamName}/${workerName}`,
       OMC_TEAM_NAME: teamName,

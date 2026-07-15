@@ -6,10 +6,10 @@
  * Emits warnings (not errors) for missing binaries — AC-11.
  */
 
-import { execSync } from 'child_process';
 import { colors } from '../utils/formatting.js';
 import { loadConfig } from '../../config/loader.js';
 import type { TeamRoleProvider } from '../../shared/types.js';
+import { detectCli } from '../../team/cli-detection.js';
 
 interface ProviderProbe {
   provider: TeamRoleProvider;
@@ -27,32 +27,19 @@ const PROVIDER_BINARY: Record<TeamRoleProvider, string> = {
   grok: 'grok',
   cursor: 'cursor-agent',
   antigravity: 'agy',
+  copilot: 'copilot',
 };
 
 function probeProvider(provider: TeamRoleProvider): ProviderProbe {
   const binary = PROVIDER_BINARY[provider];
-  const probe: ProviderProbe = { provider, binary, found: false };
-
-  try {
-    const resolved = execSync(`command -v ${binary}`, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] })
-      .trim();
-    if (resolved) {
-      probe.found = true;
-      probe.path = resolved;
-      try {
-        const version = execSync(`${binary} --version`, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 })
-          .trim()
-          .split('\n')[0];
-        if (version) probe.version = version;
-      } catch {
-        // Version probe is best-effort; binary found is enough.
-      }
-    }
-  } catch (err) {
-    probe.error = err instanceof Error ? err.message : String(err);
-  }
-
-  return probe;
+  const detected = detectCli(binary);
+  return {
+    provider,
+    binary,
+    found: detected.available,
+    ...(detected.path ? { path: detected.path.split(/\r?\n/)[0] } : {}),
+    ...(detected.version ? { version: detected.version.split(/\r?\n/)[0] } : {}),
+  };
 }
 
 function collectConfiguredProviders(): Set<TeamRoleProvider> {
@@ -64,7 +51,7 @@ function collectConfiguredProviders(): Set<TeamRoleProvider> {
   const roleRouting = cfg.team?.roleRouting ?? {};
   for (const spec of Object.values(roleRouting)) {
     const provider = spec?.provider as TeamRoleProvider | undefined;
-    if (provider === 'claude' || provider === 'codex' || provider === 'gemini' || provider === 'grok' || provider === 'cursor' || provider === 'antigravity') {
+    if (provider === 'claude' || provider === 'codex' || provider === 'gemini' || provider === 'grok' || provider === 'cursor' || provider === 'antigravity' || provider === 'copilot') {
       providers.add(provider);
     }
   }

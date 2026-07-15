@@ -40,6 +40,7 @@ type PackedPackage = {
   files: Set<string>;
   packageJson: PackageJson;
   pluginJson: PluginJson;
+  copilotPluginJson: PluginJson & { agents?: unknown };
   mcpServers: Record<string, McpServerConfig>;
   startedWithoutGeneratedBundles: boolean;
 };
@@ -179,6 +180,9 @@ function getPackedPackage(): PackedPackage {
           "utf-8",
         ),
       ) as PluginJson,
+      copilotPluginJson: JSON.parse(
+        readFileSync(join(extractedPackageRoot, 'plugin.json'), 'utf-8'),
+      ) as PluginJson & { agents?: unknown },
       mcpServers: readMcpServersFromPath(
         join(extractedPackageRoot, ".mcp.json"),
       ),
@@ -309,6 +313,10 @@ describe("npm package bin surface regression", () => {
     ) as PluginJson;
 
     expect(packedPackageFixture.pluginJson).toEqual(sourcePluginJson);
+    expect(packedPackageFixture.copilotPluginJson).toEqual(
+      JSON.parse(readFileSync(join(process.cwd(), 'plugin.json'), 'utf-8')),
+    );
+    expect(packedPackageFixture.copilotPluginJson.agents).toBe('./agents-copilot/');
     expect(
       referencesStandardHooksManifest(packedPackageFixture.pluginJson.hooks),
     ).toBe(false);

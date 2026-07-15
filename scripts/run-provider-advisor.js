@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from 'child_process';
+import { existsSync } from 'fs';
 import { mkdir, writeFile } from 'fs/promises';
 import { join } from 'path';
 import process from 'process';
@@ -12,8 +13,47 @@ const PROVIDER_BINARIES = {
   antigravity: 'agy',
   grok: 'grok',
   cursor: 'cursor-agent',
+  copilot: 'copilot',
 };
 const SHOULD_USE_WINDOWS_SHELL = process.platform === 'win32';
+const COPILOT_DEFAULT_MODEL = 'gpt-5.6-sol';
+const COPILOT_DEFAULT_REASONING_EFFORT = 'max';
+const COPILOT_REASONING_EFFORTS = new Set([
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+]);
+
+function shouldUseWindowsShell(provider) {
+  return SHOULD_USE_WINDOWS_SHELL && provider !== 'copilot';
+}
+
+function nonEmpty(value) {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
+}
+
+function resolveCopilotModel(env = process.env) {
+  return nonEmpty(env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL)
+    ?? nonEmpty(env.OMC_COPILOT_DEFAULT_MODEL)
+    ?? COPILOT_DEFAULT_MODEL;
+}
+
+function resolveCopilotReasoningEffort(env = process.env) {
+  const raw = nonEmpty(env.OMC_COPILOT_REASONING_EFFORT)
+    ?? COPILOT_DEFAULT_REASONING_EFFORT;
+  const normalized = raw.toLowerCase();
+  if (!COPILOT_REASONING_EFFORTS.has(normalized)) {
+    throw new Error(
+      `Copilot reasoning effort: invalid value "${raw}". Allowed: ${Array.from(COPILOT_REASONING_EFFORTS).join(', ')}`,
+    );
+  }
+  return normalized;
+}
 
 // Antigravity (`agy`) headless print mode has a known upstream non-TTY bug
 // (google-antigravity/antigravity-cli#76) that, beyond the empty-exit-0 case,
@@ -50,6 +90,7 @@ const ANTIGRAVITY_TIMEOUT_MS = (() => {
  * - grok: `grok -p <prompt> --always-approve` (headless mode takes the prompt
  *   as an arg; grok's stdin is reserved for ACP JSON-RPC, never the prompt)
  * - cursor: `cursor-agent --print --force --trust --sandbox disabled <prompt>`
+ * - copilot: deterministic, autonomous prompt mode with configurable model and effort defaults
  */
 function buildProviderArgs(provider, prompt, { pipePromptViaStdin = false } = {}) {
   if (provider === 'codex') {
@@ -75,6 +116,17 @@ function buildProviderArgs(provider, prompt, { pipePromptViaStdin = false } = {}
     // Cursor Agent's print mode takes the prompt as a positional arg. Keep stdin
     // closed so it cannot interpret advisor prompt bytes as interactive input.
     return ['--print', '--force', '--trust', '--sandbox', 'disabled', prompt];
+  }
+  if (provider === 'copilot') {
+    return [
+      '--model', resolveCopilotModel(),
+      '--effort', resolveCopilotReasoningEffort(),
+      '--allow-all',
+      '--no-ask-user',
+      '--silent',
+      '--stream=off',
+      '-p', prompt,
+    ];
   }
   // claude: `claude -p` reads the prompt from stdin when no prompt arg is given.
   return pipePromptViaStdin ? ['-p'] : ['-p', prompt];
@@ -106,7 +158,8 @@ function shouldPipePromptViaStdin(provider, prompt) {
     return prompt.includes('\n') || prompt.length > 500 || /^\s*-/.test(prompt);
   }
 
-  // grok (ACP stdin), cursor-agent (interactive stdin), and any other provider
+  // grok (ACP stdin), cursor-agent (interactive stdin), Copilot (`-p` argv), and
+  // any other provider
   // never pipe the prompt.
   return false;
 }
@@ -115,8 +168,8 @@ const ASK_ORIGINAL_TASK_ENV = 'OMC_ASK_ORIGINAL_TASK';
 const ASK_ORIGINAL_TASK_ENV_ALIAS = 'OMX_ASK_ORIGINAL_TASK';
 
 function usage() {
-  console.error('Usage: omc ask <claude|codex|gemini|antigravity|grok|cursor> "<prompt>"');
-  console.error('Legacy direct usage: node scripts/run-provider-advisor.js <claude|codex|gemini|antigravity|grok|cursor> <prompt...>');
+  console.error('Usage: omc ask <claude|codex|gemini|antigravity|grok|cursor|copilot> "<prompt>"');
+  console.error('Legacy direct usage: node scripts/run-provider-advisor.js <claude|codex|gemini|antigravity|grok|cursor|copilot> <prompt...>');
   console.error('                 or: node scripts/run-provider-advisor.js claude --print "<prompt>"');
   console.error('                 or: node scripts/run-provider-advisor.js gemini --prompt "<prompt>"');
 }
@@ -159,23 +212,67 @@ function parseArgs(argv) {
   return { provider, prompt: rest.join(' ').trim() };
 }
 
-// Strip Claude session markers so provider advisors do not detect or inherit the active Claude Code session.
-const CLAUDE_SESSION_STRIPPED_ENV_VARS = new Set([
+// Strip host session markers so provider advisors never inherit the active parent agent session.
+const HOST_SESSION_STRIPPED_ENV_VARS = new Set([
   'CLAUDECODE',
   'CLAUDE_SESSION_ID',
   'CLAUDECODE_SESSION_ID',
   'CLAUDE_CODE_ENTRYPOINT',
+  'COPILOT_CLI',
+  'COPILOT_AGENT_SESSION_ID',
+  'OMC_HOST',
 ]);
 const CODEX_STRIPPED_ENV_VARS = new Set(['RUST_LOG', 'RUST_BACKTRACE', 'RUST_LIB_BACKTRACE']);
 
 function buildProviderEnv(provider, env = process.env) {
   const strippedEnvVars = provider === 'codex'
-    ? new Set([...CLAUDE_SESSION_STRIPPED_ENV_VARS, ...CODEX_STRIPPED_ENV_VARS])
-    : CLAUDE_SESSION_STRIPPED_ENV_VARS;
+    ? new Set([...HOST_SESSION_STRIPPED_ENV_VARS, ...CODEX_STRIPPED_ENV_VARS])
+    : HOST_SESSION_STRIPPED_ENV_VARS;
 
   return Object.fromEntries(
     Object.entries(env).filter(([key]) => !strippedEnvVars.has(key)),
   );
+}
+
+function resolveWindowsBinary(binary, env) {
+  const result = spawnSync('where', [binary], {
+    encoding: 'utf8',
+    env,
+  });
+  if (result.status !== 0) return undefined;
+  const candidates = result.stdout
+    ?.split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean) ?? [];
+  return candidates.find(candidate => /\.(exe|com)$/i.test(candidate))
+    ?? candidates.find(candidate => /\.(cmd|bat)$/i.test(candidate));
+}
+
+function spawnProvider(provider, binary, args, options) {
+  if (provider === 'copilot' && SHOULD_USE_WINDOWS_SHELL && /\.(cmd|bat)$/i.test(binary)) {
+    const ps1Shim = binary.replace(/\.(cmd|bat)$/i, '.ps1');
+    if (!existsSync(ps1Shim)) {
+      throw new Error(
+        `[ask-copilot] Cannot safely launch ${binary}: sibling PowerShell shim not found at ${ps1Shim}. Reinstall the current Copilot CLI.`,
+      );
+    }
+
+    const run = spawnSync(
+      'pwsh.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1Shim, ...args],
+      {
+        ...options,
+        shell: false,
+      },
+    );
+    if (run.error?.code === 'ENOENT') {
+      throw new Error(
+        '[ask-copilot] PowerShell 7 (pwsh.exe) is required to safely launch an npm-installed Copilot CLI on Windows.',
+      );
+    }
+    return run;
+  }
+  return spawnSync(binary, args, options);
 }
 
 // Antigravity (`agy`) headless print mode requires the prompt as an argv value
@@ -195,19 +292,29 @@ function guardProviderPlatform(provider) {
 }
 
 function ensureBinary(provider, binary) {
-  const probe = spawnSync(binary, ['--version'], {
+  const providerEnv = buildProviderEnv(provider);
+  const probeOptions = {
     stdio: 'ignore',
     encoding: 'utf8',
-    env: buildProviderEnv(provider),
-    shell: SHOULD_USE_WINDOWS_SHELL,
-  });
+    env: providerEnv,
+    shell: shouldUseWindowsShell(provider),
+  };
+  let resolvedBinary = binary;
+  let probe = spawnProvider(provider, resolvedBinary, ['--version'], probeOptions);
 
-  const isMissingOnWindowsShell = SHOULD_USE_WINDOWS_SHELL
+  if (provider === 'copilot' && SHOULD_USE_WINDOWS_SHELL && probe.error?.code === 'ENOENT') {
+    resolvedBinary = resolveWindowsBinary(binary, providerEnv) ?? binary;
+    if (resolvedBinary !== binary) {
+      probe = spawnProvider(provider, resolvedBinary, ['--version'], probeOptions);
+    }
+  }
+
+  const isMissingOnWindowsShell = shouldUseWindowsShell(provider)
     && probe.status !== 0
     && (() => {
       const whereResult = spawnSync('where', [binary], {
         encoding: 'utf8',
-        env: buildProviderEnv(provider),
+        env: providerEnv,
       });
       return whereResult.status !== 0 || !whereResult.stdout?.trim();
     })();
@@ -218,6 +325,7 @@ function ensureBinary(provider, binary) {
     console.error(`[ask-${binary}] Install/configure ${binary} CLI, then verify with: ${verify}`);
     process.exit(1);
   }
+  return resolvedBinary;
 }
 
 function buildSummary(exitCode, output) {
@@ -312,18 +420,18 @@ async function writeArtifact({ provider, originalTask, finalPrompt, rawOutput, e
 
 async function main() {
   const { provider, prompt } = parseArgs(process.argv.slice(2));
-  const binary = PROVIDER_BINARIES[provider];
+  const binaryName = PROVIDER_BINARIES[provider];
 
   guardProviderPlatform(provider);
-  ensureBinary(provider, binary);
+  const binary = ensureBinary(provider, binaryName);
 
   const pipePromptViaStdin = shouldPipePromptViaStdin(provider, prompt);
   const providerArgs = buildProviderArgs(provider, prompt, { pipePromptViaStdin });
-  const run = spawnSync(binary, providerArgs, {
+  const run = spawnProvider(provider, binary, providerArgs, {
     encoding: 'utf8',
     maxBuffer: 10 * 1024 * 1024,
     env: buildProviderEnv(provider),
-    shell: SHOULD_USE_WINDOWS_SHELL,
+    shell: shouldUseWindowsShell(provider),
     // Bound antigravity so an upstream non-TTY hang (#76) fails cleanly instead of
     // blocking forever; agy's own --print-timeout does not work. SIGKILL (not a
     // catchable SIGTERM) guarantees spawnSync returns even if agy traps signals.

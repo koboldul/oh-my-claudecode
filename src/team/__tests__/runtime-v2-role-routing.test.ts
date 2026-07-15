@@ -65,7 +65,7 @@ describe('runtime-v2 role routing — processCliWorkerVerdicts (AC-7)', () => {
   async function bootstrap(opts: {
     verdict: 'approve' | 'revise' | 'reject';
     paneAlive?: boolean;
-    workerCli?: 'codex' | 'gemini' | 'claude';
+    workerCli?: 'codex' | 'gemini' | 'claude' | 'copilot';
     omitVerdictFile?: boolean;
     invalidVerdictJson?: boolean;
   }): Promise<{ teamRoot: string; outputFile: string; taskPath: string }> {
@@ -178,6 +178,16 @@ describe('runtime-v2 role routing — processCliWorkerVerdicts (AC-7)', () => {
 
     // Verdict file renamed to .processed
     await expect(access(outputFile + '.processed')).resolves.toBeUndefined();
+  });
+
+  it('processes structured reviewer verdicts from Copilot workers', async () => {
+    cwd = await mkdtemp(join(tmpdir(), 'omc-runtime-routing-copilot-'));
+    const { taskPath } = await bootstrap({ verdict: 'approve', workerCli: 'copilot' });
+    const { processCliWorkerVerdicts } = await import('../runtime-v2.js');
+    const results = await processCliWorkerVerdicts('role-routing-team', cwd);
+    expect(results[0]).toMatchObject({ status: 'completed', verdict: 'approve' });
+    const task = JSON.parse(await readFile(taskPath, 'utf-8'));
+    expect(task.metadata?.verdict_source).toBe('cli_worker_output_contract');
   });
 
   it('revise verdict transitions task to failed with verdict metadata', async () => {
