@@ -99,6 +99,7 @@ jobs:
           src/hooks/merge-readiness/__tests__/runtime.test.ts
           src/hooks/merge-readiness/__tests__/tool-flow.test.ts
           src/__tests__/windows-prompt-hook-runner.test.ts
+          src/installer/__tests__/claude-md-transaction.test.ts
 
   build:
     name: Build
@@ -117,6 +118,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Verify committed plugin shipping surface
+        run: npm run plugin:shipping:verify
 
       - name: Build
         run: npm run build
@@ -150,27 +154,26 @@ jobs:
   no-committed-build-artifacts:
     name: No Committed Build Artifacts
     runs-on: ubuntu-latest
-    # PR-only: the maintainer regenerates dist/ and bridge/ in the merge/release
-    # commit, so pushes to dev/main legitimately change them. Contributors must not.
+    # This candidate-side classifier is credential-free containment only; it
+    # never authorizes generated artifacts or supplies merge approval.
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Reject committed dist/ or bridge/ changes
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Hold candidate generated changes
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          CHANGED=$(git diff --name-only "$BASE_SHA" HEAD -- dist/ bridge/ || true)
-          if [ -n "$CHANGED" ]; then
-            echo "::error::This PR commits generated build artifacts. dist/ and bridge/ are produced by 'npm run build' and must NOT be committed — the maintainer regenerates them at merge/release. Run 'git restore dist/ bridge/' and recommit. See .github/CLAUDE.md."
-            echo "Offending files:"
-            echo "$CHANGED" | sed 's/^/  - /'
-            exit 1
-          fi
-          echo "✅ No committed dist/ or bridge/ changes."
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node scripts/ci/check-no-committed-build-artifacts.mjs --base "$BASE_SHA" --head "$HEAD_SHA"
 
   multirepo-paths-gate:
     name: Multi-repo Path Gate (AST-grep)

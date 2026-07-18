@@ -9,7 +9,7 @@
  * of {worktree}/.omc/. This preserves state across worktree deletions.
  */
 import { createHash } from 'crypto';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { existsSync, mkdirSync, readFileSync, realpathSync, readdirSync, writeFileSync, unlinkSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { resolve, normalize, relative, sep, join, isAbsolute, basename, dirname } from 'path';
@@ -53,6 +53,8 @@ const MAX_WORKTREE_CACHE_SIZE = 8;
 const worktreeCacheMap = new Map();
 /** LRU cache for literal git-toplevel lookups (getGitTopLevel, no submodule climb). */
 const toplevelCacheMap = new Map();
+/** LRU cache for outermost superproject root lookups, including negative results. */
+const superprojectCacheMap = new Map();
 /**
  * LRU cache for workspace marker lookups.
  */
@@ -141,27 +143,60 @@ export function readWorkspaceMarkerConfig(workspaceRoot) {
  * `--show-superproject-working-tree` anchors state to the superproject, walking
  * up through nested submodules until no superproject remains.
  */
+function isDefinitiveNonGitError(error) {
+    if (!error || typeof error !== 'object')
+        return false;
+    const { status, stderr } = error;
+    if (status !== 128)
+        return false;
+    const output = typeof stderr === 'string'
+        ? stderr
+        : Buffer.isBuffer(stderr)
+            ? stderr.toString()
+            : '';
+    return /not a git repository/i.test(output);
+}
 function resolveSuperprojectRoot(cwd) {
+    const cacheKey = resolve(cwd);
+    if (superprojectCacheMap.has(cacheKey)) {
+        const cached = superprojectCacheMap.get(cacheKey) ?? null;
+        superprojectCacheMap.delete(cacheKey);
+        superprojectCacheMap.set(cacheKey, cached);
+        return cached;
+    }
     let anchor = null;
-    let probeCwd = cwd;
+    let probeCwd = cacheKey;
+    let completed = false;
     // Bounded by submodule nesting depth; guard against pathological loops.
     for (let depth = 0; depth < 32; depth++) {
         let superRoot;
         try {
-            superRoot = execSync('git rev-parse --show-superproject-working-tree', {
+            superRoot = execFileSync('git', ['rev-parse', '--show-superproject-working-tree'], {
                 cwd: probeCwd,
                 encoding: 'utf-8',
                 stdio: ['pipe', 'pipe', 'pipe'],
+                windowsHide: true,
                 timeout: 5000,
             }).trim();
         }
-        catch {
+        catch (error) {
+            completed = depth === 0 && isDefinitiveNonGitError(error);
             break;
         }
-        if (!superRoot)
+        if (!superRoot) {
+            completed = true;
             break;
+        }
         anchor = superRoot;
         probeCwd = superRoot;
+    }
+    if (completed) {
+        if (superprojectCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
+            const oldest = superprojectCacheMap.keys().next().value;
+            if (oldest !== undefined)
+                superprojectCacheMap.delete(oldest);
+        }
+        superprojectCacheMap.set(cacheKey, anchor);
     }
     return anchor;
 }
@@ -206,10 +241,11 @@ export function getGitTopLevel(cwd) {
         return root || null;
     }
     try {
-        const root = execSync('git rev-parse --show-toplevel', {
+        const root = execFileSync('git', ['rev-parse', '--show-toplevel'], {
             cwd: effectiveCwd,
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
             timeout: 5000,
         }).trim();
         if (toplevelCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
@@ -427,10 +463,11 @@ export function getProjectIdentifier(worktreeRoot) {
     }
     let source;
     try {
-        const remoteUrl = execSync('git remote get-url origin', {
+        const remoteUrl = execFileSync('git', ['remote', 'get-url', 'origin'], {
             cwd: root,
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
         }).trim();
         source = remoteUrl || root;
     }
@@ -445,10 +482,11 @@ export function getProjectIdentifier(worktreeRoot) {
     // directories despite sharing the same remote URL hash.
     let primaryRoot = root;
     try {
-        const commonDir = execSync('git rev-parse --path-format=absolute --git-common-dir', {
+        const commonDir = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
             cwd: root,
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
             timeout: 5000,
         }).trim();
         // Only resolve when --git-common-dir points to a .git directory.
@@ -654,6 +692,7 @@ export function ensureAllOmcDirs(worktreeRoot) {
 export function clearWorktreeCache() {
     worktreeCacheMap.clear();
     toplevelCacheMap.clear();
+    superprojectCacheMap.clear();
     workspaceCacheMap.clear();
 }
 // ============================================================================
@@ -982,10 +1021,11 @@ export function resolveTranscriptPath(transcriptPath, cwd) {
     // the main repo's encoded path. Use `git rev-parse --git-common-dir`
     // to find the main repo root and re-encode.
     try {
-        const gitCommonDir = execSync('git rev-parse --git-common-dir', {
+        const gitCommonDir = execFileSync('git', ['rev-parse', '--git-common-dir'], {
             cwd: effectiveCwd,
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
         }).trim();
         const absoluteCommonDir = resolve(effectiveCwd, gitCommonDir);
         // For linked worktrees, git-common-dir is <repo>/.git/worktrees/<name>
@@ -1000,10 +1040,11 @@ export function resolveTranscriptPath(transcriptPath, cwd) {
             mainRepoRoot = realpathSync(mainRepoRoot);
         }
         catch { /* keep as-is */ }
-        const worktreeTop = execSync('git rev-parse --show-toplevel', {
+        const worktreeTop = execFileSync('git', ['rev-parse', '--show-toplevel'], {
             cwd: effectiveCwd,
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
         }).trim();
         if (mainRepoRoot !== worktreeTop) {
             // basename handles `\` (Windows transcript_path) and `/` (POSIX).
@@ -1093,10 +1134,11 @@ export function validateWorkingDirectory(workingDirectory) {
 }
 function getGitCommonDir(cwd) {
     try {
-        const commonDir = execSync('git rev-parse --path-format=absolute --git-common-dir', {
+        const commonDir = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
             cwd,
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
             timeout: 5000,
         }).trim();
         return realpathSync(commonDir);

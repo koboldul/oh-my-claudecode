@@ -246,9 +246,9 @@ npm run build
 
 Runs the complete pipeline: `tsc` → esbuild bundles → docs composition → all bridge artifacts.
 
-### Do NOT commit `dist/` or `bridge/`
+### Generated `dist/` and `bridge/` changes are held
 
-`npm run build` regenerates `dist/` and `bridge/`. **These are build artifacts — do not commit them in your PR.** They are gitignored, but the `bridge/*.cjs` bundles are tracked in the repo, so a rebuild will show them as modified in your working tree. The maintainer regenerates them at merge/release; committing them in a contributor PR inflates the diff, causes merge conflicts, and obscures the real change.
+`npm run build` regenerates `dist/` and `bridge/`. **Do not commit these build artifacts in ordinary PRs.** They are gitignored, but tracked `bridge/*.cjs` bundles can appear modified after a rebuild. Committing them inflates the diff, causes merge conflicts, and obscures the source change.
 
 Before committing, restore them:
 
@@ -256,7 +256,9 @@ Before committing, restore them:
 git restore dist/ bridge/
 ```
 
-CI enforces this: the **No Committed Build Artifacts** check fails any PR whose diff touches `dist/` or `bridge/`. (Your source change still ships — `bridge/` is rebuilt from it when the maintainer merges.)
+The ordinary PR **No Committed Build Artifacts** job is a credential-free, candidate-side classifier. It is replaceable by the PR branch, is non-authoritative for every contributor and maintainer, and holds any candidate `dist/` or `bridge/` delta with `OWNER_CONFIRMATION_REQUIRED`; it cannot approve a generated change or authorize a merge.
+
+A generated delta remains held until owners provide protected split-root authorization: workflow root **W** is the reviewed workflow commit on default `main`; verifier/manifest root **B** is the detached protected `dev` event-base commit. The protected evidence must bind the final PR head **H**, its unique merge base, and complete generated delta records, then be evaluated in a fresh eligible event after B exists. Before merge, target-branch governance must remove this ordinary candidate check from required checks or supersede it with the required protected split-root check.
 
 ---
 

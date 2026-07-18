@@ -67,6 +67,7 @@ import { appendToInbox } from './worker-bootstrap.js';
 import { appendToLeaderInbox, ensureLeaderInbox } from './leader-inbox.js';
 import { formatMergeConflictForLeader, formatRebaseConflictForWorker, } from './conflict-mailbox.js';
 import { pauseHookViaSentinel, resumeHookViaSentinel, } from './worker-commit-cadence.js';
+const liveServiceOwners = new Map();
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 const DEFAULT_DRAIN_TIMEOUT_MS = 10000;
 // ---------------------------------------------------------------------------
@@ -128,6 +129,7 @@ function gitRevParseHead(repoRoot, branch) {
         cwd: repoRoot,
         encoding: 'utf-8',
         stdio: 'pipe',
+        windowsHide: true,
     }).trim();
 }
 function gitPath(worktreePath, gitPathName) {
@@ -136,6 +138,7 @@ function gitPath(worktreePath, gitPathName) {
             cwd: worktreePath,
             encoding: 'utf-8',
             stdio: 'pipe',
+            windowsHide: true,
         }).trim();
         if (resolved)
             return resolved;
@@ -156,6 +159,7 @@ function isWorktreeRegistered(repoRoot, wtPath) {
             cwd: repoRoot,
             encoding: 'utf-8',
             stdio: 'pipe',
+            windowsHide: true,
         });
         for (const line of out.split('\n')) {
             if (line.startsWith('worktree ')) {
@@ -179,6 +183,7 @@ function ensureMergerWorktree(repoRoot, mergerPath, leaderBranch) {
     execFileSync('git', ['worktree', 'add', '--force', mergerPath, leaderBranch], {
         cwd: repoRoot,
         stdio: 'pipe',
+        windowsHide: true,
     });
 }
 function preflightMergerWorktree(mergerPath, leaderBranch) {
@@ -187,6 +192,7 @@ function preflightMergerWorktree(mergerPath, leaderBranch) {
         execFileSync('git', ['fetch', '--no-tags', 'origin', leaderBranch], {
             cwd: mergerPath,
             stdio: 'pipe',
+            windowsHide: true,
         });
     }
     catch {
@@ -195,6 +201,7 @@ function preflightMergerWorktree(mergerPath, leaderBranch) {
     execFileSync('git', ['reset', '--hard', leaderBranch], {
         cwd: mergerPath,
         stdio: 'pipe',
+        windowsHide: true,
     });
 }
 function parseUUFiles(porcelainOutput) {
@@ -246,6 +253,16 @@ export async function startMergeOrchestrator(config) {
             persisted = { lastShas: {} };
         }
     }
+    const service = config.serviceGeneration === undefined || config.serviceAttemptId === undefined
+        ? undefined : { generation: config.serviceGeneration, attemptId: config.serviceAttemptId };
+    const live = liveServiceOwners.get(config.teamName);
+    if (service && live && (live.generation > service.generation || (live.generation === service.generation && live.attemptId !== service.attemptId))) {
+        throw new Error('auto_merge_service_owned_by_live_generation');
+    }
+    if (service)
+        liveServiceOwners.set(config.teamName, service);
+    const ownsService = () => !service || liveServiceOwners.get(config.teamName)?.generation === service.generation
+        && liveServiceOwners.get(config.teamName)?.attemptId === service.attemptId;
     const workers = new Map();
     const pausedWorkers = new Set(); // workers mid-rebase (cadence paused)
     const mutex = createMutex();
@@ -253,6 +270,7 @@ export async function startMergeOrchestrator(config) {
     function persistState() {
         const payload = {
             lastShas: Object.fromEntries(Array.from(workers.values()).map((w) => [w.workerName, w.lastObservedSha])),
+            ...(service ? { service } : {}),
         };
         atomicWriteJson(persistedPath, payload);
     }
@@ -282,6 +300,7 @@ export async function startMergeOrchestrator(config) {
                 execFileSync('git', ['fetch', '--no-tags', 'origin', config.leaderBranch], {
                     cwd: wtPath,
                     stdio: 'pipe',
+                    windowsHide: true,
                 });
             }
             catch {
@@ -291,6 +310,7 @@ export async function startMergeOrchestrator(config) {
                 execFileSync('git', ['rebase', config.leaderBranch], {
                     cwd: wtPath,
                     stdio: 'pipe',
+                    windowsHide: true,
                 });
                 // Clean rebase — resume immediately.
                 await resumeHookViaSentinel(wtPath);
@@ -308,6 +328,7 @@ export async function startMergeOrchestrator(config) {
                         cwd: wtPath,
                         encoding: 'utf-8',
                         stdio: 'pipe',
+                        windowsHide: true,
                     });
                     conflictingFiles = parseUUFiles(status);
                 }
@@ -320,6 +341,7 @@ export async function startMergeOrchestrator(config) {
                             cwd: config.repoRoot,
                             encoding: 'utf-8',
                             stdio: 'pipe',
+                            windowsHide: true,
                         }).trim();
                     }
                     catch {
@@ -378,7 +400,7 @@ export async function startMergeOrchestrator(config) {
                 // Deliver merge-conflict mailbox to leader.
                 let mergeBaseSha = 'unknown';
                 try {
-                    mergeBaseSha = execFileSync('git', ['merge-base', config.leaderBranch, entry.workerBranch], { cwd: mergerPath, encoding: 'utf-8', stdio: 'pipe' }).trim();
+                    mergeBaseSha = execFileSync('git', ['merge-base', config.leaderBranch, entry.workerBranch], { cwd: mergerPath, encoding: 'utf-8', stdio: 'pipe', windowsHide: true }).trim();
                 }
                 catch {
                     // best-effort
@@ -448,7 +470,7 @@ export async function startMergeOrchestrator(config) {
         });
     }
     async function runPollOnce() {
-        if (stopped)
+        if (stopped || !ownsService())
             return;
         for (const entry of workers.values()) {
             // Apply per-worker exponential backoff: skip ticks based on consecutiveFailures.
@@ -521,6 +543,7 @@ export async function startMergeOrchestrator(config) {
                 cwd: entry.workerWorktreePath,
                 encoding: 'utf-8',
                 stdio: 'pipe',
+                windowsHide: true,
             }).trim();
             if (status.length > 0) {
                 const dirtyFiles = status
@@ -560,6 +583,8 @@ export async function startMergeOrchestrator(config) {
     // ----- Public handle -----
     return {
         async registerWorker(workerName) {
+            if (!ownsService())
+                return;
             if (workers.has(workerName))
                 return;
             const workerBranch = getBranchName(config.teamName, workerName);
@@ -594,6 +619,8 @@ export async function startMergeOrchestrator(config) {
             }
         },
         async unregisterWorker(workerName) {
+            if (!ownsService())
+                return;
             workers.delete(workerName);
             pausedWorkers.delete(workerName);
             try {
@@ -607,6 +634,8 @@ export async function startMergeOrchestrator(config) {
             await runPollOnce();
         },
         async drainAndStop() {
+            if (!ownsService())
+                return { unmerged: [] };
             stopped = true;
             clearInterval(interval);
             const start = Date.now();
@@ -668,6 +697,8 @@ export async function startMergeOrchestrator(config) {
                     // best-effort
                 }
             }
+            if (service && ownsService())
+                liveServiceOwners.delete(config.teamName);
             return { unmerged };
         },
         getState() {

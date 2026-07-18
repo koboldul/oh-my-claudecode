@@ -220,24 +220,44 @@ export class LspClient {
      * Handle a parsed JSON-RPC message
      */
     handleMessage(message) {
-        if ('id' in message && message.id !== undefined) {
+        const record = message;
+        const hasOwnMethod = Object.prototype.hasOwnProperty.call(message, 'method');
+        const hasOwnId = Object.prototype.hasOwnProperty.call(message, 'id');
+        if (hasOwnMethod && typeof record.method === 'string') {
+            const id = record.id;
+            if (hasOwnId) {
+                if (typeof id === 'string' || (typeof id === 'number' && Number.isInteger(id))) {
+                    this.handleServerRequest(message);
+                }
+                return;
+            }
+            this.handleNotification(message);
+            return;
+        }
+        if (!hasOwnMethod && hasOwnId && typeof record.id === 'number') {
             // Response to a request
-            const pending = this.pendingRequests.get(message.id);
+            const response = message;
+            const pending = this.pendingRequests.get(response.id);
             if (pending) {
                 clearTimeout(pending.timeout);
-                this.pendingRequests.delete(message.id);
-                if (message.error) {
-                    pending.reject(new Error(message.error.message));
+                this.pendingRequests.delete(response.id);
+                if (response.error) {
+                    pending.reject(new Error(response.error.message));
                 }
                 else {
-                    pending.resolve(message.result);
+                    pending.resolve(response.result);
                 }
             }
         }
-        else if ('method' in message) {
-            // Notification from server
-            this.handleNotification(message);
-        }
+    }
+    /** Reply to unsupported server requests without claiming they succeeded. */
+    handleServerRequest(request) {
+        const error = request.method === 'client/registerCapability'
+            ? { code: -32803, message: 'Dynamic capability registration is not supported' }
+            : { code: -32601, message: 'Method not found' };
+        const response = { jsonrpc: '2.0', id: request.id, error };
+        const content = JSON.stringify(response);
+        this.process?.stdin?.write(`Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`);
     }
     /**
      * Handle server notifications
@@ -680,12 +700,11 @@ export class LspClientManager {
      * Get or create a client for a file
      */
     async getClientForFile(filePath) {
-        const serverConfig = getServerForFile(filePath);
+        const workspaceRoot = this.findWorkspaceRoot(filePath);
+        const serverConfig = getServerForFile(filePath, workspaceRoot);
         if (!serverConfig) {
             return null;
         }
-        // Find workspace root
-        const workspaceRoot = this.findWorkspaceRoot(filePath);
         const devContainerContext = resolveDevContainerContext(workspaceRoot);
         const key = `${workspaceRoot}:${serverConfig.command}:${devContainerContext?.containerId ?? 'host'}`;
         let client = this.clients.get(key);
@@ -708,11 +727,11 @@ export class LspClientManager {
      * The lastUsed timestamp is refreshed on both entry and exit.
      */
     async runWithClientLease(filePath, fn) {
-        const serverConfig = getServerForFile(filePath);
+        const workspaceRoot = this.findWorkspaceRoot(filePath);
+        const serverConfig = getServerForFile(filePath, workspaceRoot);
         if (!serverConfig) {
             throw new Error(`No language server available for: ${filePath}`);
         }
-        const workspaceRoot = this.findWorkspaceRoot(filePath);
         const devContainerContext = resolveDevContainerContext(workspaceRoot);
         const key = `${workspaceRoot}:${serverConfig.command}:${devContainerContext?.containerId ?? 'host'}`;
         let client = this.clients.get(key);

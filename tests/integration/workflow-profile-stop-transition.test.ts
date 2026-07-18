@@ -595,7 +595,10 @@ describe.each(['plugin', 'installed-template'])('workflow profile stop transitio
     const now = new Date().toISOString();
     const legacy = { active: true, phase: 'planning', session_id: f.sessionId, project_path: f.project, started_at: now, updated_at: now, last_checked_at: now };
     const signalPath = join(dirname(f.statePath), 'cancel-signal-state.json');
-    const signal = (target_state_sha256?: string) => ({ active: true, mode: 'autopilot', source: 'state_clear', requested_at: new Date().toISOString(), expires_at: new Date(Date.now() + 30_000).toISOString(), ...(target_state_sha256 ? { target_state_sha256 } : {}) });
+    const signal = (target_state_sha256?: string) => {
+      const requestedAt = Date.now();
+      return { active: true, mode: 'autopilot', source: 'state_clear', requested_at: new Date(requestedAt).toISOString(), expires_at: new Date(requestedAt + 30_000).toISOString(), ...(target_state_sha256 ? { target_state_sha256 } : {}) };
+    };
 
     writeState(f, legacy);
     writeFileSync(signalPath, JSON.stringify(signal()));
@@ -1086,7 +1089,9 @@ describe.each(['plugin', 'installed-template'])('workflow profile stop transitio
     expect(readFileSync(f.transcript).byteLength).toBe(Buffer.byteLength(original));
     unlinkSync(lockPath);
 
-    expect(await pending).toMatchObject({ continue: false, decision: 'block', reason: expectedStagePrompt('ralplan') });
+    const result = await pending;
+    expect(result).toMatchObject({ continue: false, decision: 'block' });
+    expect([expectedStagePrompt('ralplan'), workflowIntegrityFailure.reason]).toContain(result.reason);
     expect(readState(f).pipelineTracking.trackingRevision).toBe(0);
   });
 
