@@ -464,7 +464,7 @@ describe('canonical hook reduction', () => {
     ]);
   });
 
-  it('discards mutation on deny', () => {
+  it('denies and retries when a deny branch cannot emit a required mutation', () => {
     const deny = reduceHookEvaluations(copilotEnvelope(1), [{
       callId: 'call-0',
       decision: 'deny',
@@ -474,14 +474,19 @@ describe('canonical hook reduction', () => {
       },
     }]);
 
-    expect(deny.mutations).toEqual([]);
+    expect(deny).toMatchObject({
+      decision: 'deny',
+      retry: true,
+      unchanged: true,
+      mutations: [],
+    });
+    expect(deny.diagnostics).toEqual([
+      expect.stringContaining('decision "deny" does not encode input mutation'),
+    ]);
   });
 
-  it('preserves a required ask mutation for a supported singleton host', () => {
-    const envelope = withCapabilities(copilotEnvelope(1), {
-      singletonMutationOutput: true,
-    });
-    const result = reduceHookEvaluations(envelope, [{
+  it('preserves a required ask mutation for a Copilot singleton', () => {
+    const result = reduceHookEvaluations(copilotEnvelope(1), [{
       callId: 'call-0',
       decision: 'ask',
       reason: 'Confirm the sanitized input.',
@@ -504,16 +509,19 @@ describe('canonical hook reduction', () => {
     });
   });
 
-  it('denies and retries an unsupported required ask mutation', () => {
-    const result = reduceHookEvaluations(copilotEnvelope(1), [{
-      callId: 'call-0',
-      decision: 'ask',
-      reason: 'Confirm the sanitized input.',
-      mutation: {
-        input: { pattern: 'changed' },
-        requirement: 'required',
+  it('denies an uncorrelatable batched ask without retaining its mutation', () => {
+    const result = reduceHookEvaluations(copilotEnvelope(2), [
+      {
+        callId: 'call-0',
+        decision: 'ask',
+        reason: 'Confirm the sanitized input.',
+        mutation: {
+          input: { pattern: 'changed' },
+          requirement: 'required',
+        },
       },
-    }]);
+      { callId: 'call-1', decision: 'allow' },
+    ]);
 
     expect(result).toMatchObject({
       decision: 'deny',
@@ -521,13 +529,10 @@ describe('canonical hook reduction', () => {
       unchanged: true,
       mutations: [],
     });
-    expect(result.reason).toContain('retry the call separately');
-    expect(result.diagnostics).toEqual([
-      expect.stringContaining('Required input mutation'),
-    ]);
+    expect(result.reason).toContain('cannot correlate confirmation');
   });
 
-  it('keeps ask while explicitly diagnosing an unsupported optional mutation', () => {
+  it('keeps ask with a supported optional singleton mutation', () => {
     const result = reduceHookEvaluations(copilotEnvelope(1), [{
       callId: 'call-0',
       decision: 'ask',
@@ -542,12 +547,14 @@ describe('canonical hook reduction', () => {
       decision: 'ask',
       reason: 'Confirm the original input.',
       retry: false,
-      unchanged: true,
-      mutations: [],
+      unchanged: false,
+      mutations: [{
+        callId: 'call-0',
+        input: { pattern: 'optional-change' },
+        requirement: 'optional',
+      }],
     });
-    expect(result.diagnostics).toEqual([
-      expect.stringContaining('Optional input mutation'),
-    ]);
+    expect(result.diagnostics).toEqual([]);
   });
 
   it('passes an unsupported optional multi-call mutation unchanged with a diagnostic', () => {
@@ -596,10 +603,7 @@ describe('canonical hook reduction', () => {
   });
 
   it('retains a supported singleton mutation', () => {
-    const envelope = withCapabilities(copilotEnvelope(1), {
-      singletonMutationOutput: true,
-    });
-    const result = reduceHookEvaluations(envelope, [{
+    const result = reduceHookEvaluations(copilotEnvelope(1), [{
       callId: 'call-0',
       decision: 'allow',
       mutation: {
@@ -617,6 +621,96 @@ describe('canonical hook reduction', () => {
         requirement: 'optional',
       }],
     });
+  });
+
+  it.each([
+    {
+      name: 'mismatched callId',
+      callId: 'other-call',
+      input: { pattern: 'changed' },
+      diagnostic: 'does not match "call-0"',
+    },
+    {
+      name: 'scalar input',
+      callId: 'call-0',
+      input: 'changed',
+      diagnostic: 'replacement input must be a plain object',
+    },
+    {
+      name: 'null input',
+      callId: 'call-0',
+      input: null,
+      diagnostic: 'replacement input must be a plain object',
+    },
+  ])('denies and retries a required singleton mutation with $name', ({
+    callId,
+    input,
+    diagnostic,
+  }) => {
+    const result = reduceHookEvaluations(copilotEnvelope(1), [{
+      callId,
+      decision: 'pass',
+      mutation: {
+        input,
+        requirement: 'required',
+      },
+    }]);
+
+    expect(result).toMatchObject({
+      decision: 'deny',
+      retry: true,
+      unchanged: true,
+      mutations: [],
+    });
+    expect(result.diagnostics).toEqual([
+      expect.stringContaining(diagnostic),
+    ]);
+    expect(result.contexts).toContain(result.diagnostics[0]);
+  });
+
+  it.each([
+    {
+      name: 'mismatched callId',
+      callId: 'other-call',
+      input: { pattern: 'changed' },
+      diagnostic: 'does not match "call-0"',
+    },
+    {
+      name: 'scalar input',
+      callId: 'call-0',
+      input: 42,
+      diagnostic: 'replacement input must be a plain object',
+    },
+    {
+      name: 'null input',
+      callId: 'call-0',
+      input: null,
+      diagnostic: 'replacement input must be a plain object',
+    },
+  ])('discards an optional singleton mutation with $name', ({
+    callId,
+    input,
+    diagnostic,
+  }) => {
+    const result = reduceHookEvaluations(copilotEnvelope(1), [{
+      callId,
+      decision: 'pass',
+      mutation: {
+        input,
+        requirement: 'optional',
+      },
+    }]);
+
+    expect(result).toMatchObject({
+      decision: 'pass',
+      retry: false,
+      unchanged: true,
+      mutations: [],
+    });
+    expect(result.diagnostics).toEqual([
+      expect.stringContaining(diagnostic),
+    ]);
+    expect(result.contexts).toContain(result.diagnostics[0]);
   });
 
   it('deduplicates and bounds context in first-seen order', () => {

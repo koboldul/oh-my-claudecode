@@ -447,7 +447,7 @@ describe('plugin shipping surface transaction', () => {
     );
   });
 
-  it('does not let a base-owned generated directory bless a candidate-only runtime artifact', () => {
+  it('includes a built hook runtime in local closure without blessing a feature PR commit', async () => {
     const fixture = createFixture();
     writeJson(join(fixture.root, 'package.json'), {
       name: 'fixture-plugin',
@@ -461,15 +461,20 @@ describe('plugin shipping surface transaction', () => {
     git(fixture.root, ['commit', '--quiet', '-m', 'declare generated directories']);
     const base = git(fixture.root, ['rev-parse', 'HEAD']).trim();
 
-    writeFileSync(join(fixture.root, 'bridge', 'unrelated.cjs'), 'module.exports = true;\n');
-    git(fixture.root, ['add', '-f', '--', 'bridge/unrelated.cjs']);
-    git(fixture.root, ['commit', '--quiet', '-m', 'add candidate-only generated artifact']);
+    writeFileSync(join(fixture.root, 'bridge', 'hook-runtime.cjs'), 'module.exports = true;\n');
+    const module = await shippingSurface;
+    const localSurface = module.inspectPluginShippingSurface(fixture.root);
+    expect(localSurface.requiredPaths).toContain('bridge/hook-runtime.cjs');
+    expect(localSurface.stagePaths).toContain('bridge/hook-runtime.cjs');
+
+    git(fixture.root, ['add', '-f', '--', 'bridge/hook-runtime.cjs']);
+    git(fixture.root, ['commit', '--quiet', '-m', 'add candidate-only hook runtime']);
 
     const result = run(fixture.root, 'check-pr', '--base', base);
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(
-      'pull request changes generated artifacts outside the runtime closure: bridge/unrelated.cjs',
+      'pull request changes generated artifacts outside the runtime closure: bridge/hook-runtime.cjs',
     );
   });
 

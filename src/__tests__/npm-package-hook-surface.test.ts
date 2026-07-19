@@ -13,7 +13,7 @@ import {
 } from './npm-package-surface-helpers.js';
 
 describe('npm package hook surface regression', () => {
-  it('builds the coordinator for packaging without mutating ordinary test entrypoints', () => {
+  it('builds generated hook runtimes for packaging without mutating ordinary test entrypoints', () => {
     const packageJson = JSON.parse(
       readFileSync(join(PACKAGE_ROOT, 'package.json'), 'utf-8'),
     ) as {
@@ -24,9 +24,19 @@ describe('npm package hook surface regression', () => {
     expect(packageJson.scripts?.build).toMatch(
       /npm run compose-docs && npm run build:claude-md-coordinator/,
     );
+    expect(packageJson.scripts?.build).toContain('npm run build:hook-runtime');
+    expect(packageJson.scripts?.['build:hook-runtime']).toBe(
+      'node scripts/build-hook-runtime.mjs',
+    );
+    expect(
+      existsSync(join(PACKAGE_ROOT, 'scripts', 'build-hook-runtime.mjs')),
+    ).toBe(true);
     for (const entrypoint of ['test', 'test:ui', 'test:run', 'test:coverage']) {
       expect(packageJson.scripts?.[entrypoint], entrypoint).not.toContain(
         'build:claude-md-coordinator',
+      );
+      expect(packageJson.scripts?.[entrypoint], entrypoint).not.toContain(
+        'build:hook-runtime',
       );
     }
     expect(packageJson.scripts?.prepack).toBe('npm run build');
@@ -35,6 +45,7 @@ describe('npm package hook surface regression', () => {
       expect.arrayContaining([
         '.claude-plugin',
         '.mcp.json',
+        'bridge',
         'hooks',
         'scripts',
         'templates',

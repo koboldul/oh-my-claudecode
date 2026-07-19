@@ -1,0 +1,13 @@
+{
+  "continue": true,
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow",
+    "updatedInput": {
+      "command": "<command>",
+      "description": "<description>",
+      "initial_wait": 30
+    },
+    "additionalContext": "<additional-context>"
+  }
+}

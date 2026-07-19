@@ -1,0 +1,8 @@
+{
+  "permissionDecision": "allow",
+  "modifiedArgs": {
+    "command": "<command>",
+    "description": "<description>",
+    "initial_wait": 30
+  }
+}

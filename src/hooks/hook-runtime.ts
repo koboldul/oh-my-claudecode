@@ -12,6 +12,15 @@ import {
   type HookMutationIntent,
   type HookReduction,
 } from './hook-protocol.js';
+import { canEncodeHookMutation } from './hook-output.js';
+
+export {
+  canEncodeHookMutation,
+  encodeClaudeHookOutput,
+  encodeCopilotHookOutput,
+  encodeHookOutput,
+  type EncodedHookOutput,
+} from './hook-output.js';
 
 export const MAX_HOOK_CONTEXT_MESSAGES = 8;
 export const MAX_HOOK_CONTEXT_CHARACTERS = 6_000;
@@ -56,6 +65,17 @@ interface DecisionCandidate {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
+    return false;
+  }
 }
 
 function normalizeEventName(hookType: string): string {
@@ -267,20 +287,47 @@ function normalizationSafetyIssue(envelope: CanonicalHookEnvelope) {
   });
 }
 
-function mutationSupported(
+function mutationRepresentationIssue(
   envelope: CanonicalHookEnvelope,
-  evaluation: HookEvaluation,
-): boolean {
+  decision: HookDecision,
+  callId: string | undefined,
+  input: unknown,
+): string | undefined {
+  if (!canEncodeHookMutation(envelope, decision)) {
+    return `${envelope.host} ${envelope.hookType} output for decision "${decision}" does not encode input mutation`;
+  }
+
   const logicalCallCount = Number.isInteger(envelope.logicalCallCount)
     ? envelope.logicalCallCount
     : envelope.toolCalls.length;
   if (logicalCallCount > 1) {
-    return Boolean(
-      evaluation.callId
-      && envelope.capabilities.correlatedMutationOutput,
-    );
+    if (!callId || !envelope.capabilities.correlatedMutationOutput) {
+      return 'correlated multi-call mutation output is unsupported';
+    }
+    if (!envelope.toolCalls.some((call) => call.id === callId)) {
+      return `callId "${callId}" does not identify a logical call in the batch`;
+    }
+  } else {
+    if (logicalCallCount !== 1) {
+      return 'mutation output requires exactly one logical call';
+    }
+    if (!envelope.capabilities.singletonMutationOutput) {
+      return 'singleton mutation output is unsupported';
+    }
+    if (callId) {
+      const onlyCall = envelope.toolCalls[0];
+      if (!onlyCall || callId !== onlyCall.id) {
+        const expectedCall = onlyCall
+          ? `"${onlyCall.id}"`
+          : 'the sole logical call';
+        return `callId "${callId}" does not match ${expectedCall}`;
+      }
+    }
   }
-  return envelope.capabilities.singletonMutationOutput;
+
+  return isPlainObject(input)
+    ? undefined
+    : 'replacement input must be a plain object';
 }
 
 function normalizeEffects(evaluations: readonly HookEvaluation[]): HookEffect[] {
@@ -482,47 +529,52 @@ function reduceHookEvaluationsInternal(
     );
   }
 
-  if (decision !== 'deny') {
-    let discardedOptionalMutation = false;
+  let discardedOptionalMutation = false;
 
-    for (const evaluation of normalizedEvaluations) {
-      if (!evaluation.mutation) continue;
+  for (const evaluation of normalizedEvaluations) {
+    if (!evaluation.mutation) continue;
 
-      if (mutationSupported(envelope, evaluation)) {
-        mutations.push({
-          callId: evaluation.callId,
-          input: evaluation.mutation.input,
-          requirement: evaluation.mutation.requirement,
-        });
-        continue;
-      }
-
-      const callLabel = evaluation.callId
-        ? ` for call "${evaluation.callId}"`
-        : '';
-      if (evaluation.mutation.requirement === 'required') {
-        decision = 'deny';
-        retry = true;
-        reason = `Required input mutation${callLabel} cannot be represented by ${envelope.contract}; retry the call separately with the required input changes.`;
-        diagnostics.push(reason);
-        mutations.length = 0;
-        break;
-      }
-
-      discardedOptionalMutation = true;
-      diagnostics.push(
-        `Optional input mutation${callLabel} was not applied because ${envelope.contract} does not support this mutation output; the original input will be used.`,
-      );
+    const representationIssue = mutationRepresentationIssue(
+      envelope,
+      decision,
+      evaluation.callId,
+      evaluation.mutation.input,
+    );
+    if (!representationIssue) {
+      mutations.push({
+        callId: evaluation.callId,
+        input: evaluation.mutation.input,
+        requirement: evaluation.mutation.requirement,
+      });
+      continue;
     }
 
-    if (
-      discardedOptionalMutation
-      && decision !== 'deny'
-      && decision !== 'ask'
-    ) {
-      decision = 'pass';
+    const callLabel = evaluation.callId
+      ? ` for call "${evaluation.callId}"`
+      : '';
+    if (evaluation.mutation.requirement === 'required') {
+      decision = 'deny';
+      retry = true;
+      const mutationReason = `Required input mutation${callLabel} cannot be represented by ${envelope.contract} because ${representationIssue}; retry the call separately with the required input changes.`;
+      reason = reason ? `${reason} ${mutationReason}` : mutationReason;
+      diagnostics.push(mutationReason);
       mutations.length = 0;
+      break;
     }
+
+    discardedOptionalMutation = true;
+    diagnostics.push(
+      `Optional input mutation${callLabel} was not applied because ${envelope.contract} cannot represent it: ${representationIssue}; the original input will be used.`,
+    );
+  }
+
+  if (
+    discardedOptionalMutation
+    && decision !== 'deny'
+    && decision !== 'ask'
+  ) {
+    decision = 'pass';
+    mutations.length = 0;
   }
 
   const boundedDiagnostics = boundHookContexts(diagnostics);

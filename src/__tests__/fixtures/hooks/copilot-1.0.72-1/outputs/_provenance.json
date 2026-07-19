@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "copilotVersion": "1.0.72-1",
+  "sourceArtifacts": [
+    ".omc/research/copilot-hook-output-contracts/report.md",
+    ".omc/research/copilot-hook-output-contracts/evidence.json"
+  ],
+  "fixtures": {
+    "preToolUse-pass.json": {
+      "status": "observed",
+      "evidenceId": "pass-empty-camel"
+    },
+    "preToolUse-allow.json": {
+      "status": "observed",
+      "evidenceId": "allow-camel"
+    },
+    "preToolUse-deny.json": {
+      "status": "observed",
+      "evidenceId": "deny-reason-camel"
+    },
+    "preToolUse-ask.json": {
+      "status": "observed",
+      "evidenceId": "ask-camel"
+    },
+    "preToolUse-modifiedArgs.json": {
+      "status": "observed",
+      "evidenceId": "modifiedArgs-camel",
+      "mutationSemantics": "complete-replacement"
+    },
+    "preToolUse-additionalContext.json": {
+      "status": "observed",
+      "evidenceId": "additionalContext-camel"
+    },
+    "agentStop-block.json": {
+      "status": "observed",
+      "evidenceId": "agentStop-block"
+    },
+    "agentStop-pass.json": {
+      "status": "observed",
+      "evidenceId": "agentStop-block",
+      "observation": "empty output released the second stop"
+    }
+  },
+  "excluded": {
+    "preToolUse-literal-pass": {
+      "evidenceId": "pass-literal-camel",
+      "reason": "tolerated by this CLI version but absent from the bundled SDK type"
+    }
+  }
+}

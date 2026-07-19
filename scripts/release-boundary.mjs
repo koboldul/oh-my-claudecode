@@ -36,6 +36,7 @@ const REQUIRED_ENTRYPOINTS = Object.freeze([
   'bin/oh-my-claudecode.js',
   'bridge/cli.cjs',
   'bridge/claude-md-coordinator.cjs',
+  'bridge/hook-runtime.cjs',
   'bridge/mcp-server.cjs',
   'bridge/runtime-cli.cjs',
   'bridge/team.js',

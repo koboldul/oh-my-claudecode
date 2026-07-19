@@ -75,6 +75,20 @@ describe('no committed build artifacts candidate classifier', () => {
     expect(result.stderr).toContain('OWNER_CONFIRMATION_REQUIRED: candidate generated delta: "bridge/candidate\\nname.cjs"');
   });
 
+  it('keeps the generated hook runtime out of feature PR commits', () => {
+    const root = fixture();
+    const base = git(root, ['rev-parse', 'HEAD']).trim();
+    mkdirSync(join(root, 'bridge'), { recursive: true });
+    writeFileSync(join(root, 'bridge', 'hook-runtime.cjs'), 'module.exports = {};\n');
+    const head = commit(root, 'candidate hook runtime');
+    const result = run(root, base, head);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(
+      'OWNER_CONFIRMATION_REQUIRED: candidate generated delta: "bridge/hook-runtime.cjs"',
+    );
+  });
+
   it('rejects malformed, unavailable, duplicate, unknown, and mismatched head inputs', () => {
     const root = fixture();
     const head = git(root, ['rev-parse', 'HEAD']).trim();

@@ -137,6 +137,7 @@ function releaseTarball(gitHead = SHA, extraEntries: TarEntry[] = [], readme = '
     { path: 'package/bin/oh-my-claudecode.js', content: '#!/usr/bin/env node\n', mode: 0o755 },
     { path: 'package/bridge/cli.cjs', content: 'module.exports = {};\n' },
     { path: 'package/bridge/claude-md-coordinator.cjs', content: 'module.exports = {};\n' },
+    { path: 'package/bridge/hook-runtime.cjs', content: 'module.exports = {};\n' },
     { path: 'package/bridge/mcp-server.cjs', content: 'module.exports = {};\n' },
     { path: 'package/bridge/runtime-cli.cjs', content: 'module.exports = {};\n' },
     { path: 'package/bridge/team.js', content: 'export {};\n' },
@@ -407,6 +408,11 @@ describe('release-boundary.mjs', () => {
       byteLength: expect.any(Number),
       sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
     }));
+    expect(evidence.archiveManifest.files).toContainEqual(expect.objectContaining({
+      path: 'package/bridge/hook-runtime.cjs',
+      byteLength: expect.any(Number),
+      sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+    }));
     expect(evidence.archiveManifest.files.map((file: { path: string }) => file.path)).toEqual([
       'package/.claude-plugin/marketplace.json',
       'package/.claude-plugin/plugin.json',
@@ -415,6 +421,7 @@ describe('release-boundary.mjs', () => {
       'package/bin/oh-my-claudecode.js',
       'package/bridge/claude-md-coordinator.cjs',
       'package/bridge/cli.cjs',
+      'package/bridge/hook-runtime.cjs',
       'package/bridge/mcp-server.cjs',
       'package/bridge/runtime-cli.cjs',
       'package/bridge/team.js',
@@ -434,11 +441,26 @@ describe('release-boundary.mjs', () => {
       { path: 'package/.mcp.json', content: JSON.stringify({ mcpServers: { omc: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/bridge/mcp-server.cjs'] } } }) },
       { path: 'package/bin/oh-my-claudecode.js', content: '#!/usr/bin/env node\n', mode: 0o755 },
       { path: 'package/bridge/cli.cjs', content: 'module.exports = {};\n' },
+      { path: 'package/bridge/hook-runtime.cjs', content: 'module.exports = {};\n' },
       { path: 'package/bridge/mcp-server.cjs', content: 'module.exports = {};\n' },
       { path: 'package/bridge/runtime-cli.cjs', content: 'module.exports = {};\n' },
       { path: 'package/bridge/team.js', content: 'export {};\n' },
     ]));
     expect(() => assertArchive(missingCoordinatorPath, { version: VERSION, gitHead: SHA })).toThrow('bridge/claude-md-coordinator.cjs');
+    const missingHookRuntimePath = writeTarball(root, 'missing-hook-runtime.tgz', makeTarball([
+      { path: 'package/package.json', content: `${JSON.stringify(packageManifest(SHA), null, 2)}\n` },
+      { path: 'package/.claude-plugin/plugin.json', content: JSON.stringify({ name: 'oh-my-claudecode', version: VERSION }) },
+      { path: 'package/plugin.json', content: JSON.stringify({ name: 'oh-my-claudecode', version: VERSION, agents: './agents-copilot/' }) },
+      { path: 'package/.claude-plugin/marketplace.json', content: JSON.stringify({ version: VERSION, plugins: [{ name: 'oh-my-claudecode', version: VERSION, source: './' }] }) },
+      { path: 'package/.mcp.json', content: JSON.stringify({ mcpServers: { omc: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/bridge/mcp-server.cjs'] } } }) },
+      { path: 'package/bin/oh-my-claudecode.js', content: '#!/usr/bin/env node\n', mode: 0o755 },
+      { path: 'package/bridge/cli.cjs', content: 'module.exports = {};\n' },
+      { path: 'package/bridge/claude-md-coordinator.cjs', content: 'module.exports = {};\n' },
+      { path: 'package/bridge/mcp-server.cjs', content: 'module.exports = {};\n' },
+      { path: 'package/bridge/runtime-cli.cjs', content: 'module.exports = {};\n' },
+      { path: 'package/bridge/team.js', content: 'export {};\n' },
+    ]));
+    expect(() => assertArchive(missingHookRuntimePath, { version: VERSION, gitHead: SHA })).toThrow('bridge/hook-runtime.cjs');
     await expect(cliMain([
       'assert-evidence',
       '--tarball',

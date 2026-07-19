@@ -88,7 +88,7 @@ export const COPILOT_1072_CAPABILITIES: HookCapabilities = Object.freeze({
   batchInput: true,
   correlatedDecisionOutput: false,
   correlatedMutationOutput: false,
-  singletonMutationOutput: false,
+  singletonMutationOutput: true,
 });
 
 export type NormalizationIssueCode =

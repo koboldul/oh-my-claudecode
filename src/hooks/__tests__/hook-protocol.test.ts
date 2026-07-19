@@ -306,7 +306,7 @@ describe('canonical hook protocol normalization', () => {
     );
   });
 
-  it('marks unverified Copilot decision and mutation capabilities unsupported', () => {
+  it('marks only proven Copilot singleton mutation support as available', () => {
     const envelope = normalizeHookEnvelope({
       sessionId: 'session',
       toolCalls: [copilotCall('call-1', 0)],
@@ -317,7 +317,7 @@ describe('canonical hook protocol normalization', () => {
       batchInput: true,
       correlatedDecisionOutput: false,
       correlatedMutationOutput: false,
-      singletonMutationOutput: false,
+      singletonMutationOutput: true,
     });
   });
 
