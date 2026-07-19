@@ -18,9 +18,16 @@ import { wrapWithLoginShell, quoteShellArg } from '../tmux-utils.js';
 import { buildEnvExportPrefix } from '../launch.js';
 
 function isTmuxAvailable(): boolean {
+  if (process.env.OMC_RUN_TMUX_INTEGRATION !== '1') {
+    return false;
+  }
+
   try {
-    execFileSync('tmux', ['-V'], { stdio: 'ignore' });
-    return true;
+    const version = execFileSync('tmux', ['-V'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return /\b(?:tmux|psmux)\b/i.test(version);
   } catch {
     return false;
   }
