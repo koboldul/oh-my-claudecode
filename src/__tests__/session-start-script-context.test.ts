@@ -7,6 +7,14 @@ import { join } from 'node:path';
 const SCRIPT_PATH = join(__dirname, '..', '..', 'scripts', 'session-start.mjs');
 const NODE = process.execPath;
 
+function isolatedHostEnv(host: 'claude' | 'copilot'): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.COPILOT_CLI;
+  delete env.COPILOT_AGENT_SESSION_ID;
+  delete env.OMC_HOST;
+  return { ...env, OMC_HOST: host };
+}
+
 describe('session-start.mjs regression #1386', () => {
   let tempDir: string;
   let fakeHome: string;
@@ -44,14 +52,9 @@ describe('session-start.mjs regression #1386', () => {
       }),
       encoding: 'utf-8',
       env: {
-        ...process.env,
+        ...isolatedHostEnv('claude'),
         HOME: fakeHome,
         USERPROFILE: fakeHome,
-        // Pin the Claude Code host explicitly so these default-behavior
-        // assertions are deterministic even when the test suite itself runs
-        // inside a Copilot CLI session (ambient COPILOT_CLI/
-        // COPILOT_AGENT_SESSION_ID would otherwise leak through).
-        OMC_HOST: 'claude',
       },
       timeout: 15000,
     }).trim();
@@ -136,12 +139,9 @@ describe('session-start.mjs regression #1386', () => {
       }),
       encoding: 'utf-8',
       env: {
-        ...process.env,
+        ...isolatedHostEnv('claude'),
         HOME: fakeHome,
         USERPROFILE: fakeHome,
-        // See earlier note: pin the host so this test is deterministic
-        // regardless of the ambient environment running the suite.
-        OMC_HOST: 'claude',
       },
       timeout: 15000,
     }).trim();
@@ -183,13 +183,10 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
       encoding: 'utf-8',
       env: {
-        ...process.env,
+        ...isolatedHostEnv('claude'),
         HOME: fakeHome,
         USERPROFILE: fakeHome,
         CLAUDE_CODE_USE_BEDROCK: '1',
-        // See earlier note: pin the host so this test is deterministic
-        // regardless of the ambient environment running the suite.
-        OMC_HOST: 'claude',
       },
       timeout: 15000,
     }).trim();
@@ -236,14 +233,11 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
       encoding: 'utf-8',
       env: {
-        ...process.env,
+        ...isolatedHostEnv('claude'),
         HOME: fakeHome,
         USERPROFILE: fakeHome,
         CLAUDE_PLUGIN_ROOT: pluginRoot,
         OMC_NOTIFY: '0',
-        // See earlier note: pin the host so this test is deterministic
-        // regardless of the ambient environment running the suite.
-        OMC_HOST: 'claude',
       },
       timeout: 15000,
     });
@@ -293,14 +287,11 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
       encoding: 'utf-8',
       env: {
-        ...process.env,
+        ...isolatedHostEnv('claude'),
         HOME: fakeHome,
         USERPROFILE: fakeHome,
         CLAUDE_PLUGIN_ROOT: stalePluginRoot,
         OMC_NOTIFY: '0',
-        // See earlier note: pin the host so this test is deterministic
-        // regardless of the ambient environment running the suite.
-        OMC_HOST: 'claude',
       },
       timeout: 15000,
     });
@@ -354,7 +345,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
       encoding: 'utf-8',
       env: {
-        ...process.env,
+        ...isolatedHostEnv('claude'),
         HOME: fakeHome,
         USERPROFILE: fakeHome,
         CLAUDE_PLUGIN_ROOT: pluginRoot,
@@ -409,7 +400,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
       encoding: 'utf-8',
       env: {
-        ...process.env,
+        ...isolatedHostEnv('claude'),
         HOME: fakeHome,
         USERPROFILE: fakeHome,
         CLAUDE_PLUGIN_ROOT: pluginRoot,
@@ -453,7 +444,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
       encoding: 'utf-8',
       env: {
-        ...process.env,
+        ...isolatedHostEnv('claude'),
         HOME: fakeHome,
         USERPROFILE: fakeHome,
         CLAUDE_PLUGIN_ROOT: pluginRoot,
@@ -503,7 +494,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
       encoding: 'utf-8',
       env: {
-        ...process.env,
+        ...isolatedHostEnv('claude'),
         HOME: fakeHome,
         USERPROFILE: fakeHome,
         CLAUDE_PLUGIN_ROOT: pluginRoot,
@@ -556,7 +547,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
       encoding: 'utf-8',
       env: {
-        ...process.env,
+        ...isolatedHostEnv('claude'),
         HOME: fakeHome,
         USERPROFILE: fakeHome,
         CLAUDE_PLUGIN_ROOT: pluginRoot,
@@ -605,12 +596,10 @@ describe('session-start.mjs — GitHub Copilot CLI host isolation', () => {
       }),
       encoding: 'utf-8',
       env: {
-        ...process.env,
+        ...isolatedHostEnv('copilot'),
         HOME: fakeHome,
         USERPROFILE: fakeHome,
         OMC_NOTIFY: '0',
-        // Explicit Copilot host signal — never falls back to ambient env.
-        OMC_HOST: 'copilot',
         ...extraEnv,
       },
       timeout: 15000,

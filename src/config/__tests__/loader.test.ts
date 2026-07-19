@@ -863,7 +863,8 @@ describe("loadConfig() — autopilot team worker config", () => {
 
 describe("loadConfig() — autopilot.workflows", () => {
   const originalCwd = process.cwd();
-  const originalConfigHome = process.env.XDG_CONFIG_HOME;
+  const configHomeEnv = process.platform === "win32" ? "APPDATA" : "XDG_CONFIG_HOME";
+  const originalConfigHome = process.env[configHomeEnv];
   let tempDir: string;
   let configHome: string;
 
@@ -881,14 +882,14 @@ describe("loadConfig() — autopilot.workflows", () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "omc-workflow-config-"));
     configHome = join(tempDir, "config");
-    process.env.XDG_CONFIG_HOME = configHome;
+    process.env[configHomeEnv] = configHome;
     process.chdir(tempDir);
   });
 
   afterEach(() => {
     process.chdir(originalCwd);
-    if (originalConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
-    else process.env.XDG_CONFIG_HOME = originalConfigHome;
+    if (originalConfigHome === undefined) delete process.env[configHomeEnv];
+    else process.env[configHomeEnv] = originalConfigHome;
     rmSync(tempDir, { recursive: true, force: true });
   });
 
