@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest';
 
 const REPO_ROOT = process.cwd();
 const BUILD_SCRIPT = join(REPO_ROOT, 'scripts', 'build-hook-runtime.mjs');
+const BUNDLE_ENTRY = join(REPO_ROOT, 'src', 'hooks', 'hook-runtime-entry.ts');
 const FIXTURE_ROOT = join(REPO_ROOT, 'src', '__tests__', 'fixtures', 'hooks');
 
 describe('canonical hook runtime bundle', () => {
@@ -30,6 +31,10 @@ describe('canonical hook runtime bundle', () => {
       expect(readFileSync(outfile, 'utf8')).not.toMatch(
         /require\((?:'|")zod(?:'|")\)/,
       );
+      expect(readFileSync(BUILD_SCRIPT, 'utf8')).toContain(
+        'src/hooks/hook-runtime-entry.ts',
+      );
+      expect(existsSync(BUNDLE_ENTRY)).toBe(true);
 
       const emptyNodeModules = join(tempRoot, 'empty-node-modules');
       mkdirSync(emptyNodeModules);
@@ -37,13 +42,35 @@ describe('canonical hook runtime bundle', () => {
       const probe = String.raw`
         const { readFileSync } = require('node:fs');
         const runtime = require(process.argv[1]);
+        const requiredExports = [
+          'normalizeHookEnvelope',
+          'runHookPayload',
+          'runHookJson',
+          'reduceHookEvaluations',
+          'encodeHookOutput',
+          'buildLegacyProcessorInput',
+          'normalizeLegacyHookInput',
+          'adaptLegacyHookOutput',
+        ];
+
+        for (const name of requiredExports) {
+          if (typeof runtime[name] !== 'function') {
+            throw new TypeError('missing runtime export: ' + name);
+          }
+        }
 
         const load = (path) => JSON.parse(readFileSync(path, 'utf8'));
         const summarize = async (fixturePath) => {
+          const processorInputs = [];
           const result = await runtime.runHookPayload(
             'pre-tool-use',
             load(fixturePath),
-            () => ({ decision: 'pass' }),
+            (unit, envelope) => {
+              processorInputs.push(
+                runtime.buildLegacyProcessorInput(envelope, unit),
+              );
+              return { decision: 'pass' };
+            },
           );
           return {
             host: result.envelope.host,
@@ -52,6 +79,7 @@ describe('canonical hook runtime bundle', () => {
             originalCallCount: result.envelope.originalCallCount,
             logicalCallCount: result.envelope.logicalCallCount,
             evaluationCount: result.evaluations.length,
+            processorInputs,
             calls: result.envelope.toolCalls.map((call) => ({
               nativeName: call.nativeName,
               canonicalName: call.canonicalName,
@@ -65,7 +93,28 @@ describe('canonical hook runtime bundle', () => {
           summarize(process.argv[2]),
           summarize(process.argv[3]),
         ]).then(([claude, copilot]) => {
-          process.stdout.write(JSON.stringify({ claude, copilot }));
+          const legacyInput = runtime.normalizeLegacyHookInput({
+            session_id: 'legacy-session',
+            cwd: 'C:\\legacy repo',
+            tool_name: 'Read',
+            tool_input: { file_path: 'README.md' },
+          }, 'pre-tool-use');
+          const legacyEvaluation = runtime.adaptLegacyHookOutput(
+            'pre-tool-use',
+            {
+              continue: true,
+              hookSpecificOutput: {
+                permissionDecision: 'deny',
+                permissionDecisionReason: 'legacy denial',
+              },
+            },
+          );
+          process.stdout.write(JSON.stringify({
+            claude,
+            copilot,
+            legacyInput,
+            legacyEvaluation,
+          }));
         }).catch((error) => {
           console.error(error);
           process.exitCode = 1;
@@ -90,6 +139,8 @@ describe('canonical hook runtime bundle', () => {
       const result = JSON.parse(output) as {
         claude: Record<string, unknown>;
         copilot: Record<string, unknown>;
+        legacyInput: Record<string, unknown>;
+        legacyEvaluation: Record<string, unknown>;
       };
 
       expect(result.claude).toMatchObject({
@@ -104,6 +155,12 @@ describe('canonical hook runtime bundle', () => {
           canonicalName: 'Read',
           input: { file_path: '<path>' },
           status: 'valid',
+        }],
+        processorInputs: [{
+          toolName: 'Read',
+          nativeToolName: 'Read',
+          canonicalToolName: 'Read',
+          toolInput: { file_path: '<path>' },
         }],
       });
       expect(result.copilot).toMatchObject({
@@ -134,6 +191,38 @@ describe('canonical hook runtime bundle', () => {
             status: 'valid',
           },
         ],
+        processorInputs: [
+          {
+            toolName: 'Glob',
+            nativeToolName: 'glob',
+            canonicalToolName: 'Glob',
+            toolInput: {
+              pattern: '<glob-pattern>',
+              paths: '<path-1>',
+            },
+          },
+          {
+            toolName: 'Grep',
+            nativeToolName: 'rg',
+            canonicalToolName: 'Grep',
+            toolInput: {
+              pattern: '<search-pattern>',
+              output_mode: 'content',
+              head_limit: 20,
+            },
+          },
+        ],
+      });
+      expect(result.legacyInput).toMatchObject({
+        sessionId: 'legacy-session',
+        directory: 'C:\\legacy repo',
+        toolName: 'Read',
+        toolInput: { file_path: 'README.md' },
+      });
+      expect(result.legacyEvaluation).toMatchObject({
+        source: 'handler',
+        decision: 'deny',
+        reason: 'legacy denial',
       });
     } finally {
       rmSync(tempRoot, { recursive: true, force: true });

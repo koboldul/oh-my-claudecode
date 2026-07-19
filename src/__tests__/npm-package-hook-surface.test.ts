@@ -31,6 +31,16 @@ describe('npm package hook surface regression', () => {
     expect(
       existsSync(join(PACKAGE_ROOT, 'scripts', 'build-hook-runtime.mjs')),
     ).toBe(true);
+    expect(
+      existsSync(
+        join(PACKAGE_ROOT, 'scripts', 'lib', 'hook-runtime-loader.mjs'),
+      ),
+    ).toBe(true);
+    expect(
+      existsSync(
+        join(PACKAGE_ROOT, 'src', 'hooks', 'hook-runtime-entry.ts'),
+      ),
+    ).toBe(true);
     for (const entrypoint of ['test', 'test:ui', 'test:run', 'test:coverage']) {
       expect(packageJson.scripts?.[entrypoint], entrypoint).not.toContain(
         'build:claude-md-coordinator',

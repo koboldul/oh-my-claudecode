@@ -4,6 +4,7 @@ import { mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 const DEFAULT_OUTFILE = 'bridge/hook-runtime.cjs';
+const ENTRY_POINT = 'src/hooks/hook-runtime-entry.ts';
 
 function parseOutfile(args) {
   let outfile = DEFAULT_OUTFILE;
@@ -21,7 +22,7 @@ const outfile = parseOutfile(process.argv.slice(2));
 await mkdir(dirname(outfile), { recursive: true });
 
 await esbuild.build({
-  entryPoints: ['src/hooks/hook-runtime.ts'],
+  entryPoints: [ENTRY_POINT],
   bundle: true,
   packages: 'bundle',
   preserveSymlinks: true,
