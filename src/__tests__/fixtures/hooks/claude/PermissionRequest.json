@@ -1,0 +1,12 @@
+{
+  "session_id": "<session-id>",
+  "transcript_path": "<transcript-path>",
+  "cwd": "<cwd>",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "<command>"
+  },
+  "permission_suggestions": []
+}

@@ -1,0 +1,7 @@
+{
+  "source": "new",
+  "initialPrompt": "<initial-prompt>",
+  "sessionId": "<session-id>",
+  "timestamp": 1700000000000,
+  "cwd": "<cwd>"
+}

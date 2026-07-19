@@ -1,0 +1,15 @@
+{
+  "session_id": "<session-id>",
+  "transcript_path": "<transcript-path>",
+  "cwd": "<cwd>",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUseFailure",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "<command>"
+  },
+  "tool_use_id": "<tool-use-id>",
+  "error": "<tool-error>",
+  "is_interrupt": false,
+  "duration_ms": 0
+}

@@ -2,55 +2,96 @@
 // and additional CLI detection utilities
 export { isCliAvailable, validateCliAvailable, getContract, type CliAgentType } from './model-contract.js';
 import { spawnSync } from 'child_process';
-import { win32 as win32Path } from 'path';
+import { resolveCliBinaryPath } from './model-contract.js';
 
 export interface CliInfo {
   available: boolean;
+  runnable: boolean;
   version?: string;
   path?: string;
+  error?: string;
+}
+
+const VERSION_PROBE_TIMEOUT_MS = 5000;
+
+function firstOutputLine(output: unknown): string | undefined {
+  return output
+    ?.toString()
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .find(Boolean);
+}
+
+function describeVersionProbeFailure(
+  result: ReturnType<typeof spawnSync>,
+): string {
+  const probeError = result.error as NodeJS.ErrnoException | undefined;
+  if (probeError?.code === 'ETIMEDOUT') {
+    return `Version probe timed out after ${VERSION_PROBE_TIMEOUT_MS}ms.`;
+  }
+  if (probeError) {
+    return `Version probe failed: ${probeError.message}`;
+  }
+
+  const stderr = firstOutputLine(result.stderr);
+  if (typeof result.status === 'number') {
+    return `Version probe exited with code ${result.status}${stderr ? `: ${stderr}` : '.'}`;
+  }
+  if (result.signal) {
+    return `Version probe terminated by signal ${result.signal}.`;
+  }
+  return 'Version probe did not complete.';
 }
 
 export function detectCli(binary: string): CliInfo {
+  let resolvedBinary: string;
   try {
-    const versionOptions = {
-      timeout: 5000,
-      shell: process.platform === 'win32' && binary !== 'copilot',
+    resolvedBinary = resolveCliBinaryPath(binary);
+  } catch (error) {
+    return {
+      available: false,
+      runnable: false,
+      error: error instanceof Error ? error.message : String(error),
     };
-    let resolvedBinary = binary;
-    let versionResult = spawnSync(resolvedBinary, ['--version'], versionOptions);
-    const probeError = versionResult.error as NodeJS.ErrnoException | undefined;
-    if (process.platform === 'win32' && binary === 'copilot' && probeError?.code === 'ENOENT') {
-      const pathResult = spawnSync('where', [binary], { timeout: 5000, encoding: 'utf8' });
-      const firstPath = pathResult.stdout
-        ?.toString()
-        .split(/\r?\n/)
-        .map(line => line.trim())
-        .filter(Boolean)
-        .find(line => /\.(exe|com|cmd|bat)$/i.test(line));
-      if (pathResult.status === 0 && firstPath && win32Path.isAbsolute(firstPath)) {
-        resolvedBinary = firstPath;
-        versionResult = /\.(cmd|bat)$/i.test(resolvedBinary)
-          ? spawnSync(
-              process.env.COMSPEC || 'cmd.exe',
-              ['/d', '/s', '/c', `"${resolvedBinary}" --version`],
-              { timeout: 5000 },
-            )
-          : spawnSync(resolvedBinary, ['--version'], { timeout: 5000, shell: false });
-      }
-    }
+  }
+
+  try {
+    const versionResult = process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolvedBinary)
+      ? spawnSync(
+          process.env.COMSPEC || 'cmd.exe',
+          ['/d', '/c', resolvedBinary, '--version'],
+          { timeout: VERSION_PROBE_TIMEOUT_MS },
+        )
+      : spawnSync(resolvedBinary, ['--version'], {
+          timeout: VERSION_PROBE_TIMEOUT_MS,
+          shell: false,
+        });
+
     if (versionResult.status === 0) {
+      const version = firstOutputLine(versionResult.stdout)
+        ?? firstOutputLine(versionResult.stderr);
       return {
         available: true,
-        version: versionResult.stdout?.toString().trim(),
-        path: resolvedBinary === binary
-          ? spawnSync(process.platform === 'win32' ? 'where' : 'which', [binary], { timeout: 5000 })
-              .stdout?.toString().trim()
-          : resolvedBinary,
+        runnable: true,
+        path: resolvedBinary,
+        ...(version
+          ? { version }
+          : { error: 'Version probe succeeded but returned no version output.' }),
       };
     }
-    return { available: false };
-  } catch {
-    return { available: false };
+    return {
+      available: true,
+      runnable: false,
+      path: resolvedBinary,
+      error: describeVersionProbeFailure(versionResult),
+    };
+  } catch (error) {
+    return {
+      available: true,
+      runnable: false,
+      path: resolvedBinary,
+      error: `Version probe failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
 }
 

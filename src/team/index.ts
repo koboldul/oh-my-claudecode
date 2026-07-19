@@ -206,6 +206,14 @@ export type { CliBinaryValidation } from './model-contract.js';
 // cli-detection: only export symbols not already covered by model-contract
 export type { CliInfo } from './cli-detection.js';
 export { detectCli, detectAllClis } from './cli-detection.js';
+export {
+  VERIFIED_COPILOT_CLI_VERSION,
+  assessCopilotCliVersion,
+  detectCopilotCliCompatibility,
+  parseCopilotCliVersion,
+  type CopilotCliCompatibility,
+  type CopilotCliCompatibilityStatus,
+} from './copilot-cli-compatibility.js';
 
 // worker-bootstrap
 export type { WorkerBootstrapParams } from './worker-bootstrap.js';

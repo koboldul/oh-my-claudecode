@@ -1,0 +1,8 @@
+{
+  "sessionId": "<session-id>",
+  "timestamp": 1700000000000,
+  "cwd": "<cwd>",
+  "toolName": "glob",
+  "toolArgs": "{\"pattern\":\"<glob-pattern>\",\"paths\":\"<path>\"}",
+  "error": "<tool-error>"
+}

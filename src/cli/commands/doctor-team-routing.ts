@@ -15,6 +15,7 @@ interface ProviderProbe {
   provider: TeamRoleProvider;
   binary: string;
   found: boolean;
+  runnable: boolean;
   path?: string;
   version?: string;
   error?: string;
@@ -37,8 +38,10 @@ function probeProvider(provider: TeamRoleProvider): ProviderProbe {
     provider,
     binary,
     found: detected.available,
+    runnable: detected.runnable,
     ...(detected.path ? { path: detected.path.split(/\r?\n/)[0] } : {}),
     ...(detected.version ? { version: detected.version.split(/\r?\n/)[0] } : {}),
+    ...(detected.error ? { error: detected.error } : {}),
   };
 }
 
@@ -69,6 +72,7 @@ export async function doctorTeamRoutingCommand(options: { json?: boolean }): Pro
 
   const probes = [...providers].map(probeProvider);
   const missing = probes.filter((p) => !p.found);
+  const unusable = probes.filter((p) => !p.runnable);
 
   if (options.json) {
     console.log(
@@ -76,6 +80,7 @@ export async function doctorTeamRoutingCommand(options: { json?: boolean }): Pro
         {
           probes,
           missing: missing.map((p) => p.provider),
+          unusable: unusable.map((p) => p.provider),
         },
         null,
         2,
@@ -84,19 +89,22 @@ export async function doctorTeamRoutingCommand(options: { json?: boolean }): Pro
   } else {
     console.log(colors.bold('Team role routing — provider CLI probe'));
     for (const p of probes) {
-      if (p.found) {
+      if (p.runnable) {
         const version = p.version ? ` (${p.version})` : '';
         console.log(`  ${colors.green('✓')} ${p.provider}: ${p.path}${version}`);
+      } else if (p.found) {
+        const detail = p.error ? `: ${p.error}` : '';
+        console.log(`  ${colors.yellow('⚠')} ${p.provider}: resolved at ${p.path}, but the version probe failed${detail} — fix the provider before routing /team tasks to it`);
       } else {
-        console.log(`  ${colors.yellow('⚠')} ${p.provider}: not found on PATH — /team tasks routed to ${p.provider} will fall back to claude`);
+        console.log(`  ${colors.yellow('⚠')} ${p.provider}: not found on PATH — /team tasks routed to it cannot start`);
       }
     }
-    if (missing.length === 0) {
-      console.log(colors.green('\nAll configured providers are available.'));
+    if (unusable.length === 0) {
+      console.log(colors.green('\nAll configured providers are available and runnable.'));
     } else {
       console.log(
         colors.yellow(
-          `\n${missing.length} provider${missing.length === 1 ? '' : 's'} missing (warn only — /team falls back to claude).`,
+          `\n${unusable.length} provider${unusable.length === 1 ? '' : 's'} unavailable or failed its version probe; affected /team routes are not ready.`,
         ),
       );
     }

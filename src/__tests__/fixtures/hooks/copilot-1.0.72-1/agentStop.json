@@ -1,0 +1,7 @@
+{
+  "transcriptPath": "<transcript-path>",
+  "stopReason": "end_turn",
+  "sessionId": "<session-id>",
+  "timestamp": 1700000000000,
+  "cwd": "<cwd>"
+}

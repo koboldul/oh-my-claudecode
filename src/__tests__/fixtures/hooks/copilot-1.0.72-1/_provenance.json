@@ -1,0 +1,87 @@
+{
+  "fixtures": {
+    "sessionStart": {
+      "status": "observed",
+      "source": "provided-live-session",
+      "copilotVersion": "1.0.72-1",
+      "recordSha256": "5781b4902d40156639a787771067ce10bca420756de38305111a345bb98ab33c",
+      "recordLine": 8
+    },
+    "userPromptSubmitted": {
+      "status": "observed",
+      "source": "provided-live-session",
+      "copilotVersion": "1.0.72-1",
+      "recordSha256": "4a8632715f699d1926ab7f26c1bafae144e51c4465649d6a88fa3bdc515e2fa8",
+      "recordLine": 4
+    },
+    "preToolUse": {
+      "status": "observed",
+      "source": "provided-live-session",
+      "copilotVersion": "1.0.72-1",
+      "recordSha256": "3752d281ccba9addabbebc29cb3c65203306e77c6ca6c1173b503827019127e3",
+      "recordLine": 24
+    },
+    "permissionRequest": {
+      "status": "observed",
+      "source": "provided-live-session",
+      "copilotVersion": "1.0.72-1",
+      "recordSha256": "48d1e9f3bbef0703522d11a114bd7f4f52502b98f32b3098a41ce7d703310b3f",
+      "recordLine": 41
+    },
+    "postToolUse": {
+      "status": "observed",
+      "source": "provided-live-session",
+      "copilotVersion": "1.0.72-1",
+      "recordSha256": "401c33e6c8615ca967291092782886f0797215333aca7f081aaef83dd4426081",
+      "recordLine": 16
+    },
+    "postToolUseFailure": {
+      "status": "observed",
+      "source": "provided-live-session",
+      "copilotVersion": "1.0.72-1",
+      "recordSha256": "76f9ea08ce77d4d7e315324b06ab9873a81152a9b0a0524b671cc8d6812588c6",
+      "recordLine": 568
+    },
+    "subagentStart": {
+      "status": "observed",
+      "source": "provided-live-session",
+      "copilotVersion": "1.0.72-1",
+      "recordSha256": "ba65c3729d71a3785b94c7627b9b1b798e5c608dcac3eb2f07699b1a2efce8ef",
+      "recordLine": 383
+    },
+    "subagentStop": {
+      "status": "observed",
+      "source": "provided-live-session",
+      "copilotVersion": "1.0.72-1",
+      "recordSha256": "243f6982e7cd64fa95a1749b24419144701f18f7bf573dbc88f1fe97ab06d4da",
+      "recordLine": 5757
+    },
+    "agentStop": {
+      "status": "observed",
+      "source": "provided-live-session",
+      "copilotVersion": "1.0.72-1",
+      "recordSha256": "887fc7f04bbf3061e436a4fcea5c685ad19bae3e10621b3d60d9c89a1ea37186",
+      "recordLine": 154
+    },
+    "preCompact": {
+      "status": "observed",
+      "source": "local-session-events",
+      "copilotVersion": "1.0.72-1",
+      "recordSha256": "1c481e04a298e1f02328de42bd19f1658ae5018db289a8f7d66cb232419bb172",
+      "recordLine": 2838,
+      "sourceSessionStartSha256": "4eaf1710521fbd56199182e6a05e1a3037929c49dac6f6ad393ca248c6f6b2cf"
+    },
+    "sessionEnd": {
+      "status": "observed",
+      "source": "local-session-events",
+      "copilotVersion": "1.0.72-1",
+      "recordSha256": "1ad0f1ef39c2a7af011f12a489110e5b4939fda8c7d745ca6562453feae049c8",
+      "recordLine": 1559,
+      "sourceSessionStartSha256": "1ea5a3f7c1363fae5564d4079140c0287914e645d5cc5ee7a0fc5d535cabd647"
+    }
+  },
+  "statusLine": {
+    "status": "phase-5-prerequisite",
+    "fixture": "statusLine.json"
+  }
+}

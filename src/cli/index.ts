@@ -44,6 +44,7 @@ import {
   waitDetectCommand
 } from './commands/wait.js';
 import { doctorConflictsCommand } from './commands/doctor-conflicts.js';
+import { doctorCopilotCommand } from './commands/doctor-copilot.js';
 import { doctorTeamRoutingCommand } from './commands/doctor-team-routing.js';
 import { capabilitiesCheckCommand, capabilitiesLockCommand } from './commands/capabilities.js';
 import { sessionSearchCommand } from './commands/session-search.js';
@@ -1232,10 +1233,11 @@ const doctorCmd = program
   .description('Diagnostic tools for troubleshooting OMC installation')
   .option('--plugin-dir <path>', 'Override OMC plugin root directory (sets OMC_PLUGIN_ROOT)')
   .option('--team-routing', 'Probe CLI presence for every provider referenced by team.roleRouting')
-  .option('--json', 'Output as JSON (used with --team-routing)')
+  .option('--json', 'Output doctor diagnostics as JSON')
   .addHelpText('after', `
 Examples:
   $ omc doctor conflicts                        Check for plugin conflicts
+  $ omc doctor copilot                          Check Copilot CLI contract compatibility
   $ omc doctor team-routing                     Probe /team role-routing provider CLIs
   $ omc doctor --team-routing                   Same as above (flag form)
   $ omc doctor --plugin-dir /path/to/plugin     Run diagnostics against a specific plugin dir`)
@@ -1249,6 +1251,20 @@ Examples:
     }
     // Without --team-routing, show help text for the parent command.
     doctorCmd.help();
+  });
+
+doctorCmd
+  .command('copilot')
+  .description('Check GitHub Copilot CLI compatibility against the verified host contract')
+  .addHelpText('after', `
+Examples:
+  $ omc doctor copilot                          Check the installed Copilot CLI version
+  $ omc doctor copilot --json                   Output results as JSON`)
+  .action(async (_options, command) => {
+    const exitCode = await doctorCopilotCommand({
+      json: command.parent?.opts().json ?? false,
+    });
+    process.exit(exitCode);
   });
 
 doctorCmd

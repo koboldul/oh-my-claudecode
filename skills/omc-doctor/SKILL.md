@@ -160,6 +160,7 @@ Run these when the Copilot CLI install was detected in Step 0. All commands are 
 ```bash
 node -e "const p=require('path'),f=require('fs'),h=require('os').homedir();const jr=s=>s.split(/\r?\n/).filter(l=>!/^\s*\/\//.test(l)).join('\n');const cop=process.env.COPILOT_HOME||p.join(h,'.copilot');const dir=p.join(cop,'installed-plugins','omc','oh-my-claudecode');const exists=f.existsSync(dir);let pkgV='(unknown)';try{pkgV=JSON.parse(f.readFileSync(p.join(dir,'package.json'),'utf8')).version}catch{};let cfgV='',en='(unknown)';try{const c=JSON.parse(jr(f.readFileSync(p.join(cop,'config.json'),'utf8')));const ip=(c.installedPlugins||[]).find(x=>x&&x.name==='oh-my-claudecode');if(ip){cfgV=ip.version||'';en=(ip.enabled===false)?false:true}}catch{};let se='(unknown)';try{const s=JSON.parse(jr(f.readFileSync(p.join(cop,'settings.json'),'utf8')));const ep=(s.enabledPlugins||{});if(Object.prototype.hasOwnProperty.call(ep,'oh-my-claudecode@omc'))se=!!ep['oh-my-claudecode@omc']}catch{};if(!exists){console.log('Copilot OMC plugin: (not installed) - checked '+dir)}else{const cfgNote=cfgV?(cfgV===pkgV?'':' (config records '+cfgV+')'):'';console.log('Copilot OMC plugin dir:',dir);console.log('Copilot plugin version:',pkgV+cfgNote);console.log('Copilot plugin enabled (config.json):',en);console.log('Copilot plugin enabled (settings.json):',se)}"
 npm view oh-my-claude-sisyphus version 2>/dev/null || echo "Latest: (unavailable)"
+copilot --version
 ```
 
 > The `config.json` read strips full-line `//` comments only (the file is JSONC), which preserves `https://` URLs inside string values. `settings.json` is strict JSON but is read the same way for safety.
@@ -168,6 +169,10 @@ npm view oh-my-claude-sisyphus version 2>/dev/null || echo "Latest: (unavailable
 - If plugin dir missing: CRITICAL - install with Copilot's `/plugin` command: `/plugin marketplace add https://github.com/Yeachan-Heo/oh-my-claudecode` then `/plugin install oh-my-claudecode`.
 - If `enabled` (config.json) or the settings.json flag is `false`: WARN - plugin installed but disabled; re-enable it via Copilot's `/plugin` command.
 - If plugin version is behind the latest npm version: WARN - outdated; update via Copilot's `/plugin` command, then restart Copilot CLI.
+- If `copilot --version` reports **1.0.72-1**: OK - this is the verified Copilot host contract.
+- If it reports an earlier version: CRITICAL - unsupported; upgrade GitHub Copilot CLI to at least 1.0.72-1 using the same package manager used to install it, then rerun `copilot --version`.
+- If it reports a later version: WARN - compatibility is unverified, not failed. Continue diagnostics, but note that contract fixtures and live qualification have not yet passed for that version.
+- When the OMC terminal CLI is available, `omc doctor copilot` performs this compatibility check and `omc doctor copilot --json` emits the structured result.
 
 ### C2: Confirm skills, agents, MCP server, and hooks loaded
 
@@ -180,10 +185,12 @@ Ask the user to run Copilot's `/env` command (it lists loaded instructions, MCP 
 
 ### C3: Hook event compatibility (informational)
 
-Copilot recognizes Claude's PascalCase hook event names as aliases (`UserPromptSubmit`, `Stop`, `PreToolUse`, ...), so keyword auto-detection and the ralph/ultrawork/autopilot persistence loop work the same as under Claude Code. The only unsupported event is `SubagentStart` (trace-only). See docs/REFERENCE.md#github-copilot-cli-compatibility.
+Copilot CLI 1.0.72-1 has been observed emitting the camelCase `subagentStart` event. Acceptance of Claude-style manifest event names does not prove identical payload shapes, state transitions, or persistence outcomes. OMC's Copilot behavior remains partial parity until each hook path passes versioned fixture and live qualification.
 
 **Diagnosis**:
-- Informational - no action needed. Do **not** add camelCase mirror events to `hooks/hooks.json`; Copilot runs every entry per event, so a duplicate would double-fire the hook.
+- Informational - treat camelCase `subagentStart` as observed behavior, not an unsupported event.
+- Do not report persistence loops as Claude-identical without version-qualified evidence.
+- Do **not** add camelCase mirror events to `hooks/hooks.json`; duplicate manifest entries can double-fire a hook.
 
 ### C4: CLAUDE.md / `omc setup` NOT required under Copilot
 
@@ -221,6 +228,7 @@ Report rows for the host(s) detected in Step 0. Rows marked _(Claude only)_ / _(
 | Legacy Commands (~/.claude/commands/) _(Claude only)_ | OK/WARN | ... |
 | Legacy Skills (~/.claude/skills/) _(Claude only)_ | OK/WARN | ... |
 | Copilot Plugin (installed + enabled) _(Copilot only)_ | OK/WARN/CRITICAL | C1 |
+| Copilot CLI Contract Version _(Copilot only)_ | OK/WARN/CRITICAL | 1.0.72-1 verified; earlier unsupported; later unverified |
 | Copilot Skills/Agents/MCP/Hooks (`/env`) _(Copilot only)_ | OK/WARN | C2 |
 
 ### Issues Found

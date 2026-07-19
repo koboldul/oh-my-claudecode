@@ -27,6 +27,7 @@ describe('doctor team-routing Copilot provider', () => {
     });
     mocks.detectCli.mockImplementation((binary: string) => ({
       available: true,
+      runnable: true,
       path: `C:\\Tools\\${binary}.exe`,
       version: `${binary} 1.0.0`,
     }));
@@ -45,7 +46,42 @@ describe('doctor team-routing Copilot provider', () => {
           provider: 'copilot',
           binary: 'copilot',
           found: true,
+          runnable: true,
           path: 'C:\\Tools\\copilot.exe',
+        }),
+      ]));
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it('reports a resolved provider with a failed probe as unusable', async () => {
+    mocks.detectCli.mockImplementation((binary: string) => binary === 'copilot'
+      ? {
+          available: true,
+          runnable: false,
+          path: 'C:\\Tools\\copilot.exe',
+          error: 'Version probe timed out after 5000ms.',
+        }
+      : {
+          available: true,
+          runnable: true,
+          path: `C:\\Tools\\${binary}.exe`,
+          version: `${binary} 1.0.0`,
+        });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    try {
+      expect(await doctorTeamRoutingCommand({ json: true })).toBe(0);
+      const report = JSON.parse(String(log.mock.calls[0]?.[0]));
+      expect(report.missing).not.toContain('copilot');
+      expect(report.unusable).toContain('copilot');
+      expect(report.probes).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          provider: 'copilot',
+          found: true,
+          runnable: false,
+          error: 'Version probe timed out after 5000ms.',
         }),
       ]));
     } finally {

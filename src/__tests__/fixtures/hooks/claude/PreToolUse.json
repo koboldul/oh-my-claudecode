@@ -1,0 +1,12 @@
+{
+  "session_id": "<session-id>",
+  "transcript_path": "<transcript-path>",
+  "cwd": "<cwd>",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "<path>"
+  },
+  "tool_use_id": "<tool-use-id>"
+}

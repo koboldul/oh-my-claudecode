@@ -1,0 +1,18 @@
+{
+  "session_id": "<session-id>",
+  "transcript_path": "<transcript-path>",
+  "cwd": "<cwd>",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "<path>",
+    "content": "<file-content>"
+  },
+  "tool_response": {
+    "filePath": "<path>",
+    "success": true
+  },
+  "tool_use_id": "<tool-use-id>",
+  "duration_ms": 0
+}

@@ -1,0 +1,16 @@
+{
+  "sessionId": "<session-id>",
+  "cwd": "<cwd>",
+  "toolCalls": [
+    {
+      "id": "<tool-call-id-1>",
+      "name": "glob",
+      "args": "{\"pattern\":\"<glob-pattern>\",\"paths\":\"<path-1>\"}"
+    },
+    {
+      "id": "<tool-call-id-2>",
+      "name": "rg",
+      "args": "{\"pattern\":\"<search-pattern>\",\"paths\":[\"<path-2>\",\"<path-3>\",\"<path-4>\"],\"output_mode\":\"content\",\"glob\":\"<glob-pattern>\",\"-n\":true,\"head_limit\":20}"
+    }
+  ]
+}

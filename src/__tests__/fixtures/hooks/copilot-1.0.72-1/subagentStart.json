@@ -1,0 +1,9 @@
+{
+  "sessionId": "<session-id>",
+  "transcriptPath": "<transcript-path>",
+  "agentName": "<agent-name>",
+  "agentDisplayName": "<agent-display-name>",
+  "agentDescription": "<agent-description>",
+  "timestamp": 1700000000000,
+  "cwd": "<cwd>"
+}

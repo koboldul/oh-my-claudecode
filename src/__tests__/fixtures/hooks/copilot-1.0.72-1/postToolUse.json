@@ -1,0 +1,13 @@
+{
+  "sessionId": "<session-id>",
+  "timestamp": 1700000000000,
+  "cwd": "<cwd>",
+  "toolName": "fetch_copilot_cli_documentation",
+  "toolArgs": "{}",
+  "toolResult": {
+    "textResultForLlm": "<tool-output>",
+    "resultType": "success",
+    "sessionLog": "<session-log>",
+    "toolTelemetry": {}
+  }
+}

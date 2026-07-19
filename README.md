@@ -64,7 +64,7 @@ Then:
 /plugin install oh-my-claudecode
 ```
 
-> **GitHub Copilot CLI users:** OMC is a first-class [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli) plugin. Install it with `copilot plugin marketplace add Yeachan-Heo/oh-my-claudecode` then `copilot plugin install oh-my-claudecode@omc` (or the `/plugin ...` slash equivalents in a session; substitute a fork's `owner/repo` in `marketplace add` to install a fork). Copilot receives dedicated `oh-my-claudecode:*` agent profiles using `gpt-5.6-sol` with `max` reasoning, while Claude Code keeps its native Haiku/Sonnet/Opus profiles. Skills, the `t` MCP server, and hooks — including keyword auto-detection and persistence loops — remain available. Restart Copilot after installing, then run `/env` to confirm. Full guide: [Installation → GitHub Copilot CLI](docs/REFERENCE.md#github-copilot-cli).
+> **GitHub Copilot CLI users:** OMC is exposed as a [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli) plugin. Install it with `copilot plugin marketplace add Yeachan-Heo/oh-my-claudecode` then `copilot plugin install oh-my-claudecode@omc` (or the `/plugin ...` slash equivalents in a session; substitute a fork's `owner/repo` in `marketplace add` to install a fork). The manifest exposes dedicated `oh-my-claudecode:*` agent profiles, skills, commands, the `t` MCP server, and hooks. Restart Copilot after installing, then run `/env` to confirm those surfaces loaded. This does **not** mean every OMC workflow already behaves identically to Claude Code: Copilot parity remains partial while batched-hook adapters and live integration gates land, so persistence loops, OMC HUD wiring, and all skills are not yet claimed as behaviorally equivalent. Full guide: [Installation → GitHub Copilot CLI](docs/REFERENCE.md#github-copilot-cli).
 
 If you prefer the npm CLI/runtime path instead of the marketplace flow:
 
@@ -81,7 +81,7 @@ npm i -g oh-my-claude-sisyphus@latest
 
 **Step 2: Setup (Claude Code / npm CLI only)**
 
-> **GitHub Copilot CLI users: skip this step.** Plugin installation from Step 1 is sufficient — Copilot loads skills, agents, the `t` MCP server, and hooks directly from the installed plugin. There is no separate setup script to run. Verify with `/env`; diagnose with `/oh-my-claudecode:setup doctor`; update with `copilot plugin update oh-my-claudecode` (then restart Copilot CLI). Only continue with the commands below if you also use Claude Code.
+> **GitHub Copilot CLI users: skip this step.** Plugin installation from Step 1 is sufficient to expose the plugin's skills, agents, commands, `t` MCP server, and hooks; there is no separate setup script to run. Verify loaded surfaces with `/env`; diagnose with `/oh-my-claudecode:setup doctor`; update the marketplace install with `copilot plugin update oh-my-claudecode@omc` (then restart Copilot CLI). Surface discovery is not a behavioral-parity test. Only continue with the commands below if you also use Claude Code.
 
 ```bash
 # Inside a Claude Code / OMC session
@@ -141,7 +141,7 @@ That's it. Everything else is automatic.
 OMC exposes two different surfaces:
 
 - **Terminal CLI commands**: run `omc ...` from your shell after installing the npm/runtime path (`npm i -g oh-my-claude-sisyphus@latest`) or from a local checkout.
-- **In-session skills**: run `/...` inside a Claude Code or GitHub Copilot CLI session after installing the plugin.
+- **In-session skills**: run `/...` inside a Claude Code or GitHub Copilot CLI session after installing the plugin. Copilot manifest exposure does not imply that every skill has passed equivalent live behavior gates.
 
 | Feature                                        | Terminal CLI                                  | In-session skill                                                        | Notes                                                                                                                                |
 | ---------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |

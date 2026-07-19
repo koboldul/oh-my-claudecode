@@ -1,0 +1,11 @@
+{
+  "hookName": "permissionRequest",
+  "sessionId": "<session-id>",
+  "timestamp": 1700000000000,
+  "cwd": "<cwd>",
+  "permissionSuggestions": [],
+  "toolName": "powershell",
+  "toolInput": {
+    "command": "<command>"
+  }
+}

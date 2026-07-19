@@ -66,6 +66,21 @@ describe('omc-doctor skill GitHub Copilot CLI awareness', () => {
     expect(content).toContain('camelCase mirror events');
   });
 
+  it('documents the verified Copilot CLI contract and forward-version warning policy', () => {
+    expect(content).toContain('1.0.72-1');
+    expect(content).toContain('omc doctor copilot');
+    expect(content).toContain('earlier version: CRITICAL - unsupported');
+    expect(content).toContain('later version: WARN - compatibility is unverified, not failed');
+    expect(content).toContain('upgrade GitHub Copilot CLI');
+  });
+
+  it('describes observed subagentStart behavior without claiming full persistence parity', () => {
+    expect(content).toContain('camelCase `subagentStart`');
+    expect(content).toContain('remains partial parity');
+    expect(content).not.toContain('persistence loop work the same as under Claude Code');
+    expect(content).not.toContain('The only unsupported event is `SubagentStart`');
+  });
+
   it('does not flag Claude-only artifacts for a Copilot-only install', () => {
     expect(content).toContain('do **not** report a missing');
     // Restart guidance must cover Copilot CLI, not just Claude Code.
