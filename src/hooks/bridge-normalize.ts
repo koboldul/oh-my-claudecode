@@ -10,9 +10,26 @@
  * Sensitive hooks use strict allowlists; others pass through unknown fields.
  */
 
+import { createHash } from 'crypto';
 import { z } from 'zod';
 import type { HookInput } from './bridge.js';
 import { resolveTranscriptPath } from '../lib/worktree-paths.js';
+import {
+  CLAUDE_SINGLE_CAPABILITIES,
+  COPILOT_1072_CAPABILITIES,
+  formatUnknownError,
+  type CanonicalAgentRef,
+  type CanonicalHookEventPayload,
+  type CanonicalHookEnvelope,
+  type CanonicalNotificationPayload,
+  type CanonicalToolCall,
+  type DetectedHookContract,
+  type HookDecision,
+  type HookHost,
+  type HostHookDecision,
+  type NormalizationIssue,
+  type ShellDialect,
+} from './hook-protocol.js';
 
 // --- Zod schemas for hook input validation ---
 
@@ -85,6 +102,838 @@ interface RawHookInput {
 
   // Allow other fields to pass through
   [key: string]: unknown;
+}
+
+interface DedupeCanonicalToolCallsResult {
+  calls: CanonicalToolCall[];
+  issues: NormalizationIssue[];
+}
+
+export const MAX_STABLE_SERIALIZATION_DEPTH = 128;
+
+class StableSerializationError extends Error {}
+
+const CLAUDE_ENVELOPE_MARKERS = new Set([
+  'hook_event_name',
+  'session_id',
+  'tool_name',
+  'tool_input',
+  'tool_response',
+  'transcript_path',
+  'stop_reason',
+  'agent_id',
+  'agent_type',
+  'tool_use_id',
+  'permission_mode',
+]);
+
+const COPILOT_ENVELOPE_MARKERS = new Set([
+  'sessionId',
+  'toolCalls',
+  'toolName',
+  'toolArgs',
+  'toolResult',
+  'hookName',
+  'transcriptPath',
+  'stopReason',
+  'initialPrompt',
+  'promptId',
+  'agentName',
+  'agentDisplayName',
+  'agentDescription',
+  'customInstructions',
+]);
+
+const COPILOT_TOOL_ALIASES: Readonly<Record<string, string>> = {
+  agent: 'Task',
+  bash: 'Bash',
+  edit: 'Edit',
+  glob: 'Glob',
+  grep: 'Grep',
+  powershell: 'Bash',
+  pwsh: 'Bash',
+  read: 'Read',
+  rg: 'Grep',
+  skill: 'Skill',
+  task: 'Task',
+  write: 'Write',
+};
+
+const EVENT_NAME_ALIASES: Readonly<Record<string, string>> = {
+  AgentStop: 'stop',
+  Notification: 'notification',
+  PermissionRequest: 'permission-request',
+  PostToolUse: 'post-tool-use',
+  PostToolUseFailure: 'post-tool-use-failure',
+  PreCompact: 'pre-compact',
+  PreToolUse: 'pre-tool-use',
+  SessionEnd: 'session-end',
+  SessionStart: 'session-start',
+  Stop: 'stop',
+  SubagentStart: 'subagent-start',
+  SubagentStop: 'subagent-stop',
+  UserPromptSubmit: 'user-prompt-submit',
+  agentStop: 'stop',
+  notification: 'notification',
+  permissionRequest: 'permission-request',
+  postToolUse: 'post-tool-use',
+  postToolUseFailure: 'post-tool-use-failure',
+  preCompact: 'pre-compact',
+  preToolUse: 'pre-tool-use',
+  sessionEnd: 'session-end',
+  sessionStart: 'session-start',
+  subagentStart: 'subagent-start',
+  subagentStop: 'subagent-stop',
+  userPromptSubmitted: 'user-prompt-submit',
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasOwn(input: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(input, key);
+}
+
+function stringField(input: Record<string, unknown>, key: string): string | undefined {
+  const value = input[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function firstDefinedField(
+  input: Record<string, unknown>,
+  keys: readonly string[],
+): unknown | undefined {
+  for (const key of keys) {
+    if (hasOwn(input, key) && input[key] !== undefined) return input[key];
+  }
+  return undefined;
+}
+
+function firstStringField(
+  input: Record<string, unknown>,
+  keys: readonly string[],
+): string | undefined {
+  for (const key of keys) {
+    const value = stringField(input, key);
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+function firstNumberField(
+  input: Record<string, unknown>,
+  keys: readonly string[],
+): number | undefined {
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function firstBooleanField(
+  input: Record<string, unknown>,
+  keys: readonly string[],
+): boolean | undefined {
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === 'boolean') return value;
+  }
+  return undefined;
+}
+
+function firstArrayField(
+  input: Record<string, unknown>,
+  keys: readonly string[],
+): unknown[] | undefined {
+  for (const key of keys) {
+    const value = input[key];
+    if (Array.isArray(value)) return [...value];
+  }
+  return undefined;
+}
+
+function hostFieldKeys(
+  host: HookHost,
+  snakeCase: string,
+  camelCase: string,
+  ...fallbacks: string[]
+): string[] {
+  return host === 'claude'
+    ? [snakeCase, camelCase, ...fallbacks]
+    : [camelCase, snakeCase, ...fallbacks];
+}
+
+function normalizeEventPayload(
+  raw: Record<string, unknown>,
+  host: HookHost,
+  hookType: string,
+): CanonicalHookEventPayload {
+  const prompt = firstStringField(raw, ['prompt']);
+  const initialPrompt = firstStringField(raw, ['initialPrompt', 'initial_prompt']);
+  const promptId = firstStringField(raw, hostFieldKeys(host, 'prompt_id', 'promptId'));
+  const source = firstStringField(raw, ['source']);
+  const model = firstStringField(raw, hostFieldKeys(host, 'model_id', 'modelId', 'model'));
+  const timestamp = firstNumberField(raw, ['timestamp']);
+  const message = firstDefinedField(raw, ['message']);
+  const parts = firstArrayField(raw, ['parts']);
+  const toolOutput = firstDefinedField(
+    raw,
+    host === 'claude'
+      ? ['tool_response', 'toolOutput', 'toolResponse', 'toolResult', 'output', 'result']
+      : ['toolResult', 'toolOutput', 'toolResponse', 'tool_response', 'output', 'result'],
+  );
+  const toolError = firstDefinedField(raw, ['error', 'toolError', 'tool_error']);
+  const trigger = firstStringField(raw, ['trigger']);
+  const customInstructions = firstStringField(
+    raw,
+    hostFieldKeys(host, 'custom_instructions', 'customInstructions'),
+  );
+  const permissionSuggestions = firstArrayField(
+    raw,
+    hostFieldKeys(host, 'permission_suggestions', 'permissionSuggestions'),
+  );
+  const permissionMode = firstStringField(
+    raw,
+    hostFieldKeys(host, 'permission_mode', 'permissionMode'),
+  );
+  const durationMs = firstNumberField(
+    raw,
+    hostFieldKeys(host, 'duration_ms', 'durationMs'),
+  );
+  const interrupted = firstBooleanField(
+    raw,
+    hostFieldKeys(host, 'is_interrupt', 'isInterrupt'),
+  );
+  const stopHookActive = firstBooleanField(
+    raw,
+    hostFieldKeys(host, 'stop_hook_active', 'stopHookActive'),
+  );
+  const lastAssistantMessage = firstStringField(
+    raw,
+    hostFieldKeys(host, 'last_assistant_message', 'lastAssistantMessage'),
+  );
+  const backgroundTasks = firstArrayField(
+    raw,
+    hostFieldKeys(host, 'background_tasks', 'backgroundTasks'),
+  );
+  const sessionCrons = firstArrayField(
+    raw,
+    hostFieldKeys(host, 'session_crons', 'sessionCrons'),
+  );
+  const agentTranscriptPath = firstStringField(
+    raw,
+    hostFieldKeys(host, 'agent_transcript_path', 'agentTranscriptPath'),
+  );
+  const parentSessionId = firstStringField(
+    raw,
+    hostFieldKeys(host, 'parent_session_id', 'parentSessionId'),
+  );
+  const userRequested = firstBooleanField(
+    raw,
+    hostFieldKeys(host, 'user_requested', 'userRequested'),
+  );
+  const status = firstDefinedField(raw, ['status']);
+  const eventKey = hookType.replace(/[^a-z]/gi, '').toLowerCase();
+  const sessionEndReason = eventKey === 'sessionend'
+    ? firstStringField(raw, ['reason'])
+    : undefined;
+
+  const notificationType = firstStringField(
+    raw,
+    hostFieldKeys(host, 'notification_type', 'notificationType'),
+  );
+  const notificationTitle = firstStringField(
+    raw,
+    hostFieldKeys(host, 'notification_title', 'notificationTitle', 'title'),
+  );
+  const notificationData = firstDefinedField(
+    raw,
+    hostFieldKeys(host, 'notification_data', 'notificationData', 'data'),
+  );
+  const notification: CanonicalNotificationPayload | undefined =
+    eventKey === 'notification'
+    || notificationType !== undefined
+    || notificationTitle !== undefined
+    || notificationData !== undefined
+      ? {
+          ...(notificationType !== undefined ? { type: notificationType } : {}),
+          ...(notificationTitle !== undefined ? { title: notificationTitle } : {}),
+          ...(message !== undefined ? { message } : {}),
+          ...(notificationData !== undefined ? { data: notificationData } : {}),
+        }
+      : undefined;
+
+  return {
+    ...(prompt !== undefined ? { prompt } : {}),
+    ...(initialPrompt !== undefined ? { initialPrompt } : {}),
+    ...(promptId !== undefined ? { promptId } : {}),
+    ...(source !== undefined ? { source } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(timestamp !== undefined ? { timestamp } : {}),
+    ...(message !== undefined ? { message } : {}),
+    ...(parts !== undefined ? { parts } : {}),
+    ...(toolOutput !== undefined ? { toolOutput } : {}),
+    ...(toolError !== undefined ? { toolError } : {}),
+    ...(notification !== undefined ? { notification } : {}),
+    ...(trigger !== undefined ? { trigger } : {}),
+    ...(customInstructions !== undefined ? { customInstructions } : {}),
+    ...(sessionEndReason !== undefined ? { sessionEndReason } : {}),
+    ...(permissionSuggestions !== undefined ? { permissionSuggestions } : {}),
+    ...(permissionMode !== undefined ? { permissionMode } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(interrupted !== undefined ? { interrupted } : {}),
+    ...(stopHookActive !== undefined ? { stopHookActive } : {}),
+    ...(lastAssistantMessage !== undefined ? { lastAssistantMessage } : {}),
+    ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
+    ...(sessionCrons !== undefined ? { sessionCrons } : {}),
+    ...(agentTranscriptPath !== undefined ? { agentTranscriptPath } : {}),
+    ...(parentSessionId !== undefined ? { parentSessionId } : {}),
+    ...(userRequested !== undefined ? { userRequested } : {}),
+    ...(status !== undefined ? { status } : {}),
+  };
+}
+
+function stableSerialize(
+  value: unknown,
+  seen = new Set<object>(),
+  depth = 0,
+): string {
+  if (depth > MAX_STABLE_SERIALIZATION_DEPTH) {
+    throw new StableSerializationError(
+      `Tool arguments exceed the maximum fingerprint depth of ${MAX_STABLE_SERIALIZATION_DEPTH}.`,
+    );
+  }
+  if (value === null) return 'null';
+
+  switch (typeof value) {
+    case 'string':
+    case 'boolean':
+      return JSON.stringify(value);
+    case 'number':
+      return Number.isFinite(value) ? JSON.stringify(value) : JSON.stringify(String(value));
+    case 'bigint':
+      return JSON.stringify(`${value.toString()}n`);
+    case 'undefined':
+      return '"__undefined__"';
+    case 'function':
+      return '"__function__"';
+    case 'symbol':
+      return JSON.stringify(String(value));
+    case 'object':
+      break;
+  }
+
+  const objectValue = value as object;
+  if (seen.has(objectValue)) return '"__circular__"';
+  seen.add(objectValue);
+
+  let serialized: string;
+  if (Array.isArray(value)) {
+    serialized = `[${value
+      .map((item) => stableSerialize(item, seen, depth + 1))
+      .join(',')}]`;
+  } else {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, child]) => !['undefined', 'function', 'symbol'].includes(typeof child))
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(
+        ([key, child]) =>
+          `${JSON.stringify(key)}:${stableSerialize(child, seen, depth + 1)}`,
+      );
+    serialized = `{${entries.join(',')}}`;
+  }
+
+  seen.delete(objectValue);
+  return serialized;
+}
+
+function shellDialectForTool(host: HookHost, nativeName: string): ShellDialect | undefined {
+  const normalized = nativeName.toLowerCase().replace(/^proxy_/, '');
+  if (normalized === 'powershell' || normalized === 'pwsh') return 'powershell';
+  if (normalized === 'bash' || (host === 'claude' && normalized === 'shell')) return 'posix';
+  if (host === 'claude' && nativeName === 'Bash') return 'posix';
+  return undefined;
+}
+
+function malformedCallIssue(
+  code: NormalizationIssue['code'],
+  message: string,
+  originalIndex: number,
+  callId?: string,
+): NormalizationIssue {
+  return {
+    code,
+    message,
+    severity: 'safety',
+    scope: 'call',
+    originalIndex,
+    callId,
+  };
+}
+
+function parseSerializedArgs(
+  rawArgs: unknown,
+  originalIndex: number,
+  callId?: string,
+): { input: unknown; issue?: NormalizationIssue } {
+  if (typeof rawArgs !== 'string') {
+    return {
+      input: rawArgs,
+      issue: malformedCallIssue(
+        'malformed-tool-args',
+        `Tool call at index ${originalIndex} must provide serialized JSON args.`,
+        originalIndex,
+        callId,
+      ),
+    };
+  }
+
+  try {
+    return { input: JSON.parse(rawArgs) as unknown };
+  } catch {
+    return {
+      input: rawArgs,
+      issue: malformedCallIssue(
+        'malformed-tool-args',
+        `Tool call at index ${originalIndex} contains malformed JSON args.`,
+        originalIndex,
+        callId,
+      ),
+    };
+  }
+}
+
+function syntheticCallId(originalIndex: number): string {
+  return `__missing_tool_call_id_${originalIndex}`;
+}
+
+function normalizeHostDecision(value: unknown): HostHookDecision | undefined {
+  if (typeof value === 'string') {
+    const decision = value === 'block' ? 'deny' : value;
+    if (['pass', 'allow', 'ask', 'deny'].includes(decision)) {
+      return { decision: decision as HookDecision };
+    }
+    return undefined;
+  }
+
+  if (!isRecord(value)) return undefined;
+  const rawDecision = value.decision ?? value.behavior;
+  const normalized = normalizeHostDecision(rawDecision);
+  if (!normalized) return undefined;
+  const reason = stringField(value, 'reason');
+  return reason ? { ...normalized, reason } : normalized;
+}
+
+function inferHookType(raw: Record<string, unknown>, hookType?: string): string {
+  if (hookType) return hookType;
+  const nativeEvent =
+    stringField(raw, 'hook_event_name')
+    ?? stringField(raw, 'hookName')
+    ?? stringField(raw, 'hookEventName');
+  if (!nativeEvent) return 'unknown';
+  return EVENT_NAME_ALIASES[nativeEvent] ?? nativeEvent;
+}
+
+/**
+ * Detect the host contract from the complete top-level hook envelope.
+ * Nested tool arguments are deliberately ignored so snake_case argument keys
+ * cannot change host detection.
+ */
+export function detectHookContract(raw: unknown, _hookType?: string): DetectedHookContract {
+  if (!isRecord(raw)) {
+    return {
+      host: 'claude',
+      contract: 'claude-single',
+      capabilities: CLAUDE_SINGLE_CAPABILITIES,
+    };
+  }
+
+  for (const marker of CLAUDE_ENVELOPE_MARKERS) {
+    if (hasOwn(raw, marker)) {
+      return {
+        host: 'claude',
+        contract: 'claude-single',
+        capabilities: CLAUDE_SINGLE_CAPABILITIES,
+      };
+    }
+  }
+
+  for (const marker of COPILOT_ENVELOPE_MARKERS) {
+    if (hasOwn(raw, marker)) {
+      return {
+        host: 'copilot',
+        contract: 'copilot-1.0.72-1',
+        capabilities: COPILOT_1072_CAPABILITIES,
+      };
+    }
+  }
+
+  return {
+    host: 'claude',
+    contract: 'claude-single',
+    capabilities: CLAUDE_SINGLE_CAPABILITIES,
+  };
+}
+
+export function canonicalToolName(host: HookHost, nativeName: string): string {
+  const unproxiedName = nativeName.replace(/^proxy_/, '');
+  if (host === 'copilot') {
+    return COPILOT_TOOL_ALIASES[unproxiedName.toLowerCase()] ?? unproxiedName;
+  }
+  return unproxiedName === 'powershell' || unproxiedName === 'pwsh'
+    ? 'Bash'
+    : unproxiedName;
+}
+
+export function stableCallFingerprint(name: string, parsedInput: unknown): string {
+  return createHash('sha256')
+    .update(name)
+    .update('\0')
+    .update(stableSerialize(parsedInput))
+    .digest('hex');
+}
+
+function safeCallFingerprint(
+  name: string,
+  parsedInput: unknown,
+  rawArgs: unknown,
+  originalIndex: number,
+  callId?: string,
+): { fingerprint: string; issue?: NormalizationIssue } {
+  try {
+    return { fingerprint: stableCallFingerprint(name, parsedInput) };
+  } catch (error) {
+    const detail = formatUnknownError(error);
+    const fallback = typeof rawArgs === 'string'
+      ? rawArgs
+      : `${typeof rawArgs}:serialization-unavailable`;
+    return {
+      fingerprint: createHash('sha256')
+        .update(name)
+        .update('\0serialization-error\0')
+        .update(fallback)
+        .digest('hex'),
+      issue: malformedCallIssue(
+        'tool-call-serialization-failed',
+        `Tool call at index ${originalIndex} could not be fingerprinted safely: ${detail}`,
+        originalIndex,
+        callId,
+      ),
+    };
+  }
+}
+
+export function decodeCopilotToolCall(rawCall: unknown, originalIndex: number): CanonicalToolCall {
+  if (!isRecord(rawCall)) {
+    const issue = malformedCallIssue(
+      'malformed-tool-call',
+      `Tool call at index ${originalIndex} must be an object.`,
+      originalIndex,
+    );
+    const id = syntheticCallId(originalIndex);
+    const fingerprint = safeCallFingerprint('', rawCall, rawCall, originalIndex, id);
+    return {
+      id,
+      idSource: 'synthetic',
+      correlation: 'unavailable',
+      originalIndex,
+      duplicateIndices: [],
+      nativeName: '',
+      canonicalName: '',
+      input: rawCall,
+      rawArgs: rawCall,
+      fingerprint: fingerprint.fingerprint,
+      status: 'malformed',
+      malformed: true,
+      issues: fingerprint.issue ? [issue, fingerprint.issue] : [issue],
+    };
+  }
+
+  const issues: NormalizationIssue[] = [];
+  const rawId = stringField(rawCall, 'id');
+  const id = rawId ?? syntheticCallId(originalIndex);
+  if (!rawId) {
+    issues.push(
+      malformedCallIssue(
+        'missing-tool-call-id',
+        `Tool call at index ${originalIndex} is missing a correlation ID.`,
+        originalIndex,
+        id,
+      ),
+    );
+  }
+
+  const nativeName = stringField(rawCall, 'name') ?? '';
+  if (!nativeName) {
+    issues.push(
+      malformedCallIssue(
+        'missing-tool-name',
+        `Tool call at index ${originalIndex} is missing a tool name.`,
+        originalIndex,
+        id,
+      ),
+    );
+  }
+
+  const rawArgs = rawCall.args;
+  const parsedArgs = parseSerializedArgs(rawArgs, originalIndex, id);
+  if (parsedArgs.issue) issues.push(parsedArgs.issue);
+  const fingerprint = safeCallFingerprint(
+    nativeName,
+    parsedArgs.input,
+    rawArgs,
+    originalIndex,
+    id,
+  );
+  if (fingerprint.issue) issues.push(fingerprint.issue);
+
+  const malformed = issues.length > 0;
+  return {
+    id,
+    idSource: rawId ? 'host' : 'synthetic',
+    correlation: rawId ? 'host-id' : 'unavailable',
+    originalIndex,
+    duplicateIndices: [],
+    nativeName,
+    canonicalName: canonicalToolName('copilot', nativeName),
+    shellDialect: shellDialectForTool('copilot', nativeName),
+    input: parsedArgs.input,
+    rawArgs,
+    fingerprint: fingerprint.fingerprint,
+    status: malformed ? 'malformed' : 'valid',
+    malformed,
+    issues,
+  };
+}
+
+export function dedupeCanonicalToolCalls(
+  calls: readonly CanonicalToolCall[],
+): DedupeCanonicalToolCallsResult {
+  const uniqueCalls: CanonicalToolCall[] = [];
+  const issues: NormalizationIssue[] = [];
+  const indexById = new Map<string, number>();
+
+  for (const call of calls) {
+    const existingIndex = indexById.get(call.id);
+    if (existingIndex === undefined) {
+      indexById.set(call.id, uniqueCalls.length);
+      uniqueCalls.push({
+        ...call,
+        duplicateIndices: [...call.duplicateIndices],
+        issues: [...call.issues],
+      });
+      continue;
+    }
+
+    const existing = uniqueCalls[existingIndex];
+    if (existing.fingerprint === call.fingerprint) {
+      const malformed =
+        existing.malformed
+        || existing.status === 'malformed'
+        || existing.issues.length > 0
+        || call.malformed
+        || call.status === 'malformed'
+        || call.issues.length > 0;
+      uniqueCalls[existingIndex] = {
+        ...existing,
+        duplicateIndices: [
+          ...existing.duplicateIndices,
+          call.originalIndex,
+          ...call.duplicateIndices,
+        ],
+        issues: [
+          ...existing.issues,
+          ...call.issues,
+        ],
+        status: malformed ? 'malformed' : 'valid',
+        malformed,
+      };
+      continue;
+    }
+
+    issues.push({
+      code: 'conflicting-duplicate-id',
+      message: `Tool call ID "${call.id}" has conflicting names or arguments.`,
+      severity: 'safety',
+      scope: 'batch',
+      originalIndex: call.originalIndex,
+      callId: call.id,
+      batchSafety: true,
+    });
+  }
+
+  return { calls: uniqueCalls, issues };
+}
+
+function decodeSingleToolCall(
+  host: HookHost,
+  raw: Record<string, unknown>,
+): CanonicalToolCall | undefined {
+  const nativeName = host === 'claude'
+    ? stringField(raw, 'tool_name') ?? stringField(raw, 'toolName')
+    : stringField(raw, 'toolName') ?? stringField(raw, 'tool_name');
+  if (!nativeName) return undefined;
+
+  const hostId =
+    stringField(raw, 'tool_use_id')
+    ?? stringField(raw, 'toolUseId')
+    ?? stringField(raw, 'toolCallId');
+  const issues: NormalizationIssue[] = [];
+  let input: unknown;
+  let rawArgs: unknown;
+
+  if (host === 'copilot' && hasOwn(raw, 'toolArgs')) {
+    rawArgs = raw.toolArgs;
+    const parsedArgs = parseSerializedArgs(rawArgs, 0, hostId);
+    input = parsedArgs.input;
+    if (parsedArgs.issue) issues.push(parsedArgs.issue);
+  } else {
+    input = host === 'claude'
+      ? raw.tool_input ?? raw.toolInput
+      : raw.toolInput ?? raw.tool_input;
+    rawArgs = input;
+  }
+
+  const fingerprint = safeCallFingerprint(
+    nativeName,
+    input,
+    rawArgs,
+    0,
+    hostId,
+  );
+  if (fingerprint.issue) issues.push(fingerprint.issue);
+  const id = hostId ?? `__single_tool_call_${fingerprint.fingerprint.slice(0, 24)}`;
+  const malformed = issues.length > 0;
+  return {
+    id,
+    idSource: hostId ? 'host' : 'synthetic',
+    correlation: hostId ? 'host-id' : 'unavailable',
+    originalIndex: 0,
+    duplicateIndices: [],
+    nativeName,
+    canonicalName: canonicalToolName(host, nativeName),
+    shellDialect: shellDialectForTool(host, nativeName),
+    input,
+    rawArgs,
+    fingerprint: fingerprint.fingerprint,
+    status: malformed ? 'malformed' : 'valid',
+    malformed,
+    issues,
+  };
+}
+
+/**
+ * Normalize a complete host envelope without changing nested tool argument keys.
+ */
+export function normalizeHookEnvelope(raw: unknown, hookType?: string): CanonicalHookEnvelope {
+  const detected = detectHookContract(raw, hookType);
+  if (!isRecord(raw)) {
+    return {
+      ...detected,
+      hookType: hookType ?? 'unknown',
+      eventPayload: {},
+      originalCallCount: 0,
+      logicalCallCount: 0,
+      toolCalls: [],
+      issues: [{
+        code: 'invalid-envelope',
+        message: 'Hook input must be a JSON object.',
+        severity: 'safety',
+        scope: 'batch',
+        batchSafety: true,
+      }],
+    };
+  }
+
+  const issues: NormalizationIssue[] = [];
+  let decodedCalls: CanonicalToolCall[] = [];
+
+  if (detected.host === 'copilot' && hasOwn(raw, 'toolCalls')) {
+    if (Array.isArray(raw.toolCalls)) {
+      decodedCalls = raw.toolCalls.map((call, index) => decodeCopilotToolCall(call, index));
+    } else {
+      issues.push({
+        code: 'invalid-tool-calls',
+        message: 'Copilot toolCalls must be an array.',
+        severity: 'safety',
+        scope: 'batch',
+        batchSafety: true,
+      });
+    }
+  } else {
+    const singleCall = decodeSingleToolCall(detected.host, raw);
+    if (singleCall) decodedCalls = [singleCall];
+  }
+
+  for (const call of decodedCalls) {
+    issues.push(...call.issues);
+  }
+
+  const deduped = dedupeCanonicalToolCalls(decodedCalls);
+  issues.push(...deduped.issues);
+
+  const canonicalHookType = inferHookType(raw, hookType);
+  const sessionId = detected.host === 'claude'
+    ? stringField(raw, 'session_id') ?? stringField(raw, 'sessionId')
+    : stringField(raw, 'sessionId') ?? stringField(raw, 'session_id');
+  const directory = stringField(raw, 'cwd') ?? stringField(raw, 'directory');
+  const rawTranscriptPath = detected.host === 'claude'
+    ? stringField(raw, 'transcript_path') ?? stringField(raw, 'transcriptPath')
+    : stringField(raw, 'transcriptPath') ?? stringField(raw, 'transcript_path');
+  const transcriptPath = resolveTranscriptPath(rawTranscriptPath, directory);
+  const stopReason = detected.host === 'claude'
+    ? stringField(raw, 'stop_reason') ?? stringField(raw, 'stopReason')
+    : stringField(raw, 'stopReason') ?? stringField(raw, 'stop_reason');
+
+  const agentId =
+    stringField(raw, 'agent_id')
+    ?? stringField(raw, 'agentId');
+  const agentName = detected.host === 'claude'
+    ? stringField(raw, 'agent_type')
+      ?? stringField(raw, 'agent_name')
+      ?? stringField(raw, 'agentName')
+    : stringField(raw, 'agentName')
+      ?? stringField(raw, 'agent_type')
+      ?? stringField(raw, 'agent_name');
+  const agentDisplayName =
+    stringField(raw, 'agentDisplayName')
+    ?? stringField(raw, 'agent_display_name');
+  const agentDescription =
+    stringField(raw, 'agentDescription')
+    ?? stringField(raw, 'agent_description');
+
+  let agent: CanonicalAgentRef | undefined;
+  if (agentId || agentName || agentDisplayName || agentDescription) {
+    agent = {
+      ...(agentId ? { id: agentId } : {}),
+      ...(agentName ? { name: agentName } : {}),
+      ...(agentDisplayName ? { displayName: agentDisplayName } : {}),
+      ...(agentDescription ? { description: agentDescription } : {}),
+      correlation: agentId ? 'host-id' : 'unavailable',
+    };
+  }
+
+  const hostDecision =
+    normalizeHostDecision(raw.hostDecision)
+    ?? normalizeHostDecision(raw.nativeDecision);
+
+  return {
+    ...detected,
+    hookType: canonicalHookType,
+    sessionId,
+    directory,
+    transcriptPath,
+    stopReason,
+    eventPayload: normalizeEventPayload(raw, detected.host, canonicalHookType),
+    originalCallCount: decodedCalls.length,
+    logicalCallCount: deduped.calls.length,
+    toolCalls: deduped.calls,
+    agent,
+    issues,
+    hostDecision,
+  };
 }
 
 // --- Security: Hook sensitivity classification ---
