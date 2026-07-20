@@ -19,12 +19,21 @@ import {
   mkdirSync,
   unlinkSync,
   readdirSync,
+  openSync,
+  closeSync,
+  readSync,
+  statSync,
 } from "fs";
+import { createHash } from "crypto";
 import { dirname, join } from "path";
 import { getOmcRoot, resolveSessionStatePaths } from '../../lib/worktree-paths.js';
 import { resolveSessionId } from '../../lib/session-id.js';
 import { withFileLockSync, lockPathFor } from '../../lib/file-lock.js';
-import { recordAgentStart, recordAgentStop } from './session-replay.js';
+import {
+  recordAgentReconciliation,
+  recordAgentStart,
+  recordAgentStop,
+} from './session-replay.js';
 import { recordMissionAgentStart, recordMissionAgentStop } from '../../hud/mission-board.js';
 
 // ============================================================================
@@ -34,7 +43,29 @@ import { recordMissionAgentStart, recordMissionAgentStop } from '../../hud/missi
 export interface SubagentInfo {
   agent_id: string;
   agent_type: string;
+  agent_name?: string;
+  agent_display_name?: string;
+  agent_description?: string;
   started_at: string;
+  start_sequence?: number;
+  start_event_id?: string;
+  stop_event_id?: string;
+  identity_digest?: string;
+  start_identity_digest?: string;
+  stop_identity_digest?: string;
+  delivery_fingerprint?: string;
+  delivery_receipt?: string;
+  stop_delivery_fingerprint?: string;
+  stop_delivery_receipt?: string;
+  start_event_timestamp?: number;
+  stop_event_timestamp?: number;
+  reported_agent_id?: string;
+  id_source?: "host" | "synthetic";
+  host_id_source?: "payload" | "event-log";
+  correlation_status?: "host-id" | "unavailable";
+  correlation_strategy?: SubagentCorrelationStrategy;
+  synthetic_correlation?: boolean;
+  reordered?: boolean;
   parent_mode: string; // 'autopilot' | 'ultrawork' | 'team' | 'ralph' | 'none'
   task_description?: string;
   file_ownership?: string[];
@@ -49,6 +80,14 @@ export interface SubagentInfo {
   telemetry_status?: "unmatched_stop";
   telemetry_note?: string;
 }
+
+export type SubagentCorrelationStrategy =
+  | "host-id"
+  | "synthetic-start-id"
+  | "agent-name-fifo"
+  | "reordered-host-id"
+  | "reordered-agent-name"
+  | "unmatched-stop";
 
 export interface ToolUsageEntry {
   tool_name: string;
@@ -86,6 +125,17 @@ export interface SubagentTrackingState {
   total_completed: number;
   total_failed: number;
   last_updated: string;
+  lifecycle_sequence?: number;
+  delivery_receipts?: SubagentDeliveryReceipt[];
+}
+
+export interface SubagentDeliveryReceipt {
+  action: "start" | "stop";
+  receipt: string;
+  fingerprint: string;
+  agent_id?: string;
+  event_id?: string;
+  recorded_at: string;
 }
 
 export interface SubagentStartInput {
@@ -98,7 +148,35 @@ export interface SubagentStartInput {
   agent_type: string;
   prompt?: string;
   model?: string;
+  deliveryReceipt?: string;
 }
+
+export interface CanonicalSubagentInput {
+  host?: "claude" | "copilot";
+  sessionId?: string;
+  directory?: string;
+  transcriptPath?: string;
+  stopReason?: string;
+  originalIndex?: number;
+  agentId?: string;
+  agentName?: string;
+  agentDisplayName?: string;
+  agentDescription?: string;
+  prompt?: string;
+  model?: string;
+  timestamp?: number;
+  permissionMode?: string;
+  lastAssistantMessage?: string;
+  toolOutput?: unknown;
+  status?: unknown;
+  success?: boolean;
+  eventPayload?: Record<string, unknown>;
+  deliveryReceipt?: string;
+}
+
+export type SubagentStartProcessorInput =
+  | SubagentStartInput
+  | CanonicalSubagentInput;
 
 export interface SubagentStopInput {
   session_id: string;
@@ -111,6 +189,21 @@ export interface SubagentStopInput {
   output?: string;
   /** @deprecated The SDK does not provide a success field. Use inferred status instead. */
   success?: boolean;
+  deliveryReceipt?: string;
+}
+
+export type SubagentStopProcessorInput =
+  | SubagentStopInput
+  | CanonicalSubagentInput;
+
+export interface SubagentLifecycleOutput {
+  agent_id: string;
+  agent_name?: string;
+  correlation_strategy: SubagentCorrelationStrategy;
+  correlation_status: "host-id" | "unavailable";
+  synthetic_correlation: boolean;
+  duplicate?: boolean;
+  reordered?: boolean;
 }
 
 export interface HookOutput {
@@ -120,8 +213,16 @@ export interface HookOutput {
     additionalContext?: string;
     agent_count?: number;
     stale_agents?: string[];
+    agent_id?: string;
+    agent_name?: string;
+    correlation_strategy?: SubagentCorrelationStrategy;
+    correlation_status?: "host-id" | "unavailable";
+    synthetic_correlation?: boolean;
+    duplicate?: boolean;
+    reordered?: boolean;
   };
   suppressOutput?: boolean;
+  tracking?: SubagentLifecycleOutput;
 }
 
 export interface AgentIntervention {
@@ -149,6 +250,38 @@ const FLUSH_RETRY_BASE_MS = 50;
 const UNTRACKED_NATIVE_FORK_AGENT_TYPE = "untracked-native-fork";
 const UNMATCHED_STOP_TELEMETRY_NOTE =
   "SubagentStop arrived without a matching SubagentStart; native Agent/Task start telemetry was not observed.";
+const REORDERED_LIFECYCLE_TELEMETRY_NOTE =
+  "Subagent lifecycle events arrived out of order and were reconciled deterministically.";
+const REORDER_WINDOW_MS = 30_000;
+const MAX_DELIVERY_RECEIPTS = 512;
+const COPILOT_EVENT_MATCH_WINDOW_MS = 2_000;
+const COPILOT_EVENT_TAIL_BYTES = 256 * 1024;
+const COPILOT_EVENT_TAIL_LINES = 512;
+
+interface NormalizedSubagentStartInput
+  extends Omit<SubagentStartInput, "agent_id"> {
+  agent_id?: string;
+  id_source: "host" | "synthetic";
+  agent_name?: string;
+  agent_display_name?: string;
+  agent_description?: string;
+  event_timestamp?: number;
+  host_id_source?: "payload" | "event-log";
+  content_digest: string;
+  delivery_fingerprint: string;
+  delivery_receipt?: string;
+}
+
+interface NormalizedSubagentStopInput extends SubagentStopInput {
+  agent_name?: string;
+  agent_display_name?: string;
+  agent_description?: string;
+  event_timestamp?: number;
+  host_id_source?: "payload" | "event-log";
+  content_digest: string;
+  delivery_fingerprint: string;
+  delivery_receipt?: string;
+}
 
 // Lock options — short timeout for hot-path writes; stale detection generous
 // so healthy writers aren't mistakenly treated as abandoned.
@@ -156,6 +289,10 @@ const LOCK_OPTS = {
   timeoutMs: 500,
   retryDelayMs: 50,
   staleLockMs: 30_000,
+};
+const LIFECYCLE_LOCK_OPTS = {
+  ...LOCK_OPTS,
+  timeoutMs: 5_000,
 };
 
 // Per write-path debounce state for batching writes (avoids race conditions).
@@ -183,6 +320,35 @@ function syncSleep(ms: number): void {
     const waitUntil = Date.now() + ms;
     while (Date.now() < waitUntil) { /* spin */ }
   }
+}
+
+function withLifecycleLock<T>(
+  lockPath: string,
+  processEvent: () => T,
+): T {
+  const deadline = Date.now() + LIFECYCLE_LOCK_OPTS.timeoutMs;
+  let lastError: unknown;
+
+  while (Date.now() < deadline) {
+    let lockAcquired = false;
+    try {
+      return withFileLockSync(lockPath, () => {
+        lockAcquired = true;
+        return processEvent();
+      }, {
+        ...LIFECYCLE_LOCK_OPTS,
+        timeoutMs: Math.min(250, deadline - Date.now()),
+      });
+    } catch (error) {
+      if (lockAcquired) throw error;
+      lastError = error;
+    }
+    syncSleep(LIFECYCLE_LOCK_OPTS.retryDelayMs);
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`Failed to acquire lifecycle lock: ${lockPath}`);
 }
 
 // ============================================================================
@@ -270,6 +436,23 @@ export function mergeTrackerStates(
   const diskTime = new Date(diskState.last_updated).getTime();
   const pendingTime = new Date(pendingState.last_updated).getTime();
   const last_updated = diskTime > pendingTime ? diskState.last_updated : pendingState.last_updated;
+  const lifecycle_sequence = Math.max(
+    diskState.lifecycle_sequence ?? 0,
+    pendingState.lifecycle_sequence ?? 0,
+  );
+  const receiptMap = new Map<string, SubagentDeliveryReceipt>();
+  for (const receipt of [
+    ...(diskState.delivery_receipts ?? []),
+    ...(pendingState.delivery_receipts ?? []),
+  ]) {
+    receiptMap.set(`${receipt.action}:${receipt.receipt}`, receipt);
+  }
+  const delivery_receipts = Array.from(receiptMap.values())
+    .sort((left, right) =>
+      new Date(left.recorded_at).getTime()
+      - new Date(right.recorded_at).getTime()
+    )
+    .slice(-MAX_DELIVERY_RECEIPTS);
 
   return {
     agents: Array.from(agentMap.values()),
@@ -277,6 +460,8 @@ export function mergeTrackerStates(
     total_completed,
     total_failed,
     last_updated,
+    ...(lifecycle_sequence > 0 ? { lifecycle_sequence } : {}),
+    ...(delivery_receipts.length > 0 ? { delivery_receipts } : {}),
   };
 }
 
@@ -604,6 +789,504 @@ export function getStaleAgents(state: SubagentTrackingState): SubagentInfo[] {
   });
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function firstNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function firstBoolean(...values: unknown[]): boolean | undefined {
+  for (const value of values) {
+    if (typeof value === "boolean") return value;
+  }
+  return undefined;
+}
+
+function lifecycleTimestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value < 1_000_000_000_000 ? value * 1_000 : value;
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function lifecycleLabelMatches(
+  expected: string | undefined,
+  actual: string | undefined,
+): boolean {
+  if (!expected) return true;
+  if (!actual) return false;
+  return expected.trim().toLowerCase() === actual.trim().toLowerCase();
+}
+
+function resolveCopilotEventLogPath(
+  transcriptPath: string,
+): string | undefined {
+  if (!transcriptPath) return undefined;
+  const candidates = [
+    join(transcriptPath, "events.jsonl"),
+    join(dirname(transcriptPath), "events.jsonl"),
+    transcriptPath,
+  ];
+
+  for (const candidate of new Set(candidates)) {
+    try {
+      if (existsSync(candidate) && statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {
+      // Evidence is optional; continue to the next canonical location.
+    }
+  }
+  return undefined;
+}
+
+function readBoundedEventLogTail(filePath: string): string[] {
+  let fd: number | undefined;
+  try {
+    const size = statSync(filePath).size;
+    const byteLength = Math.min(size, COPILOT_EVENT_TAIL_BYTES);
+    const offset = Math.max(0, size - byteLength);
+    const buffer = Buffer.alloc(byteLength);
+    fd = openSync(filePath, "r");
+    const bytesRead = readSync(fd, buffer, 0, byteLength, offset);
+    let content = buffer.subarray(0, bytesRead).toString("utf8");
+    if (offset > 0) {
+      const firstNewline = content.indexOf("\n");
+      content = firstNewline === -1 ? "" : content.slice(firstNewline + 1);
+    }
+    return content
+      .split(/\r?\n/)
+      .filter((line) => line.trim().length > 0)
+      .slice(-COPILOT_EVENT_TAIL_LINES);
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* already closed */ }
+    }
+  }
+}
+
+function resolveCopilotLifecycleId(
+  kind: "start" | "stop",
+  transcriptPath: string,
+  eventTimestamp: number | undefined,
+  agentName: string | undefined,
+  agentDisplayName: string | undefined,
+): string | undefined {
+  if (eventTimestamp === undefined) return undefined;
+  const eventLogPath = resolveCopilotEventLogPath(transcriptPath);
+  if (!eventLogPath) return undefined;
+  const expectedType =
+    kind === "start" ? "subagent.started" : "subagent.completed";
+  const candidates: Array<{
+    agentId: string;
+    delta: number;
+    lineIndex: number;
+  }> = [];
+
+  const lines = readBoundedEventLogTail(eventLogPath);
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(lines[lineIndex]) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (event.type !== expectedType) continue;
+
+    const data = asRecord(event.data);
+    const timestamp = lifecycleTimestamp(event.timestamp ?? data?.timestamp);
+    if (timestamp === undefined) continue;
+    const delta = Math.abs(timestamp - eventTimestamp);
+    if (delta > COPILOT_EVENT_MATCH_WINDOW_MS) continue;
+
+    const eventAgentName = firstString(
+      event.agentName,
+      data?.agentName,
+    );
+    const eventDisplayName = firstString(
+      event.displayName,
+      event.agentDisplayName,
+      data?.displayName,
+      data?.agentDisplayName,
+    );
+    if (!lifecycleLabelMatches(agentName, eventAgentName)) continue;
+    if (!lifecycleLabelMatches(agentDisplayName, eventDisplayName)) continue;
+
+    const agentId = firstString(event.agentId, data?.toolCallId);
+    if (!agentId) continue;
+    candidates.push({ agentId, delta, lineIndex });
+  }
+
+  return candidates
+    .sort((left, right) =>
+      left.delta - right.delta || right.lineIndex - left.lineIndex
+    )[0]?.agentId;
+}
+
+function lifecycleDigest(
+  kind: "start" | "stop",
+  fields: readonly unknown[],
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify([kind, ...fields]))
+    .digest("hex");
+}
+
+function digestDisplayId(digest: string): string {
+  return `${digest.slice(0, 12)}-${digest.slice(12, 24)}`;
+}
+
+function allocateLifecycleIdentity(
+  state: SubagentTrackingState,
+  kind: "start" | "stop",
+  sessionId: string,
+  contentDigest: string,
+): {
+  sequence: number;
+  identityDigest: string;
+  eventId: string;
+} {
+  const sequence = (state.lifecycle_sequence ?? 0) + 1;
+  state.lifecycle_sequence = sequence;
+  const identityDigest = lifecycleDigest(kind, [
+    sessionId,
+    contentDigest,
+    sequence,
+  ]);
+
+  return {
+    sequence,
+    identityDigest,
+    eventId: `subagent-${kind}:${identityDigest}`,
+  };
+}
+
+function resolveLifecycleIdentity(
+  state: SubagentTrackingState,
+  kind: "start" | "stop",
+  sessionId: string,
+  contentDigest: string,
+  hostAgentId?: string,
+): {
+  sequence?: number;
+  identityDigest: string;
+  eventId: string;
+} {
+  if (!hostAgentId) {
+    return allocateLifecycleIdentity(
+      state,
+      kind,
+      sessionId,
+      contentDigest,
+    );
+  }
+
+  const identityDigest = lifecycleDigest(kind, [
+    sessionId,
+    "host",
+    hostAgentId,
+  ]);
+  return {
+    identityDigest,
+    eventId: `subagent-${kind}:${identityDigest}`,
+  };
+}
+
+function findDeliveryReceipt(
+  state: SubagentTrackingState,
+  action: "start" | "stop",
+  receipt?: string,
+): SubagentDeliveryReceipt | undefined {
+  if (!receipt) return undefined;
+  return state.delivery_receipts?.find(
+    (entry) => entry.action === action && entry.receipt === receipt,
+  );
+}
+
+function recordDeliveryReceipt(
+  state: SubagentTrackingState,
+  receipt: SubagentDeliveryReceipt | undefined,
+): void {
+  if (!receipt) return;
+  state.delivery_receipts = [
+    ...(state.delivery_receipts ?? []).filter(
+      (entry) =>
+        entry.action !== receipt.action || entry.receipt !== receipt.receipt,
+    ),
+    receipt,
+  ].slice(-MAX_DELIVERY_RECEIPTS);
+}
+
+function updateReceiptAgentId(
+  state: SubagentTrackingState,
+  previousAgentId: string,
+  nextAgentId: string,
+): void {
+  for (const receipt of state.delivery_receipts ?? []) {
+    if (receipt.agent_id === previousAgentId) {
+      receipt.agent_id = nextAgentId;
+    }
+  }
+}
+
+function timestampIso(timestamp?: number): string {
+  if (timestamp !== undefined) {
+    const date = new Date(timestamp);
+    if (!Number.isNaN(date.getTime())) return date.toISOString();
+  }
+  return new Date().toISOString();
+}
+
+function normalizedAgentName(agent: SubagentInfo): string {
+  return agent.agent_name ?? agent.agent_type;
+}
+
+function lifecycleOutput(
+  agent: SubagentInfo,
+  options: {
+    duplicate?: boolean;
+    reordered?: boolean;
+  } = {},
+): SubagentLifecycleOutput {
+  return {
+    agent_id: agent.agent_id,
+    agent_name: agent.agent_name,
+    correlation_strategy: agent.correlation_strategy
+      ?? (agent.id_source === "synthetic" ? "synthetic-start-id" : "host-id"),
+    correlation_status: agent.correlation_status
+      ?? (agent.id_source === "host" ? "host-id" : "unavailable"),
+    synthetic_correlation: agent.synthetic_correlation === true,
+    ...(options.duplicate ? { duplicate: true } : {}),
+    ...(options.reordered ? { reordered: true } : {}),
+  };
+}
+
+function normalizeSubagentStartInput(
+  input: SubagentStartProcessorInput,
+): NormalizedSubagentStartInput | undefined {
+  const raw = input as unknown as Record<string, unknown>;
+  const eventPayload = asRecord(raw.eventPayload);
+  const sessionId = firstString(raw.session_id, raw.sessionId);
+  const cwd = firstString(raw.cwd, raw.directory);
+  if (!sessionId || !cwd) return undefined;
+
+  const explicitAgentId = firstString(raw.agent_id, raw.agentId);
+  const agentName = firstString(
+    raw.agent_type,
+    raw.agentName,
+    raw.agent_name,
+  );
+  const agentDisplayName = firstString(
+    raw.agentDisplayName,
+    raw.agent_display_name,
+  );
+  const agentDescription = firstString(
+    raw.agentDescription,
+    raw.agent_description,
+  );
+  if (!explicitAgentId && !agentName && !agentDisplayName) return undefined;
+
+  const timestamp = firstNumber(raw.timestamp, eventPayload?.timestamp);
+  const transcriptPath = firstString(
+    raw.transcript_path,
+    raw.transcriptPath,
+  ) ?? "";
+  const eventLogAgentId =
+    !explicitAgentId && raw.host === "copilot"
+      ? resolveCopilotLifecycleId(
+          "start",
+          transcriptPath,
+          timestamp,
+          agentName,
+          agentDisplayName,
+        )
+      : undefined;
+  const agentId = explicitAgentId ?? eventLogAgentId;
+  const prompt = firstString(raw.prompt, eventPayload?.prompt);
+  const model = firstString(raw.model, eventPayload?.model);
+  const contentDigest = lifecycleDigest("start", [
+    sessionId,
+    raw.host,
+    agentId,
+    agentName,
+    agentDisplayName,
+    agentDescription,
+    timestamp,
+    transcriptPath,
+    prompt,
+    model,
+    raw.originalIndex,
+  ]);
+  const deliveryReceipt = firstString(
+    raw.deliveryReceipt,
+    raw.delivery_receipt,
+    raw.deliveryId,
+    raw.idempotencyKey,
+    eventPayload?.deliveryReceipt,
+    eventPayload?.deliveryId,
+    eventPayload?.idempotencyKey,
+  );
+
+  return {
+    session_id: sessionId,
+    transcript_path: transcriptPath,
+    cwd,
+    permission_mode: firstString(
+      raw.permission_mode,
+      raw.permissionMode,
+      eventPayload?.permissionMode,
+    ) ?? "default",
+    hook_event_name: "SubagentStart",
+    agent_id: agentId,
+    agent_type: agentName ?? agentDisplayName ?? "unknown",
+    prompt,
+    model,
+    id_source: agentId ? "host" : "synthetic",
+    host_id_source: explicitAgentId
+      ? "payload"
+      : eventLogAgentId
+        ? "event-log"
+        : undefined,
+    agent_name: agentName ?? agentDisplayName,
+    agent_display_name: agentDisplayName,
+    agent_description: agentDescription,
+    event_timestamp: timestamp,
+    content_digest: contentDigest,
+    delivery_fingerprint: `subagent-start:${contentDigest}`,
+    delivery_receipt: deliveryReceipt,
+  };
+}
+
+function normalizeSubagentStopInput(
+  input: SubagentStopProcessorInput,
+): NormalizedSubagentStopInput | undefined {
+  const raw = input as unknown as Record<string, unknown>;
+  const eventPayload = asRecord(raw.eventPayload);
+  const sessionId = firstString(raw.session_id, raw.sessionId);
+  const cwd = firstString(raw.cwd, raw.directory);
+  if (!sessionId || !cwd) return undefined;
+
+  const explicitAgentId = firstString(raw.agent_id, raw.agentId);
+  const agentName = firstString(
+    raw.agent_type,
+    raw.agentName,
+    raw.agent_name,
+  );
+  const agentDisplayName = firstString(
+    raw.agentDisplayName,
+    raw.agent_display_name,
+  );
+  const agentDescription = firstString(
+    raw.agentDescription,
+    raw.agent_description,
+  );
+  const timestamp = firstNumber(raw.timestamp, eventPayload?.timestamp);
+  const transcriptPath = firstString(
+    raw.transcript_path,
+    raw.transcriptPath,
+  ) ?? "";
+  const eventLogAgentId =
+    !explicitAgentId && raw.host === "copilot"
+      ? resolveCopilotLifecycleId(
+          "stop",
+          transcriptPath,
+          timestamp,
+          agentName,
+          agentDisplayName,
+        )
+      : undefined;
+  const agentId = explicitAgentId ?? eventLogAgentId;
+  const output = firstString(
+    raw.output,
+    raw.lastAssistantMessage,
+    eventPayload?.lastAssistantMessage,
+    raw.toolOutput,
+    eventPayload?.toolOutput,
+  );
+  const stopReason = firstString(
+    raw.stop_reason,
+    raw.stopReason,
+  );
+  const contentDigest = lifecycleDigest("stop", [
+    sessionId,
+    raw.host,
+    agentId,
+    agentName,
+    agentDisplayName,
+    agentDescription,
+    timestamp,
+    transcriptPath,
+    stopReason,
+    output,
+    raw.originalIndex,
+  ]);
+  const deliveryReceipt = firstString(
+    raw.deliveryReceipt,
+    raw.delivery_receipt,
+    raw.deliveryId,
+    raw.idempotencyKey,
+    eventPayload?.deliveryReceipt,
+    eventPayload?.deliveryId,
+    eventPayload?.idempotencyKey,
+  );
+  const success = firstBoolean(raw.success)
+    ?? (firstString(raw.status, eventPayload?.status) === "failed"
+      ? false
+      : undefined);
+
+  return {
+    session_id: sessionId,
+    transcript_path: transcriptPath,
+    cwd,
+    permission_mode: firstString(
+      raw.permission_mode,
+      raw.permissionMode,
+      eventPayload?.permissionMode,
+    ) ?? "default",
+    hook_event_name: "SubagentStop",
+    agent_id: agentId,
+    agent_type: agentName ?? agentDisplayName,
+    output,
+    success,
+    agent_name: agentName ?? agentDisplayName,
+    agent_display_name: agentDisplayName,
+    agent_description: agentDescription,
+    event_timestamp: timestamp,
+    host_id_source: explicitAgentId
+      ? "payload"
+      : eventLogAgentId
+        ? "event-log"
+        : undefined,
+    content_digest: contentDigest,
+    delivery_fingerprint: `subagent-stop:${contentDigest}`,
+    delivery_receipt: deliveryReceipt,
+  };
+}
+
 // ============================================================================
 // Hook Processors
 // ============================================================================
@@ -611,114 +1294,465 @@ export function getStaleAgents(state: SubagentTrackingState): SubagentInfo[] {
 /**
  * Process SubagentStart event
  */
-export function processSubagentStart(input: SubagentStartInput): HookOutput {
-  const sessionId = resolveSessionId({ context: 'hook', hookPayload: input });
-  const writePath = resolveWritePath(input.cwd, sessionId);
+export function processSubagentStart(
+  input: SubagentStartProcessorInput,
+): HookOutput {
+  const normalized = normalizeSubagentStartInput(input);
+  if (!normalized) return { continue: true };
+
+  const sessionId = resolveSessionId({
+    context: "hook",
+    hookPayload: normalized,
+  });
+  const writePath = resolveWritePath(normalized.cwd, sessionId);
   ensureParentDir(writePath);
   const lockPath = lockPathFor(writePath);
 
   try {
-    return withFileLockSync(lockPath, () => {
-      const state = readTrackingState(input.cwd, sessionId);
-      const parentMode = detectParentMode(input.cwd);
-      const startedAt = new Date().toISOString();
-      const taskDescription = input.prompt?.substring(0, 200); // Truncate for storage
-      const existingAgent = state.agents.find((agent) => agent.agent_id === input.agent_id);
-      const isDuplicateRunningStart = existingAgent?.status === "running";
-      let trackedAgent: SubagentInfo;
+    const processed = withLifecycleLock(lockPath, () => {
+      const state = readTrackingState(normalized.cwd, sessionId);
+      const parentMode = detectParentMode(normalized.cwd);
+      const startedAt = timestampIso(normalized.event_timestamp);
+      const taskDescription = (
+        normalized.prompt
+        ?? normalized.agent_description
+      )?.substring(0, 200);
 
-      if (existingAgent) {
-        existingAgent.agent_type = input.agent_type;
+      const duplicateOutput = (duplicateAgent: SubagentInfo): HookOutput => {
+        const runningCount = state.agents.filter(
+          (agent) => agent.status === "running",
+        ).length;
+
+        return {
+          continue: true,
+          hookSpecificOutput: {
+            hookEventName: "SubagentStart",
+            additionalContext:
+              `Agent ${duplicateAgent.agent_type} start already recorded `
+              + `(${duplicateAgent.agent_id}); ${runningCount} agent(s) running`,
+            agent_count: runningCount,
+            stale_agents: getStaleAgents(state).map(
+              (agent) => agent.agent_id,
+            ),
+            agent_id: duplicateAgent.agent_id,
+            agent_name: duplicateAgent.agent_name,
+            correlation_strategy: duplicateAgent.correlation_strategy,
+            correlation_status: duplicateAgent.correlation_status
+              ?? (duplicateAgent.id_source === "host"
+                ? "host-id"
+                : "unavailable"),
+            synthetic_correlation:
+              duplicateAgent.synthetic_correlation === true,
+            duplicate: true,
+          },
+          tracking: lifecycleOutput(duplicateAgent, { duplicate: true }),
+        };
+      };
+
+      const priorReceipt = findDeliveryReceipt(
+        state,
+        "start",
+        normalized.delivery_receipt,
+      );
+      if (priorReceipt) {
+        const duplicateAgent = priorReceipt.agent_id
+          ? state.agents.find(
+              (agent) => agent.agent_id === priorReceipt.agent_id,
+            )
+          : undefined;
+        return {
+          output: duplicateAgent
+            ? duplicateOutput(duplicateAgent)
+            : {
+                continue: true,
+                hookSpecificOutput: {
+                  hookEventName: "SubagentStart",
+                  additionalContext:
+                    `Subagent start delivery ${priorReceipt.receipt} already recorded`,
+                  duplicate: true,
+                },
+              },
+          record: undefined,
+        };
+      }
+
+      let existingIndex = normalized.agent_id
+        ? state.agents.findIndex(
+            (agent) => agent.agent_id === normalized.agent_id,
+          )
+        : -1;
+
+      if (existingIndex !== -1) {
+        const existingAgent = state.agents[existingIndex];
+        const pendingReordered =
+          existingAgent.status !== "running"
+          && existingAgent.telemetry_status === "unmatched_stop"
+          && existingAgent.start_event_id === undefined;
+
+        if (
+          pendingReordered
+          && !canReconcileReorderedStop(
+            existingAgent,
+            normalized.event_timestamp,
+          )
+        ) {
+          const previousAgentId = existingAgent.agent_id;
+          existingAgent.reported_agent_id ??= previousAgentId;
+          existingAgent.agent_id = digestDisplayId(
+            existingAgent.stop_identity_digest
+              ?? existingAgent.identity_digest
+              ?? lifecycleDigest("stop", [
+                normalized.session_id,
+                existingAgent.stop_delivery_fingerprint,
+                existingAgent.completed_at,
+              ]),
+          );
+          updateReceiptAgentId(
+            state,
+            previousAgentId,
+            existingAgent.agent_id,
+          );
+          existingIndex = -1;
+        } else if (!pendingReordered) {
+          existingAgent.agent_name ??= normalized.agent_name;
+          existingAgent.agent_display_name ??= normalized.agent_display_name;
+          existingAgent.agent_description ??= normalized.agent_description;
+          existingAgent.correlation_strategy ??=
+            normalized.id_source === "synthetic"
+              ? "synthetic-start-id"
+              : "host-id";
+          existingAgent.correlation_status ??=
+            normalized.id_source === "host" ? "host-id" : "unavailable";
+          existingAgent.host_id_source ??= normalized.host_id_source;
+          existingAgent.synthetic_correlation ??=
+            normalized.id_source === "synthetic";
+          recordDeliveryReceipt(
+            state,
+            normalized.delivery_receipt
+              ? {
+                  action: "start",
+                  receipt: normalized.delivery_receipt,
+                  fingerprint: normalized.delivery_fingerprint,
+                  agent_id: existingAgent.agent_id,
+                  event_id: existingAgent.start_event_id,
+                  recorded_at: startedAt,
+                }
+              : undefined,
+          );
+          writeTrackingStateImmediate(normalized.cwd, state, sessionId);
+          return {
+            output: duplicateOutput(existingAgent),
+            record: undefined,
+          };
+        }
+      }
+
+      const identity = resolveLifecycleIdentity(
+        state,
+        "start",
+        normalized.session_id,
+        normalized.content_digest,
+        normalized.agent_id,
+      );
+      const agentId = normalized.agent_id
+        ?? digestDisplayId(identity.identityDigest);
+
+      if (
+        existingIndex === -1
+        && normalized.agent_name
+      ) {
+        existingIndex = findPendingReorderedStopByName(
+          state,
+          normalized.agent_name,
+          normalized.event_timestamp,
+          normalized.agent_id,
+        );
+      }
+
+      let trackedAgent: SubagentInfo;
+      let reordered = false;
+      let previousAgentId: string | undefined;
+
+      if (existingIndex !== -1) {
+        const existingAgent = state.agents[existingIndex];
+        previousAgentId = existingAgent.agent_id;
+        const hasHostIdentity =
+          normalized.id_source === "host"
+          || existingAgent.id_source === "host";
+        existingAgent.agent_id =
+          normalized.id_source === "host"
+            ? agentId
+            : previousAgentId;
+        existingAgent.agent_type = normalized.agent_type;
+        existingAgent.agent_name = normalized.agent_name;
+        existingAgent.agent_display_name = normalized.agent_display_name;
+        existingAgent.agent_description = normalized.agent_description;
+        existingAgent.started_at = startedAt;
+        existingAgent.start_sequence = state.total_spawned + 1;
+        existingAgent.start_event_id = identity.eventId;
+        existingAgent.identity_digest ??= identity.identityDigest;
+        existingAgent.start_identity_digest = identity.identityDigest;
+        existingAgent.delivery_fingerprint = normalized.delivery_fingerprint;
+        existingAgent.delivery_receipt = normalized.delivery_receipt;
+        existingAgent.start_event_timestamp = normalized.event_timestamp;
+        existingAgent.id_source = hasHostIdentity ? "host" : "synthetic";
+        existingAgent.host_id_source ??= normalized.host_id_source;
+        existingAgent.correlation_status =
+          hasHostIdentity ? "host-id" : "unavailable";
         existingAgent.parent_mode = parentMode;
         existingAgent.task_description = taskDescription;
-        existingAgent.model = input.model;
-
-        if (existingAgent.status !== "running") {
-          existingAgent.status = "running";
-          existingAgent.started_at = startedAt;
-          existingAgent.completed_at = undefined;
-          existingAgent.duration_ms = undefined;
-          existingAgent.output_summary = undefined;
-          state.total_spawned++;
+        existingAgent.model = normalized.model;
+        existingAgent.synthetic = undefined;
+        existingAgent.telemetry_status = undefined;
+        existingAgent.telemetry_note = REORDERED_LIFECYCLE_TELEMETRY_NOTE;
+        existingAgent.reordered = true;
+        existingAgent.synthetic_correlation =
+          !hasHostIdentity;
+        existingAgent.correlation_strategy =
+          hasHostIdentity ? "reordered-host-id" : "reordered-agent-name";
+        if (previousAgentId !== existingAgent.agent_id) {
+          updateReceiptAgentId(
+            state,
+            previousAgentId,
+            existingAgent.agent_id,
+          );
         }
+        if (existingAgent.completed_at) {
+          existingAgent.duration_ms = Math.max(
+            0,
+            new Date(existingAgent.completed_at).getTime()
+              - new Date(startedAt).getTime(),
+          );
+        }
+        state.total_spawned++;
         trackedAgent = existingAgent;
+        reordered = true;
       } else {
-        // Create new agent entry
         const agentInfo: SubagentInfo = {
-          agent_id: input.agent_id,
-          agent_type: input.agent_type,
+          agent_id: agentId,
+          agent_type: normalized.agent_type,
+          agent_name: normalized.agent_name,
+          agent_display_name: normalized.agent_display_name,
+          agent_description: normalized.agent_description,
           started_at: startedAt,
+          start_sequence: state.total_spawned + 1,
+          start_event_id: identity.eventId,
+          identity_digest: identity.identityDigest,
+          start_identity_digest: identity.identityDigest,
+          delivery_fingerprint: normalized.delivery_fingerprint,
+          delivery_receipt: normalized.delivery_receipt,
+          start_event_timestamp: normalized.event_timestamp,
+          id_source: normalized.id_source,
+          host_id_source: normalized.host_id_source,
+          correlation_status:
+            normalized.id_source === "host" ? "host-id" : "unavailable",
+          correlation_strategy:
+            normalized.id_source === "synthetic"
+              ? "synthetic-start-id"
+              : "host-id",
+          synthetic_correlation: normalized.id_source === "synthetic",
           parent_mode: parentMode,
           task_description: taskDescription,
           status: "running",
-          model: input.model,
+          model: normalized.model,
         };
 
-        // Add to state
         state.agents.push(agentInfo);
         state.total_spawned++;
         trackedAgent = agentInfo;
       }
 
-      // Write updated state (debounced; outside lock scope intentionally — flush is fine)
-      writeTrackingState(input.cwd, state, sessionId);
+      recordDeliveryReceipt(
+        state,
+        normalized.delivery_receipt
+          ? {
+              action: "start",
+              receipt: normalized.delivery_receipt,
+              fingerprint: normalized.delivery_fingerprint,
+              agent_id: trackedAgent.agent_id,
+              event_id: trackedAgent.start_event_id,
+              recorded_at: startedAt,
+            }
+          : undefined,
+      );
 
-      if (!isDuplicateRunningStart) {
-        // Record to session replay JSONL for /trace
-        try {
-          recordAgentStart(input.cwd, input.session_id, input.agent_id, input.agent_type, input.prompt, parentMode, input.model);
-        } catch { /* best-effort */ }
+      // Lifecycle counters must be committed while the lock is held. Debounced
+      // whole-state snapshots can merge disjoint agents but cannot add counters.
+      writeTrackingStateImmediate(normalized.cwd, state, sessionId);
 
+      const staleAgents = getStaleAgents(state);
+      const runningCount = state.agents.filter(
+        (agent) => agent.status === "running",
+      ).length;
+
+      return {
+        output: {
+          continue: true,
+          hookSpecificOutput: {
+            hookEventName: "SubagentStart",
+            additionalContext:
+              `Agent ${trackedAgent.agent_type} started `
+              + `(${trackedAgent.agent_id}); ${runningCount} agent(s) running`,
+            agent_count: runningCount,
+            stale_agents: staleAgents.map((agent) => agent.agent_id),
+            agent_id: trackedAgent.agent_id,
+            agent_name: trackedAgent.agent_name,
+            correlation_strategy: trackedAgent.correlation_strategy,
+            correlation_status: trackedAgent.correlation_status
+              ?? (trackedAgent.id_source === "host"
+                ? "host-id"
+                : "unavailable"),
+            synthetic_correlation:
+              trackedAgent.synthetic_correlation === true,
+            ...(reordered ? { reordered: true } : {}),
+          },
+          tracking: lifecycleOutput(trackedAgent, { reordered }),
+        },
+        record: {
+          trackedAgent,
+          parentMode,
+          reordered,
+          startedAt,
+          previousAgentId,
+        },
+      };
+    });
+
+    if (processed.record) {
+      const {
+        trackedAgent,
+        parentMode,
+        reordered,
+        startedAt,
+        previousAgentId,
+      } = processed.record;
+      try {
+        recordAgentStart(
+          normalized.cwd,
+          normalized.session_id,
+          trackedAgent.agent_id,
+          trackedAgent.agent_type,
+          normalized.prompt ?? normalized.agent_description,
+          parentMode,
+          normalized.model,
+        );
+      } catch { /* best-effort */ }
+
+      if (reordered && trackedAgent.status !== "running") {
         try {
-          recordMissionAgentStart(input.cwd, {
-            sessionId: input.session_id,
-            agentId: input.agent_id,
-            agentType: input.agent_type,
-            parentMode,
-            taskDescription: input.prompt,
-            at: trackedAgent.started_at,
-          }, sessionId);
+          recordAgentReconciliation(
+            normalized.cwd,
+            normalized.session_id,
+            previousAgentId ?? trackedAgent.agent_id,
+            trackedAgent.agent_id,
+            trackedAgent.agent_type,
+            trackedAgent.status === "completed",
+            trackedAgent.duration_ms,
+          );
         } catch { /* best-effort */ }
       }
 
-      // Check for stale agents
-      const staleAgents = getStaleAgents(state);
+      try {
+        recordMissionAgentStart(normalized.cwd, {
+          sessionId: normalized.session_id,
+          agentId: trackedAgent.agent_id,
+          agentType: trackedAgent.agent_type,
+          parentMode,
+          taskDescription:
+            normalized.prompt ?? normalized.agent_description,
+          at: trackedAgent.started_at,
+        }, sessionId);
+      } catch { /* best-effort */ }
 
-      return {
-        continue: true,
-        hookSpecificOutput: {
-          hookEventName: "SubagentStart",
-          additionalContext: `Agent ${input.agent_type} started (${input.agent_id})`,
-          agent_count: state.agents.filter((a) => a.status === "running").length,
-          stale_agents: staleAgents.map((a) => a.agent_id),
-        },
-      };
-    }, LOCK_OPTS);
+      if (reordered && trackedAgent.status !== "running") {
+        try {
+          recordMissionAgentStop(normalized.cwd, {
+            sessionId: normalized.session_id,
+            agentId: trackedAgent.agent_id,
+            success: trackedAgent.status === "completed",
+            outputSummary: trackedAgent.output_summary,
+            at: trackedAgent.completed_at ?? startedAt,
+          }, sessionId);
+        } catch { /* best-effort */ }
+      }
+    }
+
+    return processed.output;
   } catch {
     return { continue: true }; // Fail gracefully if lock cannot be acquired
   }
 }
 
 /**
- * Find a single running agent that can be safely reconciled against an
- * unmatched Stop event. The tracking state is already session-scoped, so any
- * running entry here belongs to the current session. Reconciliation is only
- * considered reliable when there is exactly one candidate (optionally narrowed
- * by agent_type metadata) — otherwise the choice would be ambiguous and could
- * close the wrong agent. Returns the index of the candidate, or -1.
+ * Find the oldest running agent with a matching normalized name. Sequence is
+ * authoritative for new records; timestamp and array order preserve stable
+ * behavior for legacy records.
  */
-function findReconcilableRunningAgent(
+function findRunningAgentByNameFifo(
   state: SubagentTrackingState,
-  agentType?: string,
+  agentName: string,
 ): number {
-  const candidates: number[] = [];
-  for (let i = 0; i < state.agents.length; i++) {
-    const agent = state.agents[i];
-    if (agent.status !== "running") continue;
-    if (agentType && agent.agent_type !== agentType) continue;
-    candidates.push(i);
+  return state.agents
+    .map((agent, index) => ({ agent, index }))
+    .filter(({ agent }) =>
+      agent.status === "running"
+      && normalizedAgentName(agent) === agentName
+    )
+    .sort((left, right) => {
+      const leftSequence = left.agent.start_sequence ?? Number.MAX_SAFE_INTEGER;
+      const rightSequence =
+        right.agent.start_sequence ?? Number.MAX_SAFE_INTEGER;
+      if (leftSequence !== rightSequence) {
+        return leftSequence - rightSequence;
+      }
+      const timeDifference =
+        new Date(left.agent.started_at).getTime()
+        - new Date(right.agent.started_at).getTime();
+      return timeDifference || left.index - right.index;
+    })[0]?.index ?? -1;
+}
+
+function canReconcileReorderedStop(
+  agent: SubagentInfo,
+  startTimestamp?: number,
+): boolean {
+  if (
+    startTimestamp === undefined
+    || agent.stop_event_timestamp === undefined
+  ) {
+    return false;
   }
-  return candidates.length === 1 ? candidates[0] : -1;
+
+  const delta = agent.stop_event_timestamp - startTimestamp;
+  return delta >= 0 && delta <= REORDER_WINDOW_MS;
+}
+
+function findPendingReorderedStopByName(
+  state: SubagentTrackingState,
+  agentName: string,
+  startTimestamp?: number,
+  startAgentId?: string,
+): number {
+  return state.agents
+    .map((agent, index) => ({ agent, index }))
+    .filter(({ agent }) =>
+      agent.status !== "running"
+      && agent.start_event_id === undefined
+      && agent.telemetry_status === "unmatched_stop"
+      && normalizedAgentName(agent) === agentName
+      && (
+        startAgentId === undefined
+        || agent.id_source === "synthetic"
+        || agent.agent_id === startAgentId
+      )
+      && canReconcileReorderedStop(agent, startTimestamp)
+    )
+    .sort((left, right) => {
+      const timeDifference =
+        new Date(left.agent.completed_at ?? left.agent.started_at).getTime()
+        - new Date(right.agent.completed_at ?? right.agent.started_at).getTime();
+      return timeDifference || left.index - right.index;
+    })[0]?.index ?? -1;
 }
 
 /**
@@ -752,69 +1786,201 @@ function reapStaleRunningAgents(
 /**
  * Process SubagentStop event
  */
-export function processSubagentStop(input: SubagentStopInput): HookOutput {
-  const sessionId = resolveSessionId({ context: 'hook', hookPayload: input });
-  const writePath = resolveWritePath(input.cwd, sessionId);
+export function processSubagentStop(
+  input: SubagentStopProcessorInput,
+): HookOutput {
+  const normalized = normalizeSubagentStopInput(input);
+  if (!normalized) return { continue: true, suppressOutput: true };
+
+  const sessionId = resolveSessionId({
+    context: "hook",
+    hookPayload: normalized,
+  });
+  const writePath = resolveWritePath(normalized.cwd, sessionId);
   ensureParentDir(writePath);
   const lockPath = lockPathFor(writePath);
 
   try {
-    return withFileLockSync(lockPath, () => {
-      const state = readTrackingState(input.cwd, sessionId);
+    const processed = withLifecycleLock(lockPath, () => {
+      const state = readTrackingState(normalized.cwd, sessionId);
+      const succeeded = normalized.success !== false;
+      const nowIso = timestampIso(normalized.event_timestamp);
+      const priorReceipt = findDeliveryReceipt(
+        state,
+        "stop",
+        normalized.delivery_receipt,
+      );
+      if (priorReceipt) {
+        const duplicateAgent = priorReceipt.agent_id
+          ? state.agents.find(
+              (agent) => agent.agent_id === priorReceipt.agent_id,
+            )
+          : undefined;
+        return {
+          output: {
+            continue: true,
+            suppressOutput: true,
+            ...(duplicateAgent
+              ? {
+                  tracking: lifecycleOutput(
+                    duplicateAgent,
+                    { duplicate: true },
+                  ),
+                }
+              : {}),
+          },
+          record: undefined,
+        };
+      }
 
-      // SDK does not provide `success` field, so default to 'completed' when undefined (Bug #1 fix)
-      const succeeded = input.success !== false;
-      const nowIso = new Date().toISOString();
+      const historicalExactDuplicate = normalized.agent_id
+        ? state.agents.find(
+            (agent) =>
+              agent.status !== "running"
+              && agent.reported_agent_id === normalized.agent_id
+              && agent.stop_delivery_fingerprint
+                === normalized.delivery_fingerprint,
+          )
+        : undefined;
+      if (historicalExactDuplicate) {
+        return {
+          output: {
+            continue: true,
+            suppressOutput: true,
+            tracking: lifecycleOutput(
+              historicalExactDuplicate,
+              { duplicate: true },
+            ),
+          },
+          record: undefined,
+        };
+      }
 
-      // Find the agent by exact agent_id first.
-      let agentIndex = input.agent_id
-        ? state.agents.findIndex((a) => a.agent_id === input.agent_id)
+      let agentIndex = normalized.agent_id
+        ? state.agents.findIndex(
+            (agent) => agent.agent_id === normalized.agent_id,
+          )
         : -1;
+      let correlationStrategy: SubagentCorrelationStrategy = "host-id";
 
-      // Native fork stop events can arrive with an agent_id that was never
-      // registered by SubagentStart (#3252). When the exact lookup misses,
-      // attempt a safe fallback reconciliation against running agents in this
-      // (session-scoped) state before falling back to reap + create-and-close,
-      // so the running entry cannot leak as "running" forever.
-      if (agentIndex === -1 && input.agent_id) {
-        agentIndex = findReconcilableRunningAgent(state, input.agent_type);
+      if (
+        agentIndex === -1
+        && !normalized.agent_id
+        && normalized.agent_name
+      ) {
+        agentIndex = findRunningAgentByNameFifo(
+          state,
+          normalized.agent_name,
+        );
+        correlationStrategy = "agent-name-fifo";
       }
 
       if (agentIndex !== -1) {
         const agent = state.agents[agentIndex];
-        agent.status = succeeded ? "completed" : "failed";
-        agent.completed_at = nowIso;
-
-        // Calculate duration
-        const startTime = new Date(agent.started_at).getTime();
-        agent.duration_ms = new Date(nowIso).getTime() - startTime;
-
-        // Store output summary (truncated)
-        if (input.output) {
-          agent.output_summary = input.output.substring(0, 500);
+        if (agent.status !== "running") {
+          recordDeliveryReceipt(
+            state,
+            normalized.delivery_receipt
+              ? {
+                  action: "stop",
+                  receipt: normalized.delivery_receipt,
+                  fingerprint: normalized.delivery_fingerprint,
+                  agent_id: agent.agent_id,
+                  event_id: agent.stop_event_id,
+                  recorded_at: nowIso,
+                }
+              : undefined,
+          );
+          writeTrackingStateImmediate(normalized.cwd, state, sessionId);
+          return {
+            output: {
+              continue: true,
+              suppressOutput: true,
+              tracking: lifecycleOutput(agent, { duplicate: true }),
+            },
+            record: undefined,
+          };
         }
 
-        // Update counters
+        const stopIdentity = resolveLifecycleIdentity(
+          state,
+          "stop",
+          normalized.session_id,
+          normalized.content_digest,
+          normalized.agent_id,
+        );
+        agent.status = succeeded ? "completed" : "failed";
+        agent.completed_at = nowIso;
+        agent.stop_event_id = stopIdentity.eventId;
+        agent.stop_identity_digest = stopIdentity.identityDigest;
+        agent.stop_delivery_fingerprint = normalized.delivery_fingerprint;
+        agent.stop_delivery_receipt = normalized.delivery_receipt;
+        agent.stop_event_timestamp = normalized.event_timestamp;
+        agent.agent_name ??= normalized.agent_name;
+        agent.agent_display_name ??= normalized.agent_display_name;
+        agent.agent_description ??= normalized.agent_description;
+        agent.correlation_strategy = correlationStrategy;
+        agent.correlation_status =
+          correlationStrategy === "host-id" ? "host-id" : "unavailable";
+        agent.host_id_source ??= normalized.host_id_source;
+        agent.synthetic_correlation =
+          correlationStrategy === "agent-name-fifo";
+
+        const startTime = new Date(agent.started_at).getTime();
+        agent.duration_ms = Math.max(
+          0,
+          new Date(nowIso).getTime() - startTime,
+        );
+
+        if (normalized.output) {
+          agent.output_summary = normalized.output.substring(0, 500);
+        }
+
         if (succeeded) {
           state.total_completed++;
         } else {
           state.total_failed++;
         }
-      } else if (input.agent_id) {
-        // No exact or fallback match. Reap any stale running agents so unmatched
-        // fork stops cannot accumulate "running" entries forever, then record
-        // this stop as an explicitly synthetic closed entry. Avoid duration_ms: 0
-        // and agent_type: "unknown" because those look like real telemetry.
+      } else if (normalized.agent_id || normalized.agent_name) {
+        const stopIdentity = resolveLifecycleIdentity(
+          state,
+          "stop",
+          normalized.session_id,
+          normalized.content_digest,
+          normalized.agent_id,
+        );
         reapStaleRunningAgents(state, nowIso);
 
         const synthetic: SubagentInfo = {
-          agent_id: input.agent_id,
-          agent_type: input.agent_type || UNTRACKED_NATIVE_FORK_AGENT_TYPE,
+          agent_id:
+            normalized.agent_id
+            ?? digestDisplayId(stopIdentity.identityDigest),
+          agent_type:
+            normalized.agent_type
+            ?? normalized.agent_name
+            ?? UNTRACKED_NATIVE_FORK_AGENT_TYPE,
+          agent_name: normalized.agent_name,
+          agent_display_name: normalized.agent_display_name,
+          agent_description: normalized.agent_description,
           started_at: nowIso,
-          parent_mode: detectParentMode(input.cwd),
+          stop_event_id: stopIdentity.eventId,
+          identity_digest: stopIdentity.identityDigest,
+          stop_identity_digest: stopIdentity.identityDigest,
+          stop_delivery_fingerprint: normalized.delivery_fingerprint,
+          stop_delivery_receipt: normalized.delivery_receipt,
+          stop_event_timestamp: normalized.event_timestamp,
+          id_source: normalized.agent_id ? "host" : "synthetic",
+          host_id_source: normalized.host_id_source,
+          correlation_status:
+            normalized.agent_id ? "host-id" : "unavailable",
+          correlation_strategy: "unmatched-stop",
+          synthetic_correlation: normalized.agent_id === undefined,
+          parent_mode: detectParentMode(normalized.cwd),
           status: succeeded ? "completed" : "failed",
           completed_at: nowIso,
-          output_summary: input.output ? input.output.substring(0, 500) : undefined,
+          output_summary: normalized.output
+            ? normalized.output.substring(0, 500)
+            : undefined,
           synthetic: true,
           telemetry_status: "unmatched_stop",
           telemetry_note: UNMATCHED_STOP_TELEMETRY_NOTE,
@@ -829,20 +1995,31 @@ export function processSubagentStop(input: SubagentStopInput): HookOutput {
         }
       }
 
-      // Capture the closed agent before eviction may reorder/remove entries.
       const stoppedAgent =
         agentIndex !== -1 ? state.agents[agentIndex] : undefined;
 
-      // Evict oldest completed agents if over limit
+      recordDeliveryReceipt(
+        state,
+        stoppedAgent && normalized.delivery_receipt
+          ? {
+              action: "stop",
+              receipt: normalized.delivery_receipt,
+              fingerprint: normalized.delivery_fingerprint,
+              agent_id: stoppedAgent.agent_id,
+              event_id: stoppedAgent.stop_event_id,
+              recorded_at: nowIso,
+            }
+          : undefined,
+      );
+
       const completedAgents = state.agents.filter(
         (a) => a.status === "completed" || a.status === "failed",
       );
       if (completedAgents.length > MAX_COMPLETED_AGENTS) {
-        // Sort by completed_at and keep only the most recent
         completedAgents.sort((a, b) => {
           const timeA = a.completed_at ? new Date(a.completed_at).getTime() : 0;
           const timeB = b.completed_at ? new Date(b.completed_at).getTime() : 0;
-          return timeB - timeA; // Newest first
+          return timeB - timeA;
         });
 
         const toRemove = new Set(
@@ -851,34 +2028,61 @@ export function processSubagentStop(input: SubagentStopInput): HookOutput {
         state.agents = state.agents.filter((a) => !toRemove.has(a.agent_id));
       }
 
-      // Write updated state
-      writeTrackingState(input.cwd, state, sessionId);
+      writeTrackingStateImmediate(normalized.cwd, state, sessionId);
 
-      if (input.agent_id) {
-        // Record to session replay JSONL for /trace
-        // Fix: SDK doesn't populate agent_type in SubagentStop, so use tracked state
-        try {
-          const agentType = stoppedAgent?.agent_type || input.agent_type || UNTRACKED_NATIVE_FORK_AGENT_TYPE;
-          recordAgentStop(input.cwd, input.session_id, input.agent_id, agentType, succeeded, stoppedAgent?.duration_ms, stoppedAgent?.synthetic
-            ? { synthetic: true, telemetry_status: stoppedAgent.telemetry_status, reason: stoppedAgent.telemetry_note }
-            : undefined);
-        } catch { /* best-effort */ }
+      return {
+        output: {
+          continue: true,
+          suppressOutput: true,
+          ...(stoppedAgent
+            ? { tracking: lifecycleOutput(stoppedAgent) }
+            : {}),
+        },
+        record: stoppedAgent
+          ? {
+              stoppedAgent,
+              succeeded,
+              nowIso,
+            }
+          : undefined,
+      };
+    });
 
+    if (processed.record) {
+      const { stoppedAgent, succeeded, nowIso } = processed.record;
+      try {
+        recordAgentStop(
+          normalized.cwd,
+          normalized.session_id,
+          stoppedAgent.agent_id,
+          stoppedAgent.agent_type,
+          succeeded,
+          stoppedAgent.duration_ms,
+          stoppedAgent.synthetic
+            ? {
+                synthetic: true,
+                telemetry_status: stoppedAgent.telemetry_status,
+                reason: stoppedAgent.telemetry_note,
+              }
+            : undefined,
+        );
+      } catch { /* best-effort */ }
+
+      if (!stoppedAgent.synthetic) {
         try {
-          recordMissionAgentStop(input.cwd, {
-            sessionId: input.session_id,
-            agentId: input.agent_id,
+          recordMissionAgentStop(normalized.cwd, {
+            sessionId: normalized.session_id,
+            agentId: stoppedAgent.agent_id,
             success: succeeded,
-            outputSummary: stoppedAgent?.output_summary ?? input.output,
-            at: stoppedAgent?.completed_at ?? nowIso,
+            outputSummary:
+              stoppedAgent.output_summary ?? normalized.output,
+            at: stoppedAgent.completed_at ?? nowIso,
           }, sessionId);
         } catch { /* best-effort */ }
       }
-      return {
-        continue: true,
-        suppressOutput: true,
-      };
-    }, LOCK_OPTS);
+    }
+
+    return processed.output;
   } catch {
     return { continue: true }; // Fail gracefully if lock cannot be acquired
   }

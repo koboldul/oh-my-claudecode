@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
 import { readStdin } from './lib/stdin.mjs';
+import {
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 
 function shouldSkipSubagentTracker(action) {
   if (process.env.DISABLE_OMC === '1' || process.env.DISABLE_OMC === 'true') {
@@ -17,6 +19,34 @@ function shouldSkipSubagentTracker(action) {
   return skipHooks.includes(hookName) || skipHooks.includes('subagent-tracker');
 }
 
+function describeCanonicalFailure(result) {
+  const failures = [];
+
+  for (const issue of result?.envelope?.issues ?? []) {
+    if (issue?.severity === 'safety' || issue?.severity === 'batch-safety') {
+      failures.push(issue.message || issue.code || 'hook input normalization failed');
+    }
+  }
+
+  for (const evaluation of result?.evaluations ?? []) {
+    if (evaluation?.source === 'adapter' && evaluation?.decision === 'deny') {
+      failures.push(evaluation.reason || 'legacy processor adapter failed');
+    }
+  }
+
+  for (const decision of result?.reduction?.callDecisions ?? []) {
+    if (decision?.source === 'adapter' && decision?.decision === 'deny') {
+      failures.push(decision.reason || 'hook reduction failed');
+    }
+  }
+
+  if (result?.reduction?.decision && result.reduction.decision !== 'pass') {
+    failures.push(result.reduction.reason || `unexpected ${result.reduction.decision} reduction`);
+  }
+
+  return failures.length > 0 ? [...new Set(failures)].join('; ') : undefined;
+}
+
 async function main() {
   const action = process.argv[2]; // 'start' or 'stop'
 
@@ -25,28 +55,53 @@ async function main() {
     return;
   }
 
-  // Read stdin (timeout-protected, see issue #240/#459)
-  const input = await readStdin();
+  const hookType =
+    action === 'start'
+      ? 'subagent-start'
+      : action === 'stop'
+        ? 'subagent-stop'
+        : undefined;
+  if (!hookType) {
+    surfaceOptionalHookFailure(
+      new Error(`Unknown action: ${String(action)}`),
+      { hookName: 'subagent-tracker' },
+    );
+    return;
+  }
 
   try {
-    const data = JSON.parse(input);
+    const runtime = loadHookRuntime();
     const { processSubagentStart, processSubagentStop } = await import('../dist/hooks/subagent-tracker/index.js');
+    const input = await readStdin();
+    const result = await runtime.runHookJson(
+      hookType,
+      input,
+      (unit, envelope) => {
+        const processorInput = runtime.buildLegacyProcessorInput(envelope, unit);
+        const deliveryReceipt = process.env.OMC_HOOK_DELIVERY_RECEIPT?.trim();
+        if (deliveryReceipt) {
+          processorInput.deliveryReceipt = deliveryReceipt;
+        }
+        return action === 'start'
+          ? processSubagentStart(processorInput)
+          : processSubagentStop(processorInput);
+      },
+    );
 
-    let result;
-    if (action === 'start') {
-      result = await processSubagentStart(data);
-    } else if (action === 'stop') {
-      result = await processSubagentStop(data);
-    } else {
-      console.error(`[subagent-tracker] Unknown action: ${action}`);
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    const canonicalFailure = describeCanonicalFailure(result);
+    if (canonicalFailure) {
+      surfaceOptionalHookFailure(
+        new Error(canonicalFailure),
+        { hookName: `subagent-${action}` },
+      );
       return;
     }
 
-    console.log(JSON.stringify(result));
+    console.log(JSON.stringify(
+      runtime.encodeHookOutput(result.envelope, result.reduction),
+    ));
   } catch (error) {
-    console.error('[subagent-tracker] Error:', error.message);
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    surfaceOptionalHookFailure(error, { hookName: `subagent-${action}` });
   }
 }
 

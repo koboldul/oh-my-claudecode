@@ -116,6 +116,7 @@ function resolveTimeoutCushionMs(manifestTimeoutMs, hookEvent) {
 const TIMEOUT_CUSHION_MS = 500;
 // = max declared manifest budget (60000ms, setup-maintenance) minus the 500ms cushion; applied ONLY when manifest resolution is null so long legit hooks are not prematurely reaped.
 const DEFAULT_GENERIC_TIMEOUT_MS = 59500;
+const CRITICAL_HOOK_EVENTS = new Set(['permissionrequest', 'pretooluse']);
 
 
 function resolveInnerTimeoutMs(manifestHook) {
@@ -137,6 +138,16 @@ function resolveTrustedPromptWorkerTimeoutMs(targetPath, manifestHook, trustedPl
 
 function resolveGenericTimeoutMs(manifestHook) {
   return manifestHook ? resolveInnerTimeoutMs(manifestHook) : DEFAULT_GENERIC_TIMEOUT_MS;
+}
+
+function isCriticalManifestHook(manifestHook) {
+  if (!manifestHook || typeof manifestHook.event !== 'string') return false;
+  const normalizedEvent = manifestHook.event.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return CRITICAL_HOOK_EVENTS.has(normalizedEvent);
+}
+
+function hookFailureExitCode(manifestHook) {
+  return isCriticalManifestHook(manifestHook) ? 2 : 0;
 }
 
 function resolveHookTimeoutMsFromRoot(pluginRoot, targetPath, extraArgs) {
@@ -249,17 +260,38 @@ function resolveWorkerTarget(resolution, extraArgs) {
 }
 
 function writeTimeoutDiagnostic(targetPath, manifestHook, timeoutMs) {
-  const message = `[run.cjs] Hook ${basename(targetPath)} timed out after ${timeoutMs}ms; exiting fail-open.\n`;
+  const failureMode = isCriticalManifestHook(manifestHook)
+    ? 'fail-closed'
+    : 'fail-open';
+  const message =
+    `[run.cjs] Hook ${basename(targetPath)} timed out after ${timeoutMs}ms; `
+    + `exiting ${failureMode}.\n`;
   if (manifestHook?.event !== 'UserPromptSubmit' || isDebugHooksEnabled()) {
     process.stderr.write(message);
   }
 }
 
+function writeSpawnErrorDiagnostic(targetPath, manifestHook, error) {
+  if (!isCriticalManifestHook(manifestHook) && !isDebugHooksEnabled()) {
+    return;
+  }
+  const failureMode = isCriticalManifestHook(manifestHook)
+    ? 'fail-closed'
+    : 'fail-open';
+  const detail = error && typeof error.message === 'string'
+    ? error.message
+    : String(error);
+  process.stderr.write(
+    `[run.cjs] Hook ${basename(targetPath)} failed to spawn; `
+    + `exiting ${failureMode}: ${detail}\n`,
+  );
+}
+
 function reapTree(child) {
   if (process.platform === 'win32') {
     // Fire-and-forget: a slow, denied, or missing taskkill must not block the
-    // runner past the outer hooks.json budget. The runner still exits fail-open
-    // via child.unref() on the timeout path; taskkill reaps the tree best-effort.
+    // runner past the outer hooks.json budget. The runner still exits according
+    // to the hook failure policy; taskkill reaps the tree best-effort.
     try {
       const killer = spawn('taskkill', ['/T', '/F', '/PID', String(child.pid)], {
         windowsHide: true,
@@ -291,12 +323,20 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook) {
   return new Promise(resolve => {
     let terminal = false;
     let timer;
-    const child = spawn(process.execPath, [targetPath, ...extraArgs], {
-      stdio: 'inherit',
-      env: resolveChildEnv(targetPath),
-      windowsHide: true,
-      detached: process.platform !== 'win32',
-    });
+    const failureExitCode = hookFailureExitCode(manifestHook);
+    let child;
+    try {
+      child = spawn(process.execPath, [targetPath, ...extraArgs], {
+        stdio: 'inherit',
+        env: resolveChildEnv(targetPath),
+        windowsHide: true,
+        detached: process.platform !== 'win32',
+      });
+    } catch (error) {
+      writeSpawnErrorDiagnostic(targetPath, manifestHook, error);
+      resolve(failureExitCode);
+      return;
+    }
 
     // The generic child is detached into its own process group (POSIX). If the
     // runner is terminated or cancelled BEFORE the inner timer fires (outer
@@ -312,7 +352,7 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook) {
       terminal = true;
       detachHandlers();
       reapTree(child);
-      process.exit(0);
+      process.exit(failureExitCode);
     }
     function onRunnerExit() {
       if (terminal) return;
@@ -325,25 +365,30 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook) {
       terminal = true;
       detachHandlers();
       reapTree(child);
-      // The runner MUST exit fail-open even if the tree reap did not (or could
-      // not) complete — the core #3493 symptom is run.cjs parents living for
+      // The runner MUST exit according to hook policy even if the tree reap did
+      // not complete — the core #3493 symptom is run.cjs parents living for
       // tens of minutes. unref() releases the child handle from the event loop.
       try { child.unref(); } catch { /* handle already released */ }
       writeTimeoutDiagnostic(targetPath, manifestHook, timeoutMs);
-      resolve(0);
+      resolve(failureExitCode);
     }, timeoutMs);
 
-    child.once('exit', (code) => {
+    child.once('exit', (code, signal) => {
       if (terminal) return;
       terminal = true;
       detachHandlers();
+      if (isCriticalManifestHook(manifestHook)) {
+        resolve(code === 0 && signal === null ? 0 : 2);
+        return;
+      }
       resolve(typeof code === 'number' ? code : 0);
     });
-    child.once('error', () => {
+    child.once('error', (error) => {
       if (terminal) return;
       terminal = true;
       detachHandlers();
-      resolve(0);
+      writeSpawnErrorDiagnostic(targetPath, manifestHook, error);
+      resolve(failureExitCode);
     });
 
     for (const signal of RUNNER_TERMINATION_SIGNALS) process.on(signal, onRunnerSignal);
@@ -463,6 +508,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  hookFailureExitCode,
+  isCriticalManifestHook,
   resolveInnerTimeoutMs,
   resolveTrustedPromptWorkerTimeoutMs,
   resolveWorkerTarget,

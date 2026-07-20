@@ -54,6 +54,7 @@ function formatEventType(event: string): string {
   const map: Record<string, string> = {
     agent_start: 'AGENT',
     agent_stop: 'AGENT',
+    agent_reconcile: 'AGENT',
     tool_start: 'TOOL',
     tool_end: 'TOOL',
     file_touch: 'FILE',
@@ -91,6 +92,13 @@ function formatTimelineEvent(event: ReplayEvent): string {
         detail = `[${event.agent}] ${event.agent_type || 'unknown'} ${event.success ? 'completed' : 'FAILED'}`;
         if (event.duration_ms) detail += ` (${(event.duration_ms / 1000).toFixed(1)}s)`;
       }
+      break;
+    case 'agent_reconcile':
+      detail = `[${event.agent}] ${event.agent_type || 'unknown'} reconciled`;
+      if (event.previous_agent && event.previous_agent !== event.agent) {
+        detail += ` from ${event.previous_agent}`;
+      }
+      detail += event.success ? ' as completed' : ' as FAILED';
       break;
     case 'tool_start':
       detail = `[${event.agent}] ${event.tool} started`;
@@ -151,7 +159,7 @@ function filterEvents(events: ReplayEvent[], filter: FilterType): ReplayEvent[] 
     all: [],
     hooks: ['hook_fire', 'hook_result'],
     skills: ['skill_activated', 'skill_invoked'],
-    agents: ['agent_start', 'agent_stop'],
+    agents: ['agent_start', 'agent_stop', 'agent_reconcile'],
     keywords: ['keyword_detected'],
     tools: ['tool_start', 'tool_end'],
     modes: ['mode_change'],
@@ -173,7 +181,7 @@ function buildExecutionFlow(events: ReplayEvent[]): string[] {
   const flow: string[] = [];
   const KEY_EVENTS = new Set([
     'keyword_detected', 'skill_activated', 'skill_invoked',
-    'mode_change', 'agent_start', 'agent_stop',
+    'mode_change', 'agent_start', 'agent_stop', 'agent_reconcile',
   ]);
 
   for (const event of events) {
@@ -207,6 +215,12 @@ function buildExecutionFlow(events: ReplayEvent[]): string[] {
         const status = event.success ? 'completed' : 'FAILED';
         const dur = event.duration_ms ? ` ${(event.duration_ms / 1000).toFixed(1)}s` : '';
         flow.push(`${type} agent ${status} (${event.agent}${dur})`);
+        break;
+      }
+      case 'agent_reconcile': {
+        const type = event.agent_type || 'unknown';
+        const status = event.success ? 'completed' : 'FAILED';
+        flow.push(`${type} agent reconciled as ${status} (${event.agent})`);
         break;
       }
     }

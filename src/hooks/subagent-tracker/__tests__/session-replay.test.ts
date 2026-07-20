@@ -7,6 +7,7 @@ import {
   appendReplayEvent,
   recordAgentStart,
   recordAgentStop,
+  recordAgentReconciliation,
   recordToolEvent,
   recordFileTouch,
   recordIntervention,
@@ -90,6 +91,50 @@ describe('session-replay', () => {
       expect(events[0].event).toBe('agent_stop');
       expect(events[0].success).toBe(true);
       expect(events[0].duration_ms).toBe(5000);
+    });
+
+    it('recordAgentReconciliation should correct an unmatched stop', () => {
+      recordAgentStop(
+        testDir,
+        'reconcile-helper',
+        'synthetic-stop-id',
+        'oh-my-claudecode:executor',
+        true,
+        5000,
+        { synthetic: true, telemetry_status: 'unmatched_stop' },
+      );
+      recordAgentStart(
+        testDir,
+        'reconcile-helper',
+        'stable-agent-id',
+        'oh-my-claudecode:executor',
+      );
+      recordAgentReconciliation(
+        testDir,
+        'reconcile-helper',
+        'synthetic-stop-id',
+        'stable-agent-id',
+        'oh-my-claudecode:executor',
+        true,
+        5000,
+      );
+
+      const events = readReplayEvents(testDir, 'reconcile-helper');
+      expect(events[2]).toMatchObject({
+        event: 'agent_reconcile',
+        agent: 'stable-',
+        previous_agent: 'synthet',
+        success: true,
+      });
+      expect(getReplaySummary(testDir, 'reconcile-helper')).toMatchObject({
+        agents_spawned: 1,
+        agents_completed: 1,
+        agents_failed: 0,
+      });
+      expect(getReplaySummary(
+        testDir,
+        'reconcile-helper',
+      ).agents_untracked_stops).toBeUndefined();
     });
 
     it('recordToolEvent should record tool events', () => {

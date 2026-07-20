@@ -399,6 +399,53 @@ describe('run.cjs — graceful fallback for stale plugin paths', () => {
     expect(elapsedMs).toBeLessThan(2000);
   });
 
+  it.each(['PermissionRequest', 'PreToolUse'])(
+    'fails closed for manifest-resolved %s timeouts before the outer budget',
+    (event) => {
+      const pluginRoot = join(tmpDir, `critical-${event.toLowerCase()}-root`);
+      const scriptsDir = join(pluginRoot, 'scripts');
+      const hooksDir = join(pluginRoot, 'hooks');
+      mkdirSync(scriptsDir, { recursive: true });
+      mkdirSync(hooksDir, { recursive: true });
+
+      const scriptName = `slow-${event.toLowerCase()}.cjs`;
+      const slowTarget = join(scriptsDir, scriptName);
+      writeFileSync(
+        slowTarget,
+        'setTimeout(() => { process.stdout.write("critical-done\\n"); process.exit(0); }, 3000);',
+      );
+      writeFileSync(
+        join(hooksDir, 'hooks.json'),
+        JSON.stringify({
+          hooks: {
+            [event]: [
+              {
+                matcher: '*',
+                hooks: [
+                  {
+                    type: 'command',
+                    command: `node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/${scriptName}`,
+                    timeout: 1,
+                  },
+                ],
+              },
+            ],
+          },
+        }, null, 2),
+      );
+
+      const result = runCjs(slowTarget, {
+        CLAUDE_PLUGIN_ROOT: pluginRoot,
+      });
+
+      expect(result.status).toBe(2);
+      expect(result.stdout).not.toContain('critical-done');
+      expect(result.stderr).toContain(
+        `[run.cjs] Hook ${scriptName} timed out after 500ms; exiting fail-closed.`,
+      );
+    },
+  );
+
   it('keeps prompt hook timeout diagnostics quiet by default and visible in hook debug mode', () => {
     const pluginRoot = join(tmpDir, 'prompt-debug-plugin-root');
     const scriptsDir = join(pluginRoot, 'scripts');

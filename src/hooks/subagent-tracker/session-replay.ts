@@ -16,7 +16,8 @@ import { getOmcRoot } from '../../lib/worktree-paths.js';
 // ============================================================================
 
 export type ReplayEventType =
-  | 'agent_start' | 'agent_stop' | 'tool_start' | 'tool_end'
+  | 'agent_start' | 'agent_stop' | 'agent_reconcile'
+  | 'tool_start' | 'tool_end'
   | 'file_touch' | 'intervention' | 'error'
   | 'hook_fire' | 'hook_result'
   | 'keyword_detected' | 'skill_activated' | 'skill_invoked'
@@ -32,6 +33,7 @@ export interface ReplayEvent {
   /** Event type */
   event: ReplayEventType;
   /** Event-specific data */
+  previous_agent?: string;
   tool?: string;
   file?: string;
   duration_ms?: number;
@@ -225,6 +227,29 @@ export function recordAgentStop(
 }
 
 /**
+ * Correct a previously recorded unmatched stop after its start arrives.
+ */
+export function recordAgentReconciliation(
+  directory: string,
+  sessionId: string,
+  previousAgentId: string,
+  stableAgentId: string,
+  agentType: string,
+  success: boolean,
+  durationMs?: number,
+): void {
+  appendReplayEvent(directory, sessionId, {
+    agent: stableAgentId.substring(0, 7),
+    previous_agent: previousAgentId.substring(0, 7),
+    agent_type: agentType.replace('oh-my-claudecode:', ''),
+    event: 'agent_reconcile',
+    success,
+    duration_ms: durationMs,
+    reason: 'Reconciled a stop that arrived before its start event.',
+  });
+}
+
+/**
  * Record tool execution event
  */
 export function recordToolEvent(
@@ -392,6 +417,24 @@ export function getReplaySummary(directory: string, sessionId: string): ReplaySu
           if (stats) stats.total_ms += event.duration_ms;
         }
         break;
+      case 'agent_reconcile': {
+        const remainingUntracked = Math.max(
+          0,
+          (summary.agents_untracked_stops ?? 0) - 1,
+        );
+        if (remainingUntracked > 0) {
+          summary.agents_untracked_stops = remainingUntracked;
+        } else {
+          delete summary.agents_untracked_stops;
+        }
+        if (event.success) summary.agents_completed++;
+        else summary.agents_failed++;
+        if (event.agent_type && event.duration_ms) {
+          const stats = agentTypeStats.get(event.agent_type);
+          if (stats) stats.total_ms += event.duration_ms;
+        }
+        break;
+      }
       case 'tool_end':
         if (event.tool) {
           if (!summary.tool_summary[event.tool]) {

@@ -3,6 +3,13 @@ import * as path from 'path';
 import { getOmcRoot, getGitTopLevel } from '../../lib/worktree-paths.js';
 import { getClaudeConfigDir } from '../../utils/config-dir.js';
 
+interface PermissionToolInput {
+  command?: string;
+  file_path?: string;
+  content?: string;
+  [key: string]: unknown;
+}
+
 export interface PermissionRequestInput {
   session_id: string;
   transcript_path: string;
@@ -10,14 +17,25 @@ export interface PermissionRequestInput {
   permission_mode: string;
   hook_event_name: 'PermissionRequest';
   tool_name: string;
-  tool_input: {
-    command?: string;
-    file_path?: string;
-    content?: string;
-    [key: string]: unknown;
-  };
+  tool_input: PermissionToolInput;
   tool_use_id: string;
 }
+
+export interface CanonicalPermissionRequestInput {
+  host: 'claude' | 'copilot';
+  contract: 'claude-single' | 'copilot-1.0.72-1';
+  hookType: string;
+  directory?: string;
+  toolName?: string;
+  nativeToolName?: string;
+  canonicalToolName?: string;
+  toolInput?: unknown;
+  shellDialect?: 'posix' | 'powershell';
+}
+
+export type PermissionProcessorInput =
+  | PermissionRequestInput
+  | CanonicalPermissionRequestInput;
 
 export interface HookOutput {
   continue: boolean;
@@ -50,18 +68,134 @@ const SAFE_PATTERNS = [
 // and command substitution is already caught by $ detection
 const DANGEROUS_SHELL_CHARS = /[;&|`$()<>\n\r\t\0\\{}\[\]*?~!#]/;
 
-// Heredoc operator detection (<<, <<-, <<~, with optional quoting of delimiter)
-const HEREDOC_PATTERN = /<<[-~]?\s*['"]?\w+['"]?/;
+// Exact first-line shape emitted for safe POSIX git commit/tag message heredocs.
+// The git arguments before -m/--message are restricted to non-shell token chars.
+const SAFE_POSIX_HEREDOC_FIRST_LINE =
+  /^git[ \t]+(?:commit|tag)(?:[ \t]+[A-Za-z0-9_./:@%+=,-]+)*[ \t]+(?:-m|--message)[ \t]+"\$\(cat[ \t]+<<(-?)[ \t]*(['"])([A-Za-z_][A-Za-z0-9_]*)\2$/;
 
-/**
- * Patterns that are safe to auto-allow even when they contain heredoc content.
- * Matched against the first line of the command (before the heredoc body).
- * Issue #608: Prevents full heredoc body from being stored in settings.local.json.
- */
-const SAFE_HEREDOC_PATTERNS = [
-  /^git commit\b/,
-  /^git tag\b/,
+const DANGEROUS_POWERSHELL_CHARS = /[;&|`$(){}<>\n\r\t\0\[\]*?!#@,]/;
+const SAFE_POWERSHELL_TOKEN = /^[A-Za-z0-9_./=+-]+$/;
+const POWERSHELL_PROVIDER_PATH = /^[A-Za-z][A-Za-z0-9_-]*:/;
+const SAFE_POWERSHELL_GIT_STATUS_FLAGS = new Set([
+  '--short', '-s', '--branch', '-b', '--show-stash', '--long',
+  '--porcelain', '-z', '-v', '-vv', '--verbose', '--ahead-behind',
+  '--no-ahead-behind', '--renames', '--no-renames', '--ignored',
+  '--untracked-files', '-u', '--column', '--no-column', '--find-renames',
+  '--ignore-submodules', '--',
+]);
+const SAFE_POWERSHELL_GIT_STATUS_OPTIONS = [
+  /^--porcelain=(?:v1|v2)$/,
+  /^--untracked-files=(?:no|normal|all)$/,
+  /^-u(?:no|normal|all)$/,
+  /^--ignored=(?:no|traditional|matching)$/,
+  /^--column=(?:always|never|auto)$/,
+  /^--find-renames(?:=[0-9]+)?$/,
+  /^--ignore-submodules=(?:none|untracked|dirty|all)$/,
 ];
+const SAFE_POWERSHELL_GIT_DIFF_FLAGS = new Set([
+  '--cached', '--staged', '--stat', '--shortstat', '--numstat',
+  '--name-only', '--name-status', '--check', '--summary', '--patch', '-p',
+  '--no-patch', '-s', '--raw', '--color', '--no-color', '--minimal',
+  '--patience', '--histogram', '--word-diff', '--color-words',
+  '--no-renames', '--find-renames', '-M', '--find-copies', '-C',
+  '--full-index', '--binary', '--relative', '--no-relative', '--text', '-a',
+  '--ignore-space-at-eol', '--ignore-space-change', '-b',
+  '--ignore-all-space', '-w', '--ignore-blank-lines', '--exit-code',
+  '--quiet', '--submodule', '--ignore-submodules', '--',
+]);
+const SAFE_POWERSHELL_GIT_DIFF_OPTIONS = [
+  /^--color=(?:always|never|auto)$/,
+  /^--word-diff=(?:plain|color|porcelain|none)$/,
+  /^--diff-algorithm=(?:myers|minimal|patience|histogram)$/,
+  /^--find-renames(?:=[0-9]+)?$/,
+  /^--find-copies(?:=[0-9]+)?$/,
+  /^--unified=[0-9]+$/,
+  /^-U[0-9]+$/,
+  /^--inter-hunk-context=[0-9]+$/,
+  /^--abbrev=[0-9]+$/,
+  /^--submodule=(?:short|log|diff)$/,
+  /^--ignore-submodules=(?:none|untracked|dirty|all)$/,
+];
+const SAFE_POWERSHELL_GIT_LOG_FLAGS = new Set([
+  '--oneline', '--graph', '--decorate', '--no-decorate', '--stat',
+  '--shortstat', '--numstat', '--name-only', '--name-status', '--summary',
+  '--all', '--branches', '--tags', '--remotes', '--first-parent',
+  '--merges', '--no-merges', '--reverse', '--topo-order', '--date-order',
+  '--author-date-order', '--full-history', '--simplify-merges', '--dense',
+  '--sparse', '--boundary', '--cherry', '--cherry-mark', '--cherry-pick',
+  '--left-right', '--walk-reflogs', '-g', '--reflog', '--patch', '-p',
+  '--no-patch', '-s', '--color', '--no-color', '--',
+]);
+const SAFE_POWERSHELL_GIT_LOG_OPTIONS = [
+  /^-[0-9]+$/,
+  /^-n[0-9]+$/,
+  /^--max-count=[0-9]+$/,
+  /^--skip=[0-9]+$/,
+  /^--pretty=(?:oneline|short|medium|full|fuller|reference|email|raw)$/,
+  /^--decorate=(?:short|full|auto|no)$/,
+  /^--color=(?:always|never|auto)$/,
+  /^--date=(?:relative|local|iso|iso-strict|rfc|short|raw|human|unix)$/,
+  /^--branches=[A-Za-z0-9._/+=-]+$/,
+  /^--tags=[A-Za-z0-9._/+=-]+$/,
+  /^--remotes=[A-Za-z0-9._/+=-]+$/,
+];
+const SAFE_POWERSHELL_GIT_SHOW_FLAGS = new Set([
+  '--stat', '--shortstat', '--numstat', '--name-only', '--name-status',
+  '--summary', '--oneline', '--decorate', '--no-decorate', '--patch', '-p',
+  '--no-patch', '-s', '--raw', '--color', '--no-color', '--full-index',
+  '--binary', '--first-parent', '--',
+]);
+const SAFE_POWERSHELL_GIT_SHOW_OPTIONS = [
+  /^--pretty=(?:oneline|short|medium|full|fuller|reference|email|raw)$/,
+  /^--decorate=(?:short|full|auto|no)$/,
+  /^--color=(?:always|never|auto)$/,
+  /^--unified=[0-9]+$/,
+  /^-U[0-9]+$/,
+  /^--abbrev=[0-9]+$/,
+];
+const SAFE_POWERSHELL_GIT_BRANCH_FLAGS = new Set([
+  '-a', '--all', '-r', '--remotes', '--show-current', '-v', '-vv',
+  '--verbose', '--color', '--no-color', '--column', '--no-column',
+  '--ignore-case', '--no-abbrev', '--contains', '--no-contains', '--merged',
+  '--no-merged',
+]);
+const SAFE_POWERSHELL_GIT_BRANCH_OPTIONS = [
+  /^--color=(?:always|never|auto)$/,
+  /^--column=(?:always|never|auto)$/,
+  /^--sort=-?[A-Za-z0-9._/+=-]+$/,
+  /^--abbrev=[0-9]+$/,
+  /^--contains=[A-Za-z0-9._/+=-]+$/,
+  /^--no-contains=[A-Za-z0-9._/+=-]+$/,
+  /^--merged=[A-Za-z0-9._/+=-]+$/,
+  /^--no-merged=[A-Za-z0-9._/+=-]+$/,
+  /^--points-at=[A-Za-z0-9._/+=-]+$/,
+  /^--list=[A-Za-z0-9][A-Za-z0-9._/-]*$/,
+];
+const SAFE_POWERSHELL_GIT_BRANCH_PATTERN =
+  /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
+const SAFE_POWERSHELL_GIT_NUMERIC_VALUE = /^[0-9]+$/;
+const SAFE_POWERSHELL_GIT_DIFF_NUMERIC_FLAGS = new Set([
+  '-U',
+  '--unified',
+  '--inter-hunk-context',
+  '--abbrev',
+]);
+const SAFE_POWERSHELL_GIT_LOG_NUMERIC_FLAGS = new Set([
+  '-n',
+  '--max-count',
+  '--skip',
+]);
+const SAFE_POWERSHELL_GIT_SHOW_NUMERIC_FLAGS = new Set([
+  '-U',
+  '--unified',
+  '--abbrev',
+]);
+const SAFE_POWERSHELL_PACKAGE_SCRIPTS = new Set([
+  'lint',
+  'build',
+  'check',
+  'typecheck',
+]);
 
 const SAFE_RIPGREP_FLAGS = new Set([
   '-n',
@@ -543,11 +677,220 @@ export function isSafeTargetedLocalTestCommand(command: string, cwd: string): bo
     || isSafeTargetedNodeTestCommand(tokens, cwd);
 }
 
-export function isSafeAutoApprovedCommand(command: string, cwd: string): boolean {
+export function isSafeAutoApprovedCommand(
+  command: string,
+  cwd: string,
+  shellDialect: 'posix' | 'powershell' = 'posix',
+): boolean {
+  if (shellDialect === 'powershell') {
+    return isSafePowerShellCommand(command);
+  }
+
   return isSafeCommand(command)
     || isSafeRepoInspectionCommand(command, cwd)
     || isSafeTargetedLocalTestCommand(command, cwd)
     || isHeredocWithSafeBase(command);
+}
+
+function normalizePowerShellExecutable(token: string): string | undefined {
+  const normalized = token.toLowerCase();
+  if (normalized.endsWith('.exe') || normalized.endsWith('.cmd')) {
+    return normalized.slice(0, -4);
+  }
+  return /^[a-z][a-z0-9-]*$/.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+function isSafePowerShellPackageCommand(
+  executable: string,
+  tokens: string[],
+): boolean {
+  const firstArgument = tokens[1]?.toLowerCase();
+  const secondArgument = tokens[2]?.toLowerCase();
+
+  if (executable === 'npm') {
+    return tokens.length === 3
+      && firstArgument === 'run'
+      && secondArgument !== undefined
+      && SAFE_POWERSHELL_PACKAGE_SCRIPTS.has(secondArgument);
+  }
+
+  if (executable !== 'pnpm' && executable !== 'yarn') {
+    return false;
+  }
+
+  if (tokens.length === 2) {
+    return firstArgument !== undefined
+      && SAFE_POWERSHELL_PACKAGE_SCRIPTS.has(firstArgument);
+  }
+  return tokens.length === 3
+    && firstArgument === 'run'
+    && secondArgument !== undefined
+    && SAFE_POWERSHELL_PACKAGE_SCRIPTS.has(secondArgument);
+}
+
+function hasOnlySafePowerShellGitArguments(
+  arguments_: string[],
+  safeFlags: ReadonlySet<string>,
+  safeOptions: readonly RegExp[],
+  numericValueFlags?: ReadonlySet<string>,
+): boolean {
+  for (let index = 0; index < arguments_.length; index += 1) {
+    const argument = arguments_[index];
+    if (!argument) {
+      return false;
+    }
+
+    if (numericValueFlags?.has(argument)) {
+      const value = arguments_[index + 1];
+      if (!value || !SAFE_POWERSHELL_GIT_NUMERIC_VALUE.test(value)) {
+        return false;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (
+      safeFlags.has(argument)
+      || safeOptions.some(pattern => pattern.test(argument))
+      || !argument.startsWith('-')
+    ) {
+      continue;
+    }
+
+    return false;
+  }
+
+  return true;
+}
+
+function isSafePowerShellGitBranch(arguments_: string[]): boolean {
+  let listMode = false;
+
+  for (const argument of arguments_) {
+    if (argument === '--list' || argument === '-l') {
+      listMode = true;
+      continue;
+    }
+
+    if (
+      SAFE_POWERSHELL_GIT_BRANCH_FLAGS.has(argument)
+      || SAFE_POWERSHELL_GIT_BRANCH_OPTIONS.some(
+        pattern => pattern.test(argument),
+      )
+    ) {
+      continue;
+    }
+
+    if (listMode && SAFE_POWERSHELL_GIT_BRANCH_PATTERN.test(argument)) {
+      continue;
+    }
+
+    return false;
+  }
+
+  return true;
+}
+
+function isSafePowerShellGitCommand(tokens: string[]): boolean {
+  const subcommand = tokens[1]?.toLowerCase();
+  const arguments_ = tokens.slice(2);
+
+  switch (subcommand) {
+    case 'status':
+      return hasOnlySafePowerShellGitArguments(
+        arguments_,
+        SAFE_POWERSHELL_GIT_STATUS_FLAGS,
+        SAFE_POWERSHELL_GIT_STATUS_OPTIONS,
+      );
+    case 'diff':
+      return hasOnlySafePowerShellGitArguments(
+        arguments_,
+        SAFE_POWERSHELL_GIT_DIFF_FLAGS,
+        SAFE_POWERSHELL_GIT_DIFF_OPTIONS,
+        SAFE_POWERSHELL_GIT_DIFF_NUMERIC_FLAGS,
+      );
+    case 'log':
+      return hasOnlySafePowerShellGitArguments(
+        arguments_,
+        SAFE_POWERSHELL_GIT_LOG_FLAGS,
+        SAFE_POWERSHELL_GIT_LOG_OPTIONS,
+        SAFE_POWERSHELL_GIT_LOG_NUMERIC_FLAGS,
+      );
+    case 'branch':
+      return isSafePowerShellGitBranch(arguments_);
+    case 'show':
+      return hasOnlySafePowerShellGitArguments(
+        arguments_,
+        SAFE_POWERSHELL_GIT_SHOW_FLAGS,
+        SAFE_POWERSHELL_GIT_SHOW_OPTIONS,
+        SAFE_POWERSHELL_GIT_SHOW_NUMERIC_FLAGS,
+      );
+    case 'fetch':
+      return false;
+    default:
+      return false;
+  }
+}
+
+/**
+ * Match a deliberately small set of external executable invocations using
+ * PowerShell token semantics. Aliases, providers, expressions, and shell
+ * composition remain on the native permission path.
+ */
+export function isSafePowerShellCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed || DANGEROUS_POWERSHELL_CHARS.test(trimmed)) {
+    return false;
+  }
+
+  const tokens = tokenizeShellCommand(trimmed);
+  if (
+    !tokens
+    || tokens.some(
+      token =>
+        !SAFE_POWERSHELL_TOKEN.test(token)
+        || POWERSHELL_PROVIDER_PATH.test(token),
+    )
+  ) {
+    return false;
+  }
+
+  const firstToken = tokens[0];
+  if (!firstToken) {
+    return false;
+  }
+
+  const executable = normalizePowerShellExecutable(firstToken);
+  if (!executable) {
+    return false;
+  }
+
+  if (executable === 'git') {
+    return isSafePowerShellGitCommand(tokens);
+  }
+
+  if (isSafePowerShellPackageCommand(executable, tokens)) {
+    return true;
+  }
+
+  if (executable === 'tsc') {
+    return tokens.length === 1
+      || (tokens.length === 2 && tokens[1] === '--noEmit');
+  }
+
+  if (executable === 'eslint') {
+    return tokens.length === 2 && tokens[1] === '.';
+  }
+
+  if (executable === 'prettier') {
+    return tokens.length === 3
+      && (tokens[1] === '--check' || tokens[1] === '-c')
+      && tokens[2] === '.';
+  }
+
+  return false;
 }
 
 /**
@@ -572,28 +915,40 @@ export function isSafeCommand(command: string): boolean {
  * Code's native permission flow and the user approves "Always allow", the entire
  * heredoc body (potentially hundreds of lines) gets stored in settings.local.json.
  *
- * This function detects heredoc commands and checks whether the base command
- * (first line) matches known-safe patterns, allowing auto-approval without
- * polluting settings.local.json.
+ * The opener must terminate the first command line, the base command is limited
+ * to a non-chained git commit/tag invocation, and the delimiter must be followed
+ * only by the command-substitution close. Anything after that remains native.
  */
 export function isHeredocWithSafeBase(command: string): boolean {
   const trimmed = command.trim();
-
-  // Heredoc commands from Claude Code are always multi-line
-  if (!trimmed.includes('\n')) {
+  const lines = trimmed.split(/\r?\n/);
+  if (lines.length < 3) {
     return false;
   }
 
-  // Must contain a heredoc operator
-  if (!HEREDOC_PATTERN.test(trimmed)) {
+  const opener = lines[0].trim().match(SAFE_POSIX_HEREDOC_FIRST_LINE);
+  if (!opener) {
     return false;
   }
 
-  // Extract the first line as the base command
-  const firstLine = trimmed.split('\n')[0].trim();
+  const stripsTabs = opener[1] === '-';
+  const delimiter = opener[3];
+  if (!delimiter) {
+    return false;
+  }
 
-  // Check if the first line starts with a safe pattern
-  return SAFE_HEREDOC_PATTERNS.some(pattern => pattern.test(firstLine));
+  let closingIndex = -1;
+  for (let index = 1; index < lines.length; index += 1) {
+    const line = stripsTabs ? lines[index].replace(/^\t*/, '') : lines[index];
+    if (line === delimiter) {
+      closingIndex = index;
+      break;
+    }
+  }
+
+  return closingIndex > 0
+    && closingIndex === lines.length - 2
+    && lines[closingIndex + 1].trim() === ')"';
 }
 
 /**
@@ -636,27 +991,88 @@ export function isActiveModeRunning(directory: string): boolean {
   return false;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function canonicalShellRequest(
+  input: CanonicalPermissionRequestInput,
+): { cwd: string; command: string; shellDialect: 'posix' | 'powershell' } | undefined {
+  const nativeToolName = input.nativeToolName?.replace(/^proxy_/, '');
+  const isClaudeShell =
+    input.host === 'claude'
+    && input.contract === 'claude-single'
+    && nativeToolName === 'Bash'
+    && input.shellDialect === 'posix';
+  const isCopilotPowerShell =
+    input.host === 'copilot'
+    && input.contract === 'copilot-1.0.72-1'
+    && nativeToolName?.toLowerCase() === 'powershell'
+    && input.shellDialect === 'powershell';
+
+  if (
+    input.canonicalToolName !== 'Bash'
+    || (!isClaudeShell && !isCopilotPowerShell)
+    || typeof input.directory !== 'string'
+    || input.directory.length === 0
+    || !isRecord(input.toolInput)
+    || typeof input.toolInput.command !== 'string'
+    || input.toolInput.command.length === 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    cwd: input.directory,
+    command: input.toolInput.command,
+    shellDialect: isClaudeShell ? 'posix' : 'powershell',
+  };
+}
+
+function legacyShellRequest(
+  input: PermissionRequestInput,
+): { cwd: string; command: string; shellDialect: 'posix' } | undefined {
+  if (
+    typeof input.tool_name !== 'string'
+    || input.tool_name.replace(/^proxy_/, '') !== 'Bash'
+    || typeof input.cwd !== 'string'
+    || input.cwd.length === 0
+    || !isRecord(input.tool_input)
+    || typeof input.tool_input.command !== 'string'
+    || input.tool_input.command.length === 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    cwd: input.cwd,
+    command: input.tool_input.command,
+    shellDialect: 'posix',
+  };
+}
+
 /**
- * Process permission request and decide whether to auto-allow
+ * Process permission request and decide whether to auto-allow.
  */
-export function processPermissionRequest(input: PermissionRequestInput): HookOutput {
-  // Only process Bash tool for command auto-approval
-  // Normalize tool name - handle both proxy_ prefixed and unprefixed versions
-  const toolName = input.tool_name.replace(/^proxy_/, '');
-  if (toolName !== 'Bash') {
+export function processPermissionRequest(input: PermissionProcessorInput): HookOutput {
+  const shellRequest = 'host' in input
+    ? canonicalShellRequest(input)
+    : legacyShellRequest(input);
+  if (!shellRequest) {
     return { continue: true };
   }
 
-  const command = input.tool_input.command;
-  if (!command || typeof command !== 'string') {
-    return { continue: true };
-  }
+  const { cwd, command, shellDialect } = shellRequest;
+  const shouldAskBashPermission = hasClaudePermissionAsk(cwd, 'Bash', command);
+  const isSafeHeredoc =
+    shellDialect === 'posix'
+    && isHeredocWithSafeBase(command);
 
-  const shouldAskBashPermission = hasClaudePermissionAsk(input.cwd, 'Bash', command);
-
-  // Auto-allow safe commands
-  if (!shouldAskBashPermission && isSafeAutoApprovedCommand(command, input.cwd)) {
-    const reason = isHeredocWithSafeBase(command)
+  if (
+    !shouldAskBashPermission
+    && isSafeAutoApprovedCommand(command, cwd, shellDialect)
+  ) {
+    const reason = isSafeHeredoc
       ? 'Safe command with heredoc content'
       : 'Safe read-only or test command';
     return {
@@ -678,6 +1094,6 @@ export function processPermissionRequest(input: PermissionRequestInput): HookOut
 /**
  * Main hook entry point
  */
-export async function handlePermissionRequest(input: PermissionRequestInput): Promise<HookOutput> {
+export async function handlePermissionRequest(input: PermissionProcessorInput): Promise<HookOutput> {
   return processPermissionRequest(input);
 }

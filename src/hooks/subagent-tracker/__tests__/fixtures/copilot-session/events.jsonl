@@ -1,0 +1,6 @@
+{"id":"noise-before","type":"assistant.message","timestamp":"2026-07-19T19:59:59.000Z","data":{"message":"fixture noise"}}
+{"id":"start-a","type":"subagent.started","timestamp":"2026-07-19T20:00:00.000Z","agentId":"call_fixture_agent_a","data":{"toolCallId":"call_fixture_agent_a","agentName":"executor","agentDisplayName":"Executor","agentDescription":"First same-name fixture agent"}}
+{"id":"start-b","type":"subagent.started","timestamp":"2026-07-19T20:00:00.250Z","data":{"toolCallId":"call_fixture_agent_b","agentName":"executor","agentDisplayName":"Executor","agentDescription":"Second same-name fixture agent"}}
+{"id":"start-old","type":"subagent.started","timestamp":"2026-07-19T19:59:50.000Z","agentId":"call_fixture_old","data":{"toolCallId":"call_fixture_old","agentName":"executor","agentDisplayName":"Executor"}}
+{"id":"complete-a","type":"subagent.completed","timestamp":"2026-07-19T20:00:05.000Z","agentId":"call_fixture_agent_a","data":{"toolCallId":"call_fixture_agent_a","agentName":"executor","agentDisplayName":"Executor","durationMs":5000}}
+{"id":"complete-b","type":"subagent.completed","timestamp":"2026-07-19T20:00:06.000Z","data":{"toolCallId":"call_fixture_agent_b","agentName":"executor","agentDisplayName":"Executor","durationMs":5750}}

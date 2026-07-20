@@ -1,7 +1,9 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { buildSync } from 'esbuild';
 import {
   readMissionBoardState,
   recordMissionAgentStart,
@@ -17,6 +19,75 @@ function makeTempDir(): string {
   tempDirs.push(dir);
   mkdirSync(join(dir, '.omc', 'state'), { recursive: true });
   return dir;
+}
+
+function runMissionProcess(
+  runnerPath: string,
+  method:
+    | 'readMissionBoardState'
+    | 'recordMissionAgentStart'
+    | 'recordMissionAgentStop',
+  cwd: string,
+  sessionId: string,
+  payload: Record<string, unknown> = {},
+  env: Record<string, string> = {},
+): Promise<string> {
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawn(process.execPath, [
+      runnerPath,
+      method,
+      cwd,
+      sessionId,
+      JSON.stringify(payload),
+    ], {
+      env: {
+        ...process.env,
+        ...env,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once('error', rejectRun);
+    child.once('close', (code) => {
+      if (code === 0) {
+        resolveRun(stdout);
+      } else {
+        rejectRun(new Error(`mission process exited ${String(code)}: ${stderr}`));
+      }
+    });
+  });
+}
+
+function buildMissionRunner(cwd: string): string {
+  const bundlePath = join(cwd, 'mission-board.cjs');
+  const runnerPath = join(cwd, 'mission-runner.cjs');
+  buildSync({
+    entryPoints: [resolve(process.cwd(), 'src', 'hud', 'mission-board.ts')],
+    bundle: true,
+    platform: 'node',
+    target: 'node20',
+    format: 'cjs',
+    outfile: bundlePath,
+    logLevel: 'silent',
+  });
+  writeFileSync(runnerPath, `
+    const missionBoard = require(${JSON.stringify(bundlePath)});
+    const [method, directory, sessionId, rawPayload] = process.argv.slice(2);
+    const result = method === 'readMissionBoardState'
+      ? missionBoard.readMissionBoardState(directory, sessionId)
+      : missionBoard[method](directory, JSON.parse(rawPayload), sessionId);
+    if (result !== undefined) process.stdout.write(JSON.stringify(result));
+  `);
+  return runnerPath;
 }
 
 afterEach(() => {
@@ -58,6 +129,68 @@ describe('mission board state tracking', () => {
     expect(mission.agents[0]?.status).toBe('done');
     expect(mission.agents[0]?.completedSummary).toContain('Rendered mission');
     expect(mission.timeline.map((entry) => entry.kind)).toEqual(['update', 'completion']);
+  });
+
+  it('preserves concurrent session-agent read-modify-write transactions', async () => {
+    const cwd = makeTempDir();
+    const sessionId = 'concurrent-session-agents';
+    const runnerPath = buildMissionRunner(cwd);
+
+    await Promise.all(
+      Array.from({ length: 19 }, (_, index) =>
+        runMissionProcess(
+          runnerPath,
+          'recordMissionAgentStart',
+          cwd,
+          sessionId,
+          {
+            sessionId,
+            agentId: `agent-${index}`,
+            agentType: 'oh-my-claudecode:executor',
+            parentMode: 'ultrawork',
+            taskDescription: 'Concurrent mission work',
+            at: '2026-03-09T07:00:00.000Z',
+          },
+        )
+      ),
+    );
+
+    const started = readMissionBoardState(cwd, sessionId);
+    expect(started?.missions[0]?.agents).toHaveLength(19);
+    expect(started?.missions[0]?.taskCounts).toMatchObject({
+      total: 19,
+      inProgress: 19,
+      completed: 0,
+    });
+
+    await Promise.all(
+      Array.from({ length: 19 }, (_, index) =>
+        runMissionProcess(
+          runnerPath,
+          'recordMissionAgentStop',
+          cwd,
+          sessionId,
+          {
+            sessionId,
+            agentId: `agent-${index}`,
+            success: true,
+            outputSummary: 'Completed concurrently',
+            at: '2026-03-09T07:05:00.000Z',
+          },
+        )
+      ),
+    );
+
+    const completed = readMissionBoardState(cwd, sessionId);
+    expect(completed?.missions[0]?.agents).toHaveLength(19);
+    expect(completed?.missions[0]?.agents.every(
+      (agent) => agent.status === 'done',
+    )).toBe(true);
+    expect(completed?.missions[0]?.taskCounts).toMatchObject({
+      total: 19,
+      inProgress: 0,
+      completed: 19,
+    });
   });
 
   it('syncs team missions from existing team state files and preserves session missions', () => {
@@ -315,6 +448,104 @@ describe('mission board state tracking', () => {
     expect(allOwnerships).not.toContain('legacy-agent');
     expect(JSON.stringify(state)).not.toContain('legacy-agent');
     expect(JSON.stringify(state)).not.toContain('legacy-mission');
+  });
+
+  it('serializes concurrent reader/writer legacy migration without clobbering', async () => {
+    const cwd = makeTempDir();
+    const sessionId = 'concurrent-migration-session';
+    const runnerPath = buildMissionRunner(cwd);
+    const legacyStatePath = join(cwd, '.omc', 'state', 'mission-state.json');
+    writeFileSync(legacyStatePath, JSON.stringify({
+      updatedAt: '2026-07-19T20:00:00.000Z',
+      missions: [{
+        id: 'legacy-mission',
+        source: 'session',
+        name: 'legacy',
+        objective: 'Preserve legacy mission',
+        createdAt: '2026-07-19T20:00:00.000Z',
+        updatedAt: '2026-07-19T20:00:00.000Z',
+        status: 'done',
+        workerCount: 1,
+        taskCounts: {
+          total: 1,
+          pending: 0,
+          blocked: 0,
+          inProgress: 0,
+          completed: 1,
+          failed: 0,
+        },
+        agents: [{
+          name: 'legacy-agent',
+          role: 'executor',
+          ownership: 'legacy-agent',
+          status: 'done',
+          currentStep: null,
+          latestUpdate: null,
+          completedSummary: 'Legacy complete',
+          updatedAt: '2026-07-19T20:00:00.000Z',
+        }],
+        timeline: [],
+      }],
+    }));
+
+    const migrationEnv = { OMC_MIGRATE_LEGACY_STATE: '1' };
+    const [readerOutput] = await Promise.all([
+      runMissionProcess(
+        runnerPath,
+        'readMissionBoardState',
+        cwd,
+        sessionId,
+        {},
+        migrationEnv,
+      ),
+      runMissionProcess(
+        runnerPath,
+        'recordMissionAgentStart',
+        cwd,
+        sessionId,
+        {
+          sessionId,
+          agentId: 'writer-agent',
+          agentType: 'oh-my-claudecode:executor',
+          parentMode: 'ultrawork',
+          taskDescription: 'Concurrent writer mission',
+          at: '2026-07-19T20:00:01.000Z',
+        },
+        migrationEnv,
+      ),
+    ]);
+
+    const readerState = JSON.parse(readerOutput) as {
+      missions: Array<{ id: string }>;
+    };
+    expect(readerState.missions.some(
+      (mission) => mission.id === 'legacy-mission',
+    )).toBe(true);
+
+    const paths = resolveSessionStatePaths(
+      'mission-state',
+      sessionId,
+      cwd,
+    );
+    const persisted = JSON.parse(
+      readFileSync(paths.sessionScoped, 'utf8'),
+    ) as {
+      missions: Array<{
+        id: string;
+        agents: Array<{ ownership?: string }>;
+      }>;
+    };
+    expect(persisted.missions.some(
+      (mission) => mission.id === 'legacy-mission',
+    )).toBe(true);
+    expect(persisted.missions.some(
+      (mission) => mission.agents.some(
+        (agent) => agent.ownership === 'writer-agent',
+      ),
+    )).toBe(true);
+    expect(readdirSync(join(paths.sessionScoped, '..')).some(
+      (name) => name.includes('.migrating.'),
+    )).toBe(false);
   });
 
   it('deduplicates duplicate team worker rows when refreshing mission board state', () => {
