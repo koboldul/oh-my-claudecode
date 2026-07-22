@@ -5,15 +5,32 @@
  *
  * Uses process.execPath (the Node binary already running this script) to spawn
  * ordinary hooks. The two trusted UserPromptSubmit hooks run in a Worker so the
- * runner retains ownership of their synchronous timeout boundary.
+ * runner retains ownership of their synchronous timeout boundary. Trusted
+ * asynchronous SessionEnd hooks durably publish to the resident worker that
+ * SessionStart prewarms for this plugin build, worktree scope, and session.
  */
 
-const { spawn } = require('child_process');
-const { existsSync, readFileSync, realpathSync } = require('fs');
+// SessionEnd latency is measured from the first executable runner statement.
+// Host process launch and fresh Node startup occur before this boundary.
+const SESSION_END_RUNNER_STARTED_AT = process.hrtime.bigint();
+const RUNNER_STARTED_AT = Date.now();
+const {
+  existsSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+  writeSync,
+} = require('fs');
 const path = require('path');
 const { join, basename, dirname } = path;
-const { pathToFileURL } = require('url');
-const { Worker } = require('worker_threads');
+
+let spawn;
+let spawnInvocationCount = 0;
+function spawnProcess(...args) {
+  spawnInvocationCount += 1;
+  if (!spawn) ({ spawn } = require('child_process'));
+  return spawn(...args);
+}
 
 
 function isPluginRoot(pluginRoot) {
@@ -108,15 +125,24 @@ function isDebugHooksEnabled() {
 }
 
 function resolveTimeoutCushionMs(manifestTimeoutMs, hookEvent) {
-  if (hookEvent !== 'UserPromptSubmit') return TIMEOUT_CUSHION_MS;
+  if (hookEvent !== 'UserPromptSubmit') {
+    return Math.min(1000, Math.max(TIMEOUT_CUSHION_MS, Math.floor(manifestTimeoutMs / 2)));
+  }
   const promptCushion = Math.floor(manifestTimeoutMs * 0.2);
   return Math.min(3000, Math.max(1000, promptCushion));
 }
 
 const TIMEOUT_CUSHION_MS = 500;
-// = max declared manifest budget (60000ms, setup-maintenance) minus the 500ms cushion; applied ONLY when manifest resolution is null so long legit hooks are not prematurely reaped.
-const DEFAULT_GENERIC_TIMEOUT_MS = 59500;
+// = max declared manifest budget (60000ms, setup-maintenance) minus the generic 1000ms reserve; applied ONLY when manifest resolution is null so long legit hooks are not prematurely reaped.
+const DEFAULT_GENERIC_TIMEOUT_MS = 59000;
 const CRITICAL_HOOK_EVENTS = new Set(['permissionrequest', 'pretooluse']);
+const SESSION_END_FIRST_BYTE_TIMEOUT_MS = 25;
+const SESSION_END_TOTAL_TIMEOUT_MS = 100;
+const SESSION_END_MAX_BYTES = 64 * 1024;
+const SESSION_END_FALLBACK_OUTPUT = JSON.stringify({
+  continue: true,
+  suppressOutput: true,
+});
 
 
 function resolveInnerTimeoutMs(manifestHook) {
@@ -168,7 +194,11 @@ function resolveHookTimeoutMsFromRoot(pluginRoot, targetPath, extraArgs) {
         if (!scriptPattern.test(command)) continue;
         if (!Number.isFinite(timeout) || timeout <= 0) continue;
         if (!argNeedles.every(arg => command.includes(` ${arg}`) || command.endsWith(` ${arg}`))) continue;
-        return { event, timeoutMs: Math.floor(timeout * 1000) };
+        return {
+          event,
+          timeoutMs: Math.floor(timeout * 1000),
+          async: hook?.async === true,
+        };
       }
     }
   } catch {
@@ -259,6 +289,295 @@ function resolveWorkerTarget(resolution, extraArgs) {
   }
 }
 
+function resolveSessionEndTarget(resolution, extraArgs) {
+  if (extraArgs.length !== 0) return null;
+
+  const trustedRoot = resolution.trustedPluginRoot
+    || canonicalPluginRoot(dirname(dirname(resolution.targetPath)));
+  if (!trustedRoot) return null;
+
+  try {
+    const pathApi = process.platform === 'win32' ? path.win32 : path;
+    const resolvedRoot = pathApi.normalize(path.resolve(trustedRoot));
+    const resolvedTarget = pathApi.normalize(path.resolve(resolution.targetPath));
+    const canonicalRoot = process.platform === 'win32'
+      ? resolvedRoot.toLowerCase()
+      : resolvedRoot;
+    const canonicalTarget = process.platform === 'win32'
+      ? resolvedTarget.toLowerCase()
+      : resolvedTarget;
+    if (!isContainedBy(canonicalRoot, canonicalTarget)) return null;
+
+    const scriptName = basename(resolution.targetPath);
+    if (scriptName !== 'session-end.mjs' && scriptName !== 'wiki-session-end.mjs') {
+      return null;
+    }
+    const resolvedExpectedTarget = pathApi.normalize(
+      path.resolve(trustedRoot, 'scripts', scriptName),
+    );
+    const expectedTarget = process.platform === 'win32'
+      ? resolvedExpectedTarget.toLowerCase()
+      : resolvedExpectedTarget;
+    if (canonicalTarget !== expectedTarget) return null;
+
+    const manifestHook = resolveHookTimeoutMsFromRoot(
+      trustedRoot,
+      resolution.targetPath,
+      [],
+    );
+    if (manifestHook?.event !== 'SessionEnd' || manifestHook.async !== true) {
+      return null;
+    }
+    return { ...manifestHook, pluginRoot: trustedRoot };
+  } catch {
+    return null;
+  }
+}
+
+function isJsonObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function readSessionEndInput() {
+  return new Promise(resolve => {
+    const stdin = process.stdin;
+    const chunks = [];
+    let byteLength = 0;
+    let settled = false;
+    let firstByteTimer;
+    let totalTimer;
+
+    const cleanup = () => {
+      clearTimeout(firstByteTimer);
+      clearTimeout(totalTimer);
+      stdin.off('data', onData);
+      stdin.off('end', onEnd);
+      stdin.off('error', onError);
+    };
+    const finish = (result, closeStdin = false) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (closeStdin && !stdin.destroyed) {
+        stdin.pause();
+        stdin.destroy();
+      }
+      resolve(result);
+    };
+    const onData = chunk => {
+      clearTimeout(firstByteTimer);
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      byteLength += buffer.length;
+      if (byteLength > SESSION_END_MAX_BYTES) {
+        finish({ status: 'overflow' }, true);
+        return;
+      }
+      chunks.push(buffer);
+    };
+    const onEnd = () => {
+      const raw = Buffer.concat(chunks);
+      let input;
+      try {
+        input = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+      } catch {
+        finish({ status: 'invalid' });
+        return;
+      }
+      if (input.trim().length === 0) {
+        finish({ status: 'empty' });
+        return;
+      }
+      try {
+        const value = JSON.parse(input);
+        if (!isJsonObject(value)) {
+          finish({ status: 'invalid' });
+          return;
+        }
+        finish({ status: 'ok', raw, value });
+      } catch {
+        finish({ status: 'invalid' });
+      }
+    };
+    const onError = () => finish({ status: 'error' }, true);
+
+    stdin.on('data', onData);
+    stdin.once('end', onEnd);
+    stdin.once('error', onError);
+
+    if (stdin.readableEnded) {
+      onEnd();
+      return;
+    }
+
+    firstByteTimer = setTimeout(
+      () => finish({ status: 'timeout' }, true),
+      SESSION_END_FIRST_BYTE_TIMEOUT_MS,
+    );
+    totalTimer = setTimeout(
+      () => finish({ status: 'timeout' }, true),
+      SESSION_END_TOTAL_TIMEOUT_MS,
+    );
+    stdin.resume();
+  });
+}
+
+function detectSessionEndHost(value) {
+  for (const key of [
+    'hook_event_name',
+    'session_id',
+    'transcript_path',
+    'permission_mode',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) return 'claude';
+  }
+  for (const key of ['hookName', 'sessionId', 'transcriptPath']) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) return 'copilot';
+  }
+  return 'claude';
+}
+
+function writeSessionEndDiagnostic(targetPath, message, error) {
+  const detail = error && typeof error.message === 'string'
+    ? `: ${error.message}`
+    : error
+      ? `: ${String(error)}`
+      : '';
+  process.stderr.write(
+    `[run.cjs] Hook ${basename(targetPath)} ${message}; exiting fail-open${detail}\n`,
+  );
+}
+
+function sessionEndRuntimeError(targetPath) {
+  const pluginRoot = dirname(dirname(targetPath));
+  const bundlePath = join(pluginRoot, 'bridge', 'hook-runtime.cjs');
+  if (!existsSync(bundlePath)) {
+    return `Canonical hook runtime bundle is missing at "${bundlePath}".`;
+  }
+  const processorPath = join(
+    pluginRoot,
+    'dist',
+    'hooks',
+    'session-end',
+    'index.js',
+  );
+  if (!existsSync(processorPath)) {
+    return `Canonical SessionEnd processor is missing at "${processorPath}".`;
+  }
+  return null;
+}
+
+function writeSessionEndRuntimeError(targetPath, detail) {
+  const hookName = basename(targetPath).replace(/\.mjs$/, '');
+  writeSync(
+    2,
+    `[${hookName}] Canonical hook runtime unavailable; `
+    + `continuing without optional hook behavior: ${detail}\n`,
+  );
+}
+
+function monotonicElapsedMs(startedAt) {
+  return Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+}
+
+function writeSessionEndTimingReceipt(childEnv, timing) {
+  if (
+    childEnv.NODE_ENV !== 'test'
+    || typeof childEnv.OMC_SESSION_END_TEST_IPC_RECEIPT !== 'string'
+    || childEnv.OMC_SESSION_END_TEST_IPC_RECEIPT.length === 0
+  ) {
+    return;
+  }
+  try {
+    writeFileSync(
+      childEnv.OMC_SESSION_END_TEST_IPC_RECEIPT,
+      JSON.stringify({
+        ...timing,
+        runnerDurationMs: monotonicElapsedMs(SESSION_END_RUNNER_STARTED_AT),
+        processCreations: spawnInvocationCount,
+      }),
+      { encoding: 'utf8', mode: 0o600 },
+    );
+  } catch {
+    // Test-only timing evidence never affects hook output.
+  }
+}
+
+async function runSessionEndFastPath(targetPath, raw, value, childEnv) {
+  const fastPathStartedAt = process.hrtime.bigint();
+  const output = detectSessionEndHost(value) === 'copilot'
+    ? '{}'
+    : '{"continue":true}';
+  const ipc = require('./lib/session-end-ipc.cjs');
+  const coordinates = ipc.extractSessionEndCoordinates(value);
+  if (!coordinates) {
+    writeSessionEndDiagnostic(targetPath, 'received no valid session/worktree scope');
+    writeSessionEndTimingReceipt(childEnv, {
+      acknowledged: false,
+      code: 'invalid-coordinates',
+      fastPathMs: monotonicElapsedMs(fastPathStartedAt),
+    });
+    return output;
+  }
+  let context;
+  let published;
+  let contextMs;
+  let publishMs;
+  let controlMs;
+  let control;
+  let delivery = { acknowledged: false, code: 'not-attempted' };
+  try {
+    const contextStartedAt = Date.now();
+    context = ipc.resolveResidentContext({
+      pluginRoot: dirname(dirname(targetPath)),
+      directory: coordinates.directory,
+      sessionId: coordinates.sessionId,
+      env: childEnv,
+    });
+    contextMs = Date.now() - contextStartedAt;
+    const controlStartedAt = Date.now();
+    control = ipc.readControl(context);
+    controlMs = Date.now() - controlStartedAt;
+    const publishStartedAt = Date.now();
+    published = ipc.publishSessionEndFrame(context, {
+      producer: basename(targetPath) === 'wiki-session-end.mjs' ? 'wiki' : 'core',
+      raw,
+      host: detectSessionEndHost(value),
+      env: childEnv,
+      runtimeReady: Boolean(control),
+    });
+    publishMs = Date.now() - publishStartedAt;
+  } catch (error) {
+    writeSessionEndDiagnostic(targetPath, 'could not durably spool its input', error);
+    writeSessionEndTimingReceipt(childEnv, {
+      acknowledged: false,
+      code: 'publish-failed',
+      contextMs,
+      publishMs,
+      controlMs,
+      fastPathMs: monotonicElapsedMs(fastPathStartedAt),
+    });
+    return output;
+  }
+
+  if (control) {
+    delivery = await ipc.notifyResident(context, control, published, childEnv);
+  }
+  writeSessionEndTimingReceipt(childEnv, {
+    eventId: published.eventId,
+    rawDigest: published.rawDigest,
+    acknowledged: delivery.acknowledged,
+    code: delivery.code,
+    connectMs: delivery.connectMs,
+    ackMs: delivery.ackMs,
+    totalMs: delivery.totalMs,
+    contextMs,
+    publishMs,
+    controlMs,
+    fastPathMs: monotonicElapsedMs(fastPathStartedAt),
+  });
+  return output;
+}
+
 function writeTimeoutDiagnostic(targetPath, manifestHook, timeoutMs) {
   const failureMode = isCriticalManifestHook(manifestHook)
     ? 'fail-closed'
@@ -293,7 +612,7 @@ function reapTree(child) {
     // runner past the outer hooks.json budget. The runner still exits according
     // to the hook failure policy; taskkill reaps the tree best-effort.
     try {
-      const killer = spawn('taskkill', ['/T', '/F', '/PID', String(child.pid)], {
+      const killer = spawnProcess('taskkill', ['/T', '/F', '/PID', String(child.pid)], {
         windowsHide: true,
         detached: true,
         stdio: 'ignore',
@@ -319,14 +638,14 @@ function reapTree(child) {
 
 const RUNNER_TERMINATION_SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'];
 
-function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook) {
+function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook, deadlineAt) {
   return new Promise(resolve => {
     let terminal = false;
     let timer;
     const failureExitCode = hookFailureExitCode(manifestHook);
     let child;
     try {
-      child = spawn(process.execPath, [targetPath, ...extraArgs], {
+      child = spawnProcess(process.execPath, [targetPath, ...extraArgs], {
         stdio: 'inherit',
         env: resolveChildEnv(targetPath),
         windowsHide: true,
@@ -360,6 +679,9 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook) {
       reapTree(child);
     }
 
+    const timerDelayMs = Number.isFinite(deadlineAt)
+      ? Math.max(1, deadlineAt - Date.now())
+      : timeoutMs;
     timer = setTimeout(() => {
       if (terminal) return;
       terminal = true;
@@ -371,7 +693,7 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook) {
       try { child.unref(); } catch { /* handle already released */ }
       writeTimeoutDiagnostic(targetPath, manifestHook, timeoutMs);
       resolve(failureExitCode);
-    }, timeoutMs);
+    }, timerDelayMs);
 
     child.once('exit', (code, signal) => {
       if (terminal) return;
@@ -397,6 +719,8 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook) {
 }
 
 async function runWorker(targetPath, manifestHook, timeoutMs) {
+  const { pathToFileURL } = require('url');
+  const { Worker } = require('worker_threads');
   let worker;
   let terminal = false;
   let timer;
@@ -480,41 +804,98 @@ async function runWorker(targetPath, manifestHook, timeoutMs) {
   }
 }
 
-if (require.main === module) {
+async function main() {
   const target = process.argv[2];
   if (!target) {
-    process.exit(0);
+    return 0;
   }
 
   const resolution = resolveTarget(target);
   if (!resolution) {
-    process.exitCode = 0;
-  } else {
-    const extraArgs = process.argv.slice(3);
-    const workerManifestHook = resolveWorkerTarget(resolution, extraArgs);
-    if (workerManifestHook) {
-      const workerTimeoutMs = resolveTrustedPromptWorkerTimeoutMs(resolution.targetPath, workerManifestHook, resolution.trustedPluginRoot);
-      runWorker(resolution.targetPath, workerManifestHook, workerTimeoutMs).then(status => {
-        process.exitCode = status;
-      });
-    } else {
-      const manifestHook = resolveHookTimeoutMs(resolution.targetPath, extraArgs);
-      const timeoutMs = resolveGenericTimeoutMs(manifestHook);
-      runGenericChild(resolution.targetPath, extraArgs, timeoutMs, manifestHook).then(status => {
-        process.exitCode = status;
-      });
-    }
+    return 0;
   }
+
+  const extraArgs = process.argv.slice(3);
+  const sessionEndManifestHook = resolveSessionEndTarget(resolution, extraArgs);
+  if (sessionEndManifestHook) {
+    const childEnv = resolveChildEnv(resolution.targetPath);
+    const frame = await readSessionEndInput();
+    if (frame.status !== 'ok') {
+      writeSessionEndTimingReceipt(childEnv, {
+        acknowledged: false,
+        code: `input-${frame.status}`,
+      });
+      writeSync(1, `${SESSION_END_FALLBACK_OUTPUT}\n`);
+      process.exit(0);
+    }
+    const runtimeError = sessionEndRuntimeError(resolution.targetPath);
+    if (runtimeError) {
+      writeSessionEndTimingReceipt(childEnv, {
+        acknowledged: false,
+        code: 'runtime-unavailable',
+      });
+      writeSessionEndRuntimeError(resolution.targetPath, runtimeError);
+      writeSync(
+        1,
+        `${detectSessionEndHost(frame.value) === 'copilot' ? '{}' : '{"continue":true}'}\n`,
+      );
+      process.exit(0);
+    }
+    const output = await runSessionEndFastPath(
+      resolution.targetPath,
+      frame.raw,
+      frame.value,
+      childEnv,
+    );
+    writeSync(1, `${output}\n`);
+    process.exit(0);
+  }
+
+  const workerManifestHook = resolveWorkerTarget(resolution, extraArgs);
+  if (workerManifestHook) {
+    const workerTimeoutMs = resolveTrustedPromptWorkerTimeoutMs(
+      resolution.targetPath,
+      workerManifestHook,
+      resolution.trustedPluginRoot,
+    );
+    return runWorker(
+      resolution.targetPath,
+      workerManifestHook,
+      workerTimeoutMs,
+    );
+  }
+
+  const manifestHook = resolveHookTimeoutMs(resolution.targetPath, extraArgs);
+  const timeoutMs = resolveGenericTimeoutMs(manifestHook);
+  return runGenericChild(
+    resolution.targetPath,
+    extraArgs,
+    timeoutMs,
+    manifestHook,
+    RUNNER_STARTED_AT + timeoutMs,
+  );
+}
+
+if (require.main === module) {
+  main().then(status => {
+    process.exitCode = status;
+  }).catch(error => {
+    process.stderr.write(`[run.cjs] Unexpected runner failure: ${error?.stack || error}\n`);
+    process.exitCode = 0;
+  });
 }
 
 module.exports = {
   hookFailureExitCode,
   isCriticalManifestHook,
+  readSessionEndInput,
   resolveInnerTimeoutMs,
   resolveTrustedPromptWorkerTimeoutMs,
+  resolveSessionEndTarget,
   resolveWorkerTarget,
   resolveHookTimeoutMs,
   resolveGenericTimeoutMs,
+  runSessionEndFastPath,
   runGenericChild,
   DEFAULT_GENERIC_TIMEOUT_MS,
 };

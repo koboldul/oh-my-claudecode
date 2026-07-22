@@ -1,11 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, existsSync } from 'fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { copyFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync, spawnSync } from 'child_process';
 
 const RUN_CJS_PATH = join(__dirname, '..', '..', 'scripts', 'run.cjs');
 const NODE = process.execPath;
+const runCjsModule = require('../../scripts/run.cjs');
 
 /**
  * Regression tests for run.cjs graceful fallback when CLAUDE_PLUGIN_ROOT
@@ -283,7 +284,7 @@ describe('run.cjs — graceful fallback for stale plugin paths', () => {
 
     expect(result.status).toBe(0);
     expect(result.stdout).not.toContain('slow-stop-done');
-    expect(result.stderr).toContain('[run.cjs] Hook slow-stop-hook.cjs timed out after 1500ms; exiting fail-open.');
+    expect(result.stderr).toContain('[run.cjs] Hook slow-stop-hook.cjs timed out after 1000ms; exiting fail-open.');
     expect(result.stderr).not.toContain('timed out after 2000ms');
     expect(elapsedMs).toBeLessThan(2000);
   });
@@ -355,7 +356,7 @@ describe('run.cjs — graceful fallback for stale plugin paths', () => {
     expect(fifteenElapsedMs).toBeLessThan(15000);
   });
 
-  it('keeps the existing 500ms inner timeout cushion for non-prompt hooks', () => {
+  it('reserves up to 1000ms of the outer budget for non-prompt hook supervision', () => {
     const pluginRoot = join(tmpDir, 'non-prompt-plugin-root');
     const scriptsDir = join(pluginRoot, 'scripts');
     const hooksDir = join(pluginRoot, 'hooks');
@@ -395,7 +396,7 @@ describe('run.cjs — graceful fallback for stale plugin paths', () => {
 
     expect(result.status).toBe(0);
     expect(result.stdout).not.toContain('non-prompt-done');
-    expect(result.stderr).toContain('[run.cjs] Hook non-prompt-slow.cjs timed out after 1500ms; exiting fail-open.');
+    expect(result.stderr).toContain('[run.cjs] Hook non-prompt-slow.cjs timed out after 1000ms; exiting fail-open.');
     expect(elapsedMs).toBeLessThan(2000);
   });
 
@@ -652,6 +653,312 @@ describe('run.cjs trusted UserPromptSubmit Worker selection', () => {
     expect(debug.stdout).toBe('');
     expect(debug.stderr).toContain('Hook keyword-detector.mjs timed out after 1000ms; exiting fail-open.');
     expect(readFileSync(startedMarker, 'utf-8')).toBe('async');
+  });
+});
+
+describe('run.cjs trusted asynchronous SessionEnd resident publishing', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'omc-session-end-run-cjs-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function createSessionEndPlugin(
+    root: string,
+    source: string,
+    options: { event?: string; async?: boolean } = {},
+  ): string {
+    const scriptsDir = join(root, 'scripts');
+    mkdirSync(scriptsDir, { recursive: true });
+    mkdirSync(join(scriptsDir, 'lib'), { recursive: true });
+    mkdirSync(join(root, 'hooks'), { recursive: true });
+    mkdirSync(join(root, '.claude-plugin'), { recursive: true });
+    mkdirSync(join(root, 'bridge'), { recursive: true });
+    mkdirSync(join(root, 'dist', 'hooks', 'session-end'), { recursive: true });
+    writeFileSync(join(scriptsDir, 'run.cjs'), '// trusted plugin marker');
+    copyFileSync(
+      join(__dirname, '..', '..', 'scripts', 'lib', 'session-end-ipc.cjs'),
+      join(scriptsDir, 'lib', 'session-end-ipc.cjs'),
+    );
+    writeFileSync(
+      join(root, 'package.json'),
+      JSON.stringify({ type: 'module', version: '1.0.0' }),
+    );
+    writeFileSync(join(root, '.claude-plugin', 'plugin.json'), '{}');
+    writeFileSync(join(root, 'bridge', 'hook-runtime.cjs'), '// fixture marker');
+    writeFileSync(
+      join(root, 'dist', 'hooks', 'session-end', 'index.js'),
+      '// fixture marker',
+    );
+    const target = join(scriptsDir, 'session-end.mjs');
+    writeFileSync(target, source);
+    writeFileSync(join(root, 'hooks', 'hooks.json'), JSON.stringify({
+      hooks: {
+        [options.event ?? 'SessionEnd']: [{
+          matcher: '*',
+          hooks: [{
+            type: 'command',
+            command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/session-end.mjs',
+            timeout: 30,
+            async: options.async ?? true,
+          }],
+        }],
+      },
+    }));
+    return target;
+  }
+
+  function runSessionEnd(
+    target: string,
+    root: string,
+    input: string,
+    args: string[] = [],
+    env: Record<string, string> = {},
+  ): { status: number; stdout: string; stderr: string; error?: Error } {
+    const childEnv = { ...process.env };
+    delete childEnv.COPILOT_CLI;
+    delete childEnv.COPILOT_AGENT_SESSION_ID;
+    delete childEnv.OMC_HOST;
+    const result = spawnSync(NODE, [RUN_CJS_PATH, target, ...args], {
+      encoding: 'utf8',
+      env: {
+        ...childEnv,
+        CLAUDE_PLUGIN_ROOT: root,
+        ...env,
+      },
+      input,
+      timeout: 5_000,
+    });
+    return {
+      status: result.status ?? 1,
+      stdout: result.stdout || '',
+      stderr: result.stderr || '',
+      error: result.error,
+    };
+  }
+
+  const captureProbe = `
+    process.stdin.on('end', () => process.stdout.write('generic'));
+    process.stdin.resume();
+  `;
+
+  it('durably publishes only the exact trusted async SessionEnd target without spawning', () => {
+    const root = join(tmpDir, 'trusted');
+    const project = join(tmpDir, 'project');
+    const spoolReceipt = join(tmpDir, 'spool.txt');
+    const ipcReceipt = join(tmpDir, 'ipc.json');
+    mkdirSync(join(project, '.git'), { recursive: true });
+    const target = createSessionEndPlugin(root, captureProbe);
+    const input = ` \n${JSON.stringify({
+      session_id: 'claude-session',
+      cwd: project,
+      hook_event_name: 'SessionEnd',
+    })}\n`;
+
+    const result = runSessionEnd(target, root, input, [], {
+      NODE_ENV: 'test',
+      LOCALAPPDATA: tmpDir,
+      TMPDIR: tmpDir,
+      TMP: tmpDir,
+      TEMP: tmpDir,
+      OMC_SESSION_END_TEST_SPOOL_RECEIPT: spoolReceipt,
+      OMC_SESSION_END_TEST_IPC_RECEIPT: ipcReceipt,
+    });
+
+    expect(result).toMatchObject({
+      status: 0,
+      stdout: '{"continue":true}\n',
+      stderr: '',
+      error: undefined,
+    });
+    const spoolPath = readFileSync(spoolReceipt, 'utf8');
+    expect(existsSync(spoolPath)).toBe(true);
+    expect(JSON.parse(readFileSync(ipcReceipt, 'utf8'))).toMatchObject({
+      acknowledged: false,
+      code: 'not-attempted',
+      processCreations: 0,
+    });
+    const ipc = require('../../scripts/lib/session-end-ipc.cjs');
+    expect(ipc.readSpoolFrame(spoolPath).raw).toEqual(Buffer.from(input));
+  });
+
+  it('emits the exact Copilot continuation output from bounded object classification', () => {
+    const root = join(tmpDir, 'copilot');
+    const project = join(tmpDir, 'copilot-project');
+    const spoolReceipt = join(tmpDir, 'copilot-spool.txt');
+    mkdirSync(join(project, '.git'), { recursive: true });
+    const target = createSessionEndPlugin(root, captureProbe);
+    const result = runSessionEnd(
+      target,
+      root,
+      JSON.stringify({
+        sessionId: 'copilot-session',
+        cwd: project,
+        reason: 'complete',
+      }),
+      [],
+      {
+        NODE_ENV: 'test',
+        LOCALAPPDATA: tmpDir,
+        TMPDIR: tmpDir,
+        TMP: tmpDir,
+        TEMP: tmpDir,
+        OMC_SESSION_END_TEST_SPOOL_RECEIPT: spoolReceipt,
+      },
+    );
+
+    expect(result).toMatchObject({
+      status: 0,
+      stdout: '{}\n',
+      stderr: '',
+      error: undefined,
+    });
+    expect(existsSync(readFileSync(spoolReceipt, 'utf8'))).toBe(true);
+  });
+
+  it.each([
+    ['empty', ''],
+    ['whitespace', ' \n\t'],
+    ['invalid JSON', '{"session_id":'],
+    ['array JSON', '[]'],
+    ['null JSON', 'null'],
+    ['overflow JSON', `{"value":"${'x'.repeat(64 * 1024)}"}`],
+  ])('rejects %s input with the legacy bounded fallback', (_label, input) => {
+    const root = join(tmpDir, `invalid-${_label.replace(/\s+/g, '-')}`);
+    const target = createSessionEndPlugin(root, captureProbe);
+
+    const result = runSessionEnd(target, root, input);
+
+    expect(result).toMatchObject({
+      status: 0,
+      stdout: '{"continue":true,"suppressOutput":true}\n',
+      stderr: '',
+      error: undefined,
+    });
+  });
+
+  it('keeps async-manifest, trust, and no-extra-argument gates fail-safe on the generic path', () => {
+    const asyncFalseRoot = join(tmpDir, 'async-false');
+    const asyncFalse = createSessionEndPlugin(
+      asyncFalseRoot,
+      captureProbe,
+      { async: false },
+    );
+    expect(runSessionEnd(asyncFalse, asyncFalseRoot, '{}').stdout).toBe('generic');
+
+    const wrongEventRoot = join(tmpDir, 'wrong-event');
+    const wrongEvent = createSessionEndPlugin(
+      wrongEventRoot,
+      captureProbe,
+      { event: 'Stop' },
+    );
+    expect(runSessionEnd(wrongEvent, wrongEventRoot, '{}').stdout).toBe('generic');
+
+    const trustedRoot = join(tmpDir, 'trusted-extra');
+    const trusted = createSessionEndPlugin(trustedRoot, captureProbe);
+    expect(runSessionEnd(trusted, trustedRoot, '{}', ['extra']).stdout).toBe('generic');
+
+    const outsideRoot = join(tmpDir, 'outside');
+    mkdirSync(outsideRoot, { recursive: true });
+    const outside = join(outsideRoot, 'session-end.mjs');
+    writeFileSync(outside, captureProbe);
+    expect(runSessionEnd(outside, trustedRoot, '{}').stdout).toBe('generic');
+  });
+
+  it('keeps the durable spool when no resident is available', async () => {
+    const root = join(tmpDir, 'no-resident');
+    const project = join(tmpDir, 'no-resident-project');
+    const target = createSessionEndPlugin(root, captureProbe);
+    const spoolReceipt = join(tmpDir, 'no-resident-spool.txt');
+    mkdirSync(join(project, '.git'), { recursive: true });
+    const output = await runCjsModule.runSessionEndFastPath(
+      target,
+      Buffer.from(JSON.stringify({
+        session_id: 'no-resident',
+        cwd: project,
+      })),
+      { session_id: 'no-resident', cwd: project },
+      {
+        ...process.env,
+        NODE_ENV: 'test',
+        LOCALAPPDATA: tmpDir,
+        TMPDIR: tmpDir,
+        TMP: tmpDir,
+        TEMP: tmpDir,
+        OMC_SESSION_END_TEST_SPOOL_RECEIPT: spoolReceipt,
+      },
+    );
+
+    expect(output).toBe('{"continue":true}');
+    expect(existsSync(readFileSync(spoolReceipt, 'utf8'))).toBe(true);
+  });
+
+  it('does not depend on process.execPath because SessionEnd never spawns', async () => {
+    const root = join(tmpDir, 'no-spawn');
+    const project = join(tmpDir, 'no-spawn-project');
+    const target = createSessionEndPlugin(root, captureProbe);
+    const originalExecPath = process.execPath;
+    const spoolReceipt = join(tmpDir, 'no-spawn-spool.txt');
+    mkdirSync(join(project, '.git'), { recursive: true });
+    Object.defineProperty(process, 'execPath', {
+      configurable: true,
+      value: join(tmpDir, 'missing-node.exe'),
+    });
+    try {
+      const output = await runCjsModule.runSessionEndFastPath(
+        target,
+        Buffer.from(JSON.stringify({
+          session_id: 'no-spawn',
+          cwd: project,
+        })),
+        { session_id: 'no-spawn', cwd: project },
+        {
+          ...process.env,
+          NODE_ENV: 'test',
+          LOCALAPPDATA: tmpDir,
+          TMPDIR: tmpDir,
+          TMP: tmpDir,
+          TEMP: tmpDir,
+          OMC_SESSION_END_TEST_SPOOL_RECEIPT: spoolReceipt,
+        },
+      );
+      expect(output).toBe('{"continue":true}');
+      expect(existsSync(readFileSync(spoolReceipt, 'utf8'))).toBe(true);
+    } finally {
+      Object.defineProperty(process, 'execPath', {
+        configurable: true,
+        value: originalExecPath,
+      });
+    }
+  });
+
+  it('rejects missing session/worktree coordinates without creating a spool', async () => {
+    const root = join(tmpDir, 'missing-coordinates');
+    const target = createSessionEndPlugin(root, captureProbe);
+    const spoolReceipt = join(tmpDir, 'missing-coordinates-spool.txt');
+    const stderr = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation(() => true);
+    const output = await runCjsModule.runSessionEndFastPath(
+      target,
+      Buffer.from('{"session_id":"missing-coordinates"}'),
+      { session_id: 'missing-coordinates' },
+      {
+        ...process.env,
+        NODE_ENV: 'test',
+        OMC_SESSION_END_TEST_SPOOL_RECEIPT: spoolReceipt,
+      },
+    );
+    expect(output).toBe('{"continue":true}');
+    expect(existsSync(spoolReceipt)).toBe(false);
+    expect(stderr.mock.calls.flat().join('')).toContain(
+      'received no valid session/worktree scope',
+    );
+    stderr.mockRestore();
   });
 });
 

@@ -1,18 +1,47 @@
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import {
+  stageHookRuntime,
+  type StagedHookRuntime,
+} from './helpers/staged-hook-runtime.js';
 
-const SCRIPT_PATH = join(__dirname, '..', '..', 'scripts', 'session-start.mjs');
+const REPO_ROOT = join(__dirname, '..', '..');
 const NODE = process.execPath;
+let stagedRuntime: StagedHookRuntime;
+let scriptPath: string;
+
+beforeAll(() => {
+  stagedRuntime = stageHookRuntime(['session-start.mjs'], REPO_ROOT);
+  scriptPath = stagedRuntime.scriptPath('session-start.mjs');
+});
+
+afterAll(() => {
+  stagedRuntime.cleanup();
+});
 
 function isolatedHostEnv(host: 'claude' | 'copilot'): NodeJS.ProcessEnv {
   const env = { ...process.env };
   delete env.COPILOT_CLI;
   delete env.COPILOT_AGENT_SESSION_ID;
   delete env.OMC_HOST;
-  return { ...env, OMC_HOST: host };
+  delete env.CLAUDE_PLUGIN_ROOT;
+  return { ...env, OMC_HOST: host, CLAUDE_PLUGIN_ROOT: REPO_ROOT };
+}
+
+function removeTempDir(path: string): void {
+  try {
+    rmSync(path, {
+      recursive: true,
+      force: true,
+      maxRetries: 40,
+      retryDelay: 25,
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EPERM') throw error;
+  }
 }
 
 describe('session-start.mjs regression #1386', () => {
@@ -30,7 +59,20 @@ describe('session-start.mjs regression #1386', () => {
   });
 
   afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
+    removeTempDir(tempDir);
+  });
+
+  it('prewarms the scoped SessionEnd resident within the approved 1.5s gate', () => {
+    const source = readFileSync(
+      join(REPO_ROOT, 'scripts', 'session-start.mjs'),
+      'utf8',
+    );
+    expect(source).toContain(
+      "import { ensureSessionEndResident } from './lib/session-end-resident-control.mjs';",
+    );
+    expect(source).toContain('await ensureSessionEndResident({');
+    expect(source).toContain('timeoutMs: 1_500');
+    expect(source).not.toContain('reconcileSessionEndJobsInBackground');
   });
 
   it('marks restored ultrawork state as prior-session context instead of imperative continuation', () => {
@@ -44,7 +86,7 @@ describe('session-start.mjs regression #1386', () => {
       }),
     );
 
-    const raw = execFileSync(NODE, [SCRIPT_PATH], {
+    const raw = execFileSync(NODE, [scriptPath], {
       input: JSON.stringify({
         hook_event_name: 'SessionStart',
         session_id: 'session-1386',
@@ -131,7 +173,7 @@ describe('session-start.mjs regression #1386', () => {
       }),
     );
 
-    const raw = execFileSync(NODE, [SCRIPT_PATH], {
+    const raw = execFileSync(NODE, [scriptPath], {
       input: JSON.stringify({
         hook_event_name: 'SessionStart',
         session_id: 'session-1779',
@@ -175,7 +217,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
 </operating_principles>`,
     );
 
-    const raw = execFileSync(NODE, [SCRIPT_PATH], {
+    const raw = execFileSync(NODE, [scriptPath], {
       input: JSON.stringify({
         hook_event_name: 'SessionStart',
         session_id: 'session-bedrock-script',
@@ -225,7 +267,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
     );
 
-    const result = spawnSync(NODE, [SCRIPT_PATH], {
+    const result = spawnSync(NODE, [scriptPath], {
       input: JSON.stringify({
         hook_event_name: 'SessionStart',
         session_id: 'session-update-script',
@@ -279,7 +321,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
     );
 
-    const result = spawnSync(NODE, [SCRIPT_PATH], {
+    const result = spawnSync(NODE, [scriptPath], {
       input: JSON.stringify({
         hook_event_name: 'SessionStart',
         session_id: 'session-stale-plugin-root',
@@ -337,7 +379,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
     );
 
-    const result = spawnSync(NODE, [SCRIPT_PATH], {
+    const result = spawnSync(NODE, [scriptPath], {
       input: JSON.stringify({
         hook_event_name: 'SessionStart',
         session_id: 'session-marketplace-channel-current',
@@ -392,7 +434,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
     );
 
-    const result = spawnSync(NODE, [SCRIPT_PATH], {
+    const result = spawnSync(NODE, [scriptPath], {
       input: JSON.stringify({
         hook_event_name: 'SessionStart',
         session_id: 'session-marketplace-channel-unavailable',
@@ -436,7 +478,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
     writeFileSync(join(claudeDir, 'hud', 'omc-hud.mjs'), '');
     writeFileSync(join(claudeDir, 'settings.json'), JSON.stringify({ statusLine: 'node ~/.claude/hud/omc-hud.mjs' }));
 
-    const result = spawnSync(NODE, [SCRIPT_PATH], {
+    const result = spawnSync(NODE, [scriptPath], {
       input: JSON.stringify({
         hook_event_name: 'SessionStart',
         session_id: 'session-marketplace-stable-after-prerelease',
@@ -486,7 +528,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
     );
 
-    const result = spawnSync(NODE, [SCRIPT_PATH], {
+    const result = spawnSync(NODE, [scriptPath], {
       input: JSON.stringify({
         hook_event_name: 'SessionStart',
         session_id: 'session-marketplace-channel-update',
@@ -539,7 +581,7 @@ ${'- oversized startup guidance\n'.repeat(700)}
       }),
     );
 
-    const result = spawnSync(NODE, [SCRIPT_PATH], {
+    const result = spawnSync(NODE, [scriptPath], {
       input: JSON.stringify({
         hook_event_name: 'SessionStart',
         session_id: 'session-marketplace-current-npm-newer',
@@ -584,14 +626,15 @@ describe('session-start.mjs — GitHub Copilot CLI host isolation', () => {
   });
 
   afterEach(() => {
-    rmSync(tempDir, { recursive: true, force: true });
+    removeTempDir(tempDir);
   });
 
   function runCopilotSessionStart(extraEnv: Record<string, string> = {}) {
-    return spawnSync(NODE, [SCRIPT_PATH], {
+    return spawnSync(NODE, [scriptPath], {
       input: JSON.stringify({
-        hook_event_name: 'SessionStart',
-        session_id: 'session-copilot',
+        source: 'new',
+        sessionId: 'session-copilot',
+        timestamp: 1700000000000,
         cwd: fakeProject,
       }),
       encoding: 'utf-8',
@@ -616,9 +659,9 @@ describe('session-start.mjs — GitHub Copilot CLI host isolation', () => {
 
     expect(result.status).toBe(0);
     const output = JSON.parse(result.stdout) as {
-      hookSpecificOutput?: { additionalContext?: string };
+      additionalContext?: string;
     };
-    const context = output.hookSpecificOutput?.additionalContext ?? '';
+    const context = output.additionalContext ?? '';
     expect(context).not.toContain('HUD not configured');
     expect(context).not.toContain('restart Claude Code');
   });
@@ -638,11 +681,9 @@ describe('session-start.mjs — GitHub Copilot CLI host isolation', () => {
 
     expect(result.status).toBe(0);
     const output = JSON.parse(result.stdout) as {
-      systemMessage?: string;
-      hookSpecificOutput?: { additionalContext?: string };
+      additionalContext?: string;
     };
-    const context = output.hookSpecificOutput?.additionalContext ?? '';
-    const combined = `${output.systemMessage ?? ''}\n${context}`;
+    const combined = output.additionalContext ?? '';
     expect(combined).not.toContain('CLAUDE.md instructions');
     expect(combined).not.toContain('/omc-setup');
     expect(combined).not.toContain('silentAutoUpdate is enabled in .omc-config.json');
@@ -667,11 +708,11 @@ describe('session-start.mjs — GitHub Copilot CLI host isolation', () => {
     const result = runCopilotSessionStart({ CLAUDE_PLUGIN_ROOT: pluginRoot });
 
     expect(result.status).toBe(0);
-    const output = JSON.parse(result.stdout) as { systemMessage?: string };
-    expect(output.systemMessage).toContain('[OMC UPDATE AVAILABLE]');
-    expect(output.systemMessage).toContain('copilot plugin update oh-my-claudecode');
-    expect(output.systemMessage).toContain('restart Copilot CLI');
-    expect(output.systemMessage).not.toContain('/update');
-    expect(output.systemMessage).not.toContain('/plugin install oh-my-claudecode');
+    const output = JSON.parse(result.stdout) as { additionalContext?: string };
+    expect(output.additionalContext).toContain('[OMC UPDATE AVAILABLE]');
+    expect(output.additionalContext).toContain('copilot plugin update oh-my-claudecode');
+    expect(output.additionalContext).toContain('restart Copilot CLI');
+    expect(output.additionalContext).not.toContain('/update');
+    expect(output.additionalContext).not.toContain('/plugin install oh-my-claudecode');
   });
 });

@@ -8,7 +8,12 @@ import { getProcessStartIdentity, isProcessIdentityLive } from '../../platform/p
 
 const WORKER_ARG = '--omc-session-end-worker';
 const MAX_WORKER_MS = 10_000;
-export interface SessionEndWorkerPayload { directory: string; sessionId: string; }
+const WORKER_IDENTITY_BUDGET_MS = process.platform === 'win32' ? 1_500 : 250;
+export interface SessionEndWorkerPayload {
+  directory: string;
+  sessionId: string;
+  processStartIdentity?: string;
+}
 
 /** Durable OpenClaw routing is supplied from the manifest to the action runner, never from worker ambient state. */
 export function workerEnvironment(): NodeJS.ProcessEnv {
@@ -57,7 +62,7 @@ function reschedulePendingWorker(payload: SessionEndWorkerPayload, job: ReturnTy
 }
 
 export async function processSessionEndWorker(payload: SessionEndWorkerPayload): Promise<void> {
-  const deadlineAt = Date.now() + MAX_WORKER_MS; const nonce = randomUUID(); const identity = await getProcessStartIdentity(process.pid, Math.min(deadlineAt, Date.now() + 250));
+  const deadlineAt = Date.now() + MAX_WORKER_MS; const nonce = randomUUID(); const identity = payload.processStartIdentity ?? await getProcessStartIdentity(process.pid, Math.min(deadlineAt, Date.now() + WORKER_IDENTITY_BUDGET_MS));
   if (!identity) return;
   let claimed = claimSessionEndJob(payload.directory, payload.sessionId, nonce, identity, deadlineAt);
   if (!claimed) { await reapIfProvenStale(payload, deadlineAt); claimed = claimSessionEndJob(payload.directory, payload.sessionId, nonce, identity, deadlineAt); }
@@ -110,6 +115,34 @@ export async function processSessionEndWorker(payload: SessionEndWorkerPayload):
     const terminalized = failClosedExhaustedForegroundCleanup(payload.directory, payload.sessionId);
     reschedulePendingWorker(payload, terminalized ?? released ?? readSessionEndJob(payload.directory, payload.sessionId));
   }
+}
+/** Resident recovery path: claims the same bounded tickets but reconciles them without spawning. */
+export async function reconcileSessionEndJobsInProcess(
+  directory: string,
+  sessionIds?: readonly string[],
+  processStartIdentity?: string,
+): Promise<void> {
+  const tickets = sessionIds
+    ? [...sessionIds].slice(0, 4).map(sessionId => ({ sessionId, nonce: '' }))
+    : claimSessionEndDiscoveryTickets(directory, 4);
+  await Promise.all(tickets.map(async ticket => {
+    try {
+      await processSessionEndWorker({
+        directory,
+        sessionId: ticket.sessionId,
+        processStartIdentity,
+      });
+    } finally {
+      if (ticket.nonce) {
+        releaseSessionEndDiscoveryTicket(
+          directory,
+          ticket.sessionId,
+          ticket.nonce,
+          true,
+        );
+      }
+    }
+  }));
 }
 /** Bounded fair SessionStart recovery based on durable tickets, not a directory page. */
 export function reconcileSessionEndJobs(directory: string, sessionIds?: readonly string[]): void {

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -16,7 +17,9 @@ import {
   renewSessionEndLease,
   sealCoreManifest,
   sealWikiManifest,
+  sessionEndJobPath,
   sessionEndJobsDirectory,
+  sessionEndScopeKey,
   takeSessionEndDiscoveryPage,
 } from '../cleanup-manifest.js';
 
@@ -40,6 +43,118 @@ afterEach(() => {
 });
 
 describe('durable SessionEnd cleanup manifest', () => {
+  it('isolates identical session ids under scoped v2 manifest paths', () => {
+    const first = project();
+    const second = project();
+    const sessionId = 'same-session';
+    expect(prepareCoreManifest(first, sessionId, { scope: 'first' })).not.toBeNull();
+    expect(prepareCoreManifest(second, sessionId, { scope: 'second' })).not.toBeNull();
+
+    expect(sessionEndJobPath(first, sessionId)).not.toBe(
+      sessionEndJobPath(second, sessionId),
+    );
+    expect(readSessionEndJob(first, sessionId)?.scopeKey).toBe(
+      sessionEndScopeKey(first),
+    );
+    expect(readSessionEndJob(second, sessionId)?.scopeKey).toBe(
+      sessionEndScopeKey(second),
+    );
+    expect(readSessionEndJob(first, sessionId)?.actions.callback.payload).toMatchObject({
+      scope: 'first',
+    });
+    expect(readSessionEndJob(second, sessionId)?.actions.callback.payload).toMatchObject({
+      scope: 'second',
+    });
+  });
+
+  it('migrates only a v1 manifest whose legacy scope matches the worktree', () => {
+    const directory = project();
+    const sessionId = 'matching-v1';
+    expect(prepareCoreManifest(directory, sessionId, { legacy: true })).not.toBeNull();
+    const created = readSessionEndJob(directory, sessionId)!;
+    const legacyRoot = join(directory, '.omc', 'state', 'session-end-jobs');
+    const legacyPath = join(legacyRoot, `${sessionId}.json`);
+    const legacyScopeKey = createHash('sha256')
+      .update(JSON.stringify(directory))
+      .digest('hex');
+    mkdirSync(legacyRoot, { recursive: true });
+    writeFileSync(legacyPath, JSON.stringify({
+      ...created,
+      scopeKey: legacyScopeKey,
+    }));
+    rmSync(join(legacyRoot, 'v2'), { recursive: true, force: true });
+
+    const migrated = readSessionEndJob(directory, sessionId);
+    expect(migrated?.scopeKey).toBe(sessionEndScopeKey(directory));
+    expect(migrated?.revision).toBe(created.revision + 1);
+    expect(readFileSync(sessionEndJobPath(directory, sessionId), 'utf8')).toContain(
+      sessionEndScopeKey(directory),
+    );
+  });
+
+  it('leaves a mismatched v1 manifest untouched', () => {
+    const directory = project();
+    const sessionId = 'foreign-v1';
+    expect(prepareCoreManifest(directory, sessionId, { legacy: true })).not.toBeNull();
+    const created = readSessionEndJob(directory, sessionId)!;
+    const legacyRoot = join(directory, '.omc', 'state', 'session-end-jobs');
+    const legacyPath = join(legacyRoot, `${sessionId}.json`);
+    mkdirSync(legacyRoot, { recursive: true });
+    writeFileSync(legacyPath, JSON.stringify({
+      ...created,
+      scopeKey: '00'.repeat(32),
+    }));
+    rmSync(join(legacyRoot, 'v2'), { recursive: true, force: true });
+
+    expect(readSessionEndJob(directory, sessionId)).toBeNull();
+    expect(readFileSync(legacyPath, 'utf8')).toContain('00'.repeat(32));
+  });
+
+  it('keeps the first producer eventId/rawDigest authoritative across replay', () => {
+    const directory = project();
+    const sessionId = 'producer-idempotency';
+    const first = {
+      eventId: '11'.repeat(32),
+      rawDigest: '22'.repeat(32),
+    };
+    const replay = {
+      eventId: '33'.repeat(32),
+      rawDigest: '44'.repeat(32),
+    };
+    expect(prepareCoreManifest(
+      directory,
+      sessionId,
+      { source: 'first' },
+      first,
+    )).not.toBeNull();
+    expect(prepareCoreManifest(
+      directory,
+      sessionId,
+      { source: 'replay' },
+      replay,
+    )).not.toBeNull();
+    expect(sealWikiManifest(
+      directory,
+      sessionId,
+      { source: 'wiki-first' },
+      first,
+    )).not.toBeNull();
+    expect(sealWikiManifest(
+      directory,
+      sessionId,
+      { source: 'wiki-replay' },
+      replay,
+    )).not.toBeNull();
+
+    const manifest = readSessionEndJob(directory, sessionId)!;
+    expect(manifest.producers.core).toMatchObject(first);
+    expect(manifest.producers.wiki).toMatchObject(first);
+    expect(manifest.actions.callback.payload).toMatchObject({ source: 'first' });
+    expect(manifest.actions['wiki-capture'].payload).toMatchObject({
+      source: 'wiki-first',
+    });
+  });
+
   it('serializes concurrent core/wiki producers and rejects a second worker claim', async () => {
     const directory = project();
     const sessionId = 'concurrent-producers';

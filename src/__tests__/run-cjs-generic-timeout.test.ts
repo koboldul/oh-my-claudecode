@@ -47,12 +47,12 @@ async function waitForDeath(pid: number, timeoutMs = 2000): Promise<void> {
 
 describe('run.cjs generic hook timeout supervisor', () => {
   it('exports generic timeout resolution without dispatching when required', () => {
-    expect(runCjs.DEFAULT_GENERIC_TIMEOUT_MS).toBe(59500);
-    expect(runCjs.resolveGenericTimeoutMs(null)).toBe(59500);
+    expect(runCjs.DEFAULT_GENERIC_TIMEOUT_MS).toBe(59000);
+    expect(runCjs.resolveGenericTimeoutMs(null)).toBe(59000);
     const manifestHook = { timeoutMs: 3000, event: 'PostToolUse' };
     expect(runCjs.resolveGenericTimeoutMs(manifestHook))
       .toBe(runCjs.resolveInnerTimeoutMs(manifestHook));
-    expect(runCjs.resolveGenericTimeoutMs(manifestHook)).toBe(2500);
+    expect(runCjs.resolveGenericTimeoutMs(manifestHook)).toBe(2000);
   });
 
   it('classifies only manifest-resolved permission gates as critical', () => {
@@ -361,7 +361,7 @@ describe('run.cjs generic hook timeout supervisor', () => {
     const directory = mkdtempSync(join(tmpdir(), 'omc-runner-cancel-'));
     const pidfile = join(directory, 'grandchild.pid');
     let grandchildPid: number | undefined;
-    // Manifest-null target => the runner arms the 59500ms default timer; we terminate the
+    // Manifest-null target => the runner arms the 59000ms default timer; we terminate the
     // runner well before it fires, so only the new signal-handler reap can prevent an orphan.
     const runner = spawn(process.execPath, [RUN_CJS_PATH, HUNG_PARENT], {
       stdio: 'ignore',

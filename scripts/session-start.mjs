@@ -13,6 +13,13 @@ import { homedir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { getClaudeConfigDir, getUpdateCheckCachePath } from './lib/config-dir.mjs';
 import { resolveOmcStateRoot } from './lib/state-root.mjs';
+import {
+  describeHookRunFailure,
+  encodeLegacyCompatibleHookOutput,
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
+import { ensureSessionEndResident } from './lib/session-end-resident-control.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -288,25 +295,6 @@ function dispatchSessionStartNotificationInBackground(pluginRoot, payload) {
   }
 }
 
-function reconcileSessionEndJobsInBackground(pluginRoot, directory) {
-  const workerModuleUrl = pathToFileURL(join(pluginRoot, 'dist', 'hooks', 'session-end', 'worker.js')).href;
-  const childSource = `import(${JSON.stringify(workerModuleUrl)})\n`
-    + `  .then(({ reconcileSessionEndJobs }) => reconcileSessionEndJobs?.(${JSON.stringify(directory)}))\n`
-    + `  .catch(() => {});`;
-
-  try {
-    const child = spawn(process.execPath, ['--input-type=module', '-e', childSource], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-      env: { ...process.env, OMC_HOOK_BACKGROUND_CHILD: '1' },
-    });
-    child.unref();
-  } catch {
-    // Reconciliation is best-effort and must not delay SessionStart.
-  }
-}
-
 function hasProjectMemoryContent(memory) {
   return Boolean(
     memory &&
@@ -454,22 +442,6 @@ function validateCwd(candidate) {
 
 function isTruthyProviderFlag(value) {
   return value === '1' || value === 'true';
-}
-
-/**
- * Detect whether this session is running under GitHub Copilot CLI rather
- * than Claude Code. Copilot loads the same plugin format but does not read
- * ~/.claude/CLAUDE.md, HUD/statusLine, or /omc-setup, so Claude-only
- * diagnostics and remediation guidance must be suppressed under Copilot.
- *
- * Prefers the explicit OMC_HOST signal (set by scripts/run.cjs when it can
- * infer the host) and falls back to direct Copilot env vars when OMC_HOST is
- * absent (e.g. this script invoked without going through run.cjs).
- */
-function isCopilotHost() {
-  if (process.env.OMC_HOST === 'copilot') return true;
-  if (process.env.OMC_HOST === 'claude') return false;
-  return Boolean(process.env.COPILOT_CLI || process.env.COPILOT_AGENT_SESSION_ID);
 }
 
 function getSessionModelId() {
@@ -912,20 +884,15 @@ async function checkHudInstallation(retryCount = 0) {
   return { installed: true };
 }
 
-// Main
-async function main() {
+async function processSessionStart(data) {
   try {
-    const input = await readStdin();
-    let data = {};
-    try { data = JSON.parse(input); } catch {}
-
-    const rawDirectory = data.cwd || data.directory || process.cwd();
+    const rawDirectory = data.directory || process.cwd();
     const directory = validateCwd(rawDirectory);
     if (directory === null) {
-      console.log(JSON.stringify({ continue: true }));
-      return;
+      return { continue: true };
     }
-    const sessionId = data.session_id || data.sessionId || '';
+    const sessionId = data.sessionId || '';
+    const copilotHost = data.host === 'copilot';
     const omcRoot = await resolveOmcStateRoot(directory);
     const messages = [];
     const userMessages = [];
@@ -945,12 +912,19 @@ async function main() {
 
     writeSessionStartedMarker(omcRoot, directory, sessionId);
     reconcileAbandonedSessionStarts(omcRoot, sessionId);
-    reconcileSessionEndJobsInBackground(getRuntimeBaseDir(), directory);
+    if (sessionId) {
+      await ensureSessionEndResident({
+        pluginRoot: getRuntimeBaseDir(),
+        directory,
+        sessionId,
+        timeoutMs: 1_500,
+      });
+    }
 
     // Check for version drift between components. Under Copilot, exclude
     // ~/.claude/CLAUDE.md — Copilot does not read that file, so it is not a
     // real drift signal there (host-isolation guard).
-    const driftInfo = detectVersionDrift({ excludeClaudeMd: isCopilotHost() });
+    const driftInfo = detectVersionDrift({ excludeClaudeMd: copilotHost });
     if (driftInfo && shouldNotifyDrift(driftInfo)) {
       let driftMsg = `[OMC VERSION DRIFT DETECTED]\n\nPlugin version: ${driftInfo.pluginVersion}\n`;
       for (const d of driftInfo.drift) {
@@ -972,7 +946,7 @@ async function main() {
           const omcConfig = readJsonFile(join(configDir, '.omc-config.json')) || {};
           userMessages.push(formatUpdateNoticeForUser(updateInfo, {
             autoUpgradePrompt: omcConfig.autoUpgradePrompt !== false,
-            isCopilotHost: isCopilotHost(),
+            isCopilotHost: copilotHost,
           }));
         }
       }
@@ -980,7 +954,7 @@ async function main() {
 
     // Warn if silentAutoUpdate is enabled but running in plugin mode (#1773).
     // This guidance references /omc-setup, which is Claude-only — skip under Copilot.
-    if (process.env.CLAUDE_PLUGIN_ROOT && !isCopilotHost()) {
+    if (process.env.CLAUDE_PLUGIN_ROOT && !copilotHost) {
       try {
         const omcConfigPath = join(configDir, '.omc-config.json');
         const omcConfig = readJsonFile(omcConfigPath);
@@ -993,7 +967,7 @@ async function main() {
     // Check HUD installation (one-time setup guidance). HUD/statusLine is a
     // Claude Code-only surface — Copilot has no statusLine equivalent, so
     // skip this check entirely under Copilot (host-isolation guard).
-    if (!isCopilotHost()) {
+    if (!copilotHost) {
       const hudCheck = await checkHudInstallation();
       if (!hudCheck.installed) {
         messages.push(`<system-reminder>
@@ -1292,13 +1266,49 @@ ${cleanContent}
           additionalContext: buildSessionStartAdditionalContext(messages)
         };
       }
-      console.log(JSON.stringify(output));
-    } else {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return output;
     }
+    return { continue: true, suppressOutput: true };
   } catch (error) {
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    return { continue: true, suppressOutput: true };
   }
 }
 
-main();
+// Main
+async function main() {
+  try {
+    const runtime = loadHookRuntime();
+    const input = await readStdin();
+    if (!input.trim()) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      'session-start',
+      input,
+      async (unit, envelope) => {
+        legacyOutput = await processSessionStart(
+          runtime.buildLegacyProcessorInput(envelope, unit),
+        );
+        return legacyOutput;
+      },
+    );
+
+    const failure = describeHookRunFailure(runtime, result);
+    if (failure) throw new Error(failure);
+
+    console.log(JSON.stringify(
+      encodeLegacyCompatibleHookOutput(
+        runtime,
+        result,
+        legacyOutput,
+      ),
+    ));
+  } catch (error) {
+    surfaceOptionalHookFailure(error, { hookName: 'session-start' });
+  }
+}
+
+void main();

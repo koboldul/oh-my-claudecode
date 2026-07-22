@@ -28,7 +28,12 @@ vi.mock('../../../platform/process-utils.js', () => processIdentity);
 vi.mock('../action-runner.js', () => actionRunner);
 
 import { isManifestTerminal, mutateSessionEndJob, prepareCoreManifest, readSessionEndJob, sealCoreManifest, sealWikiManifest, takeSessionEndDiscoveryPage } from '../cleanup-manifest.js';
-import { processSessionEndWorker, reconcileSessionEndJobs, workerEnvironment } from '../worker.js';
+import {
+  processSessionEndWorker,
+  reconcileSessionEndJobs,
+  reconcileSessionEndJobsInProcess,
+  workerEnvironment,
+} from '../worker.js';
 
 const directories: string[] = [];
 
@@ -97,6 +102,22 @@ describe('SessionEnd durable worker', () => {
 
     // The no-ID entry point must discover from the durable ticket index and return immediately.
     expect(() => reconcileSessionEndJobs(directory)).not.toThrow();
+  });
+
+  it('reconciles durable tickets in-process for the resident path', async () => {
+    const directory = project();
+    const sessionId = 'resident-in-process';
+    expect(prepareCoreManifest(directory, sessionId, {})).not.toBeNull();
+    expect(sealCoreManifest(directory, sessionId)).not.toBeNull();
+    expect(sealWikiManifest(directory, sessionId)).not.toBeNull();
+
+    await reconcileSessionEndJobsInProcess(directory);
+
+    expect(readSessionEndJob(directory, sessionId)).toMatchObject({
+      phase: 'complete',
+      owner: null,
+    });
+    expect(actions.runSessionEndCallbacks).toHaveBeenCalledTimes(1);
   });
   it('reschedules a core-only manifest through producer grace after slow required actions and runs deferred callbacks once', async () => {
     vi.useFakeTimers();
