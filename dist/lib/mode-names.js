@@ -28,6 +28,17 @@ export const DEPRECATED_MODE_NAMES = {
     PIPELINE: 'pipeline',
 };
 /**
+ * Skill invocations that confirm a previously armed mode. Ultragoal remains
+ * outside ModeName but participates in the same confirmation-state contract.
+ */
+export const MODE_CONFIRMATION_SKILL_MAP = {
+    ralph: ['ralph', 'ultrawork'],
+    ultragoal: ['ultragoal'],
+    ultrawork: ['ultrawork'],
+    autopilot: ['autopilot'],
+    ralplan: ['ralplan'],
+};
+/**
  * All mode names as an array (useful for iteration).
  * Order matches the canonical ExecutionMode union in mode-registry/types.ts.
  */

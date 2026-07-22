@@ -150,6 +150,9 @@ describe('spawnWorkerForTask – prompt mode and interactive worker launch', () 
         tmuxCalls.capturePaneText = '❯ ready\n';
         tmuxCalls.lastLiteralSend = '';
         delete process.env.OMC_SHELL_READY_TIMEOUT_MS;
+        delete process.env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL;
+        delete process.env.OMC_COPILOT_DEFAULT_MODEL;
+        delete process.env.OMC_COPILOT_REASONING_EFFORT;
         cwd = mkdtempSync(join(tmpdir(), 'runtime-gemini-prompt-'));
         setupTaskDir(cwd);
     });
@@ -182,6 +185,28 @@ describe('spawnWorkerForTask – prompt mode and interactive worker launch', () 
         expect(launchCmd).toContain('.omc/state/team/test-team/workers/worker-1/inbox.md');
         // --dangerously-skip-permissions precedes -p (flags before the -p value)
         expect(launchCmd.indexOf("'--dangerously-skip-permissions'")).toBeLessThan(launchCmd.indexOf("'-p'"));
+        rmSync(cwd, { recursive: true, force: true });
+    });
+    it('copilot worker launches once with default model, max effort, autonomous flags, and -p inbox startup', async () => {
+        const runtime = makeRuntime(cwd, 'copilot');
+        await spawnWorkerForTask(runtime, 'worker-1', 0);
+        const launchCall = tmuxCalls.args.find(args => args[0] === 'send-keys' && args.includes('-l'));
+        expect(launchCall).toBeDefined();
+        const launchCmd = launchCall[launchCall.length - 1];
+        const unquotedLaunchCmd = launchCmd.replace(/['"]/g, '');
+        expect(unquotedLaunchCmd).toContain('/usr/local/bin/copilot');
+        expect(unquotedLaunchCmd).toContain('--model gpt-5.6-sol');
+        expect(unquotedLaunchCmd).toContain('--effort max');
+        expect(unquotedLaunchCmd).toContain('--allow-all');
+        expect(unquotedLaunchCmd).toContain('--no-ask-user');
+        expect(unquotedLaunchCmd).toContain('--silent');
+        expect(unquotedLaunchCmd).toContain('--stream=off');
+        expect(unquotedLaunchCmd).toContain('-p');
+        expect(unquotedLaunchCmd).toContain('.omc/state/team/test-team/workers/worker-1/inbox.md');
+        const literalMessages = tmuxCalls.args
+            .filter(args => args[0] === 'send-keys' && args.includes('-l'))
+            .map(args => args[args.length - 1]);
+        expect(literalMessages).toHaveLength(1);
         rmSync(cwd, { recursive: true, force: true });
     });
     it('antigravity worker skips trust-confirm (no "1" sent via send-keys)', async () => {
@@ -298,6 +323,9 @@ describe('spawnWorkerForTask – model passthrough from environment variables', 
         delete process.env.OMC_GROK_DEFAULT_MODEL;
         delete process.env.OMC_EXTERNAL_MODELS_DEFAULT_ANTIGRAVITY_MODEL;
         delete process.env.OMC_ANTIGRAVITY_DEFAULT_MODEL;
+        delete process.env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL;
+        delete process.env.OMC_COPILOT_DEFAULT_MODEL;
+        delete process.env.OMC_COPILOT_REASONING_EFFORT;
         delete process.env.ANTHROPIC_MODEL;
         delete process.env.CLAUDE_MODEL;
         delete process.env.ANTHROPIC_BASE_URL;

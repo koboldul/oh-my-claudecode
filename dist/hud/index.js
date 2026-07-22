@@ -3,7 +3,7 @@
  * OMC HUD - Main Entry Point
  *
  * Statusline command that visualizes oh-my-claudecode state.
- * Receives stdin JSON from Claude Code and outputs formatted statusline.
+ * Receives normalized host statusline stdin and outputs the formatted HUD.
  */
 import { readStdin, writeStdinCache, readStdinCache, getContextPercent, getModelId, getModelName, getRateLimitsFromStdin, stabilizeContextPercent, } from "./stdin.js";
 import { parseTranscript } from "./transcript.js";
@@ -26,6 +26,7 @@ import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { getOmcRoot } from "../lib/worktree-paths.js";
 import { getClaudeConfigDir, getUpdateCheckCachePath } from "../utils/config-dir.js";
+import { parseJsonc } from "../utils/jsonc.js";
 /**
  * Extract session ID (UUID) from a transcript path.
  */
@@ -108,13 +109,15 @@ function spawnSessionSummaryScript(transcriptPath, stateDir, sessionId) {
         return;
     }
     lastSummarySpawnTimestamp = now;
-    // Resolve the script path relative to this file's location
-    // In compiled output: dist/hud/index.js -> ../../scripts/session-summary.mjs
+    // Resolve the script from either dist/hud/index.js or bridge/hud-runtime.mjs.
     const thisDir = dirname(fileURLToPath(import.meta.url));
-    const scriptPath = join(thisDir, "..", "..", "scripts", "session-summary.mjs");
-    if (!existsSync(scriptPath)) {
+    const scriptPath = [
+        join(thisDir, "..", "..", "scripts", "session-summary.mjs"),
+        join(thisDir, "..", "scripts", "session-summary.mjs"),
+    ].find((candidate) => existsSync(candidate));
+    if (!scriptPath) {
         if (process.env.OMC_DEBUG) {
-            console.error("[HUD] session-summary script not found:", scriptPath);
+            console.error("[HUD] session-summary script not found");
         }
         return;
     }
@@ -154,12 +157,14 @@ async function calculateSessionHealth(sessionStart, contextPercent) {
 function showDiagnostic() {
     const version = getRuntimePackageVersion();
     const configDir = getClaudeConfigDir();
+    const isCopilot = process.env.OMC_HOST?.toLowerCase() === "copilot";
+    const hostName = isCopilot ? "GitHub Copilot CLI" : "Claude Code";
     const hudScript = join(configDir, "hud", "omc-hud.mjs");
     const settingsFile = join(configDir, "settings.json");
     const hudExists = existsSync(hudScript);
     let statusLineOk = false;
     try {
-        const settings = JSON.parse(readFileSync(settingsFile, "utf-8"));
+        const settings = parseJsonc(readFileSync(settingsFile, "utf-8"));
         const sl = settings.statusLine;
         if (sl && typeof sl === "object" && typeof sl.command === "string") {
             statusLineOk = sl.command.includes("omc-hud");
@@ -180,7 +185,7 @@ function showDiagnostic() {
         console.log("  Run /oh-my-claudecode:hud setup to fix.");
     }
     else {
-        console.log("  HUD renders automatically inside Claude Code sessions.");
+        console.log(`  HUD renders automatically inside ${hostName} sessions.`);
     }
 }
 /**
@@ -189,7 +194,7 @@ function showDiagnostic() {
  */
 async function main(watchMode = false, skipInit = false) {
     try {
-        // Read stdin from Claude Code
+        // Read and normalize stdin from the active statusline host.
         const previousStdinCache = readStdinCache();
         let stdin = await readStdin();
         if (stdin) {
@@ -352,6 +357,7 @@ async function main(watchMode = false, skipInit = false) {
         // Build render context
         const context = {
             contextPercent,
+            contextAvailable: stdin.context_window !== undefined,
             contextDisplayScope: currentSessionId ?? cwd,
             modelName: getModelName(stdin),
             modelId: getModelId(stdin),
@@ -403,7 +409,8 @@ async function main(watchMode = false, skipInit = false) {
         // estimate from local transcript artifacts but do not receive Claude Code's
         // exact serialized API request body.
         // A companion hook can read this file to inject a /compact suggestion.
-        if (config.contextLimitWarning.autoCompact &&
+        if (context.contextAvailable !== false &&
+            config.contextLimitWarning.autoCompact &&
             context.contextPercent >= config.contextLimitWarning.threshold) {
             try {
                 const omcStateDir = join(getOmcRoot(cwd), "state");
@@ -452,7 +459,12 @@ async function main(watchMode = false, skipInit = false) {
                 error.message.includes("MODULE_NOT_FOUND") ||
                 error.message.includes("Cannot find module"));
         if (isInstallError) {
-            console.log("[OMC] run /omc-setup to install properly");
+            if (process.env.OMC_HOST?.toLowerCase() === "copilot") {
+                console.log("[OMC] run /oh-my-claudecode:hud repair or /oh-my-claudecode:setup doctor");
+            }
+            else {
+                console.log("[OMC] run /omc-setup to install properly");
+            }
         }
         else {
             // Output fallback message to stdout for status line visibility

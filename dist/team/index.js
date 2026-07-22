@@ -29,6 +29,7 @@ export { getContract, isCliAvailable as isCliAvailableForAgent, validateCliAvail
 // Deprecated backward-compat exports kept for downstream consumers.
 shouldLoadShellRc, validateCliBinaryPath, resolveCliBinaryPath, clearResolvedPathCache, } from './model-contract.js';
 export { detectCli, detectAllClis } from './cli-detection.js';
+export { VERIFIED_COPILOT_CLI_VERSION, assessCopilotCliVersion, detectCopilotCliCompatibility, parseCopilotCliVersion, } from './copilot-cli-compatibility.js';
 export { generateWorkerOverlay, composeInitialInbox, appendToInbox, getWorkerEnv, ensureWorkerStateDir, writeWorkerOverlay, } from './worker-bootstrap.js';
 // tmux-comm
 export { sendTmuxTrigger, queueInboxInstruction, queueDirectMessage, queueBroadcastMessage, readMailbox, } from './tmux-comm.js';

@@ -17866,7 +17866,7 @@ var import_node_crypto2 = require("node:crypto");
 var import_child_process5 = require("child_process");
 var import_path11 = require("path");
 var import_url = require("url");
-var import_fs10 = require("fs");
+var import_fs11 = require("fs");
 var import_promises3 = require("fs/promises");
 
 // src/team/tmux-session.ts
@@ -18025,8 +18025,20 @@ function resolveSuperprojectRoot(cwd) {
   }
   return anchor;
 }
+function hasGitMetadataAncestor(directory) {
+  if (process.env.GIT_DIR || process.env.GIT_WORK_TREE) return true;
+  let probe = (0, import_path2.resolve)(directory);
+  while (true) {
+    if ((0, import_fs.existsSync)((0, import_path2.join)(probe, ".git"))) return true;
+    const parent = (0, import_path2.dirname)(probe);
+    if (parent === probe) return false;
+    probe = parent;
+  }
+}
 function resolveStateAnchorRoot(worktreeRoot) {
-  if (worktreeRoot) return resolveSuperprojectRoot(worktreeRoot) || worktreeRoot;
+  if (worktreeRoot) {
+    return hasGitMetadataAncestor(worktreeRoot) ? resolveSuperprojectRoot(worktreeRoot) || worktreeRoot : worktreeRoot;
+  }
   return getWorktreeRoot() || process.cwd();
 }
 function getGitTopLevel(cwd) {
@@ -18976,10 +18988,10 @@ function isStringArray(value) {
 }
 function isWorkerInfo(value) {
   if (!isRecord(value) || typeof value.name !== "string" || !WORKER_NAME_SAFE_PATTERN.test(value.name) || !isSafeCounter(value.index) || value.index < 1) return false;
-  return (value.role === void 0 || typeof value.role === "string") && (value.assigned_tasks === void 0 || isStringArray(value.assigned_tasks)) && (value.worker_cli === void 0 || ["claude", "codex", "gemini", "cursor", "grok", "antigravity"].includes(value.worker_cli)) && (value.pid === void 0 || isSafeCounter(value.pid) && value.pid > 0) && (value.pane_id === void 0 || typeof value.pane_id === "string") && (value.working_dir === void 0 || typeof value.working_dir === "string") && (value.worktree_repo_root === void 0 || typeof value.worktree_repo_root === "string") && (value.worktree_path === void 0 || typeof value.worktree_path === "string") && (value.worktree_branch === void 0 || typeof value.worktree_branch === "string") && (value.worktree_detached === void 0 || typeof value.worktree_detached === "boolean") && (value.worktree_created === void 0 || typeof value.worktree_created === "boolean") && (value.team_state_root === void 0 || typeof value.team_state_root === "string") && (value.output_file === void 0 || typeof value.output_file === "string") && (value.recovery_id === void 0 || isNonEmptyString(value.recovery_id)) && (value.replacement_generation === void 0 || isSafeCounter(value.replacement_generation)) && (value.pane_attempt_id === void 0 || isNonEmptyString(value.pane_attempt_id)) && (value.operational_state === void 0 || ["starting", "active", "dead", "stopped"].includes(value.operational_state)) && (value.launch_descriptor === void 0 || isLaunchDescriptor(value.launch_descriptor));
+  return (value.role === void 0 || typeof value.role === "string") && (value.assigned_tasks === void 0 || isStringArray(value.assigned_tasks)) && (value.worker_cli === void 0 || ["claude", "codex", "gemini", "cursor", "grok", "antigravity", "copilot"].includes(value.worker_cli)) && (value.pid === void 0 || isSafeCounter(value.pid) && value.pid > 0) && (value.pane_id === void 0 || typeof value.pane_id === "string") && (value.working_dir === void 0 || typeof value.working_dir === "string") && (value.worktree_repo_root === void 0 || typeof value.worktree_repo_root === "string") && (value.worktree_path === void 0 || typeof value.worktree_path === "string") && (value.worktree_branch === void 0 || typeof value.worktree_branch === "string") && (value.worktree_detached === void 0 || typeof value.worktree_detached === "boolean") && (value.worktree_created === void 0 || typeof value.worktree_created === "boolean") && (value.team_state_root === void 0 || typeof value.team_state_root === "string") && (value.output_file === void 0 || typeof value.output_file === "string") && (value.recovery_id === void 0 || isNonEmptyString(value.recovery_id)) && (value.replacement_generation === void 0 || isSafeCounter(value.replacement_generation)) && (value.pane_attempt_id === void 0 || isNonEmptyString(value.pane_attempt_id)) && (value.operational_state === void 0 || ["starting", "active", "dead", "stopped"].includes(value.operational_state)) && (value.launch_descriptor === void 0 || isLaunchDescriptor(value.launch_descriptor));
 }
 function isLaunchDescriptor(value) {
-  return isRecord(value) && value.schema_version === 1 && ["claude", "codex", "gemini", "cursor", "grok", "antigravity"].includes(value.provider) && (value.model === null || typeof value.model === "string") && isNonEmptyString(value.binary) && isStringArray(value.args);
+  return isRecord(value) && value.schema_version === 1 && ["claude", "codex", "gemini", "cursor", "grok", "antigravity", "copilot"].includes(value.provider) && (value.model === null || typeof value.model === "string") && isNonEmptyString(value.binary) && isStringArray(value.args);
 }
 function isOwnerEpoch(value) {
   return isRecord(value) && isSafeCounter(value.epoch) && value.epoch > 0 && isNonEmptyString(value.nonce) && isSafeCounter(value.pid) && value.pid > 0 && isNonEmptyString(value.process_started_at) && isTimestamp(value.created_at);
@@ -19002,8 +19014,20 @@ function isShutdownAttempt(value) {
 function isAllDeadRecovery(value) {
   return isRecord(value) && isTimestamp(value.detected_at) && isTimestamp(value.deadline_at) && isSafeCounter(value.state_revision);
 }
+function isOptionalConfiguredRoutingRoles(value) {
+  if (value === void 0) return true;
+  if (!Array.isArray(value)) return false;
+  const canonicalRoles = new Set(CANONICAL_TEAM_ROLES);
+  return value.every((role) => typeof role === "string" && canonicalRoles.has(role)) && new Set(value).size === value.length;
+}
+function isOptionalCopilotDefaults(value) {
+  if (value === void 0) return true;
+  return isRecord(value) && isNonEmptyString(value.model) && ["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(
+    value.reasoning_effort
+  );
+}
 function isTeamConfig(value, requireRevision, expectedTeamName) {
-  if (!isRecord(value) || !isNonEmptyString(value.name) || expectedTeamName !== void 0 && value.name !== expectedTeamName || !isNonEmptyString(value.agent_type) || value.task !== void 0 && typeof value.task !== "string" || value.worker_launch_mode !== void 0 && !["interactive", "prompt"].includes(value.worker_launch_mode) || !isSafeCounter(value.worker_count) || value.max_workers !== void 0 && !isSafeCounter(value.max_workers) || !Array.isArray(value.workers) || value.worker_count !== value.workers.length || !value.workers.every(isWorkerInfo) || !hasUniqueWorkerIdentity(value.workers) || !isTimestamp(value.created_at) || !isNonEmptyString(value.tmux_session) || value.next_task_id !== void 0 && !isSafeCounter(value.next_task_id) || !isOptionalPolicy(value.policy) || !isOptionalGovernance(value.governance) || !isOptionalWorkspaceShape(value) || !isOptionalPaneShape(value) || !isOptionalRouting(value.resolved_routing)) return false;
+  if (!isRecord(value) || !isNonEmptyString(value.name) || expectedTeamName !== void 0 && value.name !== expectedTeamName || !isNonEmptyString(value.agent_type) || value.task !== void 0 && typeof value.task !== "string" || value.worker_launch_mode !== void 0 && !["interactive", "prompt"].includes(value.worker_launch_mode) || !isSafeCounter(value.worker_count) || value.max_workers !== void 0 && !isSafeCounter(value.max_workers) || !Array.isArray(value.workers) || value.worker_count !== value.workers.length || !value.workers.every(isWorkerInfo) || !hasUniqueWorkerIdentity(value.workers) || !isTimestamp(value.created_at) || !isNonEmptyString(value.tmux_session) || value.next_task_id !== void 0 && !isSafeCounter(value.next_task_id) || !isOptionalPolicy(value.policy) || !isOptionalGovernance(value.governance) || !isOptionalWorkspaceShape(value) || !isOptionalPaneShape(value) || !isOptionalRouting(value.resolved_routing) || !isOptionalConfiguredRoutingRoles(value.configured_routing_roles) || !isOptionalCopilotDefaults(value.copilot_defaults)) return false;
   if (requireRevision ? !isSafeCounter(value.state_revision) : value.state_revision !== void 0 && !isSafeCounter(value.state_revision)) return false;
   if (!requireRevision && Object.hasOwn(value, "state_revision")) return false;
   return (value.lifecycle_state === void 0 || ["active", "shutting_down", "stopped"].includes(value.lifecycle_state)) && (value.runtime_owner_epoch === void 0 || isOwnerEpoch(value.runtime_owner_epoch)) && (value.active_recovery === void 0 || isRecoveryAttempt(value.active_recovery)) && (value.last_recovery === void 0 || isRecoveryAttempt(value.last_recovery)) && (value.active_scale_up === void 0 || isScaleUpAttempt(value.active_scale_up)) && (value.active_scale_down === void 0 || isScaleDownAttempt(value.active_scale_down)) && (value.service_descriptor === void 0 || isServiceDescriptor(value.service_descriptor)) && (value.shutdown_attempt === void 0 || isShutdownAttempt(value.shutdown_attempt)) && (value.all_dead_recovery === void 0 || isAllDeadRecovery(value.all_dead_recovery)) && hasMatchingActiveFenceRevisions(value);
@@ -19040,7 +19064,7 @@ function isResolvedRoleRoute(value) {
   return isRecord(value) && isRoleAssignment(value.primary) && isRoleAssignment(value.fallback);
 }
 function isRoleAssignment(value) {
-  return isRecord(value) && ["claude", "codex", "gemini", "grok", "cursor", "antigravity"].includes(value.provider) && isNonEmptyString(value.model) && KNOWN_AGENT_NAMES.some((agent) => agent === value.agent);
+  return isRecord(value) && ["claude", "codex", "gemini", "grok", "cursor", "antigravity", "copilot"].includes(value.provider) && isNonEmptyString(value.model) && (value.reasoningEffort === void 0 || ["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.reasoningEffort)) && KNOWN_AGENT_NAMES.some((agent) => agent === value.agent);
 }
 function hasMatchingActiveFenceRevisions(value) {
   if (!isSafeCounter(value.state_revision)) return true;
@@ -19165,7 +19189,7 @@ var NudgeTracker = class {
 };
 
 // src/mcp/team-job-convergence.ts
-var import_fs8 = require("fs");
+var import_fs9 = require("fs");
 var import_path9 = require("path");
 
 // src/team/git-worktree.ts
@@ -19299,7 +19323,8 @@ function validateWorktreeRemovalTarget(options) {
 }
 
 // src/lib/file-lock.ts
-var import_fs7 = require("fs");
+var import_fs8 = require("fs");
+var import_crypto4 = require("crypto");
 var path3 = __toESM(require("path"), 1);
 
 // src/lib/atomic-write.ts
@@ -19324,11 +19349,12 @@ var ATOMIC_BATCH_MAX_CONTENT_BYTES = 1024 * 1024;
 
 // src/platform/index.ts
 var path2 = __toESM(require("path"), 1);
-var import_fs6 = require("fs");
+var import_fs7 = require("fs");
 
 // src/platform/process-utils.ts
 var import_child_process4 = require("child_process");
 var import_util7 = require("util");
+var import_fs6 = require("fs");
 var fsPromises = __toESM(require("fs/promises"), 1);
 var execFileAsync2 = (0, import_util7.promisify)(import_child_process4.execFile);
 function isProcessAlive(pid) {
@@ -19343,6 +19369,132 @@ function isProcessAlive(pid) {
     return false;
   }
 }
+var currentProcessStartIdentitySync;
+function parseWindowsDmtfTimestamp(value) {
+  const match = value.match(
+    /(\d{14})\.(\d{6})([+-])(\d{3})/
+  );
+  if (!match) return void 0;
+  const compact = match[1];
+  const year = Number(compact.slice(0, 4));
+  const month = Number(compact.slice(4, 6));
+  const day = Number(compact.slice(6, 8));
+  const hour = Number(compact.slice(8, 10));
+  const minute = Number(compact.slice(10, 12));
+  const second = Number(compact.slice(12, 14));
+  const microseconds = Number(match[2]);
+  const offsetMinutes = Number(match[4]) * (match[3] === "-" ? -1 : 1);
+  if (year < 1601 || month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59 || !Number.isSafeInteger(microseconds) || !Number.isSafeInteger(offsetMinutes)) {
+    return void 0;
+  }
+  const wallClockMs = Date.UTC(
+    year,
+    month - 1,
+    day,
+    hour,
+    minute,
+    second
+  );
+  const verified = new Date(wallClockMs);
+  if (verified.getUTCFullYear() !== year || verified.getUTCMonth() !== month - 1 || verified.getUTCDate() !== day || verified.getUTCHours() !== hour || verified.getUTCMinutes() !== minute || verified.getUTCSeconds() !== second) {
+    return void 0;
+  }
+  const epochMilliseconds = wallClockMs - offsetMinutes * 6e4;
+  return {
+    epochMilliseconds,
+    epochMicroseconds: BigInt(epochMilliseconds) * 1000n + BigInt(microseconds)
+  };
+}
+function parseWindowsProcessStartIdentity(value) {
+  const parsed = parseWindowsDmtfTimestamp(value);
+  return parsed ? `windows-dmtf-us:${parsed.epochMicroseconds.toString()}` : void 0;
+}
+function getProcessStartIdentitySync(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(pid) || process.env.OMC_TEST_FILE_LOCK_PROCESS_START_UNKNOWN_PID === String(pid)) {
+    return null;
+  }
+  if (pid === process.pid && currentProcessStartIdentitySync !== void 0) {
+    return currentProcessStartIdentitySync;
+  }
+  let identity = null;
+  if (process.platform === "linux") {
+    try {
+      const stat = (0, import_fs6.readFileSync)(`/proc/${pid}/stat`, "utf8");
+      const closeParen = stat.lastIndexOf(")");
+      if (closeParen >= 0) {
+        const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
+        identity = fields[19] && /^\d+$/.test(fields[19]) ? fields[19] : null;
+      }
+    } catch (error2) {
+      identity = error2.code === "ENOENT" ? "absent" : null;
+    }
+  } else if (process.platform === "darwin") {
+    try {
+      const stdout = (0, import_child_process4.execFileSync)(
+        "ps",
+        ["-p", String(pid), "-o", "lstart="],
+        {
+          encoding: "utf8",
+          env: { ...process.env, LC_ALL: "C" },
+          stdio: ["ignore", "pipe", "ignore"],
+          timeout: 1e3,
+          windowsHide: true
+        }
+      );
+      const value = new Date(stdout.trim()).getTime();
+      identity = Number.isFinite(value) ? String(value) : null;
+    } catch {
+      identity = isProcessAlive(pid) ? null : "absent";
+    }
+  } else if (process.platform === "win32") {
+    try {
+      const stdout = (0, import_child_process4.execFileSync)(
+        "powershell",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `$p = [System.Diagnostics.Process]::GetProcessById(${pid}); [System.Management.ManagementDateTimeConverter]::ToDmtfDateTime([datetime]$p.StartTime)`
+        ],
+        {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+          timeout: 5e3,
+          windowsHide: true
+        }
+      );
+      identity = parseWindowsProcessStartIdentity(stdout) ?? null;
+    } catch {
+      try {
+        const stdout = (0, import_child_process4.execFileSync)(
+          "wmic",
+          [
+            "process",
+            "where",
+            `ProcessId=${pid}`,
+            "get",
+            "CreationDate",
+            "/format:csv"
+          ],
+          {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+            timeout: 1e3,
+            windowsHide: true
+          }
+        );
+        identity = parseWindowsProcessStartIdentity(stdout) ?? null;
+      } catch {
+        identity = isProcessAlive(pid) ? null : "absent";
+      }
+    }
+  }
+  if (pid === process.pid && identity !== null && identity !== "absent") {
+    currentProcessStartIdentitySync = identity;
+  }
+  return identity;
+}
 
 // src/platform/index.ts
 var PLATFORM = process.platform;
@@ -19350,81 +19502,432 @@ var PLATFORM = process.platform;
 // src/lib/file-lock.ts
 var DEFAULT_STALE_LOCK_MS = 3e4;
 var DEFAULT_RETRY_DELAY_MS = 50;
-function isLockStale(lockPath, staleLockMs) {
+var RECLAMATION_GUARD_SUFFIX = ".reclaim.guard";
+var RECLAMATION_RECOVERY_SUFFIX = ".recover";
+var RECLAMATION_RECOVERY_CLAIM_SUFFIX = ".reaper.";
+var RECLAMATION_GUARD_STALE_MS = 3e4;
+var RECLAMATION_RECOVERY_STALE_MS = 3e4;
+var MAX_LOCK_MTIME_FUTURE_SKEW_MS = 5 * 6e4;
+var RELEASE_GUARD_TIMEOUT_MS = 2e3;
+function identityForFd(fd) {
+  const stat = (0, import_fs8.fstatSync)(fd);
+  return { dev: stat.dev, ino: stat.ino };
+}
+function identityForPath(lockPath) {
   try {
-    const stat = (0, import_fs7.statSync)(lockPath);
-    const ageMs = Date.now() - stat.mtimeMs;
-    if (ageMs < staleLockMs) return false;
-    try {
-      const raw = (0, import_fs7.readFileSync)(lockPath, "utf-8");
-      const payload = JSON.parse(raw);
-      if (payload.pid && isProcessAlive(payload.pid)) return false;
-    } catch {
+    const stat = (0, import_fs8.lstatSync)(lockPath);
+    return { dev: stat.dev, ino: stat.ino };
+  } catch {
+    return null;
+  }
+}
+function identitiesEqual(left, right) {
+  return !!left && left.dev === right.dev && left.ino === right.ino;
+}
+function parseObservedLock(raw) {
+  try {
+    const payload = JSON.parse(raw);
+    return {
+      ...typeof payload.version === "number" ? { version: payload.version } : {},
+      ...typeof payload.pid === "number" ? { pid: payload.pid } : {},
+      ...typeof payload.processStartIdentity === "string" ? { processStartIdentity: payload.processStartIdentity } : typeof payload.processStart === "string" ? { processStartIdentity: payload.processStart } : {},
+      ...typeof payload.nonce === "string" ? { nonce: payload.nonce } : {},
+      ...typeof payload.timestamp === "number" ? { timestamp: payload.timestamp } : {}
+    };
+  } catch {
+    return {};
+  }
+}
+function isAuthenticatedOwner(owner) {
+  return owner.version === 2 && Number.isSafeInteger(owner.pid) && (owner.pid ?? 0) > 0 && typeof owner.processStartIdentity === "string" && owner.processStartIdentity.length > 0 && typeof owner.nonce === "string" && owner.nonce.length > 0 && Number.isFinite(owner.timestamp);
+}
+function staleLockObservation(lockPath, staleLockMs, requireAuthenticatedOwner = false) {
+  try {
+    const stat = (0, import_fs8.lstatSync)(lockPath);
+    const now = Date.now();
+    if (!Number.isFinite(stat.mtimeMs) || stat.mtimeMs > now + MAX_LOCK_MTIME_FUTURE_SKEW_MS) {
+      return null;
+    }
+    const ageMs = Math.max(0, now - stat.mtimeMs);
+    if (ageMs < staleLockMs) return null;
+    const raw = (0, import_fs8.readFileSync)(lockPath, "utf-8");
+    const observation = {
+      identity: { dev: stat.dev, ino: stat.ino },
+      raw,
+      owner: parseObservedLock(raw)
+    };
+    if (requireAuthenticatedOwner && !isAuthenticatedOwner(observation.owner)) {
+      return null;
+    }
+    const pid = observation.owner.pid;
+    if (!pid || !Number.isSafeInteger(pid) || pid <= 0) {
+      return observation;
+    }
+    if (!isProcessAlive(pid)) return observation;
+    const expectedStart = observation.owner.processStartIdentity;
+    if (!expectedStart) return null;
+    const currentStart = getProcessStartIdentitySync(pid);
+    if (currentStart === "absent") return observation;
+    if (currentStart === null) return null;
+    return currentStart === expectedStart ? null : observation;
+  } catch {
+    return null;
+  }
+}
+function observedLockStillMatches(lockPath, observation) {
+  if (!identitiesEqual(identityForPath(lockPath), observation.identity)) {
+    return false;
+  }
+  try {
+    return (0, import_fs8.readFileSync)(lockPath, "utf-8") === observation.raw;
+  } catch {
+    return false;
+  }
+}
+function reapObservedLock(lockPath, observation) {
+  try {
+    if (!observedLockStillMatches(lockPath, observation)) return false;
+    (0, import_fs8.unlinkSync)(lockPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function isExistsError(error2) {
+  return !!error2 && typeof error2 === "object" && "code" in error2 && error2.code === "EEXIST";
+}
+function waitSync(waitMs) {
+  if (waitMs <= 0) return;
+  const waitBuffer = new SharedArrayBuffer(4);
+  try {
+    Atomics.wait(new Int32Array(waitBuffer), 0, 0, waitMs);
+  } catch {
+    const waitUntil = Date.now() + waitMs;
+    while (Date.now() < waitUntil) {
+    }
+  }
+}
+function recoveryOperationHasContender(recoveryPath, ownClaimPath) {
+  const directory = path3.dirname(recoveryPath);
+  const prefix = `${path3.basename(recoveryPath)}${RECLAMATION_RECOVERY_CLAIM_SUFFIX}`;
+  let names;
+  try {
+    names = (0, import_fs8.readdirSync)(directory);
+  } catch {
+    return true;
+  }
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    const contenderPath = path3.join(directory, name);
+    if (contenderPath === ownClaimPath) continue;
+    const stale = staleLockObservation(
+      contenderPath,
+      RECLAMATION_RECOVERY_STALE_MS,
+      true
+    );
+    if (stale) {
+      if (reapObservedLock(contenderPath, stale)) continue;
+      if (!identityForPath(contenderPath)) continue;
     }
     return true;
+  }
+  return false;
+}
+function withRecoveryPathOperation(lockPath, callback) {
+  const recoveryPath = `${lockPath}${RECLAMATION_GUARD_SUFFIX}${RECLAMATION_RECOVERY_SUFFIX}`;
+  const owner = currentLockOwner();
+  if (!owner) return { acquired: false, value: void 0 };
+  const claimPath = `${recoveryPath}${RECLAMATION_RECOVERY_CLAIM_SUFFIX}${owner.nonce}`;
+  let claim;
+  try {
+    claim = createOwnedLockAtomically(claimPath, owner);
+  } catch (error2) {
+    if (isExistsError(error2)) {
+      return { acquired: false, value: void 0 };
+    }
+    throw error2;
+  }
+  if (!claim) return { acquired: false, value: void 0 };
+  try {
+    if (recoveryOperationHasContender(recoveryPath, claimPath)) {
+      return { acquired: false, value: void 0 };
+    }
+    return { acquired: true, value: callback() };
+  } finally {
+    releaseOwnedPath(claim);
+  }
+}
+function withReclamationRecoveryBarrier(lockPath, callback) {
+  const recoveryPath = `${lockPath}${RECLAMATION_GUARD_SUFFIX}${RECLAMATION_RECOVERY_SUFFIX}`;
+  const operation = withRecoveryPathOperation(lockPath, () => {
+    let recovery;
+    try {
+      recovery = createOwnedLockAtomically(recoveryPath);
+    } catch (error2) {
+      if (!isExistsError(error2)) throw error2;
+      const stale = staleLockObservation(
+        recoveryPath,
+        RECLAMATION_RECOVERY_STALE_MS,
+        true
+      );
+      if (!stale || !reapObservedLock(recoveryPath, stale)) {
+        return { acquired: false, value: void 0 };
+      }
+      try {
+        recovery = createOwnedLockAtomically(recoveryPath);
+      } catch (retryError) {
+        if (isExistsError(retryError)) {
+          return { acquired: false, value: void 0 };
+        }
+        throw retryError;
+      }
+    }
+    if (!recovery) return { acquired: false, value: void 0 };
+    try {
+      return { acquired: true, value: callback() };
+    } finally {
+      releaseOwnedPath(recovery);
+    }
+  });
+  if (!operation.acquired || !operation.value) {
+    return { acquired: false, value: void 0 };
+  }
+  return operation.value;
+}
+function recoverStaleReclamationRecoveryBarrier(lockPath) {
+  const recoveryPath = `${lockPath}${RECLAMATION_GUARD_SUFFIX}${RECLAMATION_RECOVERY_SUFFIX}`;
+  const operation = withRecoveryPathOperation(lockPath, () => {
+    const stale = staleLockObservation(
+      recoveryPath,
+      RECLAMATION_RECOVERY_STALE_MS,
+      true
+    );
+    return !!stale && reapObservedLock(recoveryPath, stale);
+  });
+  return operation.acquired && operation.value === true;
+}
+function recoverStaleReclamationGuard(lockPath) {
+  const guardPath = `${lockPath}${RECLAMATION_GUARD_SUFFIX}`;
+  const recovery = withReclamationRecoveryBarrier(lockPath, () => {
+    const stale = staleLockObservation(
+      guardPath,
+      RECLAMATION_GUARD_STALE_MS,
+      true
+    );
+    return !!stale && reapObservedLock(guardPath, stale);
+  });
+  return recovery.acquired && recovery.value === true;
+}
+function releaseOwnedPath(handle) {
+  const ownedBeforeClose = handleStillOwnsPath(handle);
+  try {
+    (0, import_fs8.closeSync)(handle.fd);
+  } catch {
+  }
+  if (!ownedBeforeClose || !handleStillOwnsPath(handle)) return;
+  try {
+    (0, import_fs8.unlinkSync)(handle.path);
+  } catch {
+  }
+}
+function withReclamationGuard(lockPath, callback, timeoutMs = 0) {
+  const guardPath = `${lockPath}${RECLAMATION_GUARD_SUFFIX}`;
+  const recoveryPath = `${guardPath}${RECLAMATION_RECOVERY_SUFFIX}`;
+  const deadline = Date.now() + timeoutMs;
+  let guard = null;
+  while (!guard) {
+    if (identityForPath(recoveryPath)) {
+      if (recoverStaleReclamationRecoveryBarrier(lockPath)) continue;
+      if (Date.now() >= deadline) {
+        return { acquired: false, value: void 0 };
+      }
+      waitSync(Math.min(5, Math.max(1, deadline - Date.now())));
+      continue;
+    }
+    try {
+      guard = createOwnedLock(guardPath);
+    } catch (error2) {
+      if (!isExistsError(error2)) throw error2;
+      if (recoverStaleReclamationGuard(lockPath)) continue;
+      if (Date.now() >= deadline) {
+        return { acquired: false, value: void 0 };
+      }
+      waitSync(Math.min(5, Math.max(1, deadline - Date.now())));
+      continue;
+    }
+    if (!guard) {
+      if (Date.now() >= deadline) {
+        return { acquired: false, value: void 0 };
+      }
+      waitSync(Math.min(5, Math.max(1, deadline - Date.now())));
+    }
+  }
+  if (!guard) return { acquired: false, value: void 0 };
+  try {
+    return { acquired: true, value: callback() };
+  } finally {
+    releaseOwnedPath(guard);
+  }
+}
+function currentLockOwner() {
+  const processStartIdentity = getProcessStartIdentitySync(process.pid);
+  if (processStartIdentity === null || processStartIdentity === "absent") {
+    return null;
+  }
+  return {
+    version: 2,
+    pid: process.pid,
+    processStartIdentity,
+    nonce: (0, import_crypto4.randomUUID)(),
+    timestamp: Date.now()
+  };
+}
+function createOwnedLock(lockPath, suppliedOwner) {
+  const owner = suppliedOwner ?? currentLockOwner();
+  if (!owner) return null;
+  const ownerRaw = JSON.stringify(owner);
+  const ownerBytes = Buffer.from(ownerRaw, "utf8");
+  const fd = (0, import_fs8.openSync)(
+    lockPath,
+    import_fs8.constants.O_CREAT | import_fs8.constants.O_EXCL | import_fs8.constants.O_RDWR,
+    384
+  );
+  const creationIdentity = identityForFd(fd);
+  try {
+    let written = 0;
+    while (written < ownerBytes.length) {
+      const count = (0, import_fs8.writeSync)(
+        fd,
+        ownerBytes,
+        written,
+        ownerBytes.length - written,
+        written
+      );
+      if (count <= 0) {
+        throw new Error(`Failed to publish file lock owner: ${lockPath}`);
+      }
+      written += count;
+    }
+    (0, import_fs8.fsyncSync)(fd);
+    const stat = (0, import_fs8.fstatSync)(fd);
+    if (stat.size !== ownerBytes.length || !identitiesEqual(identityForPath(lockPath), creationIdentity)) {
+      throw new Error(`Failed to verify file lock owner: ${lockPath}`);
+    }
+    const verifiedBytes = Buffer.alloc(ownerBytes.length);
+    let read = 0;
+    while (read < verifiedBytes.length) {
+      const count = (0, import_fs8.readSync)(
+        fd,
+        verifiedBytes,
+        read,
+        verifiedBytes.length - read,
+        read
+      );
+      if (count <= 0) {
+        throw new Error(`Failed to verify file lock owner: ${lockPath}`);
+      }
+      read += count;
+    }
+    if (!verifiedBytes.equals(ownerBytes)) {
+      throw new Error(`Failed to verify file lock owner: ${lockPath}`);
+    }
+    return {
+      fd,
+      path: lockPath,
+      owner,
+      ownerRaw,
+      identity: creationIdentity
+    };
+  } catch (writeErr) {
+    try {
+      (0, import_fs8.closeSync)(fd);
+    } catch {
+    }
+    try {
+      if (identitiesEqual(identityForPath(lockPath), creationIdentity)) {
+        (0, import_fs8.unlinkSync)(lockPath);
+      }
+    } catch {
+    }
+    throw writeErr;
+  }
+}
+function createOwnedLockAtomically(lockPath, suppliedOwner) {
+  const owner = suppliedOwner ?? currentLockOwner();
+  if (!owner) return null;
+  const publicationPath = path3.join(
+    path3.dirname(lockPath),
+    `.${path3.basename(lockPath)}.publish.${owner.nonce}.tmp`
+  );
+  const publication = createOwnedLock(publicationPath, owner);
+  if (!publication) return null;
+  let linked = false;
+  try {
+    (0, import_fs8.linkSync)(publicationPath, lockPath);
+    linked = true;
+    const published = {
+      ...publication,
+      path: lockPath
+    };
+    if (!handleStillOwnsPath(published)) {
+      throw new Error(`Failed to publish file lock owner: ${lockPath}`);
+    }
+    try {
+      if (handleStillOwnsPath(publication)) {
+        (0, import_fs8.unlinkSync)(publicationPath);
+      }
+    } catch {
+    }
+    return published;
+  } catch (error2) {
+    if (linked) {
+      const published = {
+        ...publication,
+        path: lockPath
+      };
+      try {
+        if (handleStillOwnsPath(published)) (0, import_fs8.unlinkSync)(lockPath);
+      } catch {
+      }
+    }
+    releaseOwnedPath(publication);
+    throw error2;
+  }
+}
+function handleStillOwnsPath(handle) {
+  if (!identitiesEqual(identityForPath(handle.path), handle.identity)) {
+    return false;
+  }
+  try {
+    const raw = (0, import_fs8.readFileSync)(handle.path, "utf-8");
+    if (raw !== handle.ownerRaw) return false;
+    const owner = JSON.parse(raw);
+    return owner.version === handle.owner.version && owner.pid === handle.owner.pid && owner.processStartIdentity === handle.owner.processStartIdentity && owner.nonce === handle.owner.nonce;
   } catch {
     return false;
   }
 }
 function tryAcquireSync(lockPath, staleLockMs) {
   ensureDirSync(path3.dirname(lockPath));
-  try {
-    const fd = (0, import_fs7.openSync)(
-      lockPath,
-      import_fs7.constants.O_CREAT | import_fs7.constants.O_EXCL | import_fs7.constants.O_WRONLY,
-      384
-    );
+  const guarded = withReclamationGuard(lockPath, () => {
     try {
-      const payload = JSON.stringify({ pid: process.pid, timestamp: Date.now() });
-      (0, import_fs7.writeSync)(fd, payload, null, "utf-8");
-    } catch (writeErr) {
-      try {
-        (0, import_fs7.closeSync)(fd);
-      } catch {
-      }
-      try {
-        (0, import_fs7.unlinkSync)(lockPath);
-      } catch {
-      }
-      throw writeErr;
-    }
-    return { fd, path: lockPath };
-  } catch (err) {
-    if (err && typeof err === "object" && "code" in err && err.code === "EEXIST") {
-      if (isLockStale(lockPath, staleLockMs)) {
-        try {
-          (0, import_fs7.unlinkSync)(lockPath);
-        } catch {
-        }
-        try {
-          const fd = (0, import_fs7.openSync)(
-            lockPath,
-            import_fs7.constants.O_CREAT | import_fs7.constants.O_EXCL | import_fs7.constants.O_WRONLY,
-            384
-          );
+      return createOwnedLock(lockPath);
+    } catch (err) {
+      if (err && typeof err === "object" && "code" in err && err.code === "EEXIST") {
+        const stale = staleLockObservation(lockPath, staleLockMs);
+        if (stale && reapObservedLock(lockPath, stale)) {
           try {
-            const payload = JSON.stringify({ pid: process.pid, timestamp: Date.now() });
-            (0, import_fs7.writeSync)(fd, payload, null, "utf-8");
-          } catch (writeErr) {
-            try {
-              (0, import_fs7.closeSync)(fd);
-            } catch {
-            }
-            try {
-              (0, import_fs7.unlinkSync)(lockPath);
-            } catch {
-            }
-            throw writeErr;
+            return createOwnedLock(lockPath);
+          } catch {
+            return null;
           }
-          return { fd, path: lockPath };
-        } catch {
-          return null;
         }
+        return null;
       }
-      return null;
+      throw err;
     }
-    throw err;
-  }
+  });
+  return guarded.acquired ? guarded.value ?? null : null;
 }
 function acquireFileLockSync(lockPath, opts) {
   const staleLockMs = opts?.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
@@ -19451,11 +19954,21 @@ function acquireFileLockSync(lockPath, opts) {
 }
 function releaseFileLockSync(handle) {
   try {
-    (0, import_fs7.closeSync)(handle.fd);
+    const guarded = withReclamationGuard(handle.path, () => {
+      releaseOwnedPath(handle);
+    }, RELEASE_GUARD_TIMEOUT_MS);
+    if (guarded.acquired) return;
   } catch {
   }
   try {
-    (0, import_fs7.unlinkSync)(handle.path);
+    const cleanup = withReclamationRecoveryBarrier(handle.path, () => {
+      releaseOwnedPath(handle);
+    });
+    if (cleanup.acquired) return;
+  } catch {
+  }
+  try {
+    (0, import_fs8.closeSync)(handle.fd);
   } catch {
   }
 }
@@ -19759,10 +20272,10 @@ function cleanupTeamWorktrees(teamName, repoRoot) {
 // src/mcp/team-job-convergence.ts
 function readResultArtifact(omcJobsDir, jobId) {
   const artifactPath = (0, import_path9.join)(omcJobsDir, `${jobId}-result.json`);
-  if (!(0, import_fs8.existsSync)(artifactPath)) return { kind: "none" };
+  if (!(0, import_fs9.existsSync)(artifactPath)) return { kind: "none" };
   let raw;
   try {
-    raw = (0, import_fs8.readFileSync)(artifactPath, "utf-8");
+    raw = (0, import_fs9.readFileSync)(artifactPath, "utf-8");
   } catch {
     return { kind: "none" };
   }
@@ -19849,10 +20362,10 @@ function clearScopedTeamState(job) {
     };
   }
   try {
-    if (!(0, import_fs8.existsSync)(stateDir)) {
+    if (!(0, import_fs9.existsSync)(stateDir)) {
       return { ok: true, message: `${worktreeMessage} team state dir not found at ${stateDir}.` };
     }
-    (0, import_fs8.rmSync)(stateDir, { recursive: true, force: true });
+    (0, import_fs9.rmSync)(stateDir, { recursive: true, force: true });
     return { ok: true, message: `${worktreeMessage} team state dir removed at ${stateDir}.` };
   } catch (error2) {
     const message = error2 instanceof Error ? error2.message : String(error2);
@@ -19866,7 +20379,7 @@ function clearScopedTeamState(job) {
 
 // src/utils/paths.ts
 var import_path10 = require("path");
-var import_fs9 = require("fs");
+var import_fs10 = require("fs");
 var import_os3 = require("os");
 function getStateDir() {
   if (process.platform === "win32") {
@@ -19997,14 +20510,14 @@ function createDeprecatedCliOnlyEnvelopeWithArgs(toolName, args) {
 }
 function persistJob(jobId, job) {
   try {
-    if (!(0, import_fs10.existsSync)(OMC_JOBS_DIR)) (0, import_fs10.mkdirSync)(OMC_JOBS_DIR, { recursive: true });
-    (0, import_fs10.writeFileSync)((0, import_path11.join)(OMC_JOBS_DIR, `${jobId}.json`), JSON.stringify(job), "utf-8");
+    if (!(0, import_fs11.existsSync)(OMC_JOBS_DIR)) (0, import_fs11.mkdirSync)(OMC_JOBS_DIR, { recursive: true });
+    (0, import_fs11.writeFileSync)((0, import_path11.join)(OMC_JOBS_DIR, `${jobId}.json`), JSON.stringify(job), "utf-8");
   } catch {
   }
 }
 function loadJobFromDisk(jobId) {
   try {
-    return JSON.parse((0, import_fs10.readFileSync)((0, import_path11.join)(OMC_JOBS_DIR, `${jobId}.json`), "utf-8"));
+    return JSON.parse((0, import_fs11.readFileSync)((0, import_path11.join)(OMC_JOBS_DIR, `${jobId}.json`), "utf-8"));
   } catch {
     return void 0;
   }
@@ -20069,7 +20582,7 @@ function makeJobResponse(jobId, job, extra = {}) {
 }
 var startSchema = external_exports.object({
   teamName: external_exports.string().describe('Slug name for the team (e.g. "auth-review")'),
-  agentTypes: external_exports.array(external_exports.string()).describe('Agent type per worker: "claude", "codex", "gemini", or "antigravity"'),
+  agentTypes: external_exports.array(external_exports.string()).describe('Agent type per worker, including "claude", "codex", "gemini", "antigravity", or "copilot"'),
   tasks: external_exports.array(external_exports.object({
     subject: external_exports.string().describe("Brief task title"),
     description: external_exports.string().describe("Full task description")
@@ -20329,7 +20842,7 @@ var TOOLS = [
       type: "object",
       properties: {
         teamName: { type: "string", description: "Slug name for the team" },
-        agentTypes: { type: "array", items: { type: "string" }, description: '"claude", "codex", "gemini", or "antigravity" per worker' },
+        agentTypes: { type: "array", items: { type: "string" }, description: 'CLI provider per worker, including "copilot"' },
         tasks: {
           type: "array",
           items: {

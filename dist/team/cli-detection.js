@@ -2,25 +2,77 @@
 // and additional CLI detection utilities
 export { isCliAvailable, validateCliAvailable, getContract } from './model-contract.js';
 import { spawnSync } from 'child_process';
+import { resolveCliBinaryPath } from './model-contract.js';
+const VERSION_PROBE_TIMEOUT_MS = 5000;
+function firstOutputLine(output) {
+    return output
+        ?.toString()
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .find(Boolean);
+}
+function describeVersionProbeFailure(result) {
+    const probeError = result.error;
+    if (probeError?.code === 'ETIMEDOUT') {
+        return `Version probe timed out after ${VERSION_PROBE_TIMEOUT_MS}ms.`;
+    }
+    if (probeError) {
+        return `Version probe failed: ${probeError.message}`;
+    }
+    const stderr = firstOutputLine(result.stderr);
+    if (typeof result.status === 'number') {
+        return `Version probe exited with code ${result.status}${stderr ? `: ${stderr}` : '.'}`;
+    }
+    if (result.signal) {
+        return `Version probe terminated by signal ${result.signal}.`;
+    }
+    return 'Version probe did not complete.';
+}
 export function detectCli(binary) {
+    let resolvedBinary;
     try {
-        const versionResult = spawnSync(binary, ['--version'], {
-            timeout: 5000,
-            shell: process.platform === 'win32',
-        });
+        resolvedBinary = resolveCliBinaryPath(binary);
+    }
+    catch (error) {
+        return {
+            available: false,
+            runnable: false,
+            error: error instanceof Error ? error.message : String(error),
+        };
+    }
+    try {
+        const versionResult = process.platform === 'win32' && /\.(cmd|bat)$/i.test(resolvedBinary)
+            ? spawnSync(process.env.COMSPEC || 'cmd.exe', ['/d', '/c', resolvedBinary, '--version'], { timeout: VERSION_PROBE_TIMEOUT_MS })
+            : spawnSync(resolvedBinary, ['--version'], {
+                timeout: VERSION_PROBE_TIMEOUT_MS,
+                shell: false,
+            });
         if (versionResult.status === 0) {
-            const finder = process.platform === 'win32' ? 'where' : 'which';
-            const pathResult = spawnSync(finder, [binary], { timeout: 5000 });
+            const version = firstOutputLine(versionResult.stdout)
+                ?? firstOutputLine(versionResult.stderr);
             return {
                 available: true,
-                version: versionResult.stdout?.toString().trim(),
-                path: pathResult.stdout?.toString().trim(),
+                runnable: true,
+                path: resolvedBinary,
+                ...(version
+                    ? { version }
+                    : { error: 'Version probe succeeded but returned no version output.' }),
             };
         }
-        return { available: false };
+        return {
+            available: true,
+            runnable: false,
+            path: resolvedBinary,
+            error: describeVersionProbeFailure(versionResult),
+        };
     }
-    catch {
-        return { available: false };
+    catch (error) {
+        return {
+            available: true,
+            runnable: false,
+            path: resolvedBinary,
+            error: `Version probe failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
     }
 }
 export function detectAllClis() {
@@ -31,6 +83,7 @@ export function detectAllClis() {
         cursor: detectCli('cursor-agent'),
         grok: detectCli('grok'),
         antigravity: detectCli('agy'),
+        copilot: detectCli('copilot'),
     };
 }
 //# sourceMappingURL=cli-detection.js.map

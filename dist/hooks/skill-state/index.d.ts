@@ -1,7 +1,7 @@
 /**
  * Skill Active State Management (v2 mixed schema)
  *
- * `skill-active-state.json` is a dual-copy workflow ledger:
+ * `skill-active-state.json` is a root aggregate plus session-local ledger:
  *
  *   {
  *     "version": 2,
@@ -24,20 +24,17 @@
  *   }
  *
  * HARD INVARIANTS:
- *   1. `writeSkillActiveStateCopies()` is the only helper allowed to persist
- *      workflow-slot state. Every workflow-slot write, confirm, tombstone, TTL
- *      pruning, and hard-clear must update BOTH
- *        - `.omc/state/skill-active-state.json`
- *        - `.omc/state/sessions/{sessionId}/skill-active-state.json`
- *      together through this single helper.
- *   2. Support-skill writes go through the same helper so the shared file
- *      never drops the `active_skills` branch.
- *   3. The session copy is authoritative for session-local reads; the root
- *      copy is authoritative for cross-session aggregation.
+ *   1. Every ledger read-modify-write goes through
+ *      `mutateSkillActiveStateLocked()`.
+ *   2. Session files contain only their own workflow/support state.
+ *   3. The root file retains per-session ledgers for repair and exposes a
+ *      legacy aggregate projection without feeding it back into sessions.
+ *   4. Seen intent IDs are bounded and copied with a verified generation.
  */
 export declare const SKILL_ACTIVE_STATE_MODE = "skill-active";
 export declare const SKILL_ACTIVE_STATE_FILE = "skill-active-state.json";
 export declare const WORKFLOW_TOMBSTONE_TTL_MS: number;
+export declare const SKILL_SEEN_INTENT_LIMIT = 128;
 /**
  * Canonical workflow skills — the only skills that get workflow slots.
  * Non-workflow skills keep today's `light/medium/heavy` protection via the
@@ -65,6 +62,7 @@ export interface SkillActiveState {
     reinforcement_count: number;
     max_reinforcements: number;
     stale_ttl_ms: number;
+    last_intent_id?: string;
 }
 /** A single workflow-slot entry keyed by canonical workflow skill name. */
 export interface ActiveSkillSlot {
@@ -91,9 +89,21 @@ export interface ActiveSkillSlot {
 /** v2 mixed schema. */
 export interface SkillActiveStateV2 {
     version: 2;
+    generation?: number;
+    seen_intents?: string[];
+    active_skills: Record<string, ActiveSkillSlot>;
+    support_skill?: SkillActiveState | null;
+    global_ledger?: SkillSessionLedger;
+    session_ledgers?: Record<string, SkillSessionLedger>;
+    session_tombstones?: Record<string, number>;
+}
+export interface SkillSessionLedger {
+    generation: number;
+    seen_intents: string[];
     active_skills: Record<string, ActiveSkillSlot>;
     support_skill?: SkillActiveState | null;
 }
+export declare function isWorkflowSkillCompleted(slot: ActiveSkillSlot): boolean;
 export interface WriteSkillActiveStateCopiesOptions {
     /**
      * Override the root copy payload. Defaults to writing the same payload as
@@ -103,6 +113,10 @@ export interface WriteSkillActiveStateCopiesOptions {
     rootState?: SkillActiveStateV2 | null;
 }
 export declare function emptySkillActiveStateV2(): SkillActiveStateV2;
+export declare class SkillStateCorruptionError extends Error {
+    readonly path: string;
+    constructor(path: string);
+}
 /** Upsert (create or update) a workflow slot on a v2 state. Pure. */
 export declare function upsertWorkflowSkillSlot(state: SkillActiveStateV2, skillName: string, slotData?: Partial<ActiveSkillSlot>): SkillActiveStateV2;
 /**
@@ -141,6 +155,20 @@ export declare function isWorkflowSkillLive(state: SkillActiveStateV2, skillName
  * until TTL pruning removes the slot or a fresh invocation reactivates it.
  */
 export declare function isWorkflowSkillTombstoned(state: SkillActiveStateV2, skillName: string, ttlMs?: number, now?: number): boolean;
+export interface MutateSkillActiveStateLockedOptions {
+    intentId?: string;
+    rootState?: SkillActiveStateV2 | null;
+}
+export interface MutateSkillActiveStateLockedResult {
+    status: 'written' | 'skipped' | 'repaired' | 'failed';
+    state?: SkillActiveStateV2;
+}
+/**
+ * The single owner for skill-ledger read-modify-write transactions.
+ * Session-local state never borrows root aggregate fields. The root retains a
+ * per-session repair copy with a matching generation and bounded intent set.
+ */
+export declare function mutateSkillActiveStateLocked(directory: string, sessionId: string | undefined, mutate: (current: SkillActiveStateV2) => SkillActiveStateV2, options?: MutateSkillActiveStateLockedOptions): MutateSkillActiveStateLockedResult;
 /**
  * Read the v2 mixed-schema workflow ledger, normalizing legacy scalar state
  * into `support_skill` without dropping support-skill data.
@@ -169,6 +197,10 @@ export declare function readSkillActiveStateNormalized(directory: string, sessio
  * @returns true when all writes / deletes succeeded, false otherwise.
  */
 export declare function writeSkillActiveStateCopies(directory: string, nextState: SkillActiveStateV2, sessionId?: string, options?: WriteSkillActiveStateCopiesOptions): boolean;
+/** Clear every root and session skill ledger under the shared owner lock. */
+export declare function clearAllSkillActiveStateLocked(directory: string): boolean;
+/** Clear one session ledger and both repair copies under the root owner lock. */
+export declare function clearSkillActiveSessionStateLocked(directory: string, sessionId: string): boolean;
 /**
  * Read the support-skill state as a legacy scalar `SkillActiveState`.
  *
@@ -190,6 +222,20 @@ export declare function readSkillActiveState(directory: string, sessionId?: stri
  *   confusion with user-defined project skills of the same name (#1581).
  */
 export declare function writeSkillActiveState(directory: string, skillName: string, sessionId?: string, rawSkillName?: string): SkillActiveState | null;
+export interface UpsertSupportSkillLockedOptions {
+    observedAt?: string;
+    intentId?: string;
+}
+export interface UpsertSupportSkillLockedResult {
+    status: 'written' | 'skipped' | 'repaired' | 'failed';
+    state?: SkillActiveState;
+}
+/**
+ * Locked semantic update for the support_skill branch. The full v2 ledger is
+ * re-read under the root owner lock, workflow slots are preserved, and root
+ * plus session copies are written together through the canonical copier.
+ */
+export declare function upsertSupportSkillActiveStateLocked(directory: string, skillName: string, sessionId?: string, rawSkillName?: string, options?: UpsertSupportSkillLockedOptions): UpsertSupportSkillLockedResult;
 /**
  * Clear support-skill state while preserving workflow slots.
  */
@@ -198,8 +244,8 @@ export declare function isSkillStateStale(state: SkillActiveState): boolean;
 /**
  * Stop-hook integration for support skills.
  *
- * Reinforcement increments go through `writeSkillActiveStateCopies()` so the
- * workflow-slot ledger is never clobbered by support-skill writes.
+ * Reinforcement updates go through the skill-state owner so workflow and
+ * support-skill writers cannot clobber each other.
  */
 export declare function checkSkillActiveState(directory: string, sessionId?: string): {
     shouldBlock: boolean;

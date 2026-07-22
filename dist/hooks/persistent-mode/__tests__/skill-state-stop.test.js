@@ -75,11 +75,15 @@ describe('persistent-mode skill-state stop integration (issue #1033)', () => {
                     status: 'running',
                 },
             ]);
+            const statePath = join(tempDir, '.omc', 'state', 'sessions', sessionId, 'skill-active-state.json');
+            const originalBytes = readFileSync(statePath);
             const result = await checkPersistentModes(sessionId, tempDir);
             expect(result.shouldBlock).toBe(false);
-            const statePath = join(tempDir, '.omc', 'state', 'sessions', sessionId, 'skill-active-state.json');
+            expect(readFileSync(statePath)).toEqual(originalBytes);
             const persisted = JSON.parse(readFileSync(statePath, 'utf-8'));
             expect(persisted.reinforcement_count).toBe(0);
+            expect(persisted.version).toBeUndefined();
+            expect(persisted.support_skill).toBeUndefined();
         }
         finally {
             rmSync(tempDir, { recursive: true, force: true });

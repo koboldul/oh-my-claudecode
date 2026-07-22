@@ -213,7 +213,7 @@ function makeJobResponse(jobId, job, extra = {}) {
 }
 const startSchema = z.object({
     teamName: z.string().describe('Slug name for the team (e.g. "auth-review")'),
-    agentTypes: z.array(z.string()).describe('Agent type per worker: "claude", "codex", "gemini", or "antigravity"'),
+    agentTypes: z.array(z.string()).describe('Agent type per worker, including "claude", "codex", "gemini", "antigravity", or "copilot"'),
     tasks: z.array(z.object({
         subject: z.string().describe('Brief task title'),
         description: z.string().describe('Full task description'),
@@ -481,7 +481,7 @@ const TOOLS = [
             type: 'object',
             properties: {
                 teamName: { type: 'string', description: 'Slug name for the team' },
-                agentTypes: { type: 'array', items: { type: 'string' }, description: '"claude", "codex", "gemini", or "antigravity" per worker' },
+                agentTypes: { type: 'array', items: { type: 'string' }, description: 'CLI provider per worker, including "copilot"' },
                 tasks: {
                     type: 'array',
                     items: {

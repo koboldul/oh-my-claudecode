@@ -3,6 +3,7 @@ import { join } from 'path';
 import { existsSync } from 'fs';
 import { tmuxExecAsync } from '../cli/tmux-utils.js';
 import { buildWorkerArgv, resolveValidatedBinaryPath, getWorkerEnv as getModelWorkerEnv, isPromptModeAgent, getPromptModeArgs, resolveClaudeWorkerModel, assertHeadlessSupported } from './model-contract.js';
+import { resolveCopilotModel, resolveCopilotReasoningEffort } from '../config/models.js';
 import { validateTeamName } from './team-name.js';
 import { createTeamSession, spawnWorkerInPane, sendToWorker, isWorkerAlive, killTeamSession, resolveSplitPaneWorkerPaneIds, waitForPaneReady, applyMainVerticalLayout, killTeamPane, splitTeamWorkerPane, } from './tmux-session.js';
 import { composeInitialInbox, ensureWorkerStateDir, writeWorkerOverlay, generateTriggerMessage, } from './worker-bootstrap.js';
@@ -590,6 +591,9 @@ export async function spawnWorkerForTask(runtime, workerNameValue, taskIndex) {
                 || process.env.OMC_GROK_DEFAULT_MODEL
                 || undefined;
         }
+        if (agentType === 'copilot') {
+            return resolveCopilotModel();
+        }
         if (agentType === 'cursor') {
             return undefined;
         }
@@ -602,8 +606,9 @@ export async function spawnWorkerForTask(runtime, workerNameValue, taskIndex) {
         cwd: runtime.cwd,
         resolvedBinaryPath,
         model: modelForAgent,
+        reasoningEffort: agentType === 'copilot' ? resolveCopilotReasoningEffort() : undefined,
     });
-    // For prompt-mode agents (e.g. Gemini Ink TUI, Antigravity --print), pass
+    // For prompt-mode agents (e.g. Gemini, Antigravity, Copilot), pass
     // instruction via CLI flag so tmux send-keys never needs to interact with
     // the TUI input widget.
     // Codex and Claude team workers are persistent interactive panes and are
@@ -736,11 +741,11 @@ export async function shutdownTeam(teamName, sessionName, cwd, timeoutMs = 30_00
         teamName,
     });
     const configData = await readJsonSafe(join(root, 'config.json'));
-    // CLI workers (claude/codex/gemini/grok/cursor tmux pane processes) never write shutdown-ack.json.
+    // CLI workers never write shutdown-ack.json.
     // Polling for ACK files on CLI worker teams wastes the full timeoutMs on every shutdown.
     // Detect CLI worker teams by checking if all agent types are known CLI types, and skip
     // ACK polling — the tmux kill below handles process cleanup instead.
-    const CLI_AGENT_TYPES = new Set(['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity']);
+    const CLI_AGENT_TYPES = new Set(['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity', 'copilot']);
     const agentTypes = configData?.agentTypes ?? [];
     const isCliWorkerTeam = agentTypes.length > 0 && agentTypes.every(t => CLI_AGENT_TYPES.has(t));
     if (!isCliWorkerTeam) {

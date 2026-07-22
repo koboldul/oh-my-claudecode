@@ -4,6 +4,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { recordToolUsage, getAgentDashboard, getStaleAgents, getTrackingStats, processSubagentStart, processSubagentStop, readTrackingState, writeTrackingState, recordToolUsageWithTiming, getAgentPerformance, updateTokenUsage, recordFileOwnership, detectFileConflicts, suggestInterventions, calculateParallelEfficiency, getAgentObservatory, flushPendingWrites, } from "../index.js";
 import { readMissionBoardState } from "../../../hud/mission-board.js";
+import { readReplayEvents } from "../session-replay.js";
 describe("subagent-tracker", () => {
     let testDir;
     beforeEach(() => {
@@ -618,10 +619,7 @@ describe("subagent-tracker", () => {
             expect(state.total_completed).toBe(0);
             expect(state.total_failed).toBe(0);
         });
-        it("closes the sole running agent when a fork stop arrives with an unmatched agent_id", () => {
-            // #3252: native fork stop events can carry an agent_id never registered
-            // by SubagentStart. With exactly one running agent, reconcile it instead
-            // of leaving it "running" forever.
+        it("does not name-correlate a stop that carries an unmatched exact agent_id", () => {
             processSubagentStart({
                 session_id: "session-unmatched-single",
                 transcript_path: join(testDir, "transcript.jsonl"),
@@ -644,49 +642,52 @@ describe("subagent-tracker", () => {
             });
             flushPendingWrites();
             const state = readTrackingState(testDir, "session-unmatched-single");
-            expect(getStaleAgents(state)).toHaveLength(0);
-            expect(state.agents.filter((a) => a.status === "running")).toHaveLength(0);
-            const reconciled = state.agents.find((a) => a.agent_id === "registered-agent");
-            expect(reconciled?.status).toBe("completed");
-            expect(reconciled?.output_summary).toBe("fork done");
-            // No synthetic entry created for the unknown id when a fallback match exists.
-            expect(state.agents.some((a) => a.agent_id === "native-fork-agent-id")).toBe(false);
+            expect(state.agents.find((a) => a.agent_id === "registered-agent")?.status)
+                .toBe("running");
+            const unmatched = state.agents.find((a) => a.agent_id === "native-fork-agent-id");
+            expect(unmatched?.status).toBe("completed");
+            expect(unmatched?.synthetic).toBe(true);
+            expect(unmatched?.correlation_strategy).toBe("unmatched-stop");
             expect(state.total_completed).toBe(1);
         });
-        it("reconciles an unmatched fork stop by agent_type when one type matches", () => {
-            for (const [id, type] of [
-                ["exec-1", "oh-my-claudecode:executor"],
-                ["explore-1", "oh-my-claudecode:explorer"],
+        it("correlates id-less same-name stops in deterministic FIFO order", () => {
+            for (const [id, timestamp] of [
+                ["exec-1", 1_700_000_000_000],
+                ["exec-2", 1_700_000_000_001],
             ]) {
                 processSubagentStart({
-                    session_id: "session-unmatched-bytype",
-                    transcript_path: join(testDir, "transcript.jsonl"),
-                    cwd: testDir,
-                    permission_mode: "default",
-                    hook_event_name: "SubagentStart",
-                    agent_id: id,
-                    agent_type: type,
-                    prompt: "do work",
+                    host: "copilot",
+                    sessionId: "session-name-fifo",
+                    transcriptPath: join(testDir, "transcript.jsonl"),
+                    directory: testDir,
+                    agentName: "executor",
+                    agentDisplayName: "Executor",
+                    agentDescription: id,
+                    timestamp,
                 });
             }
-            flushPendingWrites();
-            processSubagentStop({
-                session_id: "session-unmatched-bytype",
-                transcript_path: join(testDir, "transcript.jsonl"),
-                cwd: testDir,
-                permission_mode: "default",
-                hook_event_name: "SubagentStop",
-                agent_id: "native-fork-id",
-                agent_type: "oh-my-claudecode:explorer",
-                output: "explorer done",
+            const before = readTrackingState(testDir, "session-name-fifo");
+            const [firstId, secondId] = before.agents.map((agent) => agent.agent_id);
+            const output = processSubagentStop({
+                host: "copilot",
+                sessionId: "session-name-fifo",
+                transcriptPath: join(testDir, "transcript.jsonl"),
+                directory: testDir,
+                agentName: "executor",
+                agentDisplayName: "Executor",
+                timestamp: 1_700_000_001_000,
             });
             flushPendingWrites();
-            const state = readTrackingState(testDir, "session-unmatched-bytype");
-            const explorer = state.agents.find((a) => a.agent_id === "explore-1");
-            const executor = state.agents.find((a) => a.agent_id === "exec-1");
-            expect(explorer?.status).toBe("completed");
-            expect(executor?.status).toBe("running");
-            expect(state.agents.some((a) => a.agent_id === "native-fork-id")).toBe(false);
+            const state = readTrackingState(testDir, "session-name-fifo");
+            expect(state.agents.find((a) => a.agent_id === firstId)?.status)
+                .toBe("completed");
+            expect(state.agents.find((a) => a.agent_id === secondId)?.status)
+                .toBe("running");
+            expect(output.tracking).toMatchObject({
+                agent_id: firstId,
+                correlation_strategy: "agent-name-fifo",
+                synthetic_correlation: true,
+            });
             expect(state.total_completed).toBe(1);
         });
         it("reaps stale running agents and records a synthetic stop when reconciliation is ambiguous", () => {
@@ -736,6 +737,16 @@ describe("subagent-tracker", () => {
             expect(state.agents.find((a) => a.agent_id === "stale-2")?.status).toBe("failed");
             const synthetic = state.agents.find((a) => a.agent_id === "native-fork-id");
             expect(synthetic?.status).toBe("completed");
+            expect(synthetic?.agent_type).toBe("untracked-native-fork");
+            expect(synthetic?.duration_ms).toBeUndefined();
+            expect(synthetic?.synthetic).toBe(true);
+            expect(synthetic?.telemetry_status).toBe("unmatched_stop");
+            expect(synthetic?.telemetry_note).toContain("without a matching SubagentStart");
+            const replayStop = readReplayEvents(testDir, "session-unmatched-ambiguous").find((event) => event.event === "agent_stop" && event.agent === "native-");
+            expect(replayStop?.agent_type).toBe("untracked-native-fork");
+            expect(replayStop?.duration_ms).toBeUndefined();
+            expect(replayStop?.synthetic).toBe(true);
+            expect(replayStop?.telemetry_status).toBe("unmatched_stop");
             expect(state.total_failed).toBe(2);
             expect(state.total_completed).toBe(1);
         });
@@ -769,6 +780,11 @@ describe("subagent-tracker", () => {
             expect(state.agents.find((a) => a.agent_id === "fresh-1")?.status).toBe("running");
             expect(state.agents.find((a) => a.agent_id === "fresh-2")?.status).toBe("running");
             expect(state.agents.find((a) => a.agent_id === "native-fork-id")?.status).toBe("completed");
+            const synthetic = state.agents.find((a) => a.agent_id === "native-fork-id");
+            expect(synthetic?.agent_type).toBe("untracked-native-fork");
+            expect(synthetic?.duration_ms).toBeUndefined();
+            expect(synthetic?.synthetic).toBe(true);
+            expect(synthetic?.telemetry_status).toBe("unmatched_stop");
             expect(state.total_completed).toBe(1);
             expect(state.total_failed).toBe(0);
         });

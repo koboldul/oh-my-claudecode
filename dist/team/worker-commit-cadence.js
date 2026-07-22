@@ -228,7 +228,7 @@ export function startFallbackPoller(worktreePath, workerName, opts) {
 /**
  * Installs the appropriate commit cadence for the worker agent type.
  * - claude  → PostToolUse hook in .claude/settings.json
- * - codex / gemini / cursor / antigravity → fallback fs-watch poller (caller owns the handle)
+ * - codex / gemini / cursor / grok / antigravity / copilot → fallback fs-watch poller (caller owns the handle)
  *
  * Returns the chosen method. The fallback-poll handle is NOT started here;
  * callers that need the poller should call startFallbackPoller directly.
@@ -243,7 +243,7 @@ export async function installCommitCadence(ctx) {
         await installPostToolUseHook(ctx.worktreePath, ctx.workerName);
         return { method: 'hook' };
     }
-    // codex / gemini / cursor / antigravity: no PostToolUse hook; caller starts the fallback poller.
+    // External CLI workers have no PostToolUse hook; caller starts the fallback poller.
     return { method: 'fallback-poll' };
 }
 /**

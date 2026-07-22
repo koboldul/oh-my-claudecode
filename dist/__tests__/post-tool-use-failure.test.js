@@ -2,10 +2,12 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { ensureHookRuntimeBundle } from './helpers/ensure-hook-runtime-bundle.js';
 const NODE = process.execPath;
 const REPO_ROOT = resolve(join(__dirname, '..', '..'));
 const SCRIPT_PATH = join(REPO_ROOT, 'scripts', 'post-tool-use-failure.mjs');
 const TEST_TMP_ROOT = join(REPO_ROOT, '.tmp-post-tool-use-failure-tests');
+ensureHookRuntimeBundle();
 function runHook(input, extraEnv) {
     const raw = execFileSync(NODE, [SCRIPT_PATH], {
         input: JSON.stringify(input),

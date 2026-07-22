@@ -8,7 +8,10 @@ import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { getClaudeConfigDir } from "../utils/config-dir.js";
 import { getHookConfig, mergeHookConfigIntoNotificationConfig, } from "./hook-config.js";
-const CONFIG_FILE = join(getClaudeConfigDir(), ".omc-config.json");
+export function getNotificationConfigPath() {
+    return join(getClaudeConfigDir(), ".omc-config.json");
+}
+const CONFIG_FILE = getNotificationConfigPath();
 const DEFAULT_TMUX_TAIL_LINES = 15;
 /**
  * Read raw config from .omc-config.json
@@ -749,7 +752,10 @@ export function getReplyConfig() {
     };
 }
 import { validateCustomIntegration, checkDuplicateIds } from "./validation.js";
-const LEGACY_OPENCLAW_CONFIG = join(getClaudeConfigDir(), "omc_config.openclaw.json");
+export function getLegacyOpenClawConfigPath() {
+    return join(getClaudeConfigDir(), "omc_config.openclaw.json");
+}
+const LEGACY_OPENCLAW_CONFIG = getLegacyOpenClawConfigPath();
 /**
  * Detect if legacy OpenClaw configuration exists.
  */

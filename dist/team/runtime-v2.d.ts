@@ -122,6 +122,7 @@ export declare function resolveTaskAssignment(task: {
 }>, roleRoutingConfig: Partial<Record<CanonicalTeamRole, TeamRoleAssignmentSpec>> | undefined, resolvedBinaryPaths: Partial<Record<CliAgentType, string>>, fallbackAgent: CliAgentType): {
     agentType: CliAgentType;
     model: string;
+    reasoningEffort?: RoleAssignment['reasoningEffort'];
     role: CanonicalTeamRole | null;
 };
 export interface StartTeamV2Config {

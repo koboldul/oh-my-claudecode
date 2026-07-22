@@ -17,6 +17,7 @@ import { isModeActive, getActiveModes, getAllModeStatuses, clearModeState, getSt
 import { namedWorkflowRuntimeSupported, validateNamedWorkflowStateStructure } from '../hooks/autopilot/named-workflow-resume-validator.js';
 import { cancelMergeReadiness, createInitialMergeReadinessState, readMergeReadinessState, setMergeReadinessContent, recordMergeReadinessMCQAnswer } from '../hooks/merge-readiness/runtime.js';
 import { formatMergeReadinessReport, redactMergeReadinessState } from '../hooks/merge-readiness/report.js';
+import { clearAllSkillActiveStateLocked, clearSkillActiveSessionStateLocked, mutateSkillActiveStateLocked, readSkillActiveStateNormalized, } from '../hooks/skill-state/index.js';
 // Canonical execution modes from mode-registry (deep-interview and self-improve
 // are first-class modes with dedicated MODE_CONFIGS entries; ralplan remains an
 // extra state-only mode handled via the registry-fallback path).
@@ -603,6 +604,30 @@ function publicStateForMode(mode, state) {
         ? redactMergeReadinessState(state)
         : state;
 }
+function isSkillActiveStateEmpty(state) {
+    return Object.keys(state.active_skills).length === 0
+        && !state.support_skill
+        && (state.seen_intents?.length ?? 0) === 0
+        && Object.keys(state.session_ledgers ?? {}).length === 0
+        && !state.global_ledger;
+}
+function isExtraStateActive(mode, state) {
+    if (mode !== 'skill-active')
+        return state.active === true;
+    const skillState = state;
+    return skillState.support_skill?.active === true
+        || Object.values(skillState.active_skills ?? {}).some((slot) => typeof slot.completed_at !== 'string'
+            || slot.completed_at.trim().length === 0);
+}
+function readExtraState(mode, root, sessionId) {
+    if (mode === 'skill-active') {
+        return readSkillActiveStateNormalized(root, sessionId);
+    }
+    const statePath = sessionId
+        ? resolveSessionStatePath(mode, sessionId, root)
+        : getStatePath(mode, root);
+    return readJsonRecord(statePath);
+}
 // ============================================================================
 // state_read - Read state for a mode
 // ============================================================================
@@ -620,6 +645,43 @@ export const stateReadTool = {
         try {
             const root = validateWorkingDirectory(workingDirectory);
             const sessionId = session_id;
+            if (mode === 'skill-active') {
+                if (sessionId) {
+                    try {
+                        validateSessionId(sessionId);
+                    }
+                    catch {
+                        return {
+                            content: [{
+                                    type: 'text',
+                                    text: `No state found for mode: ${mode} in invalid session scope.`
+                                }]
+                        };
+                    }
+                }
+                const state = readSkillActiveStateNormalized(root, sessionId);
+                const statePath = sessionId
+                    ? resolveSessionStatePath(mode, sessionId, root)
+                    : getStatePath(mode, root);
+                if (isSkillActiveStateEmpty(state)) {
+                    return {
+                        content: [{
+                                type: 'text',
+                                text: sessionId
+                                    ? `No state found for mode: ${mode} in session: ${sessionId}\nExpected path: ${statePath}`
+                                    : `No state found for mode: ${mode}\nExpected legacy path: ${statePath}`
+                            }]
+                    };
+                }
+                return {
+                    content: [{
+                            type: 'text',
+                            text: sessionId
+                                ? `## State for ${mode} (session: ${sessionId})\n\nPath: ${statePath}\n\n\`\`\`json\n${JSON.stringify(state, null, 2)}\n\`\`\``
+                                : `## State for ${mode}\n\nPath: ${statePath}\n\n\`\`\`json\n${JSON.stringify(state, null, 2)}\n\`\`\``
+                        }]
+                };
+            }
             // If session_id provided, read from session-scoped path
             if (sessionId) {
                 validateSessionId(sessionId);
@@ -831,7 +893,14 @@ export const stateWriteTool = {
             };
             let writtenState = stateWithMeta;
             let namedPauseCommitted = false;
-            if (mode === 'autopilot' && builtState.active === false) {
+            if (mode === 'skill-active') {
+                const result = mutateSkillActiveStateLocked(root, sessionId, () => stateWithMeta);
+                if (result.status === 'failed') {
+                    throw new Error('skill-state owner mutation failed');
+                }
+                writtenState = (result.state ?? readSkillActiveStateNormalized(root, sessionId));
+            }
+            else if (mode === 'autopilot' && builtState.active === false) {
                 let currentState = null;
                 try {
                     currentState = JSON.parse(readFileSync(statePath, 'utf8'));
@@ -990,6 +1059,24 @@ export const stateClearTool = {
         try {
             const root = validateWorkingDirectory(workingDirectory);
             const sessionId = session_id;
+            if (mode === 'skill-active') {
+                if (sessionId)
+                    validateSessionId(sessionId);
+                const cleared = sessionId
+                    ? clearSkillActiveSessionStateLocked(root, sessionId)
+                    : clearAllSkillActiveStateLocked(root);
+                return {
+                    content: [{
+                            type: 'text',
+                            text: cleared
+                                ? sessionId
+                                    ? `Successfully cleared state for mode: ${mode} in session: ${sessionId}`
+                                    : `Successfully cleared all state for mode: ${mode}`
+                                : `Failed to clear state for mode: ${mode}${sessionId ? ` in session: ${sessionId}` : ''}`
+                        }],
+                    ...(!cleared ? { isError: true } : {})
+                };
+            }
             // Merge-readiness is an audit gate, so clearing it must leave a durable
             // terminal result and report rather than deleting the evidence trail.
             if (mode === 'merge-readiness') {
@@ -1569,13 +1656,9 @@ export const stateListActiveTool = {
                 const activeModes = [...getActiveModes(root, sessionId)];
                 for (const mode of EXTRA_STATE_ONLY_MODES) {
                     try {
-                        const statePath = resolveSessionStatePath(mode, sessionId, root);
-                        if (existsSync(statePath)) {
-                            const content = readFileSync(statePath, 'utf-8');
-                            const state = JSON.parse(content);
-                            if (state.active) {
-                                activeModes.push(mode);
-                            }
+                        const state = readExtraState(mode, root, sessionId);
+                        if (state && isExtraStateActive(mode, state)) {
+                            activeModes.push(mode);
                         }
                     }
                     catch {
@@ -1608,18 +1691,14 @@ export const stateListActiveTool = {
             // Check legacy paths
             const legacyActiveModes = [...getActiveModes(root)];
             for (const mode of EXTRA_STATE_ONLY_MODES) {
-                const statePath = getStatePath(mode, root);
-                if (existsSync(statePath)) {
-                    try {
-                        const content = readFileSync(statePath, 'utf-8');
-                        const state = JSON.parse(content);
-                        if (state.active) {
-                            legacyActiveModes.push(mode);
-                        }
+                try {
+                    const state = readExtraState(mode, root);
+                    if (state && isExtraStateActive(mode, state)) {
+                        legacyActiveModes.push(mode);
                     }
-                    catch {
-                        // Ignore parse errors
-                    }
+                }
+                catch {
+                    // Ignore parse errors
                 }
             }
             for (const mode of CONVERGED_STATE_PATH_MODES) {
@@ -1639,13 +1718,9 @@ export const stateListActiveTool = {
                 const sessionActiveModes = [...getActiveModes(root, sid)];
                 for (const mode of EXTRA_STATE_ONLY_MODES) {
                     try {
-                        const statePath = resolveSessionStatePath(mode, sid, root);
-                        if (existsSync(statePath)) {
-                            const content = readFileSync(statePath, 'utf-8');
-                            const state = JSON.parse(content);
-                            if (state.active) {
-                                sessionActiveModes.push(mode);
-                            }
+                        const state = readExtraState(mode, root, sid);
+                        if (state && isExtraStateActive(mode, state)) {
+                            sessionActiveModes.push(mode);
                         }
                     }
                     catch {
@@ -1717,16 +1792,21 @@ export const stateGetStatusTool = {
                         : resolveSessionStatePath(mode, sessionId, root);
                     const active = MODE_CONFIGS[mode]
                         ? isModeActive(mode, root, sessionId)
-                        : existsSync(statePath) && (() => {
-                            try {
-                                const content = readFileSync(statePath, 'utf-8');
-                                const state = JSON.parse(content);
-                                return state.active === true;
-                            }
-                            catch {
-                                return false;
-                            }
-                        })();
+                        : EXTRA_STATE_ONLY_MODES.includes(mode)
+                            ? (() => {
+                                const state = readExtraState(mode, root, sessionId);
+                                return !!state && isExtraStateActive(mode, state);
+                            })()
+                            : existsSync(statePath) && (() => {
+                                try {
+                                    const content = readFileSync(statePath, 'utf-8');
+                                    const state = JSON.parse(content);
+                                    return state.active === true;
+                                }
+                                catch {
+                                    return false;
+                                }
+                            })();
                     let statePreview = 'No state file';
                     if (existsSync(statePath)) {
                         try {
@@ -1756,16 +1836,21 @@ export const stateGetStatusTool = {
                 const legacyPath = getStatePath(mode, root);
                 const legacyActive = MODE_CONFIGS[mode]
                     ? isModeActive(mode, root)
-                    : existsSync(legacyPath) && (() => {
-                        try {
-                            const content = readFileSync(legacyPath, 'utf-8');
-                            const state = JSON.parse(content);
-                            return state.active === true;
-                        }
-                        catch {
-                            return false;
-                        }
-                    })();
+                    : EXTRA_STATE_ONLY_MODES.includes(mode)
+                        ? (() => {
+                            const state = readExtraState(mode, root);
+                            return !!state && isExtraStateActive(mode, state);
+                        })()
+                        : existsSync(legacyPath) && (() => {
+                            try {
+                                const content = readFileSync(legacyPath, 'utf-8');
+                                const state = JSON.parse(content);
+                                return state.active === true;
+                            }
+                            catch {
+                                return false;
+                            }
+                        })();
                 lines.push(`### Legacy Path`);
                 lines.push(`- **Active:** ${legacyActive ? 'Yes' : 'No'}`);
                 lines.push(`- **State Path:** ${legacyPath}`);
@@ -1775,6 +1860,10 @@ export const stateGetStatusTool = {
                     ? getActiveSessionsForMode(mode, root)
                     : listSessionIds(root).filter(sid => {
                         try {
+                            if (EXTRA_STATE_ONLY_MODES.includes(mode)) {
+                                const state = readExtraState(mode, root, sid);
+                                return !!state && isExtraStateActive(mode, state);
+                            }
                             const sessionPath = resolveSessionStatePath(mode, sid, root);
                             if (existsSync(sessionPath)) {
                                 const content = readFileSync(sessionPath, 'utf-8');
@@ -1825,17 +1914,8 @@ export const stateGetStatusTool = {
                 const statePath = sessionId
                     ? resolveSessionStatePath(mode, sessionId, root)
                     : getStatePath(mode, root);
-                let active = false;
-                if (existsSync(statePath)) {
-                    try {
-                        const content = readFileSync(statePath, 'utf-8');
-                        const state = JSON.parse(content);
-                        active = state.active === true;
-                    }
-                    catch {
-                        // Ignore parse errors
-                    }
-                }
+                const state = readExtraState(mode, root, sessionId);
+                const active = !!state && isExtraStateActive(mode, state);
                 const icon = active ? '[ACTIVE]' : '[INACTIVE]';
                 lines.push(`${icon} **${mode}**: ${active ? 'Active' : 'Inactive'}`);
                 lines.push(`   Path: \`${statePath}\``);

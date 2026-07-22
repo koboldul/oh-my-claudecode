@@ -100,9 +100,14 @@ function readDeepInterviewThresholdFromSettings(path) {
         ? threshold
         : null;
 }
+export function getDeepInterviewSettingsPaths() {
+    return {
+        profile: join(getClaudeConfigDir(), 'settings.json'),
+        project: join(process.cwd(), '.claude', 'settings.json'),
+    };
+}
 function getDeepInterviewAmbiguityThresholdResolution() {
-    const profileSettingsPath = join(getClaudeConfigDir(), 'settings.json');
-    const projectSettingsPath = join(process.cwd(), '.claude', 'settings.json');
+    const { profile: profileSettingsPath, project: projectSettingsPath, } = getDeepInterviewSettingsPaths();
     const profileThreshold = readDeepInterviewThresholdFromSettings(profileSettingsPath);
     const projectThreshold = readDeepInterviewThresholdFromSettings(projectSettingsPath);
     if (projectThreshold !== null) {

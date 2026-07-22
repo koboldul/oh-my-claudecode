@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import { clearWorktreeCache } from '../../../lib/worktree-paths.js';
-import { isSafeCommand, isSafeRepoInspectionCommand, isSafeTargetedLocalTestCommand, isHeredocWithSafeBase, isActiveModeRunning, processPermissionRequest, } from '../index.js';
+import { isSafeCommand, isSafeAutoApprovedCommand, isSafePowerShellCommand, isSafeRepoInspectionCommand, isSafeTargetedLocalTestCommand, isHeredocWithSafeBase, isActiveModeRunning, processPermissionRequest, } from '../index.js';
 function initializeGitRepo(directory) {
     execFileSync('git', ['init', '--quiet'], {
         cwd: directory,
@@ -156,6 +156,109 @@ describe('permission-handler', () => {
             expect(isSafeCommand('  git status; rm -rf /  ')).toBe(false);
         });
     });
+    describe('PowerShell external executable allowlist', () => {
+        const safeCases = [
+            'git status',
+            'git status --short --branch',
+            'git.exe diff --stat',
+            'git diff --cached --name-only',
+            'git log --oneline',
+            'git log -n 5 --graph',
+            'git branch',
+            'git branch -a',
+            'git branch -r',
+            'git branch --all',
+            'git branch --show-current',
+            'git branch --list feature/topic',
+            'git branch --sort=-committerdate',
+            'git show HEAD',
+            'git show --stat HEAD',
+            'npm.cmd run lint',
+            'pnpm typecheck',
+            'yarn run build',
+            'tsc.cmd --noEmit',
+            'eslint .',
+            'prettier --check .',
+        ];
+        const unsafeCases = [
+            'ls',
+            'ls Env:',
+            'cat package.json',
+            'Get-ChildItem .',
+            'gci .',
+            'git status | Remove-Item -Recurse .',
+            'git status; Remove-Item -Recurse .',
+            '& git status',
+            '{ git status }',
+            'git show Env:PATH',
+            'git status $(Remove-Item -Recurse .)',
+            'git status `Remove-Item -Recurse .`',
+            'git branch topic',
+            'git branch -d topic',
+            'git branch -D topic',
+            'git branch -m old-name new-name',
+            'git branch -M old-name new-name',
+            'git branch -c source copy',
+            'git branch -C source copy',
+            'git branch --delete topic',
+            'git branch --move old-name new-name',
+            'git branch --copy source copy',
+            'git branch --set-upstream-to origin/main',
+            'git branch --unset-upstream',
+            'git branch --edit-description',
+            'git branch --track topic origin/main',
+            'git branch -f topic HEAD',
+            'git fetch',
+            'git fetch --prune',
+            'git status --pathspec-from-file=paths.txt',
+            'git diff --output=diff.txt',
+            'git diff --ext-diff',
+            'git diff --no-index before.txt after.txt',
+            'git log --output=log.txt',
+            'git log --ext-diff',
+            'git show --output=show.txt',
+            'git show --textconv HEAD',
+            'npm test',
+            'npm run lint -- --fix',
+            'eslint --fix .',
+            'prettier --write .',
+            'Microsoft.PowerShell.Management\\Get-ChildItem .',
+        ];
+        safeCases.forEach((command) => {
+            it(`allows a narrow external command: ${command}`, () => {
+                expect(isSafePowerShellCommand(command)).toBe(true);
+                expect(isSafeAutoApprovedCommand(command, '/tmp', 'powershell')).toBe(true);
+            });
+        });
+        unsafeCases.forEach((command) => {
+            it(`rejects PowerShell aliases or syntax: ${command}`, () => {
+                expect(isSafePowerShellCommand(command)).toBe(false);
+                expect(isSafeAutoApprovedCommand(command, '/tmp', 'powershell')).toBe(false);
+            });
+        });
+    });
+    describe('canonical Copilot permission pass-through', () => {
+        function createCanonicalInput(nativeToolName, shellDialect) {
+            return {
+                host: 'copilot',
+                contract: 'copilot-1.0.72-1',
+                hookType: 'permission-request',
+                directory: '/tmp',
+                toolName: nativeToolName,
+                nativeToolName,
+                canonicalToolName: 'Bash',
+                toolInput: { command: 'git status' },
+                shellDialect,
+            };
+        }
+        it.each([
+            ['bash', 'posix'],
+            ['powershell', 'powershell'],
+        ])('passes native %s requests through without OMC allow', (nativeToolName, shellDialect) => {
+            const result = processPermissionRequest(createCanonicalInput(nativeToolName, shellDialect));
+            expect(result.hookSpecificOutput).toBeUndefined();
+        });
+    });
     describe('repo-scoped inspection commands', () => {
         const testDir = '/tmp/omc-permission-safe-inspection';
         beforeEach(() => {
@@ -240,10 +343,6 @@ describe('permission-handler', () => {
                     cmd: `git commit -m "$(cat <<'EOF'\nCommit message here.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n)"`,
                 },
                 {
-                    desc: 'git commit with unquoted EOF delimiter',
-                    cmd: `git commit -m "$(cat <<EOF\nSome commit message\nEOF\n)"`,
-                },
-                {
                     desc: 'git commit with double-quoted delimiter',
                     cmd: `git commit -m "$(cat <<"EOF"\nMessage body\nEOF\n)"`,
                 },
@@ -254,6 +353,10 @@ describe('permission-handler', () => {
                 {
                     desc: 'git commit --amend with heredoc',
                     cmd: `git commit --amend -m "$(cat <<'EOF'\nUpdated message\nEOF\n)"`,
+                },
+                {
+                    desc: 'git commit with long message flag',
+                    cmd: `git commit --message "$(cat <<'EOF'\nUpdated message\nEOF\n)"`,
                 },
                 {
                     desc: 'git tag with heredoc annotation',
@@ -281,6 +384,18 @@ describe('permission-handler', () => {
                     cmd: "git commit -m \"$(cat <<'EOF' EOF)\"",
                 },
                 {
+                    desc: 'git commit with unquoted delimiter',
+                    cmd: `git commit -m "$(cat <<EOF\nSome commit message\nEOF\n)"`,
+                },
+                {
+                    desc: 'unquoted heredoc expands variables',
+                    cmd: `git commit -m "$(cat <<EOF\nMessage from $HOME\nEOF\n)"`,
+                },
+                {
+                    desc: 'unquoted heredoc performs command substitution',
+                    cmd: `git commit -m "$(cat <<EOF\n$(touch /tmp/omc-heredoc-bypass)\nEOF\n)"`,
+                },
+                {
                     desc: 'curl with heredoc (unsafe base)',
                     cmd: `curl -X POST http://example.com << 'EOF'\n{"key":"value"}\nEOF`,
                 },
@@ -295,6 +410,34 @@ describe('permission-handler', () => {
                 {
                     desc: 'multi-line command without heredoc operator',
                     cmd: 'git status\nrm -rf /',
+                },
+                {
+                    desc: 'heredoc opener appears only after an arbitrary statement',
+                    cmd: `git commit -m "message"\nrm -rf /\ncat <<'EOF'\nmessage\nEOF`,
+                },
+                {
+                    desc: 'heredoc marker is embedded in a normal message string',
+                    cmd: `git commit -m "literal <<'EOF'\nmessage\nEOF"`,
+                },
+                {
+                    desc: 'safe command prefix is followed by a chained command',
+                    cmd: `git commit; rm -rf / -m "$(cat <<'EOF'\nmessage\nEOF\n)"`,
+                },
+                {
+                    desc: 'arbitrary statement follows an otherwise valid heredoc',
+                    cmd: `git commit -m "$(cat <<'EOF'\nmessage\nEOF\n)"\nrm -rf /`,
+                },
+                {
+                    desc: 'heredoc delimiter quote is malformed',
+                    cmd: `git commit -m "$(cat <<'EOF"\nmessage\nEOF\n)"`,
+                },
+                {
+                    desc: 'heredoc closing delimiter does not match',
+                    cmd: `git commit -m "$(cat <<'EOF'\nmessage\nNOT_EOF\n)"`,
+                },
+                {
+                    desc: 'heredoc is not wrapped in the intended message substitution',
+                    cmd: `git commit -m "cat <<'EOF'\nmessage\nEOF\n"`,
                 },
                 {
                     desc: 'echo with heredoc (not in safe list)',
@@ -317,6 +460,11 @@ describe('permission-handler', () => {
                 it(`should return false for: ${desc}`, () => {
                     expect(isHeredocWithSafeBase(cmd)).toBe(false);
                 });
+            });
+            it('applies heredoc auto-allow only to POSIX shell dialects', () => {
+                const command = `git commit -m "$(cat <<'EOF'\nmessage\nEOF\n)"`;
+                expect(isSafeAutoApprovedCommand(command, '/tmp', 'posix')).toBe(true);
+                expect(isSafeAutoApprovedCommand(command, '/tmp', 'powershell')).toBe(false);
             });
         });
     });

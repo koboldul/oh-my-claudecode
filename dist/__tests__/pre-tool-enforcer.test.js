@@ -8,6 +8,7 @@ import { execFileSync } from 'child_process';
 // @ts-expect-error Local hook helper is a JS module loaded directly by the tests.
 import { evaluateAgentHeavyPreflight } from '../../scripts/lib/pre-tool-enforcer-preflight.mjs';
 const SCRIPT_PATH = join(process.cwd(), 'scripts', 'pre-tool-enforcer.mjs');
+const ADVISORY_TEST_NOW_MS = Date.now();
 function runPreToolEnforcer(input) {
     return runPreToolEnforcerWithEnv(input);
 }
@@ -48,6 +49,12 @@ function runPreToolEnforcerWithEnv(input, env = {}) {
             ANTHROPIC_DEFAULT_OPUS_MODEL: '',
             CLAUDE_CODE_BEDROCK_FABLE_MODEL: '',
             ANTHROPIC_DEFAULT_FABLE_MODEL: '',
+            OMC_HOST: '',
+            COPILOT_CLI: '',
+            COPILOT_AGENT_SESSION_ID: '',
+            OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL: '',
+            OMC_COPILOT_DEFAULT_MODEL: '',
+            OMC_COPILOT_REASONING_EFFORT: '',
             ...env,
         },
     });
@@ -74,7 +81,7 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
     afterEach(() => {
         rmSync(tempDir, { recursive: true, force: true });
     });
-    function runWithThrottle(toolName, nowMs = '1000') {
+    function runWithThrottle(toolName, nowMs = String(ADVISORY_TEST_NOW_MS)) {
         return runPreToolEnforcerWithEnv({
             tool_name: toolName,
             cwd: tempDir,
@@ -114,7 +121,7 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
         };
         const env = {
             OMC_PRE_TOOL_ADVISORY_COOLDOWN_MS: '5000',
-            OMC_PRE_TOOL_ADVISORY_NOW_MS: '1000',
+            OMC_PRE_TOOL_ADVISORY_NOW_MS: String(ADVISORY_TEST_NOW_MS),
         };
         const first = runPreToolEnforcerWithEnv(input, env);
         const repeated = runPreToolEnforcerWithEnv(input, env);
@@ -126,17 +133,17 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
         }
     });
     it('uses deterministic cooldown interval boundaries', () => {
-        const first = runWithThrottle('Bash', '1000');
-        const beforeCooldown = runWithThrottle('Bash', '5999');
-        const atCooldown = runWithThrottle('Bash', '6000');
+        const first = runWithThrottle('Bash', String(ADVISORY_TEST_NOW_MS));
+        const beforeCooldown = runWithThrottle('Bash', String(ADVISORY_TEST_NOW_MS + 4_999));
+        const atCooldown = runWithThrottle('Bash', String(ADVISORY_TEST_NOW_MS + 5_000));
         expect(first.hookSpecificOutput.additionalContext).toContain('Use parallel execution for independent tasks');
         expect(beforeCooldown).toEqual({ continue: true, suppressOutput: true });
         expect(atCooldown.hookSpecificOutput.additionalContext).toContain('Use parallel execution for independent tasks');
     });
-    it('does not let a future throttle timestamp suppress an advisory', () => {
-        runWithThrottle('Bash', '10000');
-        const output = runWithThrottle('Bash', '1000');
-        expect(output.hookSpecificOutput.additionalContext).toContain('Use parallel execution for independent tasks');
+    it('treats a future same-message timestamp as already emitted', () => {
+        runWithThrottle('Bash', String(ADVISORY_TEST_NOW_MS + 10_000));
+        const output = runWithThrottle('Bash', String(ADVISORY_TEST_NOW_MS));
+        expect(output).toEqual({ continue: true, suppressOutput: true });
     });
     it('keeps advisory throttle state capped after adding a new entry', () => {
         const sessionId = 'session-3163';
@@ -144,12 +151,12 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
         const entries = Object.fromEntries(Array.from({ length: 100 }, (_, index) => [
             `old-${index}`,
             {
-                last_emitted_at_ms: 10_000 - index,
+                last_emitted_at_ms: ADVISORY_TEST_NOW_MS - index,
                 message: `old message ${index}`,
             },
         ]));
         writeJson(throttlePath, { version: 1, entries });
-        runWithThrottle('Bash', '20000');
+        runWithThrottle('Bash', String(ADVISORY_TEST_NOW_MS + 20_000));
         const state = JSON.parse(readFileSync(throttlePath, 'utf-8'));
         expect(Object.keys(state.entries)).toHaveLength(100);
     });
@@ -159,15 +166,16 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
         const entries = Object.fromEntries(Array.from({ length: 100 }, (_, index) => [
             `future-${index}`,
             {
-                last_emitted_at_ms: 999_000 + index,
+                last_emitted_at_ms: ADVISORY_TEST_NOW_MS + 999_000 + index,
                 message: `future message ${index}`,
             },
         ]));
         writeJson(throttlePath, { version: 1, entries });
-        runWithThrottle('Bash', '20000');
+        runWithThrottle('Bash', String(ADVISORY_TEST_NOW_MS + 20_000));
         const state = JSON.parse(readFileSync(throttlePath, 'utf-8'));
         expect(Object.keys(state.entries)).toHaveLength(1);
-        expect(Object.values(state.entries)[0].last_emitted_at_ms).toBe(20_000);
+        expect(Object.values(state.entries)[0].last_emitted_at_ms)
+            .toBe(ADVISORY_TEST_NOW_MS + 20_000);
     });
 });
 describe('pre-tool-enforcer fallback gating (issue #970)', () => {
@@ -1811,7 +1819,12 @@ describe('pre-tool-enforcer agents.<name>.model injection (issue #3242)', () => 
         writeFileSync(join(dir, 'omc.jsonc'), jsonc);
     }
     function run(input, env = {}) {
-        return runPreToolEnforcerWithEnv({ cwd: tempDir, ...input }, { XDG_CONFIG_HOME: xdgConfigHome, OMC_ROUTING_FORCE_INHERIT: 'false', ...env });
+        return runPreToolEnforcerWithEnv({ cwd: tempDir, ...input }, {
+            APPDATA: xdgConfigHome,
+            XDG_CONFIG_HOME: xdgConfigHome,
+            OMC_ROUTING_FORCE_INHERIT: 'false',
+            ...env,
+        });
     }
     function updatedModel(output) {
         const hookOutput = output.hookSpecificOutput;
@@ -1893,7 +1906,7 @@ describe('pre-tool-enforcer agents.<name>.model injection (issue #3242)', () => 
         // window and is advisory-throttled.
         const throttleEnv = {
             OMC_PRE_TOOL_ADVISORY_COOLDOWN_MS: '5000',
-            OMC_PRE_TOOL_ADVISORY_NOW_MS: '1000',
+            OMC_PRE_TOOL_ADVISORY_NOW_MS: String(ADVISORY_TEST_NOW_MS),
         };
         const first = run(input, throttleEnv);
         const throttled = run(input, throttleEnv);
@@ -1903,6 +1916,220 @@ describe('pre-tool-enforcer agents.<name>.model injection (issue #3242)', () => 
         expect(throttled.suppressOutput).toBe(true);
         expect(throttled.hookSpecificOutput).toBeDefined();
         expect(updatedModel(throttled)).toBe('sonnet');
+    });
+});
+describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
+    let tempDir;
+    let xdgConfigHome;
+    beforeEach(() => {
+        tempDir = mkdtempSync(join(tmpdir(), 'pre-tool-enforcer-copilot-model-'));
+        xdgConfigHome = join(tempDir, 'xdg-config');
+        mkdirSync(join(xdgConfigHome, 'claude-omc'), { recursive: true });
+    });
+    afterEach(() => {
+        rmSync(tempDir, { recursive: true, force: true });
+    });
+    function run(input, env = {}) {
+        const toolName = String(input.tool_name || input.toolName || '');
+        const toolInput = input.toolInput || input.tool_input || {};
+        const sessionId = String(input.session_id || input.sessionId || '');
+        return runPreToolEnforcerWithEnv({
+            cwd: tempDir,
+            sessionId,
+            toolCalls: [{
+                    id: `${sessionId || 'copilot'}-call`,
+                    name: toolName.toLowerCase(),
+                    args: JSON.stringify(toolInput),
+                }],
+        }, {
+            APPDATA: xdgConfigHome,
+            XDG_CONFIG_HOME: xdgConfigHome,
+            ...env,
+        });
+    }
+    function updatedInput(output) {
+        return output.modifiedArgs;
+    }
+    it('defaults bundled OMC subagents to GPT-5.6 Sol with max reasoning', () => {
+        const output = run({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'oh-my-claudecode:executor',
+                prompt: 'Implement the change',
+                description: 'Implement change',
+            },
+            session_id: 'copilot-defaults',
+        });
+        expect(updatedInput(output)).toMatchObject({
+            model: 'gpt-5.6-sol',
+            reasoning_effort: 'max',
+        });
+    });
+    it('supports Copilot Agent tool payloads that use agent_type', () => {
+        const output = run({
+            tool_name: 'Agent',
+            toolInput: {
+                agent_type: 'oh-my-claudecode:explore',
+                prompt: 'Find the symbol',
+                description: 'Find symbol',
+                mode: 'background',
+            },
+            session_id: 'copilot-agent-type',
+        });
+        expect(updatedInput(output)).toMatchObject({
+            agent_type: 'oh-my-claudecode:explore',
+            model: 'gpt-5.6-sol',
+            reasoning_effort: 'max',
+        });
+        expect(output.additionalContext).toContain('Spawning agent: oh-my-claudecode:explore (gpt-5.6-sol) [BACKGROUND]');
+    });
+    it('preserves explicit per-call model and reasoning effort', () => {
+        const output = run({
+            tool_name: 'Agent',
+            toolInput: {
+                agent_type: 'oh-my-claudecode:architect',
+                model: 'gpt-5.5',
+                reasoning_effort: 'high',
+                prompt: 'Review the design',
+                description: 'Review design',
+            },
+            session_id: 'copilot-explicit',
+        });
+        expect(updatedInput(output)).toBeUndefined();
+    });
+    it('fills only the missing field when one explicit choice is present', () => {
+        const modelExplicit = run({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'oh-my-claudecode:executor',
+                model: 'gpt-5.5',
+                prompt: 'Implement',
+                description: 'Implement',
+            },
+            session_id: 'copilot-model-explicit',
+        });
+        const effortExplicit = run({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'oh-my-claudecode:executor',
+                reasoning_effort: 'high',
+                prompt: 'Implement',
+                description: 'Implement',
+            },
+            session_id: 'copilot-effort-explicit',
+        });
+        expect(updatedInput(modelExplicit)).toMatchObject({
+            model: 'gpt-5.5',
+            reasoning_effort: 'max',
+        });
+        expect(updatedInput(effortExplicit)).toMatchObject({
+            model: 'gpt-5.6-sol',
+            reasoning_effort: 'high',
+        });
+    });
+    it('uses Copilot-specific environment overrides', () => {
+        const output = run({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'oh-my-claudecode:verifier',
+                prompt: 'Verify',
+                description: 'Verify',
+            },
+            session_id: 'copilot-env-override',
+        }, {
+            OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL: 'gpt-5.6-terra',
+            OMC_COPILOT_REASONING_EFFORT: 'xhigh',
+        });
+        expect(updatedInput(output)).toMatchObject({
+            model: 'gpt-5.6-terra',
+            reasoning_effort: 'xhigh',
+        });
+    });
+    it('uses project Copilot defaults over user defaults', () => {
+        writeFileSync(join(xdgConfigHome, 'claude-omc', 'config.jsonc'), '{ "externalModels": { "defaults": { "copilotModel": "gpt-5.5", "copilotReasoningEffort": "high" } } }');
+        mkdirSync(join(tempDir, '.claude'), { recursive: true });
+        writeFileSync(join(tempDir, '.claude', 'omc.jsonc'), '{ "externalModels": { "defaults": { "copilotModel": "gpt-5.6-sol" } } }');
+        const output = run({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'oh-my-claudecode:critic',
+                prompt: 'Critique',
+                description: 'Critique',
+            },
+            session_id: 'copilot-config-override',
+        });
+        expect(updatedInput(output)).toMatchObject({
+            model: 'gpt-5.6-sol',
+            reasoning_effort: 'high',
+        });
+    });
+    it('falls back to max and emits a warning for invalid configured effort', () => {
+        const output = run({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'oh-my-claudecode:executor',
+                prompt: 'Implement',
+                description: 'Implement',
+            },
+            session_id: 'copilot-invalid-effort',
+        }, { OMC_COPILOT_REASONING_EFFORT: 'extreme' });
+        expect(updatedInput(output)?.reasoning_effort).toBe('max');
+        expect(output.additionalContext).toContain('Ignoring invalid reasoning effort "extreme"');
+    });
+    it('does not modify non-OMC agents or Claude-hosted calls', () => {
+        const externalAgent = run({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'custom-agent',
+                prompt: 'Run',
+                description: 'Run',
+            },
+            session_id: 'copilot-non-omc',
+        });
+        const claudeHost = runPreToolEnforcerWithEnv({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'oh-my-claudecode:executor',
+                prompt: 'Run',
+                description: 'Run',
+            },
+            cwd: tempDir,
+            session_id: 'claude-host',
+        });
+        expect(updatedInput(externalAgent)).toBeUndefined();
+        expect(updatedInput(claudeHost)).toBeUndefined();
+    });
+    it('lets an explicit non-Copilot host override ambient Copilot markers', () => {
+        const output = runPreToolEnforcerWithEnv({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'oh-my-claudecode:executor',
+                prompt: 'Run',
+                description: 'Run',
+            },
+            cwd: tempDir,
+            session_id: 'explicit-claude-host',
+        }, {
+            OMC_HOST: 'claude',
+            COPILOT_CLI: '1',
+            COPILOT_AGENT_SESSION_ID: 'parent-session',
+        });
+        expect(updatedInput(output)).toBeUndefined();
+    });
+    it('applies Copilot defaults even when Claude force-inherit is enabled', () => {
+        const output = run({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'oh-my-claudecode:executor',
+                prompt: 'Implement',
+                description: 'Implement',
+            },
+            session_id: 'copilot-force-inherit',
+        }, { OMC_ROUTING_FORCE_INHERIT: 'true' });
+        expect(updatedInput(output)).toMatchObject({
+            model: 'gpt-5.6-sol',
+            reasoning_effort: 'max',
+        });
     });
 });
 //# sourceMappingURL=pre-tool-enforcer.test.js.map

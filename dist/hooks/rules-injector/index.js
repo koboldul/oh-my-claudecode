@@ -12,7 +12,7 @@ import { isAbsolute, relative, resolve } from 'path';
 import { findProjectRoot, findRuleFiles } from './finder.js';
 import { createContentHash, isDuplicateByContentHash, isDuplicateByRealPath, shouldApplyRule, } from './matcher.js';
 import { parseRuleFrontmatter } from './parser.js';
-import { clearInjectedRules, loadInjectedRules, saveInjectedRules, } from './storage.js';
+import { commitInjectedRuleReservation, clearInjectedRules, releaseInjectedRuleReservation, reserveInjectedRules, } from './storage.js';
 import { TRACKED_TOOLS } from './constants.js';
 // Re-export all submodules
 export * from './types.js';
@@ -28,13 +28,6 @@ export * from './storage.js';
  * @returns Hook handlers for tool execution
  */
 export function createRulesInjectorHook(workingDirectory) {
-    const sessionCaches = new Map();
-    function getSessionCache(sessionId) {
-        if (!sessionCaches.has(sessionId)) {
-            sessionCaches.set(sessionId, loadInjectedRules(sessionId));
-        }
-        return sessionCaches.get(sessionId);
-    }
     function resolveFilePath(filePath) {
         if (!filePath)
             return null;
@@ -45,16 +38,17 @@ export function createRulesInjectorHook(workingDirectory) {
     /**
      * Process a file path and return rules to inject.
      */
-    function processFilePathForRules(filePath, sessionId) {
+    function planFilePathRules(filePath) {
         const resolved = resolveFilePath(filePath);
         if (!resolved)
             return [];
         const projectRoot = findProjectRoot(resolved);
-        const cache = getSessionCache(sessionId);
+        const plannedContentHashes = new Set();
+        const plannedRealPaths = new Set();
         const ruleFileCandidates = findRuleFiles(projectRoot, resolved);
         const toInject = [];
         for (const candidate of ruleFileCandidates) {
-            if (isDuplicateByRealPath(candidate.realPath, cache.realPaths))
+            if (isDuplicateByRealPath(candidate.realPath, plannedRealPaths))
                 continue;
             try {
                 const rawContent = readFileSync(candidate.path, 'utf-8');
@@ -70,7 +64,7 @@ export function createRulesInjectorHook(workingDirectory) {
                     matchReason = matchResult.reason ?? 'matched';
                 }
                 const contentHash = createContentHash(body);
-                if (isDuplicateByContentHash(contentHash, cache.contentHashes))
+                if (isDuplicateByContentHash(contentHash, plannedContentHashes))
                     continue;
                 const relativePath = projectRoot
                     ? relative(projectRoot, candidate.path)
@@ -80,9 +74,11 @@ export function createRulesInjectorHook(workingDirectory) {
                     matchReason,
                     content: body,
                     distance: candidate.distance,
+                    contentHash,
+                    realPath: candidate.realPath,
                 });
-                cache.realPaths.add(candidate.realPath);
-                cache.contentHashes.add(contentHash);
+                plannedRealPaths.add(candidate.realPath);
+                plannedContentHashes.add(contentHash);
             }
             catch {
                 // Skip files that can't be read
@@ -91,32 +87,68 @@ export function createRulesInjectorHook(workingDirectory) {
         if (toInject.length > 0) {
             // Sort by distance (closest first)
             toInject.sort((a, b) => a.distance - b.distance);
-            saveInjectedRules(sessionId, cache);
         }
         return toInject;
     }
+    function commitReservation(sessionId, reservationId, rules) {
+        commitInjectedRuleReservation(sessionId, reservationId, rules);
+    }
+    function releaseReservation(sessionId, reservationId) {
+        releaseInjectedRuleReservation(sessionId, reservationId);
+    }
     /**
-     * Format rules for injection into output.
+     * Format one rule as one canonical context item.
+     */
+    function formatRuleForInjection(rule) {
+        return `[Rule: ${rule.relativePath}]\n[Match: ${rule.matchReason}]\n${rule.content}`;
+    }
+    /**
+     * Preserve the legacy Claude presentation, including its leading blank line.
      */
     function formatRulesForInjection(rules) {
-        if (rules.length === 0)
-            return '';
-        let output = '';
-        for (const rule of rules) {
-            output += `\n\n[Rule: ${rule.relativePath}]\n[Match: ${rule.matchReason}]\n${rule.content}`;
-        }
-        return output;
+        return rules
+            .map((rule) => `\n\n${formatRuleForInjection(rule)}`)
+            .join('');
     }
     return {
         /**
+         * Stage matching rules without marking them as delivered.
+         */
+        planToolExecution: (toolName, filePath, sessionId) => {
+            if (!TRACKED_TOOLS.includes(toolName.toLowerCase())) {
+                return { rules: [] };
+            }
+            return reserveInjectedRules(sessionId, planFilePathRules(filePath));
+        },
+        formatRuleForInjection,
+        formatRulesForInjection,
+        commitReservation,
+        releaseReservation,
+        /**
          * Process a tool execution and inject rules if relevant.
+         * Kept for direct callers that own delivery synchronously.
          */
         processToolExecution: (toolName, filePath, sessionId) => {
             if (!TRACKED_TOOLS.includes(toolName.toLowerCase())) {
                 return '';
             }
-            const rules = processFilePathForRules(filePath, sessionId);
-            return formatRulesForInjection(rules);
+            const reservation = reserveInjectedRules(sessionId, planFilePathRules(filePath));
+            if (!reservation.reservationId)
+                return '';
+            try {
+                const output = formatRulesForInjection(reservation.rules);
+                commitReservation(sessionId, reservation.reservationId, reservation.rules);
+                return output;
+            }
+            catch (error) {
+                try {
+                    releaseReservation(sessionId, reservation.reservationId);
+                }
+                catch {
+                    // The reservation expires if immediate cleanup is unavailable.
+                }
+                throw error;
+            }
         },
         /**
          * Get rules for a specific file without marking as injected.
@@ -162,7 +194,6 @@ export function createRulesInjectorHook(workingDirectory) {
          * Clear session cache when session ends.
          */
         clearSession: (sessionId) => {
-            sessionCaches.delete(sessionId);
             clearInjectedRules(sessionId);
         },
         /**

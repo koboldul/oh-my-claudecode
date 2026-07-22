@@ -6,6 +6,7 @@
  */
 import type { HookNotificationConfig } from "./hook-config-types.js";
 import type { NotificationConfig, NotificationEvent, NotificationPlatform } from "./types.js";
+export declare function getHookNotificationConfigPath(): string;
 /**
  * Read and cache the hook notification config.
  *

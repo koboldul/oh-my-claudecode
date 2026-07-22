@@ -6,7 +6,7 @@
  *
  * Strategy: write the wrapper template (which is the same byte-for-byte string
  * the installer would write to <configDir>/hud/omc-hud.mjs) into a tmp dir,
- * stage a sibling `lib/config-dir.mjs` and a fake `dist/hud/index.js` marker,
+ * stage a sibling `lib/config-dir.mjs` and a fake `bridge/hud-runtime.mjs` marker,
  * then spawn `node <tmp>/omc-hud.mjs` with controlled env + stdin and assert
  * which resolution branch fired (via stdout marker).
  */

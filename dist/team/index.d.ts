@@ -46,6 +46,7 @@ export { getContract, isCliAvailable as isCliAvailableForAgent, validateCliAvail
 export type { CliBinaryValidation } from './model-contract.js';
 export type { CliInfo } from './cli-detection.js';
 export { detectCli, detectAllClis } from './cli-detection.js';
+export { VERIFIED_COPILOT_CLI_VERSION, assessCopilotCliVersion, detectCopilotCliCompatibility, parseCopilotCliVersion, type CopilotCliCompatibility, type CopilotCliCompatibilityStatus, } from './copilot-cli-compatibility.js';
 export type { WorkerBootstrapParams } from './worker-bootstrap.js';
 export { generateWorkerOverlay, composeInitialInbox, appendToInbox, getWorkerEnv, ensureWorkerStateDir, writeWorkerOverlay, } from './worker-bootstrap.js';
 export { sendTmuxTrigger, queueInboxInstruction, queueDirectMessage, queueBroadcastMessage, readMailbox, } from './tmux-comm.js';

@@ -3,7 +3,7 @@
  *
  * Uses O_CREAT|O_EXCL (exclusive-create) for atomic lock acquisition.
  * The kernel guarantees at most one process succeeds in creating the file.
- * Includes PID-based stale lock detection and automatic reaping.
+ * Includes PID/start-identity stale detection and authenticated release.
  *
  * Provides both synchronous and asynchronous variants:
  * - Sync: for notepad (readFileSync-based) and state operations
@@ -13,6 +13,20 @@
 export interface FileLockHandle {
     fd: number;
     path: string;
+    owner: FileLockOwner;
+    ownerRaw: string;
+    identity: FileLockIdentity;
+}
+export interface FileLockOwner {
+    version: 2;
+    pid: number;
+    processStartIdentity: string;
+    nonce: string;
+    timestamp: number;
+}
+export interface FileLockIdentity {
+    dev: number;
+    ino: number;
 }
 /** Options for lock acquisition. */
 export interface FileLockOptions {
@@ -20,7 +34,7 @@ export interface FileLockOptions {
     timeoutMs?: number;
     /** Delay (ms) between retry attempts. Default: 50 */
     retryDelayMs?: number;
-    /** Age (ms) after which a lock held by a dead PID is considered stale. Default: 30000 */
+    /** Age (ms) after which a dead or PID-reused owner may be reaped. Default: 30000 */
     staleLockMs?: number;
 }
 /**

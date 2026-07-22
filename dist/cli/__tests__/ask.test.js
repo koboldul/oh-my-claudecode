@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { mkdtempSync } from 'fs';
-import { join, dirname } from 'path';
+import { basename, join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { parseAskArgs, resolveAskAdvisorScriptPath } from '../ask.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, '..', '..', '..');
@@ -19,7 +19,7 @@ function buildChildEnv(envOverrides = {}, options = {}) {
     return { ...cleanEnv, ...envOverrides };
 }
 function runCli(args, cwd, envOverrides = {}, options = {}) {
-    const result = spawnSync(process.execPath, ['--import', TSX_LOADER, CLI_ENTRY, ...args], {
+    const result = spawnSync(process.execPath, ['--import', pathToFileURL(TSX_LOADER).href, CLI_ENTRY, ...args], {
         cwd,
         encoding: 'utf-8',
         env: buildChildEnv(envOverrides, options),
@@ -45,7 +45,7 @@ function runAdvisorScript(args, cwd, envOverrides = {}, options = {}) {
     };
 }
 function runAdvisorScriptWithPrelude(preludePath, args, cwd, envOverrides = {}, options = {}) {
-    const result = spawnSync(process.execPath, ['--import', preludePath, ADVISOR_SCRIPT, ...args], {
+    const result = spawnSync(process.execPath, ['--import', pathToFileURL(preludePath).href, ADVISOR_SCRIPT, ...args], {
         cwd,
         encoding: 'utf-8',
         env: buildChildEnv(envOverrides, options),
@@ -108,6 +108,11 @@ function writeSpawnSyncCapturePrelude(dir) {
         "        CLAUDE_SESSION_ID: options.env?.CLAUDE_SESSION_ID ?? null,",
         "        CLAUDECODE_SESSION_ID: options.env?.CLAUDECODE_SESSION_ID ?? null,",
         "        CLAUDE_CODE_ENTRYPOINT: options.env?.CLAUDE_CODE_ENTRYPOINT ?? null,",
+        "        COPILOT_CLI: options.env?.COPILOT_CLI ?? null,",
+        "        COPILOT_AGENT_SESSION_ID: options.env?.COPILOT_AGENT_SESSION_ID ?? null,",
+        "        OMC_HOST: options.env?.OMC_HOST ?? null,",
+        "        GH_TOKEN: options.env?.GH_TOKEN ?? null,",
+        "        GITHUB_TOKEN: options.env?.GITHUB_TOKEN ?? null,",
         "        RUST_LOG: options.env?.RUST_LOG ?? null,",
         "        RUST_BACKTRACE: options.env?.RUST_BACKTRACE ?? null,",
         '      },',
@@ -116,7 +121,18 @@ function writeSpawnSyncCapturePrelude(dir) {
         "  if (mode === 'missing' && command === 'where') {",
         "    return { status: 1, stdout: '', stderr: '', pid: 0, output: [], signal: null };",
         '  }',
-        "  if (mode === 'missing' && (command === 'codex' || command === 'gemini') && Array.isArray(args) && args[0] === '--version') {",
+        "  if (mode === 'copilot-cmd' && command === 'copilot' && Array.isArray(args) && args[0] === '--version') {",
+        "    return { status: null, stdout: '', stderr: '', error: { code: 'ENOENT' }, pid: 0, output: [], signal: null };",
+        '  }',
+        "  if (mode === 'copilot-cmd' && command === 'where' && args[0] === 'copilot') {",
+        "    return { status: 0, stdout: process.env.SPAWN_COPILOT_EXTENSIONLESS_PATH + '\\r\\n' + process.env.SPAWN_COPILOT_CMD_PATH + '\\r\\n', stderr: '', pid: 0, output: [], signal: null };",
+        '  }',
+        "  if (mode === 'copilot-cmd' && command === 'pwsh.exe') {",
+        "    const fileIndex = args.indexOf('-File');",
+        "    const providerArgs = args.slice(fileIndex + 2);",
+        "    return { status: 0, stdout: providerArgs[0] === '--version' ? 'GitHub Copilot CLI 1.0.71-3\\n' : 'FAKE_PROVIDER_OK', stderr: '', pid: 0, output: [], signal: null };",
+        '  }',
+        "  if (mode === 'missing' && (command === 'codex' || command === 'gemini' || command === 'copilot') && Array.isArray(args) && args[0] === '--version') {",
         "    return { status: 1, stdout: '', stderr: \"'\" + command + \"' is not recognized\", pid: 0, output: [], signal: null };",
         '  }',
         "  const isVersionProbe = Array.isArray(args) && args[0] === '--version';",
@@ -230,6 +246,18 @@ describe('parseAskArgs', () => {
         expect(parseAskArgs(['grok', '-p', 'brainstorm'])).toEqual({ provider: 'grok', prompt: 'brainstorm' });
         expect(parseAskArgs(['cursor', 'review', 'this'])).toEqual({ provider: 'cursor', prompt: 'review this' });
         expect(parseAskArgs(['cursor', '-p', 'brainstorm'])).toEqual({ provider: 'cursor', prompt: 'brainstorm' });
+    });
+    it('supports every Copilot prompt alias', () => {
+        expect(parseAskArgs(['copilot', 'review', 'this'])).toEqual({ provider: 'copilot', prompt: 'review this' });
+        expect(parseAskArgs(['copilot', '-p', 'review'])).toEqual({ provider: 'copilot', prompt: 'review' });
+        expect(parseAskArgs(['copilot', '--print', 'review'])).toEqual({ provider: 'copilot', prompt: 'review' });
+        expect(parseAskArgs(['copilot', '--prompt', 'review'])).toEqual({ provider: 'copilot', prompt: 'review' });
+        expect(parseAskArgs(['copilot', '--prompt=review'])).toEqual({ provider: 'copilot', prompt: 'review' });
+        expect(parseAskArgs(['copilot', '--agent-prompt', 'critic', '--prompt', 'review'])).toEqual({
+            provider: 'copilot',
+            prompt: 'review',
+            agentPromptRole: 'critic',
+        });
     });
     it('supports --agent-prompt flag and equals syntax', () => {
         expect(parseAskArgs(['claude', '--agent-prompt', 'executor', 'do', 'it'])).toEqual({
@@ -377,6 +405,19 @@ describe('omc ask command', () => {
             rmSync(wd, { recursive: true, force: true });
         }
     });
+    it('blocks copilot when disableExternalLLM is enabled by strict security mode', () => {
+        const wd = mkdtempSync(join(tmpdir(), 'omc-ask-copilot-security-'));
+        try {
+            const stubPath = writeAdvisorStub(wd);
+            const result = runCli(['ask', 'copilot', 'review this'], wd, { OMC_ASK_ADVISOR_SCRIPT: stubPath, OMC_SECURITY: 'strict' });
+            expect(result.status).toBe(1);
+            expect(result.stderr).toContain('disableExternalLLM');
+            expect(result.stderr).toContain('copilot');
+        }
+        finally {
+            rmSync(wd, { recursive: true, force: true });
+        }
+    });
     it('loads --agent-prompt role from resolved prompts dir and prepends role content', () => {
         const wd = mkdtempSync(join(tmpdir(), 'omc-ask-agent-prompt-'));
         try {
@@ -445,7 +486,8 @@ describe('run-provider-advisor script contract', () => {
         // env-stripping on supported platforms is covered by the non-Windows tests.
         ['grok', ['grok', '--prompt', 'nested grok prompt']],
         ['cursor', ['cursor', '--prompt', 'nested cursor prompt']],
-    ])('strips Claude session env vars for %s advisor spawns', (provider, args) => {
+        ['copilot', ['copilot', '--prompt', 'nested copilot prompt']],
+    ])('strips parent host markers while preserving auth for %s advisor spawns', (provider, args) => {
         const wd = mkdtempSync(join(tmpdir(), `omc-ask-${provider}-advisor-env-`));
         try {
             const capturePath = join(wd, 'spawn-sync-calls.json');
@@ -456,6 +498,11 @@ describe('run-provider-advisor script contract', () => {
                 CLAUDE_SESSION_ID: 'session-123',
                 CLAUDECODE_SESSION_ID: 'session-legacy',
                 CLAUDE_CODE_ENTRYPOINT: 'plugin',
+                COPILOT_CLI: '1',
+                COPILOT_AGENT_SESSION_ID: 'copilot-parent-session',
+                OMC_HOST: 'copilot',
+                GH_TOKEN: 'gh-auth-token',
+                GITHUB_TOKEN: 'github-auth-token',
             }, { preserveClaudeSessionEnv: true });
             expect(result.error).toBeUndefined();
             expect(result.status).toBe(0);
@@ -467,6 +514,11 @@ describe('run-provider-advisor script contract', () => {
                     CLAUDE_SESSION_ID: null,
                     CLAUDECODE_SESSION_ID: null,
                     CLAUDE_CODE_ENTRYPOINT: null,
+                    COPILOT_CLI: null,
+                    COPILOT_AGENT_SESSION_ID: null,
+                    OMC_HOST: null,
+                    GH_TOKEN: 'gh-auth-token',
+                    GITHUB_TOKEN: 'github-auth-token',
                 });
             }
         }
@@ -521,6 +573,126 @@ describe('run-provider-advisor script contract', () => {
                 'review this\nand that',
             ]);
             expect(launch.options.input ?? null).toBeNull();
+        }
+        finally {
+            rmSync(wd, { recursive: true, force: true });
+        }
+    });
+    it('launches copilot headlessly with deterministic autonomous argv and no Windows shell/stdin', () => {
+        const wd = mkdtempSync(join(tmpdir(), 'omc-ask-copilot-args-'));
+        try {
+            const capturePath = join(wd, 'spawn-sync-calls.json');
+            const preludePath = writeSpawnSyncCapturePrelude(wd);
+            const prompt = 'review "quoted" input\nand preserve $variables';
+            const result = runAdvisorScriptWithPrelude(preludePath, ['copilot', '--prompt', prompt], wd, { SPAWN_CAPTURE_PATH: capturePath });
+            expect(result.error).toBeUndefined();
+            expect(result.status).toBe(0);
+            expect(basename(result.stdout.trim())).toMatch(/^copilot-.*\.md$/);
+            const calls = JSON.parse(readFileSync(capturePath, 'utf8'));
+            expect(calls).toHaveLength(2);
+            expect(calls.every(call => call.command === 'copilot')).toBe(true);
+            expect(calls.every(call => call.options.shell === false)).toBe(true);
+            const launch = calls.find(call => !call.args.includes('--version'));
+            expect(launch?.args).toEqual([
+                '--model', 'gpt-5.6-sol',
+                '--effort', 'max',
+                '--allow-all',
+                '--no-ask-user',
+                '--silent',
+                '--stream=off',
+                '-p', prompt,
+            ]);
+            expect(launch?.options.input ?? null).toBeNull();
+            expect(launch?.options.stdio).toEqual(['ignore', 'pipe', 'pipe']);
+        }
+        finally {
+            rmSync(wd, { recursive: true, force: true });
+        }
+    });
+    it('applies canonical Copilot model and effort overrides to advisor argv', () => {
+        const wd = mkdtempSync(join(tmpdir(), 'omc-ask-copilot-overrides-'));
+        try {
+            const capturePath = join(wd, 'spawn-sync-calls.json');
+            const preludePath = writeSpawnSyncCapturePrelude(wd);
+            const result = runAdvisorScriptWithPrelude(preludePath, ['copilot', '--prompt', 'review overrides'], wd, {
+                SPAWN_CAPTURE_PATH: capturePath,
+                OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL: 'gpt-5.6-terra',
+                OMC_COPILOT_DEFAULT_MODEL: 'gpt-5.5',
+                OMC_COPILOT_REASONING_EFFORT: 'xhigh',
+            });
+            expect(result.status).toBe(0);
+            const calls = JSON.parse(readFileSync(capturePath, 'utf8'));
+            const launch = calls.find(call => !call.args.includes('--version'));
+            expect(launch?.args).toEqual([
+                '--model', 'gpt-5.6-terra',
+                '--effort', 'xhigh',
+                '--allow-all',
+                '--no-ask-user',
+                '--silent',
+                '--stream=off',
+                '-p', 'review overrides',
+            ]);
+        }
+        finally {
+            rmSync(wd, { recursive: true, force: true });
+        }
+    });
+    it('launches long prompts through the npm Copilot PowerShell 7 shim instead of the .cmd limit', () => {
+        const wd = mkdtempSync(join(tmpdir(), 'omc-ask-copilot-cmd-'));
+        try {
+            const capturePath = join(wd, 'spawn-sync-calls.json');
+            const preludePath = writeSpawnSyncCapturePrelude(wd);
+            const shimDir = join(wd, 'bin');
+            mkdirSync(shimDir, { recursive: true });
+            const cmdShim = join(shimDir, 'copilot.cmd');
+            const ps1Shim = join(shimDir, 'copilot.ps1');
+            writeFileSync(cmdShim, '@echo off\r\n', 'utf8');
+            writeFileSync(ps1Shim, 'exit 0\n', 'utf8');
+            const prompt = `review "quoted" input & preserve | symbols\n${'x'.repeat(22_000)}`;
+            const result = runAdvisorScriptWithPrelude(preludePath, ['copilot', '--prompt', prompt], wd, {
+                SPAWN_CAPTURE_PATH: capturePath,
+                SPAWN_CAPTURE_MODE: 'copilot-cmd',
+                SPAWN_COPILOT_EXTENSIONLESS_PATH: cmdShim.replace(/\.cmd$/i, ''),
+                SPAWN_COPILOT_CMD_PATH: cmdShim,
+            });
+            expect(result.status).toBe(0);
+            const calls = JSON.parse(readFileSync(capturePath, 'utf8'));
+            expect(calls.map(call => call.command)).toEqual([
+                'copilot',
+                'where',
+                'pwsh.exe',
+                'pwsh.exe',
+            ]);
+            const launch = calls[3];
+            expect(launch.options.shell).toBe(false);
+            const fileIndex = launch.args.indexOf('-File');
+            expect(launch.args[fileIndex + 1]).toBe(ps1Shim);
+            expect(launch.args.slice(fileIndex + 2)).toEqual([
+                '--model', 'gpt-5.6-sol',
+                '--effort', 'max',
+                '--allow-all',
+                '--no-ask-user',
+                '--silent',
+                '--stream=off',
+                '-p', prompt,
+            ]);
+        }
+        finally {
+            rmSync(wd, { recursive: true, force: true });
+        }
+    });
+    it.runIf(process.platform === 'win32')('preserves quoted prompts through the PowerShell 7 npm shim', () => {
+        const wd = mkdtempSync(join(tmpdir(), 'omc-ask-copilot-pwsh-'));
+        try {
+            const echoArgsPath = join(wd, 'echo-args.cjs');
+            const ps1Shim = join(wd, 'copilot.ps1');
+            const prompt = 'review "quoted" input & preserve | symbols';
+            writeFileSync(echoArgsPath, 'process.stdout.write(JSON.stringify(process.argv.slice(2)));\n', 'utf8');
+            writeFileSync(ps1Shim, `& node "${echoArgsPath}" @args\n`, 'utf8');
+            const result = spawnSync('pwsh.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1Shim, '-p', prompt], { encoding: 'utf8' });
+            expect(result.error).toBeUndefined();
+            expect(result.status).toBe(0);
+            expect(JSON.parse(result.stdout)).toEqual(['-p', prompt]);
         }
         finally {
             rmSync(wd, { recursive: true, force: true });

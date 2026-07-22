@@ -200,6 +200,19 @@ function resolveSuperprojectRoot(cwd) {
     }
     return anchor;
 }
+function hasGitMetadataAncestor(directory) {
+    if (process.env.GIT_DIR || process.env.GIT_WORK_TREE)
+        return true;
+    let probe = resolve(directory);
+    while (true) {
+        if (existsSync(join(probe, '.git')))
+            return true;
+        const parent = dirname(probe);
+        if (parent === probe)
+            return false;
+        probe = parent;
+    }
+}
 /**
  * Resolve the state-anchor root for an optional worktreeRoot argument.
  *
@@ -216,8 +229,11 @@ function resolveSuperprojectRoot(cwd) {
  * collapse separately-scoped state dirs into one and corrupt them.
  */
 function resolveStateAnchorRoot(worktreeRoot) {
-    if (worktreeRoot)
-        return resolveSuperprojectRoot(worktreeRoot) || worktreeRoot;
+    if (worktreeRoot) {
+        return hasGitMetadataAncestor(worktreeRoot)
+            ? resolveSuperprojectRoot(worktreeRoot) || worktreeRoot
+            : worktreeRoot;
+    }
     return getWorktreeRoot() || process.cwd();
 }
 /**
@@ -934,17 +950,26 @@ export function resolveToWorktreeRoot(directory) {
     // worktrees are unaffected: with no superproject the two resolvers are equal.
     // See PR #3350 Codex review (hook normalization / submodule identity).
     const resolveRoot = process.env.OMC_STATE_DIR ? getGitTopLevel : getWorktreeRoot;
+    const processDirectory = resolve(process.cwd());
     if (directory) {
         const resolved = resolve(directory);
+        if (resolved === processDirectory && !hasGitMetadataAncestor(resolved)) {
+            console.error('[worktree] non-git directory provided, falling back to process root', {
+                directory: resolved,
+            });
+            return processDirectory;
+        }
         const root = resolveRoot(resolved);
         if (root)
             return root;
         console.error('[worktree] non-git directory provided, falling back to process root', {
             directory: resolved,
         });
+        if (resolved === processDirectory)
+            return processDirectory;
     }
     // Fallback: derive from process CWD (the MCP server / CLI entry point)
-    return resolveRoot(process.cwd()) || process.cwd();
+    return resolveRoot(processDirectory) || processDirectory;
 }
 // ============================================================================
 // TRANSCRIPT PATH RESOLUTION (Issue #1094)
@@ -1020,12 +1045,16 @@ export function resolveTranscriptPath(transcriptPath, cwd) {
     // transcript path encodes the worktree CWD, but the file lives under
     // the main repo's encoded path. Use `git rev-parse --git-common-dir`
     // to find the main repo root and re-encode.
+    const worktreeTop = getGitTopLevel(effectiveCwd);
+    if (!worktreeTop)
+        return transcriptPath;
     try {
         const gitCommonDir = execFileSync('git', ['rev-parse', '--git-common-dir'], {
             cwd: effectiveCwd,
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
             windowsHide: true,
+            timeout: 5000,
         }).trim();
         const absoluteCommonDir = resolve(effectiveCwd, gitCommonDir);
         // For linked worktrees, git-common-dir is <repo>/.git/worktrees/<name>
@@ -1040,13 +1069,14 @@ export function resolveTranscriptPath(transcriptPath, cwd) {
             mainRepoRoot = realpathSync(mainRepoRoot);
         }
         catch { /* keep as-is */ }
-        const worktreeTop = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-            cwd: effectiveCwd,
-            encoding: 'utf-8',
-            stdio: ['pipe', 'pipe', 'pipe'],
-            windowsHide: true,
-        }).trim();
-        if (mainRepoRoot !== worktreeTop) {
+        let canonicalWorktreeTop = worktreeTop;
+        try {
+            canonicalWorktreeTop = realpathSync(canonicalWorktreeTop);
+        }
+        catch {
+            // Keep Git's resolved top-level when the filesystem cannot canonicalize it.
+        }
+        if (mainRepoRoot !== canonicalWorktreeTop) {
             // basename handles `\` (Windows transcript_path) and `/` (POSIX).
             const sessionFile = basename(transcriptPath);
             if (sessionFile) {

@@ -6,7 +6,7 @@
  * and file permissions so that individual mode modules don't duplicate this logic.
  */
 /** Executes a read or mutation against a state file under its mutation lock. */
-export declare function withStateFileMutationLock<T>(filePath: string, callback: () => T, requireExclusive?: boolean): {
+export declare function withStateFileMutationLock<T>(filePath: string, callback: () => T, _requireExclusive?: boolean): {
     acquired: boolean;
     value: T | undefined;
 };
@@ -27,6 +27,29 @@ export declare function recoverEmergencyStateFile(filePath: string, options?: Em
 export declare function emergencyMutateStateFileIf(filePath: string, predicate: (current: Record<string, unknown>) => boolean, transform: ((current: Record<string, unknown>) => Record<string, unknown>) | null, recoveryOptions?: EmergencyRecoveryOptions): boolean;
 export declare function getStateSessionOwner(state: Record<string, unknown> | null | undefined): string | undefined;
 export declare function canClearStateForSession(state: Record<string, unknown> | null | undefined, sessionId: string): boolean;
+export type ModeConfirmationStatus = 'written' | 'not-applicable' | 'changed' | 'skipped' | 'failed';
+export interface ModeConfirmationResult {
+    modeName: string;
+    status: ModeConfirmationStatus;
+    paths: string[];
+}
+export interface ModeConfirmationObservation {
+    path: string;
+    ownerSessionId: string;
+    generation: number | null;
+    confirmationTimestamp: string;
+    digest: string;
+}
+/**
+ * Clear confirmation fields through the mode-state owner lock. Transactional
+ * effects target one exact observed generation; legacy callers retain the
+ * historical root-plus-session behavior.
+ */
+export declare function confirmModeAwaitingConfirmationLocked(directory: string, modeName: string, sessionId?: string, observation?: ModeConfirmationObservation): ModeConfirmationResult;
+/**
+ * Confirm every mode owned by a Skill invocation using the shared map.
+ */
+export declare function confirmSkillModeStatesLocked(directory: string, skillName: string, sessionId?: string): ModeConfirmationResult[];
 /**
  * Find session-scoped state files that belong to the requested session.
  *

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compactOmcStartupGuidance, generateConfigSchema, loadConfig, loadContextFromFiles, } from "../loader.js";
@@ -22,7 +22,49 @@ const ALL_KEYS = [
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "OMC_DELEGATION_ROUTING_ENABLED",
     "OMC_DELEGATION_ROUTING_DEFAULT_PROVIDER",
+    "OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL",
+    "OMC_COPILOT_DEFAULT_MODEL",
+    "OMC_COPILOT_REASONING_EFFORT",
 ];
+describe("loadConfig() — GitHub Copilot external defaults", () => {
+    let saved;
+    beforeEach(() => {
+        saved = saveAndClear(ALL_KEYS);
+    });
+    afterEach(() => {
+        restore(saved);
+    });
+    it("uses gpt-5.6-sol with max effort by default", () => {
+        const config = loadConfig();
+        expect(config.externalModels?.defaults?.copilotModel).toBe("gpt-5.6-sol");
+        expect(config.externalModels?.defaults?.copilotReasoningEffort).toBe("max");
+    });
+    it("prefers the canonical Copilot model env over the legacy env and validates effort", () => {
+        process.env.OMC_COPILOT_DEFAULT_MODEL = "legacy-model";
+        process.env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL = "canonical-model";
+        process.env.OMC_COPILOT_REASONING_EFFORT = "xhigh";
+        const config = loadConfig();
+        expect(config.externalModels?.defaults?.copilotModel).toBe("canonical-model");
+        expect(config.externalModels?.defaults?.copilotReasoningEffort).toBe("xhigh");
+    });
+    it("rejects invalid Copilot reasoning effort values", () => {
+        process.env.OMC_COPILOT_REASONING_EFFORT = "ultra";
+        expect(() => loadConfig()).toThrow("Allowed: none, minimal, low, medium, high, xhigh, max");
+    });
+    it("advertises Copilot defaults and provider routing in the generated schema", () => {
+        const schema = generateConfigSchema();
+        const defaults = schema.properties.externalModels.properties.defaults.properties;
+        expect(defaults.copilotModel.default).toBe("gpt-5.6-sol");
+        expect(defaults.copilotReasoningEffort.enum).toEqual([
+            "none", "minimal", "low", "medium", "high", "xhigh", "max",
+        ]);
+        expect(defaults.provider.enum).toContain("copilot");
+        expect(schema.properties.team.properties.ops.properties.defaultAgentType.enum)
+            .toContain("copilot");
+        expect(schema.properties.autopilot.properties.team.properties.agentTypes.items.enum)
+            .toContain("copilot");
+    });
+});
 // ---------------------------------------------------------------------------
 // Auto-forceInherit for Bedrock / Vertex (issues #1201, #1025)
 // ---------------------------------------------------------------------------
@@ -267,7 +309,7 @@ describe("plan output configuration", () => {
         const tempDir = mkdtempSync(join(tmpdir(), "omc-plan-output-"));
         try {
             const claudeDir = join(tempDir, ".claude");
-            require("node:fs").mkdirSync(claudeDir, { recursive: true });
+            mkdirSync(claudeDir, { recursive: true });
             writeFileSync(join(claudeDir, "omc.jsonc"), JSON.stringify({
                 planOutput: {
                     directory: "docs/plans",
@@ -395,6 +437,30 @@ describe("team.roleRouting (Option E)", () => {
             expect(config.team?.roleRouting?.executor).toEqual({ provider: "cursor" });
         }
         finally {
+            rmSync(tempDir, { recursive: true, force: true });
+        }
+    });
+    it("accepts Copilot as team defaultAgentType and reviewer roleRouting provider", () => {
+        const tempDir = mkdtempSync(join(tmpdir(), "omc-team-routing-copilot-"));
+        const originalCwd = process.cwd();
+        try {
+            const claudeDir = join(tempDir, ".claude");
+            require("node:fs").mkdirSync(claudeDir, { recursive: true });
+            writeFileSync(join(claudeDir, "omc.jsonc"), JSON.stringify({
+                team: {
+                    ops: { defaultAgentType: "copilot" },
+                    roleRouting: {
+                        "code-reviewer": { provider: "copilot" },
+                    },
+                },
+            }));
+            process.chdir(tempDir);
+            const config = loadConfig();
+            expect(config.team?.ops?.defaultAgentType).toBe("copilot");
+            expect(config.team?.roleRouting?.["code-reviewer"]).toEqual({ provider: "copilot" });
+        }
+        finally {
+            process.chdir(originalCwd);
             rmSync(tempDir, { recursive: true, force: true });
         }
     });
@@ -629,6 +695,107 @@ describe("loadConfig() — autopilot team worker config", () => {
         const schema = generateConfigSchema();
         expect(schema.properties?.autopilot).toBeDefined();
         expect(schema.properties?.autopilot?.properties?.team).toBeDefined();
+    });
+});
+describe("loadConfig() — autopilot.workflows", () => {
+    const originalCwd = process.cwd();
+    const configHomeEnv = process.platform === "win32" ? "APPDATA" : "XDG_CONFIG_HOME";
+    const originalConfigHome = process.env[configHomeEnv];
+    let tempDir;
+    let configHome;
+    const writeProjectConfig = (content) => {
+        require("node:fs").mkdirSync(join(tempDir, ".claude"), { recursive: true });
+        writeFileSync(join(tempDir, ".claude", "omc.jsonc"), content);
+    };
+    const writeUserConfig = (content) => {
+        const path = join(configHome, "claude-omc");
+        require("node:fs").mkdirSync(path, { recursive: true });
+        writeFileSync(join(path, "config.jsonc"), content);
+    };
+    beforeEach(() => {
+        tempDir = mkdtempSync(join(tmpdir(), "omc-workflow-config-"));
+        configHome = join(tempDir, "config");
+        process.env[configHomeEnv] = configHome;
+        process.chdir(tempDir);
+    });
+    afterEach(() => {
+        process.chdir(originalCwd);
+        if (originalConfigHome === undefined)
+            delete process.env[configHomeEnv];
+        else
+            process.env[configHomeEnv] = originalConfigHome;
+        rmSync(tempDir, { recursive: true, force: true });
+    });
+    it.each([
+        ["ralplan, execution", ["ralplan", "execution"]],
+        ["ralplan, execution, ralph", ["ralplan", "execution", "ralph"]],
+        ["ralplan, execution, qa", ["ralplan", "execution", "qa"]],
+        ["ralplan, execution, ralph, qa", ["ralplan", "execution", "ralph", "qa"]],
+    ])("accepts the v1 sequence %s", (_label, stages) => {
+        writeProjectConfig(JSON.stringify({
+            autopilot: { workflows: { "plan-build": { version: 1, stages } } },
+        }));
+        expect(loadConfig().autopilot?.workflows?.["plan-build"]?.stages).toEqual(stages);
+    });
+    it.each([
+        ["stageModels", { version: 1, stages: ["ralplan", "execution"], stageModels: {} }, /project autopilot\.workflows\.plan-build\.stageModels/],
+        ["wrong order", { version: 1, stages: ["execution", "ralplan"] }, /project autopilot\.workflows\.plan-build\.stages/],
+        ["duplicate stage", { version: 1, stages: ["ralplan", "execution", "qa", "qa"] }, /project autopilot\.workflows\.plan-build\.stages/],
+        ["missing version", { stages: ["ralplan", "execution"] }, /project autopilot\.workflows\.plan-build\.version/],
+        ["comma-bearing composite stage", { version: 1, stages: ["ralplan", "execution,qa"] }, /project autopilot\.workflows\.plan-build\.stages/],
+        ["nested stage array", { version: 1, stages: [["ralplan", "execution"]] }, /project autopilot\.workflows\.plan-build\.stages/],
+    ])("rejects %s with a path-specific error", (_label, profile, error) => {
+        writeProjectConfig(JSON.stringify({ autopilot: { workflows: { "plan-build": profile } } }));
+        expect(() => loadConfig()).toThrow(error);
+    });
+    it.each(["default", "autopilot", "ralplan", "ultrawork", "ultragoal", "ultrapilot"])("rejects reserved workflow name %s", (name) => {
+        writeProjectConfig(JSON.stringify({
+            autopilot: { workflows: { [name]: { version: 1, stages: ["ralplan", "execution"] } } },
+        }));
+        expect(() => loadConfig()).toThrow(new RegExp(`project autopilot\\.workflows\\.${name}: name .*reserved`));
+    });
+    it("validates malformed user and project workflow blocks before composition", () => {
+        writeUserConfig(JSON.stringify({
+            autopilot: { workflows: { "user-flow": { version: 1, stages: ["execution"] } } },
+        }));
+        expect(() => loadConfig()).toThrow(/user autopilot\.workflows\.user-flow\.stages/);
+        writeUserConfig(JSON.stringify({
+            autopilot: { workflows: { "same-flow": { version: 1, stages: ["ralplan", "execution"] } } },
+        }));
+        writeProjectConfig(JSON.stringify({
+            autopilot: { workflows: { "same-flow": { version: 1, stages: ["ralplan", "execution"], stageModels: {} } } },
+        }));
+        expect(() => loadConfig()).toThrow(/project autopilot\.workflows\.same-flow\.stageModels/);
+    });
+    it("replaces same-named profiles atomically and composes distinct names", () => {
+        writeUserConfig(JSON.stringify({
+            autopilot: {
+                workflows: {
+                    "same-flow": { version: 1, stages: ["ralplan", "execution", "ralph"] },
+                    "user-flow": { version: 1, stages: ["ralplan", "execution", "qa"] },
+                },
+            },
+        }));
+        writeProjectConfig(JSON.stringify({
+            autopilot: {
+                workflows: {
+                    "same-flow": { version: 1, stages: ["ralplan", "execution"] },
+                    "project-flow": { version: 1, stages: ["ralplan", "execution", "ralph", "qa"] },
+                },
+            },
+        }));
+        expect(loadConfig().autopilot?.workflows).toEqual({
+            "same-flow": { version: 1, stages: ["ralplan", "execution"] },
+            "user-flow": { version: 1, stages: ["ralplan", "execution", "qa"] },
+            "project-flow": { version: 1, stages: ["ralplan", "execution", "ralph", "qa"] },
+        });
+    });
+    it("publishes the closed workflow schema", () => {
+        const schema = generateConfigSchema();
+        const workflows = schema.properties?.autopilot?.properties?.workflows;
+        expect(workflows.additionalProperties?.additionalProperties).toBe(false);
+        expect(workflows.additionalProperties?.required).toEqual(["version", "stages"]);
+        expect(workflows.additionalProperties?.properties).not.toHaveProperty("stageModels");
     });
 });
 //# sourceMappingURL=loader.test.js.map

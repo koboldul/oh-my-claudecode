@@ -37,4 +37,47 @@ describe('omc-doctor skill package version diagnostic (issue #2981)', () => {
         expect(content).not.toContain('npm view oh-my-claudecode version');
     });
 });
+describe('omc-doctor skill GitHub Copilot CLI awareness', () => {
+    const skillPath = join(process.cwd(), 'skills', 'omc-doctor', 'SKILL.md');
+    const content = readFileSync(skillPath, 'utf8');
+    it('detects both Claude Code and Copilot CLI hosts before host-specific checks', () => {
+        expect(content).toContain('Detect Host Environment');
+        expect(content).toContain('Claude Code install:');
+        expect(content).toContain('Copilot CLI install:');
+        // Copilot plugins live under ~/.copilot/installed-plugins, honoring COPILOT_HOME.
+        expect(content).toContain('installed-plugins');
+        expect(content).toContain('COPILOT_HOME');
+    });
+    it('has a dedicated Copilot CLI checks section with install/enabled detection', () => {
+        expect(content).toContain('## GitHub Copilot CLI checks');
+        expect(content).toContain('installedPlugins[].cache_path');
+        expect(content).toContain('custom-marketplace installs');
+        expect(content).toContain('/plugin install oh-my-claudecode');
+        // Copilot recognizes Claude event names; never add camelCase mirrors (double-fire).
+        expect(content).toContain('camelCase mirror events');
+    });
+    it('documents the verified Copilot CLI contract and forward-version warning policy', () => {
+        expect(content).toContain('1.0.72-1');
+        expect(content).toContain('omc doctor copilot');
+        expect(content).toContain('earlier version: CRITICAL - unsupported');
+        expect(content).toContain('later version: WARN - compatibility is unverified, not failed');
+        expect(content).toContain('upgrade GitHub Copilot CLI');
+    });
+    it('describes observed subagentStart behavior without claiming full persistence parity', () => {
+        expect(content).toContain('camelCase `subagentStart`');
+        expect(content).toContain('remains partial parity');
+        expect(content).not.toContain('persistence loop work the same as under Claude Code');
+        expect(content).not.toContain('The only unsupported event is `SubagentStart`');
+    });
+    it('does not flag Claude-only artifacts for a Copilot-only install', () => {
+        expect(content).toContain('do **not** report a missing');
+        // Restart guidance must cover Copilot CLI, not just Claude Code.
+        expect(content).toContain('restart Copilot CLI');
+    });
+    it('keeps the skill free of strict-inequality tokens the doctor test guards against', () => {
+        // The existing drift-check test asserts no '!==' in the file; the Copilot
+        // additions must preserve that (JSONC reads use full-line comment stripping).
+        expect(content).not.toContain('!==');
+    });
+});
 //# sourceMappingURL=omc-doctor-skill.test.js.map

@@ -35,6 +35,7 @@ const CANCEL_SIGNAL_TTL_MS = 30_000;
 const CANCEL_SIGNAL_CLOCK_SKEW_MS = 5_000;
 const STALE_STATE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
 const PENDING_ASYNC_STATE_STALE_MS = 24 * 60 * 60 * 1000;
+const RUNNING_SUBAGENT_STALE_MS = 30 * 60 * 1000;
 const OVERSIZE_TOOL_RESULT_REDIRECT_STOP_MAX = 3;
 const OVERSIZE_TOOL_RESULT_REDIRECT_STOP_TTL_MS = 5 * 60 * 1000;
 const TERMINAL_WORKFLOW_SLOT_MODES = new Set(['autopilot', 'ralph', 'ralplan']);
@@ -334,31 +335,30 @@ function isTerminalWorkflowModeState(state) {
         return false;
     if (state.active === false)
         return true;
-    if (typeof state.completed_at === 'string' && state.completed_at.length > 0)
+    if (typeof state.completed_at === 'string'
+        && state.completed_at.trim().length > 0) {
         return true;
+    }
     const phase = normalizeWorkflowTerminalPhase(state);
     return Boolean(phase && TERMINAL_WORKFLOW_PHASES.has(phase));
 }
 async function reconcileTerminalWorkflowSlots(workingDir, sessionId) {
     try {
-        const { readSkillActiveStateNormalized, pruneExpiredWorkflowSkillTombstones, markWorkflowSkillCompleted, writeSkillActiveStateCopies, } = await import('../skill-state/index.js');
-        const original = readSkillActiveStateNormalized(workingDir, sessionId);
-        let current = pruneExpiredWorkflowSkillTombstones(original);
-        let changed = current !== original;
-        for (const [slotName, slot] of Object.entries(current.active_skills)) {
-            if (slot.completed_at || !TERMINAL_WORKFLOW_SLOT_MODES.has(slotName)) {
-                continue;
+        const { pruneExpiredWorkflowSkillTombstones, markWorkflowSkillCompleted, mutateSkillActiveStateLocked, isWorkflowSkillCompleted, } = await import('../skill-state/index.js');
+        mutateSkillActiveStateLocked(workingDir, sessionId, (original) => {
+            let current = pruneExpiredWorkflowSkillTombstones(original);
+            for (const [slotName, slot] of Object.entries(current.active_skills)) {
+                if (isWorkflowSkillCompleted(slot)
+                    || !TERMINAL_WORKFLOW_SLOT_MODES.has(slotName)) {
+                    continue;
+                }
+                const modeState = readModeState(slotName, workingDir, sessionId);
+                if (isTerminalWorkflowModeState(modeState)) {
+                    current = markWorkflowSkillCompleted(current, slotName);
+                }
             }
-            const modeState = readModeState(slotName, workingDir, sessionId);
-            if (!isTerminalWorkflowModeState(modeState)) {
-                continue;
-            }
-            current = markWorkflowSkillCompleted(current, slotName);
-            changed = true;
-        }
-        if (changed) {
-            writeSkillActiveStateCopies(workingDir, current, sessionId);
-        }
+            return current;
+        });
     }
     catch {
         // Best-effort reconciliation only. Stop enforcement falls back to the
@@ -372,7 +372,16 @@ async function reconcileTerminalWorkflowSlots(workingDir, sessionId) {
  */
 export function hasPendingOwnedAsyncWork(directory, sessionId) {
     return hasPendingBackgroundTask(directory, sessionId)
-        || hasPendingScheduledWakeup(directory, sessionId);
+        || hasPendingScheduledWakeup(directory, sessionId)
+        || hasPendingDelegatedSubagent(directory, sessionId);
+}
+function hasPendingDelegatedSubagent(directory, sessionId) {
+    const active = getActiveAgentSnapshot(directory, sessionId);
+    if (active.count === 0)
+        return false;
+    const updatedAt = parseTimestamp(active.lastUpdatedAt);
+    return updatedAt !== null
+        && Date.now() - updatedAt <= RUNNING_SUBAGENT_STALE_MS;
 }
 /**
  * Read last tool error from state directory.
@@ -1914,13 +1923,14 @@ async function resolvePersistentModeBlock(sessionId, directory, stopContext // N
     const tombstonedWorkflowModes = new Set();
     let workflowAuthority = null;
     try {
-        const { readSkillActiveStateNormalized, resolveAuthoritativeWorkflowSkill } = await import('../skill-state/index.js');
+        const { isWorkflowSkillCompleted, readSkillActiveStateNormalized, resolveAuthoritativeWorkflowSkill, } = await import('../skill-state/index.js');
         const ledger = readSkillActiveStateNormalized(workingDir, sessionId);
         const authority = resolveAuthoritativeWorkflowSkill(ledger);
         workflowAuthority = authority?.skill_name ?? null;
         for (const [name, slot] of Object.entries(ledger.active_skills)) {
-            if (slot.completed_at)
+            if (isWorkflowSkillCompleted(slot)) {
                 tombstonedWorkflowModes.add(name);
+            }
         }
     }
     catch {

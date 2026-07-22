@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, readFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 const mocks = vi.hoisted(() => ({
@@ -20,9 +20,14 @@ const modelContractMocks = vi.hoisted(() => ({
     }),
     getContract: vi.fn((agentType) => ({ binary: agentType ?? 'claude' })),
     getWorkerEnv: vi.fn(() => ({ OMC_TEAM_WORKER: 'issue2675-team/worker-1' })),
-    isPromptModeAgent: vi.fn(() => false),
-    getPromptModeArgs: vi.fn(() => []),
+    isPromptModeAgent: vi.fn((_agentType) => false),
+    getPromptModeArgs: vi.fn((_agentType, _instruction) => []),
     resolveClaudeWorkerModel: vi.fn(() => undefined),
+    buildValidatedWorkerLaunchDescriptor: vi.fn((agentType, config, appendedArgs = []) => {
+        const [binary, ...args] = modelContractMocks.buildWorkerArgv(agentType, config);
+        return { schema_version: 1, provider: agentType, model: config.model ?? null, binary, args: [...args, ...appendedArgs] };
+    }),
+    validateWorkerLaunchDescriptor: vi.fn((value) => value),
 }));
 vi.mock('../../cli/tmux-utils.js', () => ({
     tmuxExecAsync: mocks.tmuxExecAsync,
@@ -45,6 +50,8 @@ vi.mock('../model-contract.js', () => ({
     isPromptModeAgent: modelContractMocks.isPromptModeAgent,
     getPromptModeArgs: modelContractMocks.getPromptModeArgs,
     resolveClaudeWorkerModel: modelContractMocks.resolveClaudeWorkerModel,
+    buildValidatedWorkerLaunchDescriptor: modelContractMocks.buildValidatedWorkerLaunchDescriptor,
+    validateWorkerLaunchDescriptor: modelContractMocks.validateWorkerLaunchDescriptor,
     // gemini is supported on all platforms, so the preflight headless guard is a no-op here.
     assertHeadlessSupported: () => { },
     isHeadlessSupportedOnPlatform: () => true,
@@ -96,6 +103,50 @@ describe('runtime-v2 Gemini preflight routing', () => {
             workerName: 'worker-1',
             resolvedBinaryPath: 'gemini',
         }));
+    });
+    it('persists routed Copilot prompt descriptors and writes Copilot-specific worker guidance', async () => {
+        cwd = await mkdtemp(join(tmpdir(), 'copilot-routing-'));
+        modelContractMocks.isPromptModeAgent.mockImplementation(agentType => agentType === 'copilot');
+        modelContractMocks.getPromptModeArgs.mockImplementation((_agentType, instruction) => ['-p', instruction ?? '']);
+        const { startTeamV2 } = await import('../runtime-v2.js');
+        const runtime = await startTeamV2({
+            teamName: 'copilot-routing-team',
+            workerCount: 1,
+            agentTypes: ['claude'],
+            tasks: [{
+                    subject: 'Review code',
+                    description: 'Review code and write a verdict',
+                    role: 'code-reviewer',
+                }],
+            cwd,
+            pluginConfig: {
+                externalModels: {
+                    defaults: {
+                        copilotModel: 'gpt-5.5',
+                        copilotReasoningEffort: 'high',
+                    },
+                },
+                team: { roleRouting: { 'code-reviewer': { provider: 'copilot' } } },
+            },
+        });
+        const worker = runtime.config.workers[0];
+        expect(worker.worker_cli).toBe('copilot');
+        expect(worker.launch_descriptor).toMatchObject({
+            provider: 'copilot',
+            model: 'gpt-5.5',
+            args: expect.arrayContaining(['-p']),
+        });
+        expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith('copilot', expect.objectContaining({
+            model: 'gpt-5.5',
+            reasoningEffort: 'high',
+        }));
+        expect(runtime.config.configured_routing_roles).toContain('code-reviewer');
+        expect(runtime.config.copilot_defaults).toEqual({
+            model: 'gpt-5.5',
+            reasoning_effort: 'high',
+        });
+        const overlay = await readFile(join(cwd, '.omc', 'state', 'team', 'copilot-routing-team', 'workers', 'worker-1', 'AGENTS.md'), 'utf-8');
+        expect(overlay).toContain('Agent-Type Guidance (copilot)');
     });
 });
 //# sourceMappingURL=runtime-v2.gemini-preflight.test.js.map

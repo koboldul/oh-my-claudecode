@@ -11,6 +11,7 @@
  */
 import { z } from 'zod';
 import type { HookInput } from './bridge.js';
+import { type CanonicalHookEnvelope, type CanonicalToolCall, type DetectedHookContract, type HookHost, type NormalizationIssue } from './hook-protocol.js';
 /** Schema for the common hook input structure (supports both snake_case and camelCase) */
 declare const HookInputSchema: z.ZodObject<{
     tool_name: z.ZodOptional<z.ZodString>;
@@ -136,6 +137,25 @@ declare const HookInputSchema: z.ZodObject<{
     user_requested: z.ZodOptional<z.ZodBoolean>;
     userRequested: z.ZodOptional<z.ZodBoolean>;
 }, z.ZodTypeAny, "passthrough">>;
+interface DedupeCanonicalToolCallsResult {
+    calls: CanonicalToolCall[];
+    issues: NormalizationIssue[];
+}
+export declare const MAX_STABLE_SERIALIZATION_DEPTH = 128;
+/**
+ * Detect the host contract from the complete top-level hook envelope.
+ * Nested tool arguments are deliberately ignored so snake_case argument keys
+ * cannot change host detection.
+ */
+export declare function detectHookContract(raw: unknown, _hookType?: string): DetectedHookContract;
+export declare function canonicalToolName(host: HookHost, nativeName: string): string;
+export declare function stableCallFingerprint(name: string, parsedInput: unknown): string;
+export declare function decodeCopilotToolCall(rawCall: unknown, originalIndex: number): CanonicalToolCall;
+export declare function dedupeCanonicalToolCalls(calls: readonly CanonicalToolCall[]): DedupeCanonicalToolCallsResult;
+/**
+ * Normalize a complete host envelope without changing nested tool argument keys.
+ */
+export declare function normalizeHookEnvelope(raw: unknown, hookType?: string): CanonicalHookEnvelope;
 /** Hooks where unknown fields are dropped (strict allowlist only) */
 declare const SENSITIVE_HOOKS: Set<string>;
 /** All known camelCase field names the system uses (post-normalization) */

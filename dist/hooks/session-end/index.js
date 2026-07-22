@@ -1,16 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
-import { runSessionEndDeferredAction } from './callbacks.js';
-import { getOMCConfig } from '../../features/auto-update.js';
-import { buildConfigFromEnv, getEnabledPlatforms, getNotificationConfig } from '../../notifications/config.js';
-import { cleanupBridgeSessions } from '../../tools/python-repl/bridge-manager.js';
 import { resolveToWorktreeRoot, getOmcRoot, validateSessionId, isValidTranscriptPath, resolveSessionStatePath } from '../../lib/worktree-paths.js';
 import { SESSION_END_MODE_STATE_FILES, SESSION_METRICS_MODE_FILES } from '../../lib/mode-names.js';
 import { clearModeStateFile, readModeState } from '../../lib/mode-state-io.js';
-import { completeForegroundCleanup, completeForegroundCleanupAndSealCore, prepareCoreManifest, readSessionEndJob, sealWikiManifest } from './cleanup-manifest.js';
-import { spawnSessionEndWorker } from './worker.js';
-import { buildWikiSessionEndCaptureIntent } from '../wiki/session-hooks.js';
+import { completeForegroundCleanup, completeForegroundCleanupAndSealCore, prepareCoreManifest, readSessionEndJob, sealWikiManifest, } from './cleanup-manifest.js';
 const SESSION_STARTED_MARKER_FILE = 'session-started.json';
 const DEFAULT_SESSION_END_CLEANUP_BUDGET_MS = 2_000;
 const MAX_SESSION_END_CLEANUP_BUDGET_MS = 10_000;
@@ -37,7 +31,11 @@ export function resolveSessionEndCleanupBudgetMs(env = process.env) {
     }
     return Math.min(Math.floor(parsed), MAX_SESSION_END_CLEANUP_BUDGET_MS);
 }
-function hasExplicitNotificationConfig(profileName) {
+async function hasExplicitNotificationConfig(profileName) {
+    const [{ getOMCConfig }, { buildConfigFromEnv }] = await Promise.all([
+        import('../../features/auto-update.js'),
+        import('../../notifications/config.js'),
+    ]);
     const config = getOMCConfig();
     if (profileName) {
         const profile = config.notificationProfiles?.[profileName];
@@ -421,10 +419,11 @@ export function cleanupModeStates(directory, sessionId) {
     for (const { file, mode } of SESSION_END_MODE_STATE_FILES) {
         const localPath = path.join(stateDir, file);
         const sessionPath = sessionId ? resolveSessionStatePath(mode, sessionId, directory) : undefined;
+        const hasSessionState = Boolean(sessionPath && fs.existsSync(sessionPath));
         try {
             // For JSON files, check if active before removing
             if (file.endsWith('.json')) {
-                const sessionState = sessionId
+                const sessionState = sessionId && hasSessionState
                     ? readModeState(mode, directory, sessionId)
                     : null;
                 let shouldCleanup = sessionState?.active === true;
@@ -445,12 +444,11 @@ export function cleanupModeStates(directory, sessionId) {
                 }
                 if (shouldCleanup) {
                     const hadLocalPath = fs.existsSync(localPath);
-                    const hadSessionPath = Boolean(sessionPath && fs.existsSync(sessionPath));
                     if (clearModeStateFile(mode, directory, sessionId)) {
                         if (hadLocalPath && !fs.existsSync(localPath)) {
                             filesRemoved++;
                         }
-                        if (sessionPath && hadSessionPath && !fs.existsSync(sessionPath)) {
+                        if (sessionPath && hasSessionState && !fs.existsSync(sessionPath)) {
                             filesRemoved++;
                         }
                         if (!modesCleaned.includes(mode)) {
@@ -659,6 +657,7 @@ export async function cleanupSessionPython(directory, sessionId) {
         ? manifest.actions['python-cleanup'].payload.transcriptPath : '';
     const sessionIds = await extractPythonReplSessionIdsFromTranscript(transcriptPath);
     if (sessionIds.length > 0) {
+        const { cleanupBridgeSessions } = await import('../../tools/python-repl/bridge-manager.js');
         await cleanupBridgeSessions(sessionIds, { gracePeriodMs: 500, sigtermGraceMs: 500, finalWaitMs: 250, parallel: true });
     }
 }
@@ -690,18 +689,28 @@ function deferredSessionEndSnapshot(directory, sessionId) {
     };
 }
 export async function runSessionEndCallbacks(directory, sessionId, idempotencyKey, strict = false) {
+    const [{ getEnabledPlatforms, getNotificationConfig }, { runSessionEndDeferredAction }] = await Promise.all([
+        import('../../notifications/config.js'),
+        import('./callbacks.js'),
+    ]);
     const { metrics, input } = deferredSessionEndSnapshot(directory, sessionId);
     const profileName = process.env.OMC_NOTIFY_PROFILE;
     const config = getNotificationConfig(profileName);
-    const platforms = config && hasExplicitNotificationConfig(profileName) ? getEnabledPlatforms(config, 'session-end') : [];
+    const platforms = config && await hasExplicitNotificationConfig(profileName)
+        ? getEnabledPlatforms(config, 'session-end')
+        : [];
     const outcome = await runSessionEndDeferredAction({ name: 'legacy-callback', class: 'best-effort', idempotencyKey, payload: { skipPlatforms: platforms.length > 0 ? getLegacyPlatformsCoveredByNotifications(platforms) : [], idempotencyKey }, budgetMs: 2_000 }, { directory, sessionId, transcriptPath: input.transcript_path ?? '', metrics, input, deadlineAt: new Date(Date.now() + 2_000).toISOString(), action: { name: 'legacy-callback', class: 'best-effort', idempotencyKey, payload: { idempotencyKey }, budgetMs: 2_000 } });
     if (strict && outcome.status !== 'completed' && outcome.status !== 'skipped')
         throw new Error(`legacy-callback-${outcome.status}`);
 }
 export async function runSessionEndNotifications(directory, sessionId, strict = false) {
+    const [{ getNotificationConfig }, { runSessionEndDeferredAction }] = await Promise.all([
+        import('../../notifications/config.js'),
+        import('./callbacks.js'),
+    ]);
     const profileName = process.env.OMC_NOTIFY_PROFILE;
     const config = getNotificationConfig(profileName);
-    if (!config || !hasExplicitNotificationConfig(profileName))
+    if (!config || !await hasExplicitNotificationConfig(profileName))
         return;
     const { metrics, input } = deferredSessionEndSnapshot(directory, sessionId);
     const outcome = await runSessionEndDeferredAction({ name: 'notification', class: 'best-effort', payload: { profileName }, budgetMs: 2_000 }, { directory, sessionId, transcriptPath: input.transcript_path ?? '', metrics, input, deadlineAt: new Date(Date.now() + 2_000).toISOString(), action: { name: 'notification', class: 'best-effort', payload: { profileName }, budgetMs: 2_000 } });
@@ -709,6 +718,7 @@ export async function runSessionEndNotifications(directory, sessionId, strict = 
         throw new Error(`notification-${outcome.status}`);
 }
 export async function runSessionEndOpenClaw(directory, sessionId, strict = false) {
+    const { runSessionEndDeferredAction } = await import('./callbacks.js');
     const { metrics, input } = deferredSessionEndSnapshot(directory, sessionId);
     const outcome = await runSessionEndDeferredAction({ name: 'openclaw-wake', class: 'best-effort', payload: { enabled: process.env.OMC_OPENCLAW === '1', reason: metrics.reason, sessionId }, budgetMs: 2_000 }, { directory, sessionId, transcriptPath: input.transcript_path ?? '', metrics, input, deadlineAt: new Date(Date.now() + 2_000).toISOString(), action: { name: 'openclaw-wake', class: 'best-effort', payload: {}, budgetMs: 2_000 } });
     if (strict && outcome.status !== 'completed' && outcome.status !== 'skipped')
@@ -730,7 +740,13 @@ export async function runForegroundSessionEndCleanup(directory, sessionId, persi
 }
 /** Foreground path: only durable local state and worker launch; deferred adapters are worker-owned. */
 function buildDurableSessionEndPayload(directory, input, metrics) {
-    const teamState = readModeState('team', directory, input.session_id);
+    const stateDir = path.join(getOmcRoot(directory), 'state');
+    const teamSessionPath = resolveSessionStatePath('team', input.session_id, directory);
+    const hasTeamState = fs.existsSync(path.join(stateDir, 'team-state.json'))
+        || fs.existsSync(teamSessionPath);
+    const teamState = hasTeamState
+        ? readModeState('team', directory, input.session_id)
+        : null;
     const teamName = extractTeamNameFromState(teamState);
     // Keep only routing identifiers and booleans: credentials remain in the inherited worker environment.
     return {
@@ -744,33 +760,100 @@ function buildDurableSessionEndPayload(directory, input, metrics) {
         openClawEnabled: process.env.OMC_OPENCLAW === '1',
     };
 }
-export async function processSessionEnd(input) {
+export async function admitSessionEnd(input, event) {
     const directory = resolveToWorktreeRoot(input.cwd);
+    const existing = event ? readSessionEndJob(directory, input.session_id) : null;
+    if (event && existing && existing.producers.core.state !== 'absent') {
+        const matches = existing.producers.core.eventId === event.eventId
+            && existing.producers.core.rawDigest === event.rawDigest;
+        return {
+            output: { continue: true },
+            directory,
+            sessionId: input.session_id,
+            admitted: true,
+            deduplicated: matches,
+        };
+    }
     const metrics = recordSessionMetrics(directory, input);
     const payload = buildDurableSessionEndPayload(directory, input, metrics);
-    const manifest = prepareCoreManifest(directory, input.session_id, payload);
-    if (!manifest)
-        return { continue: true };
+    const manifest = prepareCoreManifest(directory, input.session_id, payload, event);
+    if (!manifest) {
+        return {
+            output: { continue: true },
+            directory,
+            sessionId: input.session_id,
+            admitted: false,
+        };
+    }
     exportSessionSummary(directory, metrics);
     let foregroundOutcome;
     try {
         foregroundOutcome = await runForegroundSessionEndCleanup(directory, input.session_id, false);
     }
     catch {
-        return { continue: true };
+        return {
+            output: { continue: true },
+            directory,
+            sessionId: input.session_id,
+            admitted: false,
+        };
     }
     const sealed = completeForegroundCleanupAndSealCore(directory, input.session_id, foregroundOutcome);
-    if (sealed)
-        spawnSessionEndWorker({ directory, sessionId: input.session_id });
-    return { continue: true };
+    return {
+        output: { continue: true },
+        directory,
+        sessionId: input.session_id,
+        admitted: Boolean(sealed),
+    };
+}
+export async function processSessionEnd(input) {
+    const admission = await admitSessionEnd(input);
+    if (admission.admitted) {
+        const { spawnSessionEndWorker } = await import('./worker.js');
+        spawnSessionEndWorker({
+            directory: admission.directory,
+            sessionId: admission.sessionId,
+        });
+    }
+    return admission.output;
 }
 /** Wiki producer has no foreground lock or write; it only seals a durable capture/no-op intent. */
-export async function processWikiSessionEnd(input) {
+export async function admitWikiSessionEnd(input, event) {
     const directory = resolveToWorktreeRoot(input.cwd);
+    const existing = event ? readSessionEndJob(directory, input.session_id) : null;
+    if (event
+        && existing
+        && existing.producers.wiki.state !== 'absent') {
+        const matches = existing.producers.wiki.eventId === event.eventId
+            && existing.producers.wiki.rawDigest === event.rawDigest;
+        return {
+            output: { continue: true },
+            directory,
+            sessionId: input.session_id,
+            admitted: true,
+            deduplicated: matches,
+        };
+    }
+    const { buildWikiSessionEndCaptureIntent } = await import('../wiki/session-hooks.js');
     const intent = buildWikiSessionEndCaptureIntent({ cwd: directory, session_id: input.session_id });
-    sealWikiManifest(directory, input.session_id, intent ? { ...intent } : undefined);
-    spawnSessionEndWorker({ directory, sessionId: input.session_id });
-    return { continue: true };
+    const sealed = sealWikiManifest(directory, input.session_id, intent ? { ...intent } : undefined, event);
+    return {
+        output: { continue: true },
+        directory,
+        sessionId: input.session_id,
+        admitted: Boolean(sealed),
+    };
+}
+export async function processWikiSessionEnd(input) {
+    const admission = await admitWikiSessionEnd(input);
+    if (admission.admitted) {
+        const { spawnSessionEndWorker } = await import('./worker.js');
+        spawnSessionEndWorker({
+            directory: admission.directory,
+            sessionId: admission.sessionId,
+        });
+    }
+    return admission.output;
 }
 export async function handleSessionEnd(input) {
     return processSessionEnd(input);

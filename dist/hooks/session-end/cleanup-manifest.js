@@ -30,8 +30,35 @@ const BEST_EFFORT_ACTION_EXECUTION_MS = ACTIONS.filter(([, actionClass]) => acti
 const REQUIRED_ACTION_MAX_ATTEMPTS = 3;
 const LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
 const DISCOVERY_FILE = 'discovery.json';
-export function sessionEndJobPath(directory, sessionId) { validateSessionId(sessionId); return path.join(getOmcRoot(directory), 'state', 'session-end-jobs', `${sessionId}.json`); }
-export function sessionEndJobsDirectory(directory) { return path.join(getOmcRoot(directory), 'state', 'session-end-jobs'); }
+function canonicalScopeDirectory(directory) {
+    let resolved = path.resolve(directory);
+    try {
+        resolved = fs.realpathSync.native(resolved);
+    }
+    catch { /* retain the resolved path */ }
+    return process.platform === 'win32'
+        ? path.win32.normalize(resolved).toLowerCase()
+        : path.normalize(resolved);
+}
+export function sessionEndScopeKey(directory) {
+    return createHash('sha256').update(canonicalScopeDirectory(directory)).digest('hex');
+}
+function legacySessionEndScopeKey(directory) {
+    return createHash('sha256').update(JSON.stringify(directory)).digest('hex');
+}
+function legacySessionEndJobsDirectory(directory) {
+    return path.join(getOmcRoot(directory), 'state', 'session-end-jobs');
+}
+function legacySessionEndJobPath(directory, sessionId) {
+    return path.join(legacySessionEndJobsDirectory(directory), `${sessionId}.json`);
+}
+export function sessionEndJobsDirectory(directory) {
+    return path.join(legacySessionEndJobsDirectory(directory), 'v2', sessionEndScopeKey(directory));
+}
+export function sessionEndJobPath(directory, sessionId) {
+    validateSessionId(sessionId);
+    return path.join(sessionEndJobsDirectory(directory), `${sessionId}.json`);
+}
 function digest(value) { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
 function nowIso() { return new Date().toISOString(); }
 function initialDeadlines() {
@@ -140,6 +167,59 @@ function readPath(jobPath) { try {
 catch {
     return null;
 } }
+function migrateLegacySessionEndJob(directory, sessionId) {
+    const target = sessionEndJobPath(directory, sessionId);
+    if (fs.existsSync(target))
+        return;
+    const legacyPath = legacySessionEndJobPath(directory, sessionId);
+    const legacy = readPath(legacyPath);
+    if (!legacy
+        || legacy.version !== 1
+        || legacy.sessionId !== sessionId
+        || legacy.scopeKey !== legacySessionEndScopeKey(directory)) {
+        return;
+    }
+    try {
+        withLock(target, () => {
+            if (fs.existsSync(target))
+                return;
+            atomicWriteJsonSync(target, {
+                ...legacy,
+                scopeKey: sessionEndScopeKey(directory),
+                revision: legacy.revision + 1,
+                updatedAt: nowIso(),
+            });
+        });
+    }
+    catch {
+        // The matching v1 manifest remains available for a later safe migration.
+    }
+}
+function migrateLegacyDiscoveryIndex(directory) {
+    const legacyDiscovery = path.join(legacySessionEndJobsDirectory(directory), DISCOVERY_FILE);
+    let legacyIndex;
+    try {
+        legacyIndex = readIndex(legacyDiscovery);
+    }
+    catch {
+        return;
+    }
+    for (const ticket of legacyIndex.tickets.slice(0, 128)) {
+        try {
+            validateSessionId(ticket.sessionId);
+            const legacy = readPath(legacySessionEndJobPath(directory, ticket.sessionId));
+            if (legacy?.scopeKey !== legacySessionEndScopeKey(directory))
+                continue;
+            migrateLegacySessionEndJob(directory, ticket.sessionId);
+            if (fs.existsSync(sessionEndJobPath(directory, ticket.sessionId))) {
+                updateTicket(directory, ticket.sessionId, true);
+            }
+        }
+        catch {
+            // Only matching, valid v1 tickets are eligible for migration.
+        }
+    }
+}
 function discoveryPath(directory) { return path.join(sessionEndJobsDirectory(directory), DISCOVERY_FILE); }
 function readIndex(file) {
     try {
@@ -166,12 +246,15 @@ function updateTicket(directory, sessionId, present) {
 function newAction(name, actionClass, payload) { return { class: actionClass, phase: actionClass === 'required' ? 'deferred-required' : 'deferred-best-effort', status: 'pending', attempts: 0, idempotencyKey: digest([name, payload]), payload, budgetMs: actionClass === 'required' ? 9_000 : 2_000 }; }
 /** Terminality is solely a manifest property. Discovery tickets are deliberately excluded. */
 export function isManifestTerminal(job) { return ['sealed', 'no-op'].includes(job.producers.core.state) && ['sealed', 'no-op'].includes(job.producers.wiki.state) && Object.values(job.actions).every((action) => action.status === 'completed' || action.status === 'expired') && job.owner === null && Object.values(job.actions).every((action) => !action.runner || action.runner.phase === 'terminal'); }
-export function readSessionEndJob(directory, sessionId) { try {
-    return readPath(sessionEndJobPath(directory, sessionId));
+export function readSessionEndJob(directory, sessionId) {
+    try {
+        migrateLegacySessionEndJob(directory, sessionId);
+        return readPath(sessionEndJobPath(directory, sessionId));
+    }
+    catch {
+        return null;
+    }
 }
-catch {
-    return null;
-} }
 /** Locked expected-revision CAS with an exact post-write reread. */
 export function mutateSessionEndJob(directory, sessionId, expectedRevision, mutate) {
     let terminal = false;
@@ -210,7 +293,7 @@ function mutateLatest(directory, sessionId, mutate) { for (let i = 0; i < 8; i++
     if (result)
         return result;
 } return null; }
-export function prepareCoreManifest(directory, sessionId, payload) {
+export function prepareCoreManifest(directory, sessionId, payload, admission) {
     const durablePayload = withOpenClawRouting(payload);
     let jobPath;
     try {
@@ -219,13 +302,29 @@ export function prepareCoreManifest(directory, sessionId, payload) {
     catch {
         return null;
     }
+    migrateLegacySessionEndJob(directory, sessionId);
     try {
         const result = withLock(jobPath, () => {
             const existing = readPath(jobPath);
             if (existing) {
                 if (existing.phase === 'complete' || existing.producers.core.state !== 'absent')
                     return existing;
-                const next = { ...existing, producers: { ...existing.producers, core: { state: 'prepared', intentKey: digest(durablePayload), payloadDigest: digest(durablePayload) } }, actions: { ...existing.actions }, revision: existing.revision + 1, updatedAt: nowIso() };
+                const next = {
+                    ...existing,
+                    producers: {
+                        ...existing.producers,
+                        core: {
+                            state: 'prepared',
+                            eventId: admission?.eventId,
+                            rawDigest: admission?.rawDigest,
+                            intentKey: digest(durablePayload),
+                            payloadDigest: digest(durablePayload),
+                        },
+                    },
+                    actions: { ...existing.actions },
+                    revision: existing.revision + 1,
+                    updatedAt: nowIso(),
+                };
                 for (const [name, action] of Object.entries(next.actions))
                     if (name !== 'wiki-capture')
                         action.payload = durablePayload;
@@ -237,7 +336,29 @@ export function prepareCoreManifest(directory, sessionId, payload) {
             }
             const now = nowIso();
             const actions = Object.fromEntries(ACTIONS.map(([name, klass]) => [name, newAction(name, klass, durablePayload)]));
-            const job = { version: 1, jobId: randomUUID(), sessionId, scopeKey: digest(directory), revision: 0, createdAt: now, updatedAt: now, ...initialDeadlines(), producers: { core: { state: 'prepared', intentKey: digest(durablePayload), payloadDigest: digest(durablePayload) }, wiki: { state: 'absent' } }, actions, owner: null, phase: 'collecting' };
+            const job = {
+                version: 1,
+                jobId: randomUUID(),
+                sessionId,
+                scopeKey: sessionEndScopeKey(directory),
+                revision: 0,
+                createdAt: now,
+                updatedAt: now,
+                ...initialDeadlines(),
+                producers: {
+                    core: {
+                        state: 'prepared',
+                        eventId: admission?.eventId,
+                        rawDigest: admission?.rawDigest,
+                        intentKey: digest(durablePayload),
+                        payloadDigest: digest(durablePayload),
+                    },
+                    wiki: { state: 'absent' },
+                },
+                actions,
+                owner: null,
+                phase: 'collecting',
+            };
             atomicWriteJsonSync(jobPath, job);
             return readPath(jobPath);
         });
@@ -286,7 +407,7 @@ export function sealCoreManifest(directory, sessionId) { return mutateLatest(dir
     if (job.phase === 'collecting')
         job.phase = 'ready';
 } }); }
-export function sealWikiManifest(directory, sessionId, payload) {
+export function sealWikiManifest(directory, sessionId, payload, admission) {
     let jobPath;
     try {
         jobPath = sessionEndJobPath(directory, sessionId);
@@ -294,20 +415,37 @@ export function sealWikiManifest(directory, sessionId, payload) {
     catch {
         return null;
     }
+    migrateLegacySessionEndJob(directory, sessionId);
     try {
         const result = withLock(jobPath, () => {
             const existing = readPath(jobPath);
             if (!existing) {
                 const now = nowIso();
                 const actions = Object.fromEntries(ACTIONS.map(([name, klass]) => [name, newAction(name, klass, {})]));
-                const wiki = payload ? { state: 'sealed', intentKey: digest(payload), payloadDigest: digest(payload), sealedAt: now, sealedBy: 'wiki-producer' } : { state: 'no-op', sealedAt: now, sealedBy: 'wiki-producer' };
+                const wiki = payload
+                    ? {
+                        state: 'sealed',
+                        eventId: admission?.eventId,
+                        rawDigest: admission?.rawDigest,
+                        intentKey: digest(payload),
+                        payloadDigest: digest(payload),
+                        sealedAt: now,
+                        sealedBy: 'wiki-producer',
+                    }
+                    : {
+                        state: 'no-op',
+                        eventId: admission?.eventId,
+                        rawDigest: admission?.rawDigest,
+                        sealedAt: now,
+                        sealedBy: 'wiki-producer',
+                    };
                 if (payload)
                     actions['wiki-capture'].payload = payload;
                 else {
                     actions['wiki-capture'].status = 'completed';
                     actions['wiki-capture'].completedAt = now;
                 }
-                const job = { version: 1, jobId: randomUUID(), sessionId, scopeKey: digest(directory), revision: 0, createdAt: now, updatedAt: now, ...initialDeadlines(), producers: { core: { state: 'absent' }, wiki }, actions, owner: null, phase: 'collecting' };
+                const job = { version: 1, jobId: randomUUID(), sessionId, scopeKey: sessionEndScopeKey(directory), revision: 0, createdAt: now, updatedAt: now, ...initialDeadlines(), producers: { core: { state: 'absent' }, wiki }, actions, owner: null, phase: 'collecting' };
                 atomicWriteJsonSync(jobPath, job);
                 return readPath(jobPath);
             }
@@ -317,7 +455,23 @@ export function sealWikiManifest(directory, sessionId, payload) {
             const next = structuredClone(existing);
             next.revision++;
             next.updatedAt = now;
-            next.producers.wiki = payload ? { state: 'sealed', intentKey: digest(payload), payloadDigest: digest(payload), sealedAt: now, sealedBy: 'wiki-producer' } : { state: 'no-op', sealedAt: now, sealedBy: 'wiki-producer' };
+            next.producers.wiki = payload
+                ? {
+                    state: 'sealed',
+                    eventId: admission?.eventId,
+                    rawDigest: admission?.rawDigest,
+                    intentKey: digest(payload),
+                    payloadDigest: digest(payload),
+                    sealedAt: now,
+                    sealedBy: 'wiki-producer',
+                }
+                : {
+                    state: 'no-op',
+                    eventId: admission?.eventId,
+                    rawDigest: admission?.rawDigest,
+                    sealedAt: now,
+                    sealedBy: 'wiki-producer',
+                };
             if (payload)
                 next.actions['wiki-capture'].payload = payload;
             else {
@@ -338,8 +492,7 @@ export function sealWikiManifest(directory, sessionId, payload) {
 export function claimSessionEndJob(directory, sessionId, nonce, identity, deadlineAt) { const current = readSessionEndJob(directory, sessionId); if (!current)
     return null; const now = Date.now(); return mutateSessionEndJob(directory, sessionId, current.revision, (job) => { if (job.phase === 'complete' || job.owner)
     throw new Error('claim-conflict'); job.owner = { nonce, pid: process.pid, processStartIdentity: identity, claimedAt: nowIso(), heartbeatAt: nowIso(), leaseExpiresAt: new Date(Math.min(now + 750, deadlineAt)).toISOString(), runDeadlineAt: new Date(deadlineAt).toISOString(), leaseGeneration: 1, claimedFromRevision: job.revision }; job.phase = 'processing'; }); }
-export function renewSessionEndLease(directory, sessionId, nonce, generation, deadlineAt) { const current = readSessionEndJob(directory, sessionId); if (!current)
-    return null; return mutateSessionEndJob(directory, sessionId, current.revision, (job) => { const owner = job.owner; if (!owner || owner.nonce !== nonce || owner.leaseGeneration !== generation)
+export function renewSessionEndLease(directory, sessionId, nonce, generation, deadlineAt) { return mutateLatest(directory, sessionId, (job) => { const owner = job.owner; if (!owner || owner.nonce !== nonce || owner.leaseGeneration !== generation)
     throw new Error('lease-conflict'); owner.leaseGeneration++; owner.heartbeatAt = nowIso(); owner.leaseExpiresAt = new Date(Math.min(Date.now() + 750, deadlineAt)).toISOString(); }); }
 /** Reaping is intentionally separate from a new claim. Caller must establish dead or PID-reused identity. */
 export function reapStaleSessionEndOwner(directory, sessionId, expectedNonce, expectedGeneration, liveness) { const current = readSessionEndJob(directory, sessionId); if (!current || Date.now() < Date.parse(current.owner?.leaseExpiresAt ?? ''))
@@ -354,12 +507,10 @@ export function reapStaleSessionEndOwner(directory, sessionId, expectedNonce, ex
             action.runner.phase = 'terminal';
     }
 } job.owner = null; job.phase = 'recoverable-failure'; }); }
-export function releaseSessionEndJob(directory, sessionId, nonce, generation) { const current = readSessionEndJob(directory, sessionId); if (!current)
-    return null; return mutateSessionEndJob(directory, sessionId, current.revision, (job) => { if (!job.owner || job.owner.nonce !== nonce || job.owner.leaseGeneration !== generation)
+export function releaseSessionEndJob(directory, sessionId, nonce, generation) { return mutateLatest(directory, sessionId, (job) => { if (!job.owner || job.owner.nonce !== nonce || job.owner.leaseGeneration !== generation)
     throw new Error('release-conflict'); job.owner = null; if (job.phase !== 'complete')
     job.phase = 'recoverable-failure'; }); }
-export function updateSessionEndJob(directory, sessionId, expectedOwner, mutate) { const current = readSessionEndJob(directory, sessionId); if (!current)
-    return null; return mutateSessionEndJob(directory, sessionId, current.revision, (job) => { if (job.owner?.nonce !== expectedOwner || job.phase === 'complete')
+export function updateSessionEndJob(directory, sessionId, expectedOwner, mutate) { return mutateLatest(directory, sessionId, (job) => { if (job.owner?.nonce !== expectedOwner || job.phase === 'complete')
     throw new Error('owner-conflict'); mutate(job); }); }
 export function claimSessionEndAction(directory, sessionId, ownerNonce, name, deadlineAt) { return updateSessionEndJob(directory, sessionId, ownerNonce, (job) => { const action = job.actions[name]; if (!action || !['pending', 'retryable'].includes(action.status) || action.claimantNonce)
     throw new Error('action-claim-conflict'); if (action.class === 'best-effort' && action.attempts > 0) {
@@ -378,6 +529,7 @@ export function finishSessionEndAction(directory, sessionId, ownerNonce, name, r
 /** Claims fair durable discovery tickets and retires tickets whose manifests are terminal. */
 export function claimSessionEndDiscoveryTickets(directory, limit = 4, leaseMs = 15_000) {
     try {
+        migrateLegacyDiscoveryIndex(directory);
         const file = discoveryPath(directory);
         if (!fs.existsSync(file))
             return [];

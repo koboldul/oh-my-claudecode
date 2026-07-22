@@ -1,10 +1,11 @@
 import type { WorkerLaunchDescriptor } from './types.js';
-export type CliAgentType = 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity';
+import type { CopilotReasoningEffort } from '../shared/types.js';
+export type CliAgentType = 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity' | 'copilot';
 export interface CliAgentContract {
     agentType: CliAgentType;
     binary: string;
     installInstructions: string;
-    buildLaunchArgs(model?: string, extraFlags?: string[]): string[];
+    buildLaunchArgs(model?: string, extraFlags?: string[], reasoningEffort?: CopilotReasoningEffort): string[];
     parseOutput(rawOutput: string): string;
     /** Whether this agent supports a prompt/headless mode that bypasses TUI input */
     supportsPromptMode?: boolean;
@@ -15,6 +16,7 @@ export interface WorkerLaunchConfig {
     teamName: string;
     workerName: string;
     model?: string;
+    reasoningEffort?: CopilotReasoningEffort;
     cwd: string;
     extraFlags?: string[];
     /**

@@ -8,6 +8,7 @@ export interface SetupInput {
     permission_mode: string;
     hook_event_name: 'Setup';
     trigger: 'init' | 'maintenance';
+    host?: 'claude' | 'copilot';
 }
 export interface SetupResult {
     directories_created: string[];

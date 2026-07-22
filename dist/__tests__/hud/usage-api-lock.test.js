@@ -1,11 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
-const CLAUDE_CONFIG_DIR = '/tmp/test-claude';
-const CACHE_PATH = `${CLAUDE_CONFIG_DIR}/plugins/oh-my-claudecode/.usage-cache-zai.json`;
+import { tmpdir } from 'os';
+import { basename, dirname, join } from 'path';
+const CLAUDE_CONFIG_DIR = join(tmpdir(), 'test-claude');
+const CACHE_PATH = join(CLAUDE_CONFIG_DIR, 'plugins', 'oh-my-claudecode', '.usage-cache-zai.json');
 const LOCK_PATH = `${CACHE_PATH}.lock`;
 function createFsMock(initialFiles) {
     const files = new Map(Object.entries(initialFiles));
+    const identities = new Map();
     const directories = new Set([CLAUDE_CONFIG_DIR]);
+    const descriptors = new Map();
+    let nextDescriptor = 1;
+    let nextInode = 1;
+    for (const path of files.keys()) {
+        identities.set(path, { dev: 1, ino: nextInode++, mtimeMs: Date.now() });
+    }
     const existsSync = vi.fn((path) => files.has(String(path)) || directories.has(String(path)));
     const readFileSync = vi.fn((path) => {
         const content = files.get(String(path));
@@ -14,13 +23,19 @@ function createFsMock(initialFiles) {
         return content;
     });
     const writeFileSync = vi.fn((path, content) => {
-        files.set(String(path), String(content));
+        const normalized = String(path);
+        files.set(normalized, String(content));
+        if (!identities.has(normalized)) {
+            identities.set(normalized, { dev: 1, ino: nextInode++, mtimeMs: Date.now() });
+        }
     });
     const mkdirSync = vi.fn((path) => {
         directories.add(String(path));
     });
     const unlinkSync = vi.fn((path) => {
-        files.delete(String(path));
+        const normalized = String(path);
+        files.delete(normalized);
+        identities.delete(normalized);
     });
     const openSync = vi.fn((path) => {
         const normalized = String(path);
@@ -30,13 +45,60 @@ function createFsMock(initialFiles) {
             throw err;
         }
         files.set(normalized, '');
-        return 1;
+        identities.set(normalized, { dev: 1, ino: nextInode++, mtimeMs: Date.now() });
+        const descriptor = nextDescriptor++;
+        descriptors.set(descriptor, normalized);
+        return descriptor;
     });
-    const statSync = vi.fn((path) => {
-        if (!files.has(String(path)))
+    const lstatSync = vi.fn((path) => {
+        const normalized = String(path);
+        const identity = identities.get(normalized);
+        if (!identity)
             throw new Error(`ENOENT: ${path}`);
-        return { mtimeMs: Date.now() };
+        return { ...identity, size: Buffer.byteLength(files.get(normalized) ?? '') };
     });
+    const fstatSync = vi.fn((descriptor) => {
+        const path = descriptors.get(descriptor);
+        if (!path)
+            throw new Error(`EBADF: ${descriptor}`);
+        return lstatSync(path);
+    });
+    const writeSync = vi.fn((descriptor, buffer, offset, length, position = 0) => {
+        const path = descriptors.get(descriptor);
+        if (!path)
+            throw new Error(`EBADF: ${descriptor}`);
+        const existing = Buffer.from(files.get(path) ?? '');
+        const next = Buffer.alloc(Math.max(existing.length, position + length));
+        existing.copy(next);
+        buffer.copy(next, position, offset, offset + length);
+        files.set(path, next.toString());
+        return length;
+    });
+    const readSync = vi.fn((descriptor, buffer, offset, length, position = 0) => {
+        const path = descriptors.get(descriptor);
+        if (!path)
+            throw new Error(`EBADF: ${descriptor}`);
+        const source = Buffer.from(files.get(path) ?? '');
+        return source.copy(buffer, offset, position, position + length);
+    });
+    const closeSync = vi.fn((descriptor) => {
+        descriptors.delete(descriptor);
+    });
+    const linkSync = vi.fn((source, destination) => {
+        if (files.has(destination)) {
+            const err = new Error(`EEXIST: ${destination}`);
+            err.code = 'EEXIST';
+            throw err;
+        }
+        const identity = identities.get(source);
+        if (!identity)
+            throw new Error(`ENOENT: ${source}`);
+        files.set(destination, files.get(source) ?? '');
+        identities.set(destination, identity);
+    });
+    const readdirSync = vi.fn((directory) => [...files.keys()]
+        .filter((path) => dirname(path) === directory)
+        .map((path) => basename(path)));
     return {
         files,
         fsModule: {
@@ -46,14 +108,21 @@ function createFsMock(initialFiles) {
             mkdirSync,
             unlinkSync,
             openSync,
-            statSync,
-            writeSync: vi.fn(),
-            closeSync: vi.fn(),
+            statSync: lstatSync,
+            lstatSync,
+            fstatSync,
+            writeSync,
+            readSync,
+            fsyncSync: vi.fn(),
+            closeSync,
+            linkSync,
+            readdirSync,
             renameSync: vi.fn(),
             constants: {
                 O_CREAT: 0x40,
                 O_EXCL: 0x80,
                 O_WRONLY: 0x1,
+                O_RDWR: 0x2,
             },
         },
     };

@@ -15,7 +15,7 @@ export interface AgentConfig {
 }
 export type AutopilotExecutionBackend = "team" | "solo";
 export type AutopilotPlanningMode = "ralplan" | "direct" | false;
-export type AutopilotTeamAgentType = "claude" | "codex" | "gemini" | "grok" | "cursor" | "antigravity";
+export type AutopilotTeamAgentType = "claude" | "codex" | "gemini" | "grok" | "cursor" | "antigravity" | "copilot";
 /** Built-in stages admitted by version 1 named autopilot workflows. */
 export type AutopilotWorkflowStage = "ralplan" | "execution" | "ralph" | "qa";
 /** Closed, versioned named autopilot workflow profile. */
@@ -318,7 +318,8 @@ export interface HookResult {
 /**
  * External model provider type
  */
-export type ExternalModelProvider = "codex" | "gemini" | "antigravity";
+export type ExternalModelProvider = "codex" | "gemini" | "antigravity" | "copilot";
+export type CopilotReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 /**
  * External model configuration for a specific role or task
  */
@@ -335,6 +336,8 @@ export interface ExternalModelsDefaults {
     geminiModel?: string;
     grokModel?: string;
     antigravityModel?: string;
+    copilotModel?: string;
+    copilotReasoningEffort?: CopilotReasoningEffort;
 }
 /**
  * External models fallback policy
@@ -424,7 +427,7 @@ export type CanonicalTeamRole = typeof CANONICAL_TEAM_ROLES[number];
 /** Cursor team workers are currently supported only for executor-style tasks. */
 export declare const CURSOR_EXECUTOR_TEAM_ROLES: readonly ["executor"];
 /** Provider for /team role routing. */
-export type TeamRoleProvider = 'claude' | 'codex' | 'gemini' | 'grok' | 'cursor' | 'antigravity';
+export type TeamRoleProvider = 'claude' | 'codex' | 'gemini' | 'grok' | 'cursor' | 'antigravity' | 'copilot';
 /** Tier name accepted in role-assignment `model` field. */
 export type TeamRoleTier = 'HIGH' | 'MEDIUM' | 'LOW';
 /** Known agent names derived from `buildDefaultConfig().agents` keys in src/config/loader.ts. */
@@ -463,6 +466,8 @@ export interface RoleAssignment {
     provider: TeamRoleProvider;
     /** Resolved model ID (tier names expanded to explicit model strings). */
     model: string;
+    /** Copilot-only reasoning effort resolved from config/environment. */
+    reasoningEffort?: CopilotReasoningEffort;
     agent: KnownAgentName;
 }
 //# sourceMappingURL=types.d.ts.map

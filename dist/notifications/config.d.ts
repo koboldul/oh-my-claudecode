@@ -5,6 +5,7 @@
  * backward compatibility with the old stopHookCallbacks format.
  */
 import type { NotificationConfig, NotificationEvent, NotificationPlatform, VerbosityLevel } from "./types.js";
+export declare function getNotificationConfigPath(): string;
 /**
  * Validate Discord mention format: <@USER_ID> or <@&ROLE_ID>.
  * Returns the mention string if valid, undefined otherwise.
@@ -132,6 +133,7 @@ export declare function getReplyListenerPlatformConfig(config: NotificationConfi
  */
 export declare function getReplyConfig(): import("./types.js").ReplyConfig | null;
 import type { CustomIntegration, CustomIntegrationsConfig } from "./types.js";
+export declare function getLegacyOpenClawConfigPath(): string;
 /**
  * Detect if legacy OpenClaw configuration exists.
  */

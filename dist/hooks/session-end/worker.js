@@ -7,6 +7,7 @@ import { armSessionEndActionWatchdog } from './action-watchdog.js';
 import { getProcessStartIdentity, isProcessIdentityLive } from '../../platform/process-utils.js';
 const WORKER_ARG = '--omc-session-end-worker';
 const MAX_WORKER_MS = 10_000;
+const WORKER_IDENTITY_BUDGET_MS = process.platform === 'win32' ? 1_500 : 250;
 /** Durable OpenClaw routing is supplied from the manifest to the action runner, never from worker ambient state. */
 export function workerEnvironment() {
     const keys = ['PATH', 'HOME', 'USERPROFILE', 'TMPDIR', 'TEMP', 'TMP', 'SystemRoot', 'COMSPEC', 'LANG', 'LC_ALL', 'NODE_ENV', 'CLAUDE_CONFIG_DIR', 'OMC_STATE_DIR', 'OMC_HOOK_CONFIG', 'OMC_CONFIG_PATH', 'OMC_NOTIFY', 'OMC_NOTIFY_PROFILE', 'OMC_TELEGRAM', 'OMC_DISCORD', 'OMC_SLACK', 'OMC_WEBHOOK', 'OMC_DISCORD_MENTION', 'OMC_DISCORD_NOTIFIER_BOT_TOKEN', 'OMC_DISCORD_NOTIFIER_CHANNEL', 'OMC_DISCORD_WEBHOOK_URL', 'OMC_TELEGRAM_BOT_TOKEN', 'OMC_TELEGRAM_NOTIFIER_BOT_TOKEN', 'OMC_TELEGRAM_CHAT_ID', 'OMC_TELEGRAM_NOTIFIER_CHAT_ID', 'OMC_TELEGRAM_NOTIFIER_UID', 'OMC_SLACK_WEBHOOK_URL', 'OMC_SLACK_MENTION', 'OMC_SLACK_BOT_TOKEN', 'OMC_SLACK_APP_TOKEN', 'OMC_SLACK_BOT_CHANNEL', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE', ...(process.env.NODE_ENV === 'test' ? ['OMC_SESSION_END_TEST_PRODUCER_GRACE_MS'] : [])];
@@ -86,7 +87,7 @@ function reschedulePendingWorker(payload, job) {
 export async function processSessionEndWorker(payload) {
     const deadlineAt = Date.now() + MAX_WORKER_MS;
     const nonce = randomUUID();
-    const identity = await getProcessStartIdentity(process.pid, Math.min(deadlineAt, Date.now() + 250));
+    const identity = payload.processStartIdentity ?? await getProcessStartIdentity(process.pid, Math.min(deadlineAt, Date.now() + WORKER_IDENTITY_BUDGET_MS));
     if (!identity)
         return;
     let claimed = claimSessionEndJob(payload.directory, payload.sessionId, nonce, identity, deadlineAt);
@@ -157,6 +158,26 @@ export async function processSessionEndWorker(payload) {
         const terminalized = failClosedExhaustedForegroundCleanup(payload.directory, payload.sessionId);
         reschedulePendingWorker(payload, terminalized ?? released ?? readSessionEndJob(payload.directory, payload.sessionId));
     }
+}
+/** Resident recovery path: claims the same bounded tickets but reconciles them without spawning. */
+export async function reconcileSessionEndJobsInProcess(directory, sessionIds, processStartIdentity) {
+    const tickets = sessionIds
+        ? [...sessionIds].slice(0, 4).map(sessionId => ({ sessionId, nonce: '' }))
+        : claimSessionEndDiscoveryTickets(directory, 4);
+    await Promise.all(tickets.map(async (ticket) => {
+        try {
+            await processSessionEndWorker({
+                directory,
+                sessionId: ticket.sessionId,
+                processStartIdentity,
+            });
+        }
+        finally {
+            if (ticket.nonce) {
+                releaseSessionEndDiscoveryTicket(directory, ticket.sessionId, ticket.nonce, true);
+            }
+        }
+    }));
 }
 /** Bounded fair SessionStart recovery based on durable tickets, not a directory page. */
 export function reconcileSessionEndJobs(directory, sessionIds) {

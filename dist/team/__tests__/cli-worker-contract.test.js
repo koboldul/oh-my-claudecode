@@ -12,6 +12,12 @@ describe('cli-worker-contract', () => {
             expect(shouldInjectContract('critic', 'gemini')).toBe(true);
             expect(shouldInjectContract('code-reviewer', 'gemini')).toBe(true);
         });
+        it('returns true for reviewer roles on Copilot prompt-mode workers', () => {
+            expect(shouldInjectContract('critic', 'copilot')).toBe(true);
+            expect(shouldInjectContract('code-reviewer', 'copilot')).toBe(true);
+            expect(shouldInjectContract('security-reviewer', 'copilot')).toBe(true);
+            expect(shouldInjectContract('test-engineer', 'copilot')).toBe(true);
+        });
         it('returns false for claude workers regardless of role', () => {
             expect(shouldInjectContract('critic', 'claude')).toBe(false);
             expect(shouldInjectContract('code-reviewer', 'claude')).toBe(false);

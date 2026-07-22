@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, it, expect } from 'vitest';
-import { generateMailboxTriggerMessage, generatePromptModeStartupPrompt, generateTriggerMessage, generateWorkerOverlay, getWorkerEnv, } from '../worker-bootstrap.js';
+import { generateMailboxTriggerMessage, generatePromptModeStartupPrompt, generateTriggerMessage, generateWorkerOverlay, renderRecoveryContinuationInstruction, getWorkerEnv, } from '../worker-bootstrap.js';
 describe('worker-bootstrap', () => {
     const originalPluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
     const originalPath = process.env.PATH;
@@ -138,6 +138,13 @@ describe('worker-bootstrap', () => {
             expect(geminiOverlay).toContain('Agent-Type Guidance (gemini)');
             expect(geminiOverlay).toContain('milestone');
         });
+        it('injects autonomous one-shot and reviewer verdict guidance for Copilot', () => {
+            const overlay = generateWorkerOverlay({ ...baseParams, agentType: 'copilot' });
+            expect(overlay).toContain('Agent-Type Guidance (copilot)');
+            expect(overlay).toContain('autonomous one-shot prompt mode');
+            expect(overlay).toContain('structured verdict file');
+            expect(overlay).toContain('transition-task-status');
+        });
         it('documents CLI lifecycle examples that match the active team api contract', () => {
             const overlay = generateWorkerOverlay(baseParams);
             expect(overlay).toContain('team api read-task');
@@ -152,6 +159,13 @@ describe('worker-bootstrap', () => {
             expect(overlay).toContain('Subagent skip reason:');
             expect(overlay).toContain('missing_delegation_compliance_evidence');
             expect(overlay).not.toContain('Read your task file at');
+        });
+        it('renders required task versions in ordinary and adopted checkpoint commands', () => {
+            expect(generateWorkerOverlay(baseParams)).toContain('\\"task_version\\":<current_task_version>');
+            const recovery = renderRecoveryContinuationInstruction({ teamName: 'test-team', workerName: 'worker-1',
+                taskId: '1', taskVersion: 7, claimToken: 'claim-token', sequence: 4, resumePayload: { cursor: 3 } });
+            expect(recovery).toContain('\\"task_version\\":7');
+            expect(recovery).not.toContain('<current_task_version>');
         });
         it('renders plugin-safe CLI lifecycle examples when omc is unavailable in plugin installs', () => {
             process.env.CLAUDE_PLUGIN_ROOT = '/plugin-root';

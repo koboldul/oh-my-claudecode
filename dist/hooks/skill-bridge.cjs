@@ -175,8 +175,20 @@ function resolveSuperprojectRoot(cwd) {
   }
   return anchor;
 }
+function hasGitMetadataAncestor(directory) {
+  if (process.env.GIT_DIR || process.env.GIT_WORK_TREE) return true;
+  let probe = (0, import_path2.resolve)(directory);
+  while (true) {
+    if ((0, import_fs.existsSync)((0, import_path2.join)(probe, ".git"))) return true;
+    const parent = (0, import_path2.dirname)(probe);
+    if (parent === probe) return false;
+    probe = parent;
+  }
+}
 function resolveStateAnchorRoot(worktreeRoot) {
-  if (worktreeRoot) return resolveSuperprojectRoot(worktreeRoot) || worktreeRoot;
+  if (worktreeRoot) {
+    return hasGitMetadataAncestor(worktreeRoot) ? resolveSuperprojectRoot(worktreeRoot) || worktreeRoot : worktreeRoot;
+  }
   return getWorktreeRoot() || process.cwd();
 }
 function getGitTopLevel(cwd) {

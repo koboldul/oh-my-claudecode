@@ -7,7 +7,10 @@
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 import { getClaudeConfigDir } from "../utils/config-dir.js";
-const DEFAULT_CONFIG_PATH = join(getClaudeConfigDir(), "omc_config.hook.json");
+export function getHookNotificationConfigPath() {
+    return join(getClaudeConfigDir(), "omc_config.hook.json");
+}
+const DEFAULT_CONFIG_PATH = getHookNotificationConfigPath();
 /** Cached hook config. `undefined` = not yet read, `null` = read but absent/disabled. */
 let cachedConfig;
 /**

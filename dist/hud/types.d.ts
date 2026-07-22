@@ -34,23 +34,25 @@ export interface StatuslineStdin {
     transcript_path?: string;
     /** Current working directory */
     cwd?: string;
-    /** Model information from Claude Code statusline stdin */
+    /** Host-normalized model information from statusline stdin */
     model?: {
         id?: string;
         display_name?: string;
     };
-    /** Context window metrics from Claude Code statusline stdin */
+    /** Host-normalized context window metrics from statusline stdin */
     context_window?: {
         context_window_size?: number;
         total_input_tokens?: number;
         used_percentage?: number;
         current_usage?: {
             input_tokens?: number;
+            /** Optional: present on some hosts (e.g. Copilot CLI) alongside input_tokens. */
+            output_tokens?: number;
             cache_creation_input_tokens?: number;
             cache_read_input_tokens?: number;
         };
     };
-    /** Rate limits from Claude Code statusline stdin */
+    /** Rate limit metrics (Claude-sourced; not available on all hosts) */
     rate_limits?: {
         five_hour?: {
             used_percentage?: number;
@@ -254,11 +256,13 @@ export interface CustomProviderResult {
 export interface HudRenderContext {
     /** Context window percentage (0-100) */
     contextPercent: number;
+    /** False when the host did not provide any context-window metrics */
+    contextAvailable?: boolean;
     /** Stable display scope for context smoothing (e.g. session/worktree key) */
     contextDisplayScope?: string | null;
-    /** Model display name from Claude Code statusline stdin; null when unavailable */
+    /** Host-provided model display name; null when unavailable */
     modelName: string | null;
-    /** Raw model id from Claude Code statusline stdin; used when full model format is requested */
+    /** Host-provided raw model id; used when full model format is requested */
     modelId?: string | null;
     /** Ralph loop state */
     ralph: RalphStateForHud | null;

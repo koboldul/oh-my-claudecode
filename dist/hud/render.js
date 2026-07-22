@@ -363,7 +363,7 @@ export async function render(context, config) {
         if (lastSkillElement)
             rendered.set("lastSkill", lastSkillElement);
     }
-    if (enabledElements.contextBar) {
+    if (enabledElements.contextBar && context.contextAvailable !== false) {
         const ctx = enabledElements.useBars
             ? renderContextWithBar(context.contextPercent, config.thresholds, 10, context.contextDisplayScope, hudLabels)
             : renderContext(context.contextPercent, config.thresholds, context.contextDisplayScope, hudLabels);
@@ -416,9 +416,11 @@ export async function render(context, config) {
         if (mbLines.length > 0)
             renderedDetail.set("missionBoard", mbLines);
     }
-    const ctxWarning = renderContextLimitWarning(context.contextPercent, config.contextLimitWarning.threshold, config.contextLimitWarning.autoCompact);
-    if (ctxWarning)
-        renderedDetail.set("contextWarning", [ctxWarning]);
+    if (context.contextAvailable !== false) {
+        const ctxWarning = renderContextLimitWarning(context.contextPercent, config.contextLimitWarning.threshold, config.contextLimitWarning.autoCompact);
+        if (ctxWarning)
+            renderedDetail.set("contextWarning", [ctxWarning]);
+    }
     const payloadWarning = renderPayloadLimitWarning(context.payloadEstimate);
     if (payloadWarning)
         renderedDetail.set("payloadWarning", [payloadWarning]);

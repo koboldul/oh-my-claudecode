@@ -47,7 +47,41 @@ export const BUILTIN_EXTERNAL_MODEL_DEFAULTS = {
     codexModel: 'gpt-5.3-codex',
     geminiModel: 'gemini-3.1-pro-preview',
     antigravityModel: 'Gemini 3.1 Pro (High)',
+    copilotModel: 'gpt-5.6-sol',
+    copilotReasoningEffort: 'max',
 };
+export const COPILOT_REASONING_EFFORTS = [
+    'none',
+    'minimal',
+    'low',
+    'medium',
+    'high',
+    'xhigh',
+    'max',
+];
+function nonEmpty(value) {
+    const trimmed = value?.trim();
+    return trimmed || undefined;
+}
+export function resolveCopilotModel(configured, env = process.env) {
+    return nonEmpty(env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL)
+        ?? nonEmpty(env.OMC_COPILOT_DEFAULT_MODEL)
+        ?? nonEmpty(configured)
+        ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotModel;
+}
+export function resolveCopilotReasoningEffort(configured, env = process.env) {
+    const raw = nonEmpty(env.OMC_COPILOT_REASONING_EFFORT)
+        ?? nonEmpty(configured)
+        ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotReasoningEffort;
+    return validateCopilotReasoningEffort(raw);
+}
+export function validateCopilotReasoningEffort(raw) {
+    const normalized = raw.toLowerCase();
+    if (!COPILOT_REASONING_EFFORTS.includes(normalized)) {
+        throw new Error(`[OMC] Copilot reasoning effort: invalid value "${raw}". Allowed: ${COPILOT_REASONING_EFFORTS.join(', ')}`);
+    }
+    return normalized;
+}
 /**
  * Centralized Model ID Constants
  *

@@ -8,7 +8,7 @@
  */
 import { resolveAutopilotPlanPath } from "../../../config/plan-output.js";
 export const EXECUTION_COMPLETION_SIGNAL = "PIPELINE_EXECUTION_COMPLETE";
-const CLI_TEAM_AGENT_TYPES = new Set(["codex", "gemini", "grok", "cursor", "antigravity"]);
+const CLI_TEAM_AGENT_TYPES = new Set(["codex", "gemini", "grok", "cursor", "antigravity", "copilot"]);
 function uniqueRequestedAgentTypes(agentTypes) {
     return [...new Set((agentTypes ?? []).filter(Boolean))];
 }
@@ -46,7 +46,7 @@ Or from Claude Code slash commands:
 /omc-teams ${agentSpec} "<implementation task from ${planPath}>"
 \`\`\`
 
-Requested worker types: ${requested}. Keep these CLI workers executor-style only: implementation, file edits, build/test fixes, and other plan execution tasks. Keep reviewer, critic, security-review, validation verdict, and final approval roles on the native Claude/OMC reviewer agents unless this repository explicitly adds safe role support for that CLI worker type.${cursorGuidance}`;
+Requested worker types: ${requested}. Cursor workers are executor-style only; keep reviewer, critic, security-review, validation verdict, and final-approval work away from Cursor. Prompt-mode external providers, including Copilot, may serve reviewer roles when team role routing selects them; they must follow the structured verdict-file contract. Keep final approval with the lead orchestrator.${cursorGuidance}`;
 }
 export const executionAdapter = {
     id: "execution",
@@ -80,7 +80,7 @@ ${teamRuntimeGuidance}
 ${useCliTeamRuntime ? `1. **Launch CLI executor workers** with \`omc team\` or \`/omc-teams\` using the requested agent types.
 2. **Decompose executor-style implementation tasks** from the implementation plan and pass them to CLI workers.
 3. **Monitor tmux/team output** and integrate completed implementation changes.
-4. **Keep review/critic/security/verdict work native**; do not assign those roles to Cursor/CLI workers.
+4. **Route review roles deliberately**; Copilot and other prompt-mode providers use the structured verdict-file contract, while Cursor remains executor-only.
 5. **Coordinate** dependencies between tasks.` : `1. **Use the implicit team** provided by Claude Code when \`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1\` is enabled; do not call removed \`TeamCreate\`/\`TeamDelete\` tools.
 2. **Track work in TodoWrite or the active task list** from the implementation plan.
 3. **Spawn executor teammates directly** with the Agent/Task tool using distinct \`name\` values (for example, \`name="worker-1"\`). Do not rely on \`team_name\`; Claude Code 2.1.178+ accepts it only as ignored legacy metadata.

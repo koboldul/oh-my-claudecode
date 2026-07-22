@@ -14,7 +14,29 @@
 export interface SubagentInfo {
     agent_id: string;
     agent_type: string;
+    agent_name?: string;
+    agent_display_name?: string;
+    agent_description?: string;
     started_at: string;
+    start_sequence?: number;
+    start_event_id?: string;
+    stop_event_id?: string;
+    identity_digest?: string;
+    start_identity_digest?: string;
+    stop_identity_digest?: string;
+    delivery_fingerprint?: string;
+    delivery_receipt?: string;
+    stop_delivery_fingerprint?: string;
+    stop_delivery_receipt?: string;
+    start_event_timestamp?: number;
+    stop_event_timestamp?: number;
+    reported_agent_id?: string;
+    id_source?: "host" | "synthetic";
+    host_id_source?: "payload" | "event-log";
+    correlation_status?: "host-id" | "unavailable";
+    correlation_strategy?: SubagentCorrelationStrategy;
+    synthetic_correlation?: boolean;
+    reordered?: boolean;
     parent_mode: string;
     task_description?: string;
     file_ownership?: string[];
@@ -29,6 +51,7 @@ export interface SubagentInfo {
     telemetry_status?: "unmatched_stop";
     telemetry_note?: string;
 }
+export type SubagentCorrelationStrategy = "host-id" | "synthetic-start-id" | "agent-name-fifo" | "reordered-host-id" | "reordered-agent-name" | "unmatched-stop";
 export interface ToolUsageEntry {
     tool_name: string;
     timestamp: string;
@@ -61,6 +84,16 @@ export interface SubagentTrackingState {
     total_completed: number;
     total_failed: number;
     last_updated: string;
+    lifecycle_sequence?: number;
+    delivery_receipts?: SubagentDeliveryReceipt[];
+}
+export interface SubagentDeliveryReceipt {
+    action: "start" | "stop";
+    receipt: string;
+    fingerprint: string;
+    agent_id?: string;
+    event_id?: string;
+    recorded_at: string;
 }
 export interface SubagentStartInput {
     session_id: string;
@@ -72,7 +105,31 @@ export interface SubagentStartInput {
     agent_type: string;
     prompt?: string;
     model?: string;
+    deliveryReceipt?: string;
 }
+export interface CanonicalSubagentInput {
+    host?: "claude" | "copilot";
+    sessionId?: string;
+    directory?: string;
+    transcriptPath?: string;
+    stopReason?: string;
+    originalIndex?: number;
+    agentId?: string;
+    agentName?: string;
+    agentDisplayName?: string;
+    agentDescription?: string;
+    prompt?: string;
+    model?: string;
+    timestamp?: number;
+    permissionMode?: string;
+    lastAssistantMessage?: string;
+    toolOutput?: unknown;
+    status?: unknown;
+    success?: boolean;
+    eventPayload?: Record<string, unknown>;
+    deliveryReceipt?: string;
+}
+export type SubagentStartProcessorInput = SubagentStartInput | CanonicalSubagentInput;
 export interface SubagentStopInput {
     session_id: string;
     transcript_path: string;
@@ -84,6 +141,17 @@ export interface SubagentStopInput {
     output?: string;
     /** @deprecated The SDK does not provide a success field. Use inferred status instead. */
     success?: boolean;
+    deliveryReceipt?: string;
+}
+export type SubagentStopProcessorInput = SubagentStopInput | CanonicalSubagentInput;
+export interface SubagentLifecycleOutput {
+    agent_id: string;
+    agent_name?: string;
+    correlation_strategy: SubagentCorrelationStrategy;
+    correlation_status: "host-id" | "unavailable";
+    synthetic_correlation: boolean;
+    duplicate?: boolean;
+    reordered?: boolean;
 }
 export interface HookOutput {
     continue: boolean;
@@ -92,8 +160,16 @@ export interface HookOutput {
         additionalContext?: string;
         agent_count?: number;
         stale_agents?: string[];
+        agent_id?: string;
+        agent_name?: string;
+        correlation_strategy?: SubagentCorrelationStrategy;
+        correlation_status?: "host-id" | "unavailable";
+        synthetic_correlation?: boolean;
+        duplicate?: boolean;
+        reordered?: boolean;
     };
     suppressOutput?: boolean;
+    tracking?: SubagentLifecycleOutput;
 }
 export interface AgentIntervention {
     type: "timeout" | "deadlock" | "excessive_cost" | "file_conflict";
@@ -174,11 +250,11 @@ export declare function getStaleAgents(state: SubagentTrackingState): SubagentIn
 /**
  * Process SubagentStart event
  */
-export declare function processSubagentStart(input: SubagentStartInput): HookOutput;
+export declare function processSubagentStart(input: SubagentStartProcessorInput): HookOutput;
 /**
  * Process SubagentStop event
  */
-export declare function processSubagentStop(input: SubagentStopInput): HookOutput;
+export declare function processSubagentStop(input: SubagentStopProcessorInput): HookOutput;
 /**
  * Cleanup stale agents (mark as failed)
  */

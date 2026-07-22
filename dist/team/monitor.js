@@ -97,7 +97,7 @@ function isWorkerInfo(value) {
         return false;
     return (value.role === undefined || typeof value.role === 'string')
         && (value.assigned_tasks === undefined || isStringArray(value.assigned_tasks))
-        && (value.worker_cli === undefined || ['claude', 'codex', 'gemini', 'cursor', 'grok', 'antigravity'].includes(value.worker_cli))
+        && (value.worker_cli === undefined || ['claude', 'codex', 'gemini', 'cursor', 'grok', 'antigravity', 'copilot'].includes(value.worker_cli))
         && (value.pid === undefined || (isSafeCounter(value.pid) && value.pid > 0))
         && (value.pane_id === undefined || typeof value.pane_id === 'string')
         && (value.working_dir === undefined || typeof value.working_dir === 'string')
@@ -116,7 +116,7 @@ function isWorkerInfo(value) {
 }
 function isLaunchDescriptor(value) {
     return isRecord(value) && value.schema_version === 1
-        && ['claude', 'codex', 'gemini', 'cursor', 'grok', 'antigravity'].includes(value.provider)
+        && ['claude', 'codex', 'gemini', 'cursor', 'grok', 'antigravity', 'copilot'].includes(value.provider)
         && (value.model === null || typeof value.model === 'string')
         && isNonEmptyString(value.binary) && isStringArray(value.args);
 }
@@ -160,6 +160,22 @@ function isShutdownAttempt(value) {
 function isAllDeadRecovery(value) {
     return isRecord(value) && isTimestamp(value.detected_at) && isTimestamp(value.deadline_at) && isSafeCounter(value.state_revision);
 }
+function isOptionalConfiguredRoutingRoles(value) {
+    if (value === undefined)
+        return true;
+    if (!Array.isArray(value))
+        return false;
+    const canonicalRoles = new Set(CANONICAL_TEAM_ROLES);
+    return value.every(role => typeof role === 'string' && canonicalRoles.has(role))
+        && new Set(value).size === value.length;
+}
+function isOptionalCopilotDefaults(value) {
+    if (value === undefined)
+        return true;
+    return isRecord(value)
+        && isNonEmptyString(value.model)
+        && ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value.reasoning_effort);
+}
 function isTeamConfig(value, requireRevision, expectedTeamName) {
     if (!isRecord(value) || !isNonEmptyString(value.name) || (expectedTeamName !== undefined && value.name !== expectedTeamName)
         || !isNonEmptyString(value.agent_type)
@@ -173,7 +189,9 @@ function isTeamConfig(value, requireRevision, expectedTeamName) {
         || (value.next_task_id !== undefined && !isSafeCounter(value.next_task_id))
         || !isOptionalPolicy(value.policy) || !isOptionalGovernance(value.governance)
         || !isOptionalWorkspaceShape(value) || !isOptionalPaneShape(value)
-        || !isOptionalRouting(value.resolved_routing))
+        || !isOptionalRouting(value.resolved_routing)
+        || !isOptionalConfiguredRoutingRoles(value.configured_routing_roles)
+        || !isOptionalCopilotDefaults(value.copilot_defaults))
         return false;
     if (requireRevision ? !isSafeCounter(value.state_revision) : value.state_revision !== undefined && !isSafeCounter(value.state_revision))
         return false;
@@ -244,8 +262,10 @@ function isResolvedRoleRoute(value) {
 }
 function isRoleAssignment(value) {
     return isRecord(value)
-        && ['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity'].includes(value.provider)
+        && ['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity', 'copilot'].includes(value.provider)
         && isNonEmptyString(value.model)
+        && (value.reasoningEffort === undefined
+            || ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value.reasoningEffort))
         && KNOWN_AGENT_NAMES.some(agent => agent === value.agent);
 }
 function hasMatchingActiveFenceRevisions(value) {

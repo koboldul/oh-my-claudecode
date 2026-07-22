@@ -1,7 +1,7 @@
 /**
  * OMC HUD - Stdin Parser
  *
- * Parse stdin JSON from Claude Code statusline interface.
+ * Parse and normalize stdin JSON from supported statusline hosts.
  * Based on claude-hud reference implementation.
  */
 import type { RateLimits, StatuslineStdin } from './types.js';
@@ -25,7 +25,7 @@ export declare function writeStdinCache(stdin: StatuslineStdin): void;
  */
 export declare function readStdinCache(): StatuslineStdin | null;
 /**
- * Read and parse stdin JSON from Claude Code.
+ * Read, parse, and normalize statusline stdin JSON.
  * Returns null if stdin is not available or invalid.
  */
 export declare function readStdin(): Promise<StatuslineStdin | null>;

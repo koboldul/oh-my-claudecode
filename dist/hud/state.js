@@ -6,7 +6,9 @@
  */
 import { existsSync, readFileSync, mkdirSync, unlinkSync } from "fs";
 import { join } from "path";
+import { applyEdits, modify, } from "jsonc-parser";
 import { getClaudeConfigDir } from "../utils/config-dir.js";
+import { parseJsonc } from "../utils/jsonc.js";
 import { validateWorkingDirectory, getOmcRoot, ensureSessionStateDir, resolveSessionStatePath, } from "../lib/worktree-paths.js";
 import { atomicWriteFileSync, atomicWriteJsonSync, } from "../lib/atomic-write.js";
 import { DEFAULT_HUD_CONFIG, PRESET_CONFIGS, isHudLocale, resolveHudLabels, sanitizeHudLabels, } from "./types.js";
@@ -239,7 +241,7 @@ export function readHudConfig() {
     if (existsSync(settingsFile)) {
         try {
             const content = readFileSync(settingsFile, "utf-8");
-            const settings = JSON.parse(content);
+            const settings = parseJsonc(content);
             if (settings.omcHud) {
                 return mergeWithDefaults({
                     ...legacyConfig,
@@ -326,10 +328,13 @@ export function writeHudConfig(config) {
     try {
         const settingsFile = getSettingsFilePath();
         const legacyConfig = getLegacyHudConfig();
-        let settings = {};
+        let settingsContent = "{\n}\n";
         if (existsSync(settingsFile)) {
-            const content = readFileSync(settingsFile, "utf-8");
-            settings = JSON.parse(content);
+            settingsContent = readFileSync(settingsFile, "utf-8");
+            const parsed = parseJsonc(settingsContent);
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+                throw new Error("settings.json root must be an object");
+            }
         }
         const mergedConfig = mergeWithDefaults({
             ...legacyConfig,
@@ -344,8 +349,19 @@ export function writeHudConfig(config) {
                 ...sanitizeHudLabels(config.labels),
             },
         });
-        settings.omcHud = mergedConfig;
-        atomicWriteFileSync(settingsFile, JSON.stringify(settings, null, 2));
+        const eol = settingsContent.includes("\r\n") ? "\r\n" : "\n";
+        const indent = settingsContent.match(/\r?\n([ \t]+)"/)?.[1];
+        const insertSpaces = !indent?.includes("\t");
+        const formattingOptions = {
+            eol,
+            insertSpaces,
+            tabSize: insertSpaces && indent ? indent.length : 2,
+            insertFinalNewline: settingsContent.endsWith("\n"),
+        };
+        const updatedSettings = applyEdits(settingsContent, modify(settingsContent, ["omcHud"], mergedConfig, {
+            formattingOptions,
+        }));
+        atomicWriteFileSync(settingsFile, updatedSettings);
         return true;
     }
     catch (error) {

@@ -423,4 +423,62 @@ describe('OMC_STATE_DIR state-root resolution (issue #2532)', () => {
         expect(existsSync(defaultPath)).toBe(false);
     });
 });
+// ────────────────────────────────────────────────────────────────────────────
+// Copilot host isolation: canonical state-root resolution without exported
+// CLAUDE_PLUGIN_ROOT (issue: GitHub Copilot CLI hook children do not reliably
+// export CLAUDE_PLUGIN_ROOT, unlike Claude Code).
+// ────────────────────────────────────────────────────────────────────────────
+describe('Copilot host state-root canonicalization through run.cjs', () => {
+    let wsParent;
+    let wsProject;
+    beforeEach(() => {
+        wsParent = mkdtempSync(join(tmpdir(), 'omc-copilot-ws-'));
+        wsProject = join(wsParent, 'project');
+        mkdirSync(wsProject, { recursive: true });
+        writeFileSync(join(wsParent, '.omc-workspace'), '{}');
+    });
+    afterEach(() => {
+        rmSync(wsParent, { recursive: true, force: true });
+    });
+    /** Build a Copilot-style hook child env: no CLAUDE_PLUGIN_ROOT, Copilot signal present. */
+    function buildCopilotHookEnv(extraEnv = {}) {
+        const env = {};
+        for (const [k, v] of Object.entries(process.env)) {
+            if (v !== undefined)
+                env[k] = v;
+        }
+        delete env.CLAUDE_PLUGIN_ROOT;
+        delete env.OMC_STATE_DIR;
+        delete env.OMC_HOST;
+        return { ...env, COPILOT_CLI: '1', ...extraEnv };
+    }
+    it('resolves .omc-workspace canonicalization through run.cjs when CLAUDE_PLUGIN_ROOT is unset and Copilot env is present', () => {
+        const sessionId = 'copilot-no-root-session';
+        const raw = execFileSync(NODE, [HOOK_RUNNER, SESSION_START], {
+            input: JSON.stringify({
+                hook_event_name: 'SessionStart',
+                session_id: sessionId,
+                transcript_path: join(wsProject, '.claude', 'projects', 'copilot.jsonl'),
+                source: 'startup',
+                model: 'claude-sonnet-4-6',
+                cwd: wsProject,
+            }),
+            encoding: 'utf-8',
+            env: buildCopilotHookEnv(),
+            timeout: 15000,
+        }).trim();
+        // Must still produce valid session-start JSON output.
+        expect(() => JSON.parse(raw)).not.toThrow();
+        // Canonical dist/lib/worktree-paths.js understands the .omc-workspace
+        // marker and anchors state at the parent; the inline state-root.mjs
+        // fallback does not understand workspace markers and would instead
+        // write under wsProject/.omc — this proves run.cjs inferred
+        // CLAUDE_PLUGIN_ROOT (from the resolved target's scripts/ parent) and
+        // state-root.mjs reused the canonical dist module through it.
+        const workspaceMarker = join(wsParent, '.omc', 'state', 'sessions', sessionId, 'session-started.json');
+        const projectLocalMarker = join(wsProject, '.omc', 'state', 'sessions', sessionId, 'session-started.json');
+        expect(existsSync(workspaceMarker)).toBe(true);
+        expect(existsSync(projectLocalMarker)).toBe(false);
+    });
+});
 //# sourceMappingURL=state-root-resolution.test.js.map

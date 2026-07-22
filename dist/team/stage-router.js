@@ -12,7 +12,7 @@
  */
 import { CANONICAL_TEAM_ROLES, CURSOR_EXECUTOR_TEAM_ROLES } from '../shared/types.js';
 import { normalizeDelegationRole } from '../features/delegation-routing/types.js';
-import { BUILTIN_EXTERNAL_MODEL_DEFAULTS, getDefaultTierModels, } from '../config/models.js';
+import { BUILTIN_EXTERNAL_MODEL_DEFAULTS, getDefaultTierModels, resolveCopilotModel, resolveCopilotReasoningEffort, } from '../config/models.js';
 /** Map canonical team role → KnownAgentName key (matches PluginConfig.agents.*). */
 const ROLE_TO_AGENT = {
     orchestrator: 'omc',
@@ -100,7 +100,7 @@ function resolveClaudeModel(role, raw, cfg) {
 /**
  * Resolve a user-supplied `model` value for an external provider worker.
  *
- * Tier names are Claude-centric and not meaningful for codex/gemini/grok/cursor/antigravity,
+ * Tier names are Claude-centric and not meaningful for external CLI providers,
  * so tier input (or absent input) maps to the provider's builtin default. Only
  * an explicit non-tier model ID is passed through.
  */
@@ -120,6 +120,9 @@ function resolveExternalModel(provider, raw, cfg) {
     }
     if (provider === 'antigravity') {
         return defaults?.antigravityModel ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.antigravityModel;
+    }
+    if (provider === 'copilot') {
+        return resolveCopilotModel(defaults?.copilotModel);
     }
     return defaults?.geminiModel ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel;
 }
@@ -150,8 +153,16 @@ export function resolveRoleAssignment(role, cfg) {
     const model = provider === 'claude'
         ? resolveClaudeModel(canonical, spec?.model, cfg)
         : resolveExternalModel(provider, spec?.model, cfg);
+    const reasoningEffort = provider === 'copilot'
+        ? resolveCopilotReasoningEffort(cfg.externalModels?.defaults?.copilotReasoningEffort)
+        : undefined;
     const agent = spec?.agent ?? ROLE_TO_AGENT[canonical];
-    return { provider, model, agent };
+    return {
+        provider,
+        model,
+        ...(reasoningEffort ? { reasoningEffort } : {}),
+        agent,
+    };
 }
 function isCanonicalRole(value) {
     return CANONICAL_TEAM_ROLES.includes(value);

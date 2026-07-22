@@ -6,7 +6,7 @@
 import type { TeamTaskStatus } from './contracts.js';
 import type { TeamPhase } from './phase-controller.js';
 import type { TeamLeaderNextAction } from './leader-nudge-guidance.js';
-import type { CanonicalTeamRole, RoleAssignment } from '../shared/types.js';
+import type { CanonicalTeamRole, CopilotReasoningEffort, RoleAssignment } from '../shared/types.js';
 /** Bridge daemon configuration — passed via --config file to bridge-entry.ts */
 export interface BridgeConfig {
     teamName: string;
@@ -90,7 +90,7 @@ export interface McpWorkerMember {
 export interface HeartbeatData {
     workerName: string;
     teamName: string;
-    provider: 'codex' | 'gemini' | 'claude' | 'cursor' | 'grok' | 'antigravity';
+    provider: 'codex' | 'gemini' | 'claude' | 'cursor' | 'grok' | 'antigravity' | 'copilot';
     pid: number;
     lastPollAt: string;
     currentTaskId?: string;
@@ -120,7 +120,7 @@ export interface TaskFailureSidecar {
     lastFailedAt: string;
 }
 /** Worker backend type */
-export type WorkerBackend = 'claude-native' | 'mcp-codex' | 'mcp-gemini' | 'tmux-claude' | 'tmux-codex' | 'tmux-gemini' | 'tmux-cursor' | 'tmux-grok' | 'tmux-antigravity';
+export type WorkerBackend = 'claude-native' | 'mcp-codex' | 'mcp-gemini' | 'tmux-claude' | 'tmux-codex' | 'tmux-gemini' | 'tmux-cursor' | 'tmux-grok' | 'tmux-antigravity' | 'tmux-copilot';
 /** Worker capability tag */
 export type WorkerCapability = 'code-edit' | 'code-review' | 'security-review' | 'architecture' | 'testing' | 'documentation' | 'ui-design' | 'refactoring' | 'research' | 'general';
 /** Team task with required version for optimistic concurrency */
@@ -324,7 +324,7 @@ export interface TeamRecoveryAttempt {
 }
 export interface WorkerLaunchDescriptor {
     schema_version: 1;
-    provider: 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity';
+    provider: 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity' | 'copilot';
     model: string | null;
     binary: string;
     args: string[];
@@ -401,7 +401,7 @@ export interface WorkerInfo {
     name: string;
     index: number;
     role: string;
-    worker_cli?: 'codex' | 'claude' | 'gemini' | 'cursor' | 'grok' | 'antigravity';
+    worker_cli?: 'codex' | 'claude' | 'gemini' | 'cursor' | 'grok' | 'antigravity' | 'copilot';
     assigned_tasks: string[];
     pid?: number;
     pane_id?: string;
@@ -481,6 +481,11 @@ export interface TeamConfig {
         primary: RoleAssignment;
         fallback: RoleAssignment;
     }>;
+    configured_routing_roles?: CanonicalTeamRole[];
+    copilot_defaults?: {
+        model: string;
+        reasoning_effort: CopilotReasoningEffort;
+    };
     state_revision?: number;
     runtime_owner_epoch?: TeamRuntimeOwnerEpoch;
     active_recovery?: TeamRecoveryAttempt;

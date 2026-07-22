@@ -24,12 +24,13 @@ async function initTeamState(teamName, wd) {
     await mkdir(join(base, 'mailbox'), { recursive: true });
     await mkdir(join(base, 'events'), { recursive: true });
     await writeFile(join(base, 'config.json'), JSON.stringify({
-        team_name: teamName,
+        name: teamName,
         task: 'test',
         agent_type: 'executor',
         worker_count: 1,
         workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] }],
         created_at: new Date().toISOString(),
+        tmux_session: 'test-session:0',
     }));
 }
 describe('teamCommand help output', () => {
@@ -204,6 +205,7 @@ describe('teamCommand api operations', () => {
             worker_count: 1,
             workers: [{ name: 'worker-1', index: 1, role: 'claude', assigned_tasks: [] }],
             created_at: new Date().toISOString(),
+            tmux_session: 'stale-session:0',
             next_task_id: 1,
         }, null, 2));
         delete process.env.OMC_TEAM_WORKER;
@@ -472,6 +474,16 @@ describe('parseTeamArgs comma-separated multi-type specs', () => {
     it('uses configured antigravity CLI provider default when supported', () => {
         const parsed = parseTeamArgs(['run all tests'], 'antigravity');
         expect(parsed.agentTypes).toEqual(['antigravity', 'antigravity', 'antigravity']);
+    });
+    it('parses Copilot in single, mixed, role-qualified, and configured-default specs', () => {
+        expect(parseTeamArgs(['2:copilot', 'implement']).agentTypes)
+            .toEqual(['copilot', 'copilot']);
+        expect(parseTeamArgs(['1:copilot,1:codex', 'compare']).agentTypes)
+            .toEqual(['copilot', 'codex']);
+        expect(parseTeamArgs(['1:copilot:code-reviewer', 'review']).workerSpecs)
+            .toEqual([{ agentType: 'copilot', role: 'code-reviewer' }]);
+        expect(parseTeamArgs(['run all tests'], 'copilot').agentTypes)
+            .toEqual(['copilot', 'copilot', 'copilot']);
     });
     it('defaults to 3 claude workers when no spec is given', () => {
         const parsed = parseTeamArgs(['run all tests']);

@@ -1,10 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { execFileSync } from 'child_process';
 import { ULTRAWORK_MESSAGE } from '../installer/hooks.js';
 import { getUltraworkMessage } from '../hooks/keyword-detector/ultrawork/index.js';
+import { stageHookRuntime } from './helpers/staged-hook-runtime.js';
+const stagedRuntime = stageHookRuntime(['persistent-mode.mjs']);
+afterAll(() => {
+    stagedRuntime.cleanup();
+});
 describe('issue #2652 runtime wiring and output contract', () => {
     it('ships the Stop hook through persistent-mode.mjs', () => {
         const hooksJsonPath = join(process.cwd(), 'hooks', 'hooks.json');
@@ -31,7 +36,7 @@ describe('issue #2652 runtime wiring and output contract', () => {
             writeFileSync(join(pluginRoot, 'dist', 'notifications', 'index.js'), `export async function notify(event, payload) {\n` +
                 `  await import('node:fs').then(({ writeFileSync }) => writeFileSync(process.env.IDLE_MARKER_PATH, JSON.stringify({ event, payload })));\n` +
                 `}\n`);
-            execFileSync(process.execPath, [join(process.cwd(), 'scripts', 'persistent-mode.mjs')], {
+            execFileSync(process.execPath, [stagedRuntime.scriptPath('persistent-mode.mjs')], {
                 input: JSON.stringify({ cwd: projectRoot, session_id: 'session-idle-test' }),
                 encoding: 'utf-8',
                 env: {

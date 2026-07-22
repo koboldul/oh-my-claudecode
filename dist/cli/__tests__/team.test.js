@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { canonicalizeTeamConfigWorkers } from '../../team/worker-canonicalization.js';
 const mocks = vi.hoisted(() => ({
     spawn: vi.fn(),
     killWorkerPanes: vi.fn(),
@@ -233,6 +234,24 @@ describe('team cli', () => {
         rmSync(cwd, { recursive: true, force: true });
         logSpy.mockRestore();
     });
+    it('teamCommand start --agent copilot expands Copilot worker types', async () => {
+        const write = vi.fn();
+        const end = vi.fn();
+        const unref = vi.fn();
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+        const cwd = mkdtempSync(join(tmpdir(), 'omc-team-cli-copilot-'));
+        mocks.spawn.mockReturnValue({ pid: 9292, stdin: { write, end }, unref });
+        const { teamCommand } = await import('../team.js');
+        await teamCommand([
+            'start', '--agent', 'copilot', '--count', '2',
+            '--task', 'review the implementation', '--name', 'copilot-team', '--cwd', cwd, '--json',
+        ]);
+        const stdinPayload = JSON.parse(write.mock.calls[0][0]);
+        expect(stdinPayload.teamName).toBe('copilot-team');
+        expect(stdinPayload.agentTypes).toEqual(['copilot', 'copilot']);
+        rmSync(cwd, { recursive: true, force: true });
+        logSpy.mockRestore();
+    });
     it('teamCommand start rejects an unsupported --agent value', async () => {
         const cwd = mkdtempSync(join(tmpdir(), 'omc-team-cli-bad-agent-'));
         const { teamCommand } = await import('../team.js');
@@ -448,7 +467,7 @@ describe('team cli', () => {
             max_workers: 20,
             workers: [],
             created_at: new Date().toISOString(),
-            tmux_session: '',
+            tmux_session: 'demo-session:0',
             leader_pane_id: null,
             hud_pane_id: null,
             resize_hook_name: null,
@@ -495,7 +514,7 @@ describe('team cli', () => {
             max_workers: 20,
             workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] }],
             created_at: new Date().toISOString(),
-            tmux_session: '',
+            tmux_session: 'demo-session:0',
             leader_pane_id: null,
             hud_pane_id: null,
             resize_hook_name: null,
@@ -661,16 +680,17 @@ describe('team cli', () => {
         const cwd = mkdtempSync(join(tmpdir(), 'omc-team-cli-v2-status-dedup-'));
         const root = join(cwd, '.omc', 'state', 'team', 'demo-team');
         mkdirSync(root, { recursive: true });
-        writeFileSync(join(root, 'config.json'), JSON.stringify({
+        const duplicateWorkerConfig = canonicalizeTeamConfigWorkers({
             name: 'demo-team',
             task: 'demo',
             agent_type: 'executor',
+            worker_launch_mode: 'interactive',
             worker_count: 2,
             max_workers: 20,
             tmux_session: 'demo-session:0',
             workers: [
                 { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%1' },
-                { name: 'worker-1', index: 0, role: 'executor', assigned_tasks: [] },
+                { name: 'worker-1', index: 2, role: 'executor', assigned_tasks: [] },
             ],
             created_at: new Date().toISOString(),
             next_task_id: 2,
@@ -678,7 +698,8 @@ describe('team cli', () => {
             hud_pane_id: null,
             resize_hook_name: null,
             resize_hook_target: null,
-        }));
+        });
+        writeFileSync(join(root, 'config.json'), JSON.stringify(duplicateWorkerConfig));
         await teamCommand(['status', 'demo-team', '--json', '--cwd', cwd]);
         const payload = JSON.parse(logSpy.mock.calls[0][0]);
         expect(payload.workerPaneIds).toEqual(['%1']);

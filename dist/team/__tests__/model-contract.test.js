@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'child_process';
-import { getContract, buildLaunchArgs, buildWorkerArgv, getWorkerEnv, parseCliOutput, isPromptModeAgent, getPromptModeArgs, isHeadlessSupportedOnPlatform, validateCliAvailable, isCliAvailable, shouldLoadShellRc, resolveCliBinaryPath, clearResolvedPathCache, validateCliBinaryPath, resolveClaudeWorkerModel, shouldUseClaudeBareMode, _testInternals, } from '../model-contract.js';
+import { getContract, buildLaunchArgs, buildWorkerArgv, getWorkerEnv, parseCliOutput, isPromptModeAgent, getPromptModeArgs, isHeadlessSupportedOnPlatform, validateCliAvailable, isCliAvailable, shouldLoadShellRc, resolveCliBinaryPath, clearResolvedPathCache, validateCliBinaryPath, resolveClaudeWorkerModel, shouldUseClaudeBareMode, _testInternals, buildValidatedWorkerLaunchDescriptor, validateWorkerLaunchDescriptor, } from '../model-contract.js';
 vi.mock('child_process', async (importOriginal) => {
     const actual = await importOriginal();
     return {
@@ -51,6 +51,33 @@ describe('model-contract', () => {
             expect(resolveCliBinaryPath('claude')).toBe('/usr/local/bin/claude');
             expect(mockSpawnSync).toHaveBeenCalledTimes(1);
             clearResolvedPathCache();
+        });
+        it('prefers an executable Windows npm shim over the extensionless shim', () => {
+            const mockSpawnSync = vi.mocked(spawnSync);
+            const restorePlatform = setProcessPlatform('win32');
+            const originalTrustedDirs = process.env.OMC_TRUSTED_CLI_DIRS;
+            process.env.OMC_TRUSTED_CLI_DIRS = 'C:\\Tools';
+            mockSpawnSync.mockReturnValue({
+                status: 0,
+                stdout: 'C:\\Tools\\copilot\r\nC:\\Tools\\copilot.cmd\r\n',
+                stderr: '',
+                pid: 0,
+                output: [],
+                signal: null,
+            });
+            try {
+                clearResolvedPathCache();
+                expect(resolveCliBinaryPath('copilot')).toBe('C:\\Tools\\copilot.cmd');
+            }
+            finally {
+                clearResolvedPathCache();
+                if (originalTrustedDirs === undefined)
+                    delete process.env.OMC_TRUSTED_CLI_DIRS;
+                else
+                    process.env.OMC_TRUSTED_CLI_DIRS = originalTrustedDirs;
+                restorePlatform();
+                mockSpawnSync.mockRestore();
+            }
         });
         it('resolveCliBinaryPath rejects unsafe names and paths', () => {
             const mockSpawnSync = vi.mocked(spawnSync);
@@ -156,6 +183,13 @@ describe('model-contract', () => {
             expect(c.installInstructions).toContain('antigravity.google');
             expect(c.installInstructions).not.toContain('| bash');
         });
+        it('returns a prompt-mode contract for GitHub Copilot CLI', () => {
+            const c = getContract('copilot');
+            expect(c.agentType).toBe('copilot');
+            expect(c.binary).toBe('copilot');
+            expect(c.supportsPromptMode).toBe(true);
+            expect(c.promptModeFlag).toBe('-p');
+        });
         it('throws for unknown agent type', () => {
             expect(() => getContract('unknown')).toThrow('Unknown agent type');
         });
@@ -167,6 +201,7 @@ describe('model-contract', () => {
                 // Other prompt-mode providers stay supported on Windows.
                 expect(isHeadlessSupportedOnPlatform('gemini', 'win32')).toBe(true);
                 expect(isHeadlessSupportedOnPlatform('grok', 'win32')).toBe(true);
+                expect(isHeadlessSupportedOnPlatform('copilot', 'win32')).toBe(true);
             });
             it('getPromptModeArgs throws for an antigravity team worker on Windows', () => {
                 const restore = setProcessPlatform('win32');
@@ -339,6 +374,63 @@ describe('model-contract', () => {
             const args = buildLaunchArgs('antigravity', { teamName: 't', workerName: 'w', cwd: '/tmp', model: 'm', extraFlags: ['--foo'] });
             expect(args).toEqual(['--dangerously-skip-permissions', '--model', 'm', '--foo']);
         });
+        it('builds the exact autonomous Copilot contract with defaults and overrides', () => {
+            const keys = [
+                'OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL',
+                'OMC_COPILOT_DEFAULT_MODEL',
+                'OMC_COPILOT_REASONING_EFFORT',
+            ];
+            const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+            try {
+                for (const key of keys)
+                    delete process.env[key];
+                expect(buildLaunchArgs('copilot', { teamName: 't', workerName: 'w', cwd: '/tmp' })).toEqual([
+                    '--model', 'gpt-5.6-sol',
+                    '--effort', 'max',
+                    '--allow-all',
+                    '--no-ask-user',
+                    '--silent',
+                    '--stream=off',
+                ]);
+                process.env.OMC_COPILOT_DEFAULT_MODEL = 'legacy-model';
+                process.env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL = 'canonical-model';
+                process.env.OMC_COPILOT_REASONING_EFFORT = 'xhigh';
+                expect(buildLaunchArgs('copilot', { teamName: 't', workerName: 'w', cwd: '/tmp' })).toEqual([
+                    '--model', 'canonical-model',
+                    '--effort', 'xhigh',
+                    '--allow-all',
+                    '--no-ask-user',
+                    '--silent',
+                    '--stream=off',
+                ]);
+                expect(buildLaunchArgs('copilot', {
+                    teamName: 't',
+                    workerName: 'w',
+                    cwd: '/tmp',
+                    model: 'explicit-model',
+                    reasoningEffort: 'high',
+                })).toEqual([
+                    '--model', 'explicit-model',
+                    '--effort', 'high',
+                    '--allow-all',
+                    '--no-ask-user',
+                    '--silent',
+                    '--stream=off',
+                ]);
+                process.env.OMC_COPILOT_REASONING_EFFORT = 'invalid';
+                expect(() => buildLaunchArgs('copilot', { teamName: 't', workerName: 'w', cwd: '/tmp' }))
+                    .toThrow('Allowed: none, minimal, low, medium, high, xhigh, max');
+            }
+            finally {
+                for (const key of keys) {
+                    const value = saved[key];
+                    if (value === undefined)
+                        delete process.env[key];
+                    else
+                        process.env[key] = value;
+                }
+            }
+        });
         it('grok includes --always-approve with no model and appends --model <m> when given', () => {
             const noModel = buildLaunchArgs('grok', { teamName: 't', workerName: 'w', cwd: '/tmp' });
             expect(noModel).toEqual(['--always-approve']);
@@ -408,6 +500,8 @@ describe('model-contract', () => {
                 OMC_MODEL_LOW: 'claude-haiku-4-5-override',
                 OMC_EXTERNAL_MODELS_DEFAULT_CODEX_MODEL: 'gpt-5',
                 OMC_GEMINI_DEFAULT_MODEL: 'gemini-2.5-pro',
+                OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL: 'gpt-5.6-sol',
+                OMC_COPILOT_REASONING_EFFORT: 'max',
                 ANTHROPIC_API_KEY: 'should-not-be-forwarded',
             });
             expect(env.ANTHROPIC_MODEL).toBe('claude-opus-4-1');
@@ -425,7 +519,26 @@ describe('model-contract', () => {
             expect(env.OMC_MODEL_LOW).toBe('claude-haiku-4-5-override');
             expect(env.OMC_EXTERNAL_MODELS_DEFAULT_CODEX_MODEL).toBe('gpt-5');
             expect(env.OMC_GEMINI_DEFAULT_MODEL).toBe('gemini-2.5-pro');
+            expect(env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL).toBe('gpt-5.6-sol');
+            expect(env.OMC_COPILOT_REASONING_EFFORT).toBe('max');
             expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+        });
+        it('clears parent host session markers for Copilot workers', () => {
+            const env = getWorkerEnv('my-team', 'worker-1', 'copilot', {
+                COPILOT_CLI: '1',
+                COPILOT_AGENT_SESSION_ID: 'parent-session',
+                CLAUDECODE: '1',
+                CLAUDE_SESSION_ID: 'claude-parent',
+                OMC_HOST: 'copilot',
+            });
+            expect(env).toMatchObject({
+                OMC_WORKER_AGENT_TYPE: 'copilot',
+                COPILOT_CLI: '',
+                COPILOT_AGENT_SESSION_ID: '',
+                CLAUDECODE: '',
+                CLAUDE_SESSION_ID: '',
+                OMC_HOST: '',
+            });
         });
         it('rejects invalid team names', () => {
             expect(() => getWorkerEnv('Bad-Team', 'worker-1', 'codex')).toThrow('Invalid team name');
@@ -550,6 +663,10 @@ describe('model-contract', () => {
             expect(c.supportsPromptMode).toBe(true);
             expect(c.promptModeFlag).toBe('-p');
         });
+        it('copilot supports one-shot -p prompt mode', () => {
+            expect(isPromptModeAgent('copilot')).toBe(true);
+            expect(getPromptModeArgs('copilot', 'Open inbox.md')).toEqual(['-p', 'Open inbox.md']);
+        });
         it('getPromptModeArgs returns flag + instruction for antigravity', () => {
             const args = getPromptModeArgs('antigravity', 'Read inbox');
             expect(args).toEqual(['-p', 'Read inbox']);
@@ -651,6 +768,78 @@ describe('model-contract', () => {
             // isBedrock() detects Bedrock from the model ID pattern
             expect(resolveClaudeWorkerModel()).toBe('us.anthropic.claude-sonnet-4-5-20250929-v1:0');
             vi.unstubAllEnvs();
+        });
+    });
+    describe('worker launch descriptors', () => {
+        it('captures exact binary model and appended prompt argv', () => {
+            const descriptor = buildValidatedWorkerLaunchDescriptor('gemini', {
+                teamName: 'team', workerName: 'worker-1', cwd: '/tmp', model: 'gemini-2.5-pro',
+                resolvedBinaryPath: '/usr/bin/gemini',
+            }, ['-p', 'read inbox']);
+            expect(descriptor).toEqual({ schema_version: 1, provider: 'gemini', model: 'gemini-2.5-pro',
+                binary: '/usr/bin/gemini', args: ['--approval-mode', 'yolo', '--model', 'gemini-2.5-pro', '-p', 'read inbox'] });
+        });
+        it('persists the exact Copilot model, effort, permissions, and prompt argv', () => {
+            const previousEffort = process.env.OMC_COPILOT_REASONING_EFFORT;
+            const previousCanonicalModel = process.env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL;
+            const previousLegacyModel = process.env.OMC_COPILOT_DEFAULT_MODEL;
+            delete process.env.OMC_COPILOT_REASONING_EFFORT;
+            delete process.env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL;
+            delete process.env.OMC_COPILOT_DEFAULT_MODEL;
+            try {
+                const descriptor = buildValidatedWorkerLaunchDescriptor('copilot', {
+                    teamName: 'team',
+                    workerName: 'worker-1',
+                    cwd: '/tmp',
+                    resolvedBinaryPath: '/usr/bin/copilot',
+                }, ['-p', 'Open inbox.md']);
+                expect(descriptor).toEqual({
+                    schema_version: 1,
+                    provider: 'copilot',
+                    model: 'gpt-5.6-sol',
+                    binary: '/usr/bin/copilot',
+                    args: [
+                        '--model', 'gpt-5.6-sol',
+                        '--effort', 'max',
+                        '--allow-all',
+                        '--no-ask-user',
+                        '--silent',
+                        '--stream=off',
+                        '-p', 'Open inbox.md',
+                    ],
+                });
+            }
+            finally {
+                if (previousEffort === undefined)
+                    delete process.env.OMC_COPILOT_REASONING_EFFORT;
+                else
+                    process.env.OMC_COPILOT_REASONING_EFFORT = previousEffort;
+                if (previousCanonicalModel === undefined)
+                    delete process.env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL;
+                else
+                    process.env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL = previousCanonicalModel;
+                if (previousLegacyModel === undefined)
+                    delete process.env.OMC_COPILOT_DEFAULT_MODEL;
+                else
+                    process.env.OMC_COPILOT_DEFAULT_MODEL = previousLegacyModel;
+            }
+        });
+        it.each([
+            { schema_version: 2, provider: 'claude', model: null, binary: '/usr/bin/claude', args: [] },
+            { schema_version: 1, provider: 'unknown', model: null, binary: '/usr/bin/unknown', args: [] },
+            { schema_version: 1, provider: 'claude', binary: '/usr/bin/claude', args: [] },
+            { schema_version: 1, provider: 'claude', model: null, binary: 'claude', args: [] },
+            { schema_version: 1, provider: 'claude', model: null, binary: '/usr/bin/claude\0x', args: [] },
+            { schema_version: 1, provider: 'claude', model: null, binary: '/usr/bin/claude', args: ['ok\0bad'] },
+        ])('rejects malformed persisted descriptor %#', value => {
+            expect(() => validateWorkerLaunchDescriptor(value)).toThrow();
+        });
+        it('returns a defensive argv copy', () => {
+            const source = { schema_version: 1, provider: 'codex', model: null,
+                binary: '/usr/bin/codex', args: ['--flag'] };
+            const validated = validateWorkerLaunchDescriptor(source);
+            validated.args.push('--changed');
+            expect(source.args).toEqual(['--flag']);
         });
     });
 });

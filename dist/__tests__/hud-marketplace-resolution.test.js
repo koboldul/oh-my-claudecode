@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { OMC_PLUGIN_ROOT_ENV } from '../lib/env-vars.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -8,7 +8,9 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const root = join(__dirname, '..', '..');
+const hooksJsonPath = join(root, 'hooks', 'hooks.json');
 const tempDirs = [];
+let originalHooksJson;
 let savedPluginRoot;
 beforeEach(() => {
     savedPluginRoot = process.env[OMC_PLUGIN_ROOT_ENV];
@@ -23,21 +25,24 @@ afterEach(() => {
 afterEach(() => {
     while (tempDirs.length > 0) {
         const dir = tempDirs.pop();
-        if (dir)
-            rmSync(dir, { recursive: true, force: true });
+        if (dir) {
+            rmSync(dir, {
+                recursive: true,
+                force: true,
+                maxRetries: 20,
+                retryDelay: 50,
+            });
+        }
     }
 });
 // plugin-setup.mjs rewrites hooks/hooks.json with an absolute node binary path
 // (it always resolves the path relative to its own __dirname, ignoring CLAUDE_CONFIG_DIR).
-// Restore the committed version after all tests in this file so sibling test
-// suites (e.g. setup-contracts-regression) don't see a mutated working tree.
+// Preserve the exact pre-test bytes so a dirty worktree is never reset to HEAD.
+beforeAll(() => {
+    originalHooksJson = readFileSync(hooksJsonPath);
+});
 afterAll(() => {
-    try {
-        execFileSync('git', ['checkout', '--', 'hooks/hooks.json'], { cwd: root, stdio: 'pipe' });
-    }
-    catch {
-        // Non-fatal: hooks.json may already be clean or git may be unavailable.
-    }
+    writeFileSync(hooksJsonPath, originalHooksJson);
 });
 describe('HUD marketplace resolution', () => {
     it('omc-hud.mjs converts absolute HUD paths to file URLs before dynamic imports', () => {
@@ -82,10 +87,10 @@ describe('HUD marketplace resolution', () => {
         mkdirSync(fakeHome, { recursive: true });
         const sentinelPath = join(configDir, 'marketplace-loaded.txt');
         const marketplaceRoot = join(configDir, 'plugins', 'marketplaces', 'omc');
-        const marketplaceHudDir = join(marketplaceRoot, 'dist', 'hud');
+        const marketplaceHudDir = join(marketplaceRoot, 'bridge');
         mkdirSync(marketplaceHudDir, { recursive: true });
         writeFileSync(join(marketplaceRoot, 'package.json'), '{"type":"module"}\n');
-        writeFileSync(join(marketplaceHudDir, 'index.js'), `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(sentinelPath)}, 'marketplace-loaded');\n`);
+        writeFileSync(join(marketplaceHudDir, 'hud-runtime.mjs'), `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(sentinelPath)}, 'marketplace-loaded');\n`);
         execFileSync(process.execPath, [join(root, 'scripts', 'plugin-setup.mjs')], {
             cwd: root,
             env: {
@@ -123,10 +128,10 @@ describe('HUD marketplace resolution', () => {
             stdio: 'pipe',
         });
         const pluginRoot = join(configDir, 'broken-plugin-root');
-        const pluginHudDir = join(pluginRoot, 'dist', 'hud');
+        const pluginHudDir = join(pluginRoot, 'bridge');
         mkdirSync(pluginHudDir, { recursive: true });
         writeFileSync(join(pluginRoot, 'package.json'), '{"type":"module"}\n');
-        writeFileSync(join(pluginHudDir, 'index.js'), "import '../platform/index.js';\n");
+        writeFileSync(join(pluginHudDir, 'hud-runtime.mjs'), "import '../platform/index.js';\n");
         const hudScriptPath = join(configDir, 'hud', 'omc-hud.mjs');
         const output = execFileSync(process.execPath, [hudScriptPath], {
             cwd: root,
@@ -142,7 +147,7 @@ describe('HUD marketplace resolution', () => {
         });
         const normalized = output.replace(/\\/g, '/');
         expect(normalized).toContain('[OMC HUD] HUD import failed from');
-        expect(normalized).toContain('/broken-plugin-root/dist/hud/index.js');
+        expect(normalized).toContain('/broken-plugin-root/bridge/hud-runtime.mjs');
     });
     it('omc-hud.mjs loads a global npm install outside a Node project via npm prefix resolution', () => {
         const configDir = mkdtempSync(join(tmpdir(), 'omc-hud-global-prefix-'));
@@ -157,10 +162,10 @@ describe('HUD marketplace resolution', () => {
             ? join(npmPrefix, 'node_modules')
             : join(npmPrefix, 'lib', 'node_modules');
         const npmPackageRoot = join(npmRoot, 'oh-my-claude-sisyphus');
-        const npmHudDir = join(npmPackageRoot, 'dist', 'hud');
+        const npmHudDir = join(npmPackageRoot, 'bridge');
         mkdirSync(npmHudDir, { recursive: true });
         writeFileSync(join(npmPackageRoot, 'package.json'), '{"type":"module"}\n');
-        writeFileSync(join(npmHudDir, 'index.js'), `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(sentinelPath)}, 'global-prefix-loaded');\n`);
+        writeFileSync(join(npmHudDir, 'hud-runtime.mjs'), `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(sentinelPath)}, 'global-prefix-loaded');\n`);
         execFileSync(process.execPath, [join(root, 'scripts', 'plugin-setup.mjs')], {
             cwd: root,
             env: {
@@ -179,6 +184,7 @@ describe('HUD marketplace resolution', () => {
                 CLAUDE_CONFIG_DIR: configDir,
                 HOME: fakeHome,
                 npm_config_prefix: npmPrefix,
+                NPM_CONFIG_PREFIX: npmPrefix,
             },
             stdio: 'pipe',
         });
@@ -191,10 +197,10 @@ describe('HUD marketplace resolution', () => {
         mkdirSync(fakeHome, { recursive: true });
         const sentinelPath = join(configDir, 'npm-package-loaded.txt');
         const npmPackageRoot = join(configDir, 'node_modules', 'oh-my-claude-sisyphus');
-        const npmHudDir = join(npmPackageRoot, 'dist', 'hud');
+        const npmHudDir = join(npmPackageRoot, 'bridge');
         mkdirSync(npmHudDir, { recursive: true });
         writeFileSync(join(npmPackageRoot, 'package.json'), '{"type":"module"}\n');
-        writeFileSync(join(npmHudDir, 'index.js'), `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(sentinelPath)}, 'npm-package-loaded');\n`);
+        writeFileSync(join(npmHudDir, 'hud-runtime.mjs'), `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(sentinelPath)}, 'npm-package-loaded');\n`);
         execFileSync(process.execPath, [join(root, 'scripts', 'plugin-setup.mjs')], {
             cwd: root,
             env: {
@@ -207,9 +213,9 @@ describe('HUD marketplace resolution', () => {
         const hudScriptPath = join(configDir, 'hud', 'omc-hud.mjs');
         expect(existsSync(hudScriptPath)).toBe(true);
         const content = readFileSync(hudScriptPath, 'utf-8');
-        expect(content).toContain('"oh-my-claude-sisyphus/dist/hud/index.js"');
-        expect(content).toContain('"oh-my-claudecode/dist/hud/index.js"');
-        expect(content.indexOf('"oh-my-claude-sisyphus/dist/hud/index.js"')).toBeLessThan(content.indexOf('"oh-my-claudecode/dist/hud/index.js"'));
+        expect(content).toContain('"oh-my-claude-sisyphus/bridge/hud-runtime.mjs"');
+        expect(content).toContain('"oh-my-claudecode/bridge/hud-runtime.mjs"');
+        expect(content.indexOf('"oh-my-claude-sisyphus/bridge/hud-runtime.mjs"')).toBeLessThan(content.indexOf('"oh-my-claudecode/bridge/hud-runtime.mjs"'));
         execFileSync(process.execPath, [hudScriptPath], {
             cwd: root,
             env: {

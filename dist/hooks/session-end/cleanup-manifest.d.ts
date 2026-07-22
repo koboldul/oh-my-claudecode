@@ -21,10 +21,16 @@ export interface SessionEndActionState {
 }
 export interface ProducerSlot {
     state: 'absent' | 'prepared' | 'sealed' | 'no-op';
+    eventId?: string;
+    rawDigest?: string;
     intentKey?: string;
     payloadDigest?: string;
     sealedAt?: string;
     sealedBy?: 'foreground' | 'recovery' | 'wiki-producer';
+}
+export interface SessionEndProducerAdmission {
+    eventId: string;
+    rawDigest: string;
 }
 export interface WorkerOwner {
     nonce: string;
@@ -76,19 +82,20 @@ export interface DiscoveryTicket {
     retryAt: string;
     acknowledgedAt?: string;
 }
-export declare function sessionEndJobPath(directory: string, sessionId: string): string;
+export declare function sessionEndScopeKey(directory: string): string;
 export declare function sessionEndJobsDirectory(directory: string): string;
+export declare function sessionEndJobPath(directory: string, sessionId: string): string;
 /** Terminality is solely a manifest property. Discovery tickets are deliberately excluded. */
 export declare function isManifestTerminal(job: SessionEndJobV1): boolean;
 export declare function readSessionEndJob(directory: string, sessionId: string): SessionEndJobV1 | null;
 /** Locked expected-revision CAS with an exact post-write reread. */
 export declare function mutateSessionEndJob(directory: string, sessionId: string, expectedRevision: number, mutate: (job: SessionEndJobV1) => void): SessionEndJobV1 | null;
-export declare function prepareCoreManifest(directory: string, sessionId: string, payload: Record<string, unknown>): SessionEndJobV1 | null;
+export declare function prepareCoreManifest(directory: string, sessionId: string, payload: Record<string, unknown>, admission?: SessionEndProducerAdmission): SessionEndJobV1 | null;
 /** Foreground cleanup is idempotent local work; its durable result is the prerequisite for producer-grace sealing. */
 export declare function completeForegroundCleanup(directory: string, sessionId: string, outcome: Record<string, unknown>): SessionEndJobV1 | null;
 export declare function completeForegroundCleanupAndSealCore(directory: string, sessionId: string, outcome: Record<string, unknown>): SessionEndJobV1 | null;
 export declare function sealCoreManifest(directory: string, sessionId: string): SessionEndJobV1 | null;
-export declare function sealWikiManifest(directory: string, sessionId: string, payload?: Record<string, unknown>): SessionEndJobV1 | null;
+export declare function sealWikiManifest(directory: string, sessionId: string, payload?: Record<string, unknown>, admission?: SessionEndProducerAdmission): SessionEndJobV1 | null;
 export declare function claimSessionEndJob(directory: string, sessionId: string, nonce: string, identity: string, deadlineAt: number): SessionEndJobV1 | null;
 export declare function renewSessionEndLease(directory: string, sessionId: string, nonce: string, generation: number, deadlineAt: number): SessionEndJobV1 | null;
 /** Reaping is intentionally separate from a new claim. Caller must establish dead or PID-reused identity. */

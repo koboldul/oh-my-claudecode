@@ -1,3 +1,9 @@
+interface PermissionToolInput {
+    command?: string;
+    file_path?: string;
+    content?: string;
+    [key: string]: unknown;
+}
 export interface PermissionRequestInput {
     session_id: string;
     transcript_path: string;
@@ -5,14 +11,21 @@ export interface PermissionRequestInput {
     permission_mode: string;
     hook_event_name: 'PermissionRequest';
     tool_name: string;
-    tool_input: {
-        command?: string;
-        file_path?: string;
-        content?: string;
-        [key: string]: unknown;
-    };
+    tool_input: PermissionToolInput;
     tool_use_id: string;
 }
+export interface CanonicalPermissionRequestInput {
+    host: 'claude' | 'copilot';
+    contract: 'claude-single' | 'copilot-1.0.72-1';
+    hookType: string;
+    directory?: string;
+    toolName?: string;
+    nativeToolName?: string;
+    canonicalToolName?: string;
+    toolInput?: unknown;
+    shellDialect?: 'posix' | 'powershell';
+}
+export type PermissionProcessorInput = PermissionRequestInput | CanonicalPermissionRequestInput;
 export interface HookOutput {
     continue: boolean;
     hookSpecificOutput?: {
@@ -35,7 +48,13 @@ export declare function getBackgroundTaskPermissionFallback(directory: string, s
 export declare function getBackgroundBashPermissionFallback(directory: string, command?: string): BackgroundPermissionFallbackResult;
 export declare function isSafeRepoInspectionCommand(command: string, cwd: string): boolean;
 export declare function isSafeTargetedLocalTestCommand(command: string, cwd: string): boolean;
-export declare function isSafeAutoApprovedCommand(command: string, cwd: string): boolean;
+export declare function isSafeAutoApprovedCommand(command: string, cwd: string, shellDialect?: 'posix' | 'powershell'): boolean;
+/**
+ * Match a deliberately small set of external executable invocations using
+ * PowerShell token semantics. Aliases, providers, expressions, and shell
+ * composition remain on the native permission path.
+ */
+export declare function isSafePowerShellCommand(command: string): boolean;
 /**
  * Check if a command matches safe patterns
  */
@@ -47,9 +66,9 @@ export declare function isSafeCommand(command: string): boolean;
  * Code's native permission flow and the user approves "Always allow", the entire
  * heredoc body (potentially hundreds of lines) gets stored in settings.local.json.
  *
- * This function detects heredoc commands and checks whether the base command
- * (first line) matches known-safe patterns, allowing auto-approval without
- * polluting settings.local.json.
+ * The opener must terminate the first command line, the base command is limited
+ * to a non-chained git commit/tag invocation, and the delimiter must be followed
+ * only by the command-substitution close. Anything after that remains native.
  */
 export declare function isHeredocWithSafeBase(command: string): boolean;
 /**
@@ -57,11 +76,12 @@ export declare function isHeredocWithSafeBase(command: string): boolean;
  */
 export declare function isActiveModeRunning(directory: string): boolean;
 /**
- * Process permission request and decide whether to auto-allow
+ * Process permission request and decide whether to auto-allow.
  */
-export declare function processPermissionRequest(input: PermissionRequestInput): HookOutput;
+export declare function processPermissionRequest(input: PermissionProcessorInput): HookOutput;
 /**
  * Main hook entry point
  */
-export declare function handlePermissionRequest(input: PermissionRequestInput): Promise<HookOutput>;
+export declare function handlePermissionRequest(input: PermissionProcessorInput): Promise<HookOutput>;
+export {};
 //# sourceMappingURL=index.d.ts.map

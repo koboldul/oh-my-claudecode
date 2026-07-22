@@ -189,6 +189,14 @@ describe('resolveTranscriptPath', () => {
             const expectedPath = join(fakeClaudeDir, 'projects', encodedMain, 'session-abc.jsonl');
             expect(resolved).toBe(expectedPath);
         });
+        it('resolves from a nested directory inside a linked worktree', () => {
+            const nestedCwd = join(worktreeDir, 'packages', 'app');
+            mkdirSync(nestedCwd, { recursive: true });
+            const encodedWorktree = encodeProjectPath(worktreeDir);
+            const worktreePath = join(fakeClaudeDir, 'projects', encodedWorktree, 'session-abc.jsonl');
+            const expectedPath = join(fakeClaudeDir, 'projects', encodeProjectPath(mainRepoDir), 'session-abc.jsonl');
+            expect(resolveTranscriptPath(worktreePath, nestedCwd)).toBe(expectedPath);
+        });
         it('does not alter path when CWD is the main repo (not a worktree)', () => {
             const encodedMain = encodeProjectPath(mainRepoDir);
             const mainPath = join(fakeClaudeDir, 'projects', encodedMain, 'session-abc.jsonl');

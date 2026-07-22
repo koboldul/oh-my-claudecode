@@ -1,9 +1,18 @@
-import { execFileSync } from 'child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { execFileSync, spawnSync } from 'child_process';
+import { copyFileSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, } from 'fs';
 import { tmpdir } from 'os';
 import { delimiter, join } from 'path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-const SCRIPT_PATH = join(process.cwd(), 'scripts', 'context-guard-stop.mjs');
+import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { stageHookRuntime } from './helpers/staged-hook-runtime.js';
+const stagedRuntime = stageHookRuntime(['context-guard-stop.mjs']);
+const SCRIPT_PATH = stagedRuntime.scriptPath('context-guard-stop.mjs');
+const COPILOT_FIXTURE_ROOT = join(process.cwd(), 'src', '__tests__', 'fixtures', 'hooks', 'copilot-1.0.72-1');
+const COPILOT_AGENT_STOP = JSON.parse(readFileSync(join(COPILOT_FIXTURE_ROOT, 'agentStop.json'), 'utf8'));
+const COPILOT_CONTEXT_EVENTS = join(COPILOT_FIXTURE_ROOT, 'context-events.jsonl');
+const COPILOT_CONTEXT_DIAGNOSTIC = '[context-guard-stop] Copilot context blocking disabled: 1.0.72-1 agentStop/events do not provide a current Stop-time token count paired with the active model context limit; continuing without a synthetic estimate.\n';
+afterAll(() => {
+    stagedRuntime.cleanup();
+});
 function runContextGuardStop(input) {
     const stdout = execFileSync(process.execPath, [SCRIPT_PATH], {
         input: JSON.stringify(input),
@@ -21,6 +30,19 @@ function runContextGuardStopWithEnv(input, env) {
         env: { ...process.env, NODE_ENV: 'test', ...env },
     });
     return JSON.parse(stdout.trim());
+}
+function runContextGuardStopCaptured(input, env = {}) {
+    const result = spawnSync(process.execPath, [SCRIPT_PATH], {
+        input: JSON.stringify(input),
+        encoding: 'utf-8',
+        timeout: 5000,
+        env: { ...process.env, NODE_ENV: 'test', ...env },
+    });
+    return {
+        status: result.status,
+        stdout: result.stdout,
+        stderr: result.stderr,
+    };
 }
 function writeTranscriptWithContext(filePath, contextWindow, inputTokens) {
     const line = JSON.stringify({
@@ -103,6 +125,31 @@ describe('context-guard-stop safe recovery messaging (issue #1373)', () => {
         });
         expect(out).toEqual({ continue: true, suppressOutput: true });
         expect(() => readFileSync(gitLogPath, 'utf-8')).toThrow();
+    });
+    it('explicitly disables Copilot blocking when events lack a paired context denominator', () => {
+        copyFileSync(COPILOT_CONTEXT_EVENTS, transcriptPath);
+        const result = runContextGuardStopCaptured({
+            ...COPILOT_AGENT_STOP,
+            cwd: tempDir,
+            sessionId: `copilot-${Date.now()}`,
+            transcriptPath,
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toBe('{}\n');
+        expect(result.stderr).toBe(COPILOT_CONTEXT_DIAGNOSTIC);
+    });
+    it('keeps Copilot context-limit bypasses silent while passing canonically', () => {
+        copyFileSync(COPILOT_CONTEXT_EVENTS, transcriptPath);
+        const result = runContextGuardStopCaptured({
+            ...COPILOT_AGENT_STOP,
+            cwd: tempDir,
+            sessionId: `copilot-limit-${Date.now()}`,
+            transcriptPath,
+            stopReason: 'context_limit',
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toBe('{}\n');
+        expect(result.stderr).toBe('');
     });
 });
 //# sourceMappingURL=context-guard-stop.test.js.map

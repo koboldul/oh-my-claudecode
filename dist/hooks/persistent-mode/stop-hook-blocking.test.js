@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -6,6 +6,12 @@ import { execSync } from "child_process";
 import { createHookOutput, checkPersistentModes, } from "./index.js";
 import { activateUltrawork, deactivateUltrawork } from "../ultrawork/index.js";
 import { getOmcRoot } from "../../lib/worktree-paths.js";
+import { stageHookRuntime } from "../../__tests__/helpers/staged-hook-runtime.js";
+const stagedRuntime = stageHookRuntime(["persistent-mode.mjs"]);
+const persistentModeScriptPath = stagedRuntime.scriptPath("persistent-mode.mjs");
+afterAll(() => {
+    stagedRuntime.cleanup();
+});
 function writeTranscriptWithContext(filePath, contextWindow, inputTokens) {
     writeFileSync(filePath, `${JSON.stringify({
         usage: { context_window: contextWindow, input_tokens: inputTokens },
@@ -656,13 +662,13 @@ describe("Stop Hook Blocking Contract", () => {
     });
     describe("persistent-mode.mjs script blocking contract", () => {
         let tempDir;
-        const scriptPath = join(process.cwd(), "scripts", "persistent-mode.mjs");
+        const scriptPath = persistentModeScriptPath;
         function runScript(input) {
             try {
                 const result = execSync(`node "${scriptPath}"`, {
                     encoding: "utf-8",
                     timeout: 5000,
-                    input: JSON.stringify(input),
+                    input: JSON.stringify({ hook_event_name: "Stop", ...input }),
                     env: { ...process.env, NODE_ENV: "test" },
                 });
                 const lines = result.trim().split("\n");

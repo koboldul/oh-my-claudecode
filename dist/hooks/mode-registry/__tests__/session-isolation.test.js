@@ -1,10 +1,14 @@
+import { randomUUID } from 'crypto';
+import { spawn } from 'child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 // Import functions to test
-import { getStateFilePath, isModeActive, getActiveModes, clearModeState, hasModeState, isModeActiveInAnySession, getActiveSessionsForMode, clearStaleSessionDirs, } from '../index.js';
+import { getStateFilePath, isModeActive, getActiveModes, clearModeState, createModeMarker, hasModeState, isModeActiveInAnySession, getActiveSessionsForMode, clearStaleSessionDirs, clearAllModeStates, } from '../index.js';
 import { validateSessionId, resolveSessionStatePath, listSessionIds, } from '../../../lib/worktree-paths.js';
+import { getProcessStartIdentitySync } from '../../../platform/process-utils.js';
+import { acquireFileLockSync, releaseFileLockSync, } from '../../../lib/file-lock.js';
 describe('Session-Scoped State Isolation', () => {
     let tempDir;
     beforeEach(() => {
@@ -12,7 +16,23 @@ describe('Session-Scoped State Isolation', () => {
     });
     afterEach(() => {
         rmSync(tempDir, { recursive: true, force: true });
+        delete process.env.OMC_TEST_CONDITIONAL_CLEAR_REPLACEMENT_PATH;
+        delete process.env.OMC_TEST_CONDITIONAL_CLEAR_REPLACEMENT_BASE64;
     });
+    function liveLockOwner() {
+        const processStartIdentity = getProcessStartIdentitySync(process.pid);
+        if (processStartIdentity === null
+            || processStartIdentity === 'absent') {
+            throw new Error('current process identity unavailable');
+        }
+        return JSON.stringify({
+            version: 2,
+            pid: process.pid,
+            processStartIdentity,
+            nonce: randomUUID(),
+            timestamp: Date.now(),
+        });
+    }
     // Helper to create state file at session-scoped path
     function createSessionState(sessionId, mode, data) {
         const sessionDir = join(tempDir, '.omc', 'state', 'sessions', sessionId);
@@ -47,7 +67,7 @@ describe('Session-Scoped State Isolation', () => {
     describe('resolveSessionStatePath', () => {
         it('should return session-scoped path', () => {
             const path = resolveSessionStatePath('ultrawork', 'session-123', tempDir);
-            expect(path).toContain('.omc/state/sessions/session-123/ultrawork-state.json');
+            expect(path).toContain(join('.omc', 'state', 'sessions', 'session-123', 'ultrawork-state.json'));
         });
         it('should normalize state name', () => {
             const path1 = resolveSessionStatePath('ultrawork', 'sid', tempDir);
@@ -76,12 +96,12 @@ describe('Session-Scoped State Isolation', () => {
     describe('Session-scoped path resolution', () => {
         it('should return session-scoped path when sessionId provided for autoresearch', () => {
             const path = getStateFilePath(tempDir, 'autoresearch', 'session-123');
-            expect(path).toContain('sessions/session-123');
+            expect(path).toContain(join('sessions', 'session-123'));
             expect(path).toContain('autoresearch-state.json');
         });
         it('should return session-scoped path when sessionId provided', () => {
             const path = getStateFilePath(tempDir, 'ultrawork', 'session-123');
-            expect(path).toContain('sessions/session-123');
+            expect(path).toContain(join('sessions', 'session-123'));
         });
         it('should return legacy path when no sessionId', () => {
             const path = getStateFilePath(tempDir, 'ultrawork');
@@ -189,14 +209,117 @@ describe('Session-Scoped State Isolation', () => {
             const remaining = JSON.parse(readFileSync(legacyMarker, 'utf-8'));
             expect(remaining.session_id).toBe(sessionB);
         });
+        it('preserves a replacement marker created after ownership discovery', () => {
+            const sessionA = 'session-A';
+            const markerDir = join(tempDir, '.omc', 'state');
+            mkdirSync(markerDir, { recursive: true });
+            const markerPath = join(markerDir, 'ralph-verification.json');
+            writeFileSync(markerPath, JSON.stringify({ pending: true, session_id: sessionA }));
+            const replacement = { pending: true, session_id: sessionA, workflowRunId: 'new-run' };
+            process.env.OMC_TEST_CONDITIONAL_CLEAR_REPLACEMENT_PATH = markerPath;
+            process.env.OMC_TEST_CONDITIONAL_CLEAR_REPLACEMENT_BASE64 = Buffer.from(JSON.stringify(replacement)).toString('base64');
+            clearModeState('ralph', tempDir, sessionA);
+            expect(JSON.parse(readFileSync(markerPath, 'utf8'))).toEqual(replacement);
+        });
     });
     describe('Stale session cleanup', () => {
+        it('serializes marker writers on the same lock used by cleanup', () => {
+            expect(createModeMarker('ralph', tempDir, { session_id: 'session-A', workflowRunId: 'old-run' })).toBe(true);
+            const markerPath = join(tempDir, '.omc', 'state', 'ralph-verification.json');
+            const lockPath = `${markerPath}.mutation.lock`;
+            writeFileSync(lockPath, liveLockOwner());
+            expect(createModeMarker('ralph', tempDir, { session_id: 'session-A', workflowRunId: 'new-run' })).toBe(false);
+            expect(JSON.parse(readFileSync(markerPath, 'utf8')).workflowRunId).toBe('old-run');
+            unlinkSync(lockPath);
+            expect(createModeMarker('ralph', tempDir, { session_id: 'session-A', workflowRunId: 'new-run' })).toBe(true);
+            expect(JSON.parse(readFileSync(markerPath, 'utf8')).workflowRunId).toBe('new-run');
+        });
+        it('waits for an in-flight marker publisher before treating it as absent', async () => {
+            const sessionId = 'marker-in-flight';
+            const markerPath = join(tempDir, '.omc', 'state', 'ralph-verification.json');
+            mkdirSync(join(tempDir, '.omc', 'state'), { recursive: true });
+            const lockPath = `${markerPath}.mutation.lock`;
+            writeFileSync(lockPath, liveLockOwner());
+            const childScript = String.raw `
+        const fs = require('fs');
+        const [markerPath, lockPath] = process.argv.slice(1);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        fs.writeFileSync(markerPath, JSON.stringify({ pending: true, session_id: 'marker-in-flight' }));
+        fs.unlinkSync(lockPath);
+      `;
+            const child = spawn(process.execPath, ['-e', childScript, markerPath, lockPath], { stdio: 'ignore' });
+            const completed = new Promise((resolve, reject) => {
+                child.once('error', reject);
+                child.once('close', code => code === 0 ? resolve() : reject(new Error(`marker publisher exited ${code}`)));
+            });
+            expect(clearModeState('ralph', tempDir, sessionId)).toBe(true);
+            await completed;
+            expect(existsSync(markerPath)).toBe(false);
+        });
         it('should remove empty session directories', () => {
             const emptyDir = join(tempDir, '.omc', 'state', 'sessions', 'empty-session');
             mkdirSync(emptyDir, { recursive: true });
             const removed = clearStaleSessionDirs(tempDir, 0);
             expect(removed).toContain('empty-session');
             expect(existsSync(emptyDir)).toBe(false);
+        });
+    });
+    describe('full registry clear', () => {
+        it('removes only known owner-mediated files and keeps unknown files', () => {
+            const sessionId = 'full-clear-unknown';
+            createSessionState(sessionId, 'ralph', {
+                active: true,
+                session_id: sessionId,
+            });
+            const sessionDir = join(tempDir, '.omc', 'state', 'sessions', sessionId);
+            const unknownPath = join(sessionDir, 'user-owned.txt');
+            writeFileSync(unknownPath, 'preserve me');
+            expect(clearAllModeStates(tempDir)).toBe(true);
+            expect(existsSync(join(sessionDir, 'ralph-state.json'))).toBe(false);
+            expect(readFileSync(unknownPath, 'utf8')).toBe('preserve me');
+            expect(existsSync(sessionDir)).toBe(true);
+        });
+        it('removes a session directory only after it is empty', () => {
+            const sessionId = 'full-clear-empty';
+            createSessionState(sessionId, 'ultrawork', {
+                active: true,
+                session_id: sessionId,
+            });
+            const sessionDir = join(tempDir, '.omc', 'state', 'sessions', sessionId);
+            expect(clearAllModeStates(tempDir)).toBe(true);
+            expect(existsSync(sessionDir)).toBe(false);
+        });
+        it('preflights all known JSON before deleting any mode state', () => {
+            createLegacyState('ultrawork', { active: true });
+            const corruptPath = join(tempDir, '.omc', 'state', 'ralph-state.json');
+            writeFileSync(corruptPath, '{corrupt');
+            const validPath = join(tempDir, '.omc', 'state', 'ultrawork-state.json');
+            expect(clearAllModeStates(tempDir)).toBe(false);
+            expect(existsSync(validPath)).toBe(true);
+            expect(readFileSync(corruptPath, 'utf8')).toBe('{corrupt');
+        });
+        it('fails closed when the sessions directory cannot be enumerated', () => {
+            createLegacyState('ultrawork', { active: true });
+            const sessionsPath = join(tempDir, '.omc', 'state', 'sessions');
+            writeFileSync(sessionsPath, 'not a directory');
+            const validPath = join(tempDir, '.omc', 'state', 'ultrawork-state.json');
+            expect(clearAllModeStates(tempDir)).toBe(false);
+            expect(existsSync(validPath)).toBe(true);
+        });
+        it('uses one global barrier for marker writers and full clears', () => {
+            createLegacyState('ultrawork', { active: true });
+            const barrier = acquireFileLockSync(join(tempDir, '.omc', 'state', '.mode-registry-clear.mutation.lock'));
+            expect(barrier).not.toBeNull();
+            try {
+                expect(createModeMarker('ralph', tempDir, {
+                    session_id: 'barrier-session',
+                })).toBe(false);
+                expect(clearAllModeStates(tempDir)).toBe(false);
+                expect(existsSync(join(tempDir, '.omc', 'state', 'ultrawork-state.json'))).toBe(true);
+            }
+            finally {
+                releaseFileLockSync(barrier);
+            }
         });
     });
     describe('Backward compat with legacy state files', () => {
@@ -254,7 +377,7 @@ describe('Session-Scoped State Isolation', () => {
         });
         it('should return correct state file path for team mode', () => {
             const path = getStateFilePath(tempDir, 'team', 'session-team-123');
-            expect(path).toContain('sessions/session-team-123');
+            expect(path).toContain(join('sessions', 'session-team-123'));
             expect(path).toContain('team-state.json');
         });
         it('should isolate team state between sessions', () => {

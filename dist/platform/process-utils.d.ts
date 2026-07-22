@@ -15,6 +15,13 @@ export declare function killProcessTree(pid: number, signal?: NodeJS.Signals): P
  * EPERM means the process exists but we lack permission to signal it.
  */
 export declare function isProcessAlive(pid: number): boolean;
+export type ProcessStartIdentitySync = string | 'absent' | null;
+export declare function parseWindowsProcessStartIdentity(value: string): string | undefined;
+/**
+ * Synchronous process-start identity for exclusive file-lock ownership.
+ * `absent` proves the PID is not live; `null` means identity is unavailable.
+ */
+export declare function getProcessStartIdentitySync(pid: number): ProcessStartIdentitySync;
 /**
  * Get process start time for PID reuse detection.
  * Returns milliseconds timestamp on macOS/Windows, jiffies on Linux.

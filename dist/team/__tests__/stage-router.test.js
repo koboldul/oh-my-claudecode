@@ -13,6 +13,9 @@ const ENV_KEYS = [
     'ANTHROPIC_DEFAULT_OPUS_MODEL',
     'ANTHROPIC_DEFAULT_SONNET_MODEL',
     'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL',
+    'OMC_COPILOT_DEFAULT_MODEL',
+    'OMC_COPILOT_REASONING_EFFORT',
 ];
 const savedEnv = {};
 beforeAll(() => {
@@ -77,6 +80,38 @@ describe('stage-router resolveRoleAssignment', () => {
             expect(out.provider).toBe('gemini');
             expect(out.model).toBe(BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel);
             expect(out.agent).toBe('codeReviewer');
+        });
+        it('resolves Copilot reviewer routing with configured model and reasoning effort', () => {
+            const cfg = {
+                externalModels: {
+                    defaults: {
+                        copilotModel: 'copilot-config-model',
+                        copilotReasoningEffort: 'high',
+                    },
+                },
+                team: { roleRouting: { 'code-reviewer': { provider: 'copilot' } } },
+            };
+            const out = resolveRoleAssignment('code-reviewer', cfg);
+            expect(out).toEqual({
+                provider: 'copilot',
+                model: 'copilot-config-model',
+                reasoningEffort: 'high',
+                agent: 'codeReviewer',
+            });
+        });
+        it('uses built-in Copilot defaults and keeps the fallback Claude-pinned', () => {
+            const cfg = {
+                team: { roleRouting: { critic: { provider: 'copilot' } } },
+            };
+            const snapshot = buildResolvedRoutingSnapshot(cfg);
+            expect(snapshot.critic.primary).toMatchObject({
+                provider: 'copilot',
+                model: 'gpt-5.6-sol',
+                reasoningEffort: 'max',
+            });
+            expect(snapshot.critic.fallback.provider).toBe('claude');
+            expect(snapshot.critic.fallback.model).toBe(CLAUDE_FAMILY_DEFAULTS.OPUS);
+            expect(snapshot.critic.fallback.reasoningEffort).toBeUndefined();
         });
         it('respects provider=grok and resolves to empty model (no Claude fallthrough) when omitted', () => {
             const cfg = {

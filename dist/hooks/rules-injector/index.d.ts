@@ -7,7 +7,7 @@
  *
  * Ported from oh-my-opencode's rules-injector hook.
  */
-import type { RuleToInject } from './types.js';
+import type { PlannedRuleToInject, RuleToInject, RulesInjectionReservation } from './types.js';
 export * from './types.js';
 export * from './constants.js';
 export * from './finder.js';
@@ -22,7 +22,16 @@ export * from './storage.js';
  */
 export declare function createRulesInjectorHook(workingDirectory: string): {
     /**
+     * Stage matching rules without marking them as delivered.
+     */
+    planToolExecution: (toolName: string, filePath: string, sessionId: string) => RulesInjectionReservation;
+    formatRuleForInjection: (rule: RuleToInject) => string;
+    formatRulesForInjection: (rules: readonly RuleToInject[]) => string;
+    commitReservation: (sessionId: string, reservationId: string, rules: readonly PlannedRuleToInject[]) => void;
+    releaseReservation: (sessionId: string, reservationId: string) => void;
+    /**
      * Process a tool execution and inject rules if relevant.
+     * Kept for direct callers that own delivery synchronously.
      */
     processToolExecution: (toolName: string, filePath: string, sessionId: string) => string;
     /**

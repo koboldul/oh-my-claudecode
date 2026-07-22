@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteJsonSync } from '../lib/atomic-write.js';
 import { withFileLockSync } from '../lib/file-lock.js';
@@ -17,6 +17,11 @@ const STATUS_ORDER = {
     blocked: 1,
     waiting: 2,
     done: 3,
+};
+const MISSION_STATE_LOCK_OPTS = {
+    timeoutMs: 5_000,
+    retryDelayMs: 50,
+    staleLockMs: 30_000,
 };
 export const DEFAULT_MISSION_BOARD_CONFIG = DEFAULT_CONFIG;
 function resolveConfig(config) {
@@ -55,11 +60,12 @@ function readJsonLinesSafe(path) {
  *   - OMC_MIGRATE_LEGACY_STATE=1 is set, AND
  *   - the session-scoped file does not yet exist, AND
  *   - a legacy file exists.
- * Uses a `.migrating` sentinel + atomic rename for crash safety.
+ * Caller must hold the mission-state owner lock. A destination recheck before
+ * the atomic rename prevents legacy data from replacing newer session state.
  * No caller opt-in is exposed — gated solely on the env var because
  * mission-board callers don't thread a migration flag through the call stack.
  */
-function maybeMigrateLegacy(paths) {
+function maybeMigrateLegacyLocked(paths) {
     if (!isLegacyStateMigrationEnabled())
         return;
     if (!paths.sessionScoped)
@@ -68,34 +74,81 @@ function maybeMigrateLegacy(paths) {
         return;
     if (!existsSync(paths.legacy))
         return;
-    const sentinel = paths.sessionScoped + '.migrating';
+    const sentinel = `${paths.sessionScoped}.migrating.${process.pid}.${Date.now()}`;
     try {
         const sessionDir = join(paths.sessionScoped, '..');
         if (!existsSync(sessionDir)) {
             mkdirSync(sessionDir, { recursive: true });
         }
         copyFileSync(paths.legacy, sentinel);
+        if (existsSync(paths.sessionScoped))
+            return;
         renameSync(sentinel, paths.sessionScoped);
     }
     catch {
-        // migration is best-effort; ignore failures so normal write proceeds
+        // Migration is best-effort; the locked writer may still create fresh state.
+    }
+    finally {
         try {
-            renameSync(sentinel, sentinel + '.failed');
+            unlinkSync(sentinel);
         }
-        catch { /* ignore */ }
+        catch { /* already moved or absent */ }
     }
 }
-function writeState(directory, state, sessionId) {
+function readResolvedState(paths, sessionId) {
+    return sessionId
+        ? readJsonSafe(paths.sessionScoped)
+        : readJsonSafe(paths.effectiveRead);
+}
+function waitForMissionLock(ms) {
+    const buffer = new SharedArrayBuffer(4);
+    const view = new Int32Array(buffer);
+    try {
+        Atomics.wait(view, 0, 0, ms);
+    }
+    catch {
+        const deadline = Date.now() + ms;
+        while (Date.now() < deadline) { /* wait */ }
+    }
+}
+function withMissionStateLock(lockPath, update) {
+    const deadline = Date.now() + MISSION_STATE_LOCK_OPTS.timeoutMs;
+    let lastError;
+    while (Date.now() < deadline) {
+        let lockAcquired = false;
+        try {
+            return withFileLockSync(lockPath, () => {
+                lockAcquired = true;
+                return update();
+            }, {
+                ...MISSION_STATE_LOCK_OPTS,
+                timeoutMs: Math.min(250, deadline - Date.now()),
+            });
+        }
+        catch (error) {
+            if (lockAcquired)
+                throw error;
+            lastError = error;
+        }
+        waitForMissionLock(MISSION_STATE_LOCK_OPTS.retryDelayMs);
+    }
+    throw lastError instanceof Error
+        ? lastError
+        : new Error(`Failed to acquire mission state lock: ${lockPath}`);
+}
+function updateState(directory, sessionId, update) {
     const paths = resolveSessionStatePaths('mission-state', sessionId, directory);
     const writePath = paths.effectiveWrite;
     const stateDir = join(writePath, '..');
     if (!existsSync(stateDir)) {
         mkdirSync(stateDir, { recursive: true });
     }
-    withFileLockSync(writePath + '.lock', () => {
+    return withMissionStateLock(writePath + '.lock', () => {
+        maybeMigrateLegacyLocked(paths);
+        const state = update(readResolvedState(paths, sessionId));
         atomicWriteJsonSync(writePath, state);
+        return state;
     });
-    return state;
 }
 function parseTime(value) {
     if (!value)
@@ -176,85 +229,93 @@ function recalcSessionMission(mission) {
 export function readMissionBoardState(directory, sessionId) {
     const effectiveSessionId = sessionId ?? getProcessSessionId();
     const paths = resolveSessionStatePaths('mission-state', effectiveSessionId, directory);
-    maybeMigrateLegacy(paths);
-    if (effectiveSessionId) {
-        // Session-scoped read: read sessionScoped path EXCLUSIVELY (no legacy fallback).
-        // Legacy fallback would leak missions from a pre-session file into a fresh session
-        // on its first read — the RMW path (read → mutate → write) would then bleed
-        // legacy data into the new session-scoped file.
-        return readJsonSafe(paths.sessionScoped);
+    if (effectiveSessionId && isLegacyStateMigrationEnabled()) {
+        const writePath = paths.effectiveWrite;
+        const stateDir = join(writePath, '..');
+        if (!existsSync(stateDir)) {
+            mkdirSync(stateDir, { recursive: true });
+        }
+        return withMissionStateLock(writePath + '.lock', () => {
+            maybeMigrateLegacyLocked(paths);
+            return readResolvedState(paths, effectiveSessionId);
+        });
     }
-    return readJsonSafe(paths.effectiveRead);
+    // Session-scoped reads intentionally do not fall back to the legacy path.
+    return readResolvedState(paths, effectiveSessionId);
 }
 export function recordMissionAgentStart(directory, input, sessionId) {
     const effectiveSessionId = sessionId ?? getProcessSessionId();
     const now = input.at || new Date().toISOString();
-    const state = readMissionBoardState(directory, effectiveSessionId) || { updatedAt: now, missions: [] };
-    const mission = ensureSessionMission(state, input);
-    const agentName = sessionAgentName(input.agentType, input.agentId);
-    const agent = mission.agents.find((entry) => entry.ownership === input.agentId) || {
-        name: agentName,
-        role: shortAgentType(input.agentType),
-        ownership: input.agentId,
-        status: 'running',
-        currentStep: null,
-        latestUpdate: null,
-        completedSummary: null,
-        updatedAt: now,
-    };
-    agent.status = 'running';
-    agent.currentStep = compactText(input.taskDescription, 56);
-    agent.latestUpdate = compactText(input.taskDescription, 64);
-    agent.completedSummary = null;
-    agent.updatedAt = now;
-    if (!mission.agents.includes(agent)) {
-        mission.agents.push(agent);
-    }
-    mission.updatedAt = now;
-    mission.timeline.push({
-        id: `session-start:${input.agentId}:${now}`,
-        at: now,
-        kind: 'update',
-        agent: agent.name,
-        detail: compactText(input.taskDescription || `started ${agent.name}`, 72) || `started ${agent.name}`,
-        sourceKey: `session-start:${input.agentId}`,
+    return updateState(directory, effectiveSessionId, (current) => {
+        const state = current || { updatedAt: now, missions: [] };
+        const mission = ensureSessionMission(state, input);
+        const agentName = sessionAgentName(input.agentType, input.agentId);
+        const agent = mission.agents.find((entry) => entry.ownership === input.agentId) || {
+            name: agentName,
+            role: shortAgentType(input.agentType),
+            ownership: input.agentId,
+            status: 'running',
+            currentStep: null,
+            latestUpdate: null,
+            completedSummary: null,
+            updatedAt: now,
+        };
+        agent.status = 'running';
+        agent.currentStep = compactText(input.taskDescription, 56);
+        agent.latestUpdate = compactText(input.taskDescription, 64);
+        agent.completedSummary = null;
+        agent.updatedAt = now;
+        if (!mission.agents.includes(agent)) {
+            mission.agents.push(agent);
+        }
+        mission.updatedAt = now;
+        mission.timeline.push({
+            id: `session-start:${input.agentId}:${now}`,
+            at: now,
+            kind: 'update',
+            agent: agent.name,
+            detail: compactText(input.taskDescription || `started ${agent.name}`, 72) || `started ${agent.name}`,
+            sourceKey: `session-start:${input.agentId}`,
+        });
+        mission.timeline = mission.timeline.slice(-DEFAULT_CONFIG.maxTimelineEvents);
+        recalcSessionMission(mission);
+        state.updatedAt = now;
+        return state;
     });
-    mission.timeline = mission.timeline.slice(-DEFAULT_CONFIG.maxTimelineEvents);
-    recalcSessionMission(mission);
-    state.updatedAt = now;
-    return writeState(directory, state, effectiveSessionId);
 }
 export function recordMissionAgentStop(directory, input, sessionId) {
     const effectiveSessionId = sessionId ?? getProcessSessionId();
     const now = input.at || new Date().toISOString();
-    const state = readMissionBoardState(directory, effectiveSessionId) || { updatedAt: now, missions: [] };
-    const mission = state.missions
-        .filter((entry) => entry.source === 'session' && entry.id.startsWith(`session:${input.sessionId}:`))
-        .sort((left, right) => parseTime(right.updatedAt) - parseTime(left.updatedAt))[0];
-    if (!mission) {
+    return updateState(directory, effectiveSessionId, (current) => {
+        const state = current || { updatedAt: now, missions: [] };
+        const mission = state.missions
+            .filter((entry) => entry.source === 'session' && entry.id.startsWith(`session:${input.sessionId}:`))
+            .sort((left, right) => parseTime(right.updatedAt) - parseTime(left.updatedAt))[0];
+        if (!mission) {
+            return state;
+        }
+        const agent = mission.agents.find((entry) => entry.ownership === input.agentId) || mission.agents[0];
+        if (!agent) {
+            return state;
+        }
+        agent.status = input.success ? 'done' : 'blocked';
+        agent.currentStep = null;
+        agent.latestUpdate = compactText(input.outputSummary, 64) || (input.success ? 'completed' : 'blocked');
+        agent.completedSummary = input.success ? compactText(input.outputSummary, 64) : null;
+        agent.updatedAt = now;
+        mission.updatedAt = now;
+        mission.timeline.push({
+            id: `session-stop:${input.agentId}:${now}`,
+            at: now,
+            kind: input.success ? 'completion' : 'failure',
+            agent: agent.name,
+            detail: compactText(input.outputSummary || (input.success ? 'completed' : 'blocked'), 72) || (input.success ? 'completed' : 'blocked'),
+            sourceKey: `session-stop:${input.agentId}`,
+        });
+        recalcSessionMission(mission);
+        state.updatedAt = now;
         return state;
-    }
-    const agent = mission.agents.find((entry) => entry.ownership === input.agentId) || mission.agents[0];
-    if (!agent) {
-        return state;
-    }
-    agent.status = input.success ? 'done' : 'blocked';
-    agent.currentStep = null;
-    agent.latestUpdate = compactText(input.outputSummary, 64) || (input.success ? 'completed' : 'blocked');
-    agent.completedSummary = input.success ? compactText(input.outputSummary, 64) : null;
-    agent.updatedAt = now;
-    mission.updatedAt = now;
-    mission.timeline.push({
-        id: `session-stop:${input.agentId}:${now}`,
-        at: now,
-        kind: input.success ? 'completion' : 'failure',
-        agent: agent.name,
-        detail: compactText(input.outputSummary || (input.success ? 'completed' : 'blocked'), 72) || (input.success ? 'completed' : 'blocked'),
-        sourceKey: `session-stop:${input.agentId}`,
     });
-    recalcSessionMission(mission);
-    state.updatedAt = now;
-    return writeState(directory, state, effectiveSessionId);
 }
 function deriveTeamStatus(taskCounts, agents) {
     if (taskCounts.inProgress > 0 || agents.some((agent) => agent.status === 'running')) {
@@ -418,7 +479,6 @@ function mergeMissions(previous, teamMissions, config) {
 export function refreshMissionBoardState(directory, rawConfig = DEFAULT_CONFIG, sessionId) {
     const effectiveSessionId = sessionId ?? getProcessSessionId();
     const config = resolveConfig(rawConfig);
-    const previous = readMissionBoardState(directory, effectiveSessionId);
     const teamsRoot = join(getOmcRoot(directory), 'state', 'team');
     const teamMissions = existsSync(teamsRoot)
         ? readdirSync(teamsRoot, { withFileTypes: true })
@@ -426,11 +486,10 @@ export function refreshMissionBoardState(directory, rawConfig = DEFAULT_CONFIG, 
             .map((entry) => collectTeamMission(join(teamsRoot, entry.name), entry.name, config))
             .filter((mission) => Boolean(mission))
         : [];
-    const state = {
+    return updateState(directory, effectiveSessionId, (previous) => ({
         updatedAt: new Date().toISOString(),
         missions: mergeMissions(previous, teamMissions, config),
-    };
-    return writeState(directory, state, effectiveSessionId);
+    }));
 }
 export function renderMissionBoard(state, rawConfig = DEFAULT_CONFIG) {
     if (!state || !Array.isArray(state.missions) || state.missions.length === 0)

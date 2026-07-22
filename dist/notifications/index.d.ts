@@ -21,6 +21,22 @@ export { verifySlackSignature, isTimestampValid, validateSlackEnvelope, validate
 export type { SlackConnectionState, SlackValidationResult, SlackSocketEnvelope, } from "./slack-socket.js";
 export { redactTokens } from "./redact.js";
 import type { NotificationEvent, NotificationPayload, DispatchResult } from "./types.js";
+export declare const NOTIFICATION_PROVISIONAL_LEASE_MS = 30000;
+export interface NotifyOnceResult {
+    status: "sent" | "duplicate" | "skipped" | "failed";
+}
+export declare function claimNotificationReceipt(intentId: string, event: NotificationEvent, sessionId: string, projectPath: string, nowMs: number): "claimed" | "duplicate" | "failed";
+export type ProvisionalNotificationReceiptClaim = {
+    status: "claimed";
+    claimId: string;
+} | {
+    status: "duplicate";
+} | {
+    status: "failed";
+};
+export declare function claimProvisionalNotificationReceipt(intentId: string, event: NotificationEvent, sessionId: string, projectPath: string, nowMs: number): ProvisionalNotificationReceiptClaim;
+export declare function finalizeNotificationReceiptQueued(intentId: string, sessionId: string, projectPath: string, claimId: string, nowMs: number): "finalized" | "changed" | "failed";
+export declare function markNotificationReceiptRetryable(intentId: string, sessionId: string, projectPath: string, claimId: string, nowMs: number): "retryable" | "changed" | "failed";
 /**
  * High-level notification function.
  *
@@ -35,6 +51,16 @@ export declare function notify(event: NotificationEvent, data: Partial<Notificat
     sessionId: string;
     profileName?: string;
 }): Promise<DispatchResult | null>;
+/**
+ * At-most-once notification dispatch guarded by a durable owner receipt.
+ * The receipt is claimed before external dispatch, so a crash may suppress a
+ * retry but can never duplicate an interactive notification.
+ */
+export declare function notifyOnce(intentId: string, event: NotificationEvent, data: Partial<NotificationPayload> & {
+    sessionId: string;
+    projectPath: string;
+    profileName?: string;
+}, nowMs?: number): Promise<NotifyOnceResult>;
 export type { CustomIntegration, CustomIntegrationType, WebhookIntegrationConfig, CliIntegrationConfig, CustomIntegrationsConfig, ExtendedNotificationConfig, } from "./types.js";
 export { sendCustomWebhook, sendCustomCli, dispatchCustomIntegrations, } from "./dispatcher.js";
 export { getCustomIntegrationsConfig, getCustomIntegrationsForEvent, hasCustomIntegrationsEnabled, detectLegacyOpenClawConfig, migrateLegacyOpenClawConfig, } from "./config.js";

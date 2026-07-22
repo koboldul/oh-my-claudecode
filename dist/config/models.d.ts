@@ -1,3 +1,4 @@
+import type { CopilotReasoningEffort } from '../shared/types.js';
 export type ModelTier = 'LOW' | 'MEDIUM' | 'HIGH';
 export type ClaudeModelFamily = 'HAIKU' | 'SONNET' | 'OPUS' | 'FABLE';
 /**
@@ -14,7 +15,13 @@ export declare const BUILTIN_EXTERNAL_MODEL_DEFAULTS: {
     readonly codexModel: "gpt-5.3-codex";
     readonly geminiModel: "gemini-3.1-pro-preview";
     readonly antigravityModel: "Gemini 3.1 Pro (High)";
+    readonly copilotModel: "gpt-5.6-sol";
+    readonly copilotReasoningEffort: CopilotReasoningEffort;
 };
+export declare const COPILOT_REASONING_EFFORTS: readonly ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+export declare function resolveCopilotModel(configured?: string, env?: NodeJS.ProcessEnv): string;
+export declare function resolveCopilotReasoningEffort(configured?: string, env?: NodeJS.ProcessEnv): CopilotReasoningEffort;
+export declare function validateCopilotReasoningEffort(raw: string): CopilotReasoningEffort;
 export declare function resolveInheritedModelFromEnv(): string | undefined;
 export declare function hasTierModelEnvOverrides(): boolean;
 export declare function getDefaultModelHigh(): string;

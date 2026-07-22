@@ -6,7 +6,7 @@
  *
  * Events are appended to: .omc/state/agent-replay-{sessionId}.jsonl
  */
-export type ReplayEventType = 'agent_start' | 'agent_stop' | 'tool_start' | 'tool_end' | 'file_touch' | 'intervention' | 'error' | 'hook_fire' | 'hook_result' | 'keyword_detected' | 'skill_activated' | 'skill_invoked' | 'mode_change';
+export type ReplayEventType = 'agent_start' | 'agent_stop' | 'agent_reconcile' | 'tool_start' | 'tool_end' | 'file_touch' | 'intervention' | 'error' | 'hook_fire' | 'hook_result' | 'keyword_detected' | 'skill_activated' | 'skill_invoked' | 'mode_change';
 export interface ReplayEvent {
     /** Seconds since session start */
     t: number;
@@ -17,6 +17,7 @@ export interface ReplayEvent {
     /** Event type */
     event: ReplayEventType;
     /** Event-specific data */
+    previous_agent?: string;
     tool?: string;
     file?: string;
     duration_ms?: number;
@@ -45,6 +46,14 @@ export interface ReplayEvent {
     context_injected?: boolean;
     /** Injected context size (bytes) */
     context_length?: number;
+    /** Durable idempotency key for owner-mediated appends. */
+    intent_id?: string;
+    /** Attempt telemetry is not successful execution state. */
+    attempt?: boolean;
+    /** Final aggregate batch disposition for an attempt. */
+    disposition?: 'accepted' | 'rejected';
+    /** Wall-clock timestamp captured by the hook snapshot. */
+    observed_at?: string;
 }
 export interface AgentBreakdown {
     type: string;
@@ -97,7 +106,19 @@ export declare function getReplayFilePath(directory: string, sessionId: string):
 /**
  * Append a replay event to the JSONL file
  */
-export declare function appendReplayEvent(directory: string, sessionId: string, event: Omit<ReplayEvent, 't'>): void;
+export declare function appendReplayEvent(directory: string, sessionId: string, event: Omit<ReplayEvent, 't'>): ReplayAppendResult;
+export interface ReplayAppendResult {
+    status: 'appended' | 'failed';
+}
+export interface ReplayAppendOnceResult {
+    status: 'appended' | 'duplicate' | 'reconciled' | 'failed';
+}
+/**
+ * Append one replay event under the replay-file owner lock. Replays with the
+ * same intent are deduplicated; a changed final disposition reconciles the
+ * existing line instead of appending contradictory telemetry.
+ */
+export declare function appendReplayEventOnce(directory: string, sessionId: string, intentId: string, event: Omit<ReplayEvent, 't' | 'intent_id'>, observedAtMs?: number): ReplayAppendOnceResult;
 /**
  * Record agent start event
  */
@@ -111,6 +132,10 @@ export interface AgentStopReplayMetadata {
  * Record agent stop event
  */
 export declare function recordAgentStop(directory: string, sessionId: string, agentId: string, agentType: string, success: boolean, durationMs?: number, metadata?: AgentStopReplayMetadata): void;
+/**
+ * Correct a previously recorded unmatched stop after its start arrives.
+ */
+export declare function recordAgentReconciliation(directory: string, sessionId: string, previousAgentId: string, stableAgentId: string, agentType: string, success: boolean, durationMs?: number): void;
 /**
  * Record tool execution event
  */

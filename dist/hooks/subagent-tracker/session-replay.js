@@ -9,6 +9,8 @@
 import { existsSync, appendFileSync, readFileSync, mkdirSync, readdirSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
 import { getOmcRoot } from '../../lib/worktree-paths.js';
+import { atomicWriteFileSync } from '../../lib/atomic-write.js';
+import { withStateFileMutationLock } from '../../lib/mode-state-io.js';
 // ============================================================================
 // Constants
 // ============================================================================
@@ -54,23 +56,112 @@ function getElapsedSeconds(sessionId) {
 export function appendReplayEvent(directory, sessionId, event) {
     try {
         const filePath = getReplayFilePath(directory, sessionId);
-        // Check file size limit
-        if (existsSync(filePath)) {
-            try {
-                const stats = statSync(filePath);
-                if (stats.size > MAX_REPLAY_SIZE_BYTES)
-                    return;
+        const locked = withStateFileMutationLock(filePath, () => {
+            if (existsSync(filePath)) {
+                try {
+                    if (statSync(filePath).size > MAX_REPLAY_SIZE_BYTES) {
+                        return { status: 'failed' };
+                    }
+                }
+                catch {
+                    return { status: 'failed' };
+                }
             }
-            catch { /* continue */ }
-        }
-        const replayEvent = {
-            t: getElapsedSeconds(sessionId),
-            ...event,
-        };
-        appendFileSync(filePath, JSON.stringify(replayEvent) + '\n', 'utf-8');
+            const replayEvent = {
+                t: getElapsedSeconds(sessionId),
+                ...event,
+            };
+            appendFileSync(filePath, JSON.stringify(replayEvent) + '\n', { encoding: 'utf-8', mode: 0o600 });
+            return { status: 'appended' };
+        });
+        return locked.acquired && locked.value
+            ? locked.value
+            : { status: 'failed' };
     }
     catch {
         // Never fail the hook on replay errors
+        return { status: 'failed' };
+    }
+}
+/**
+ * Append one replay event under the replay-file owner lock. Replays with the
+ * same intent are deduplicated; a changed final disposition reconciles the
+ * existing line instead of appending contradictory telemetry.
+ */
+export function appendReplayEventOnce(directory, sessionId, intentId, event, observedAtMs = Date.now()) {
+    if (!intentId)
+        return { status: 'failed' };
+    try {
+        const filePath = getReplayFilePath(directory, sessionId);
+        const locked = withStateFileMutationLock(filePath, () => {
+            let lines = [];
+            if (existsSync(filePath)) {
+                try {
+                    if (statSync(filePath).size > MAX_REPLAY_SIZE_BYTES) {
+                        return { status: 'failed' };
+                    }
+                    lines = readFileSync(filePath, 'utf8')
+                        .split('\n')
+                        .filter(Boolean);
+                }
+                catch {
+                    return { status: 'failed' };
+                }
+            }
+            if (!sessionStartTimes.has(sessionId)) {
+                sessionStartTimes.set(sessionId, observedAtMs);
+            }
+            const start = sessionStartTimes.get(sessionId) ?? observedAtMs;
+            const replayEvent = {
+                t: Math.round(((observedAtMs - start) / 1000) * 10) / 10,
+                ...event,
+                intent_id: intentId,
+            };
+            const serialized = JSON.stringify(replayEvent);
+            const existingIndex = lines.findIndex((line) => {
+                try {
+                    return JSON.parse(line).intent_id === intentId;
+                }
+                catch {
+                    return false;
+                }
+            });
+            if (existingIndex >= 0) {
+                let existingEvent;
+                try {
+                    existingEvent = JSON.parse(lines[existingIndex]);
+                }
+                catch {
+                    return { status: 'failed' };
+                }
+                const reconciledEvent = {
+                    ...replayEvent,
+                    t: existingEvent.t,
+                };
+                if (Object.prototype.hasOwnProperty.call(existingEvent, 'observed_at')) {
+                    reconciledEvent.observed_at = existingEvent.observed_at;
+                }
+                else {
+                    delete reconciledEvent.observed_at;
+                }
+                const reconciled = JSON.stringify(reconciledEvent);
+                if (lines[existingIndex] === reconciled) {
+                    return { status: 'duplicate' };
+                }
+                lines[existingIndex] = reconciled;
+                atomicWriteFileSync(filePath, `${lines.join('\n')}\n`);
+                return { status: 'reconciled' };
+            }
+            lines.push(serialized);
+            atomicWriteFileSync(filePath, `${lines.join('\n')}\n`);
+            return { status: 'appended' };
+        });
+        return locked.acquired && locked.value
+            ? locked.value
+            : { status: 'failed' };
+    }
+    catch {
+        return { status: 'failed' };
     }
 }
 // ============================================================================
@@ -102,6 +193,20 @@ export function recordAgentStop(directory, sessionId, agentId, agentType, succes
         synthetic: metadata?.synthetic,
         telemetry_status: metadata?.telemetry_status,
         reason: metadata?.reason,
+    });
+}
+/**
+ * Correct a previously recorded unmatched stop after its start arrives.
+ */
+export function recordAgentReconciliation(directory, sessionId, previousAgentId, stableAgentId, agentType, success, durationMs) {
+    appendReplayEvent(directory, sessionId, {
+        agent: stableAgentId.substring(0, 7),
+        previous_agent: previousAgentId.substring(0, 7),
+        agent_type: agentType.replace('oh-my-claudecode:', ''),
+        event: 'agent_reconcile',
+        success,
+        duration_ms: durationMs,
+        reason: 'Reconciled a stop that arrived before its start event.',
     });
 }
 /**
@@ -252,6 +357,25 @@ export function getReplaySummary(directory, sessionId) {
                         stats.total_ms += event.duration_ms;
                 }
                 break;
+            case 'agent_reconcile': {
+                const remainingUntracked = Math.max(0, (summary.agents_untracked_stops ?? 0) - 1);
+                if (remainingUntracked > 0) {
+                    summary.agents_untracked_stops = remainingUntracked;
+                }
+                else {
+                    delete summary.agents_untracked_stops;
+                }
+                if (event.success)
+                    summary.agents_completed++;
+                else
+                    summary.agents_failed++;
+                if (event.agent_type && event.duration_ms) {
+                    const stats = agentTypeStats.get(event.agent_type);
+                    if (stats)
+                        stats.total_ms += event.duration_ms;
+                }
+                break;
+            }
             case 'tool_end':
                 if (event.tool) {
                     if (!summary.tool_summary[event.tool]) {
