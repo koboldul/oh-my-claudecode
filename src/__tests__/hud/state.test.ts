@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { readHudConfig, writeHudConfig } from "../../hud/state.js";
 import { DEFAULT_HUD_CONFIG, PRESET_CONFIGS } from "../../hud/types.js";
+import { parseJsonc } from "../../utils/jsonc.js";
 
 // Mock fs and os modules
 vi.mock("node:fs", () => ({
@@ -72,10 +73,27 @@ describe("readHudConfig", () => {
       expect(config.elements.gitBranch).toBe(true);
     });
 
+    it("reads omcHud from JSONC settings without discarding comments", () => {
+      mockExistsSync.mockImplementation((path) =>
+        String(path).endsWith("settings.json"),
+      );
+      mockReadFileSync.mockReturnValue(`{
+  // Copilot settings remain JSONC
+  "omcHud": {
+    "preset": "minimal",
+  },
+}
+`);
+
+      const config = readHudConfig();
+
+      expect(config.preset).toBe("minimal");
+    });
+
     it("reads callCountsFormat from settings.json", () => {
       mockExistsSync.mockImplementation((path) => {
         const s = String(path);
-        return /[\/]Users[\/]testuser[\/]\.claude[\/]settings\.json$/.test(
+        return /[\\/]Users[\\/]testuser[\\/]\.claude[\\/]settings\.json$/.test(
           s,
         );
       });
@@ -233,7 +251,7 @@ describe("readHudConfig", () => {
     it("allows mission board to be explicitly enabled from settings", () => {
       mockExistsSync.mockImplementation((path) => {
         const s = String(path);
-        return /[\/]Users[\/]testuser[\/]\.claude[\/]settings\.json$/.test(s);
+        return /[\\/]Users[\\/]testuser[\\/]\.claude[\\/]settings\.json$/.test(s);
       });
       mockReadFileSync.mockReturnValue(
         JSON.stringify({
@@ -382,10 +400,33 @@ describe("writeHudConfig", () => {
     expect(written.omcHud.elements.gitRepo).toBe(true);
   });
 
+  it("preserves JSONC comments while writing omcHud", () => {
+    mockExistsSync.mockImplementation((path) =>
+      String(path).endsWith("settings.json"),
+    );
+    mockReadFileSync.mockReturnValue(`{
+  // keep this host setting
+  "theme": "dark",
+}
+`);
+
+    const ok = writeHudConfig({
+      ...DEFAULT_HUD_CONFIG,
+      preset: "minimal",
+    });
+
+    expect(ok).toBe(true);
+    const [, raw] = mockAtomicWriteFileSync.mock.calls[0] as [string, string];
+    expect(raw).toContain("// keep this host setting");
+    const written = parseJsonc(raw) as Record<string, unknown>;
+    expect(written.theme).toBe("dark");
+    expect((written.omcHud as { preset: string }).preset).toBe("minimal");
+  });
+
   it("merges legacy hud-config defaults into the written omcHud payload", () => {
     mockExistsSync.mockImplementation((path) => {
       const s = String(path);
-      return s.endsWith("settings.json") || s.endsWith(".omc/hud-config.json");
+      return s.endsWith("settings.json") || /[\\/]\.omc[\\/]hud-config\.json$/.test(s);
     });
     mockReadFileSync.mockImplementation((path) => {
       const s = String(path);

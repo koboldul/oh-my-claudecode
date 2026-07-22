@@ -28,6 +28,7 @@ const fakeConfig = {
 
 describe('HUD CLI diagnostic (no stdin, no watch mode)', () => {
   const originalIsTTY = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+  const originalOmcHost = process.env.OMC_HOST;
   let consoleLogSpy: ReturnType<typeof vi.spyOn>;
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
   let tempConfigDir: string;
@@ -100,6 +101,7 @@ describe('HUD CLI diagnostic (no stdin, no watch mode)', () => {
   }
 
   beforeEach(() => {
+    delete process.env.OMC_HOST;
     Object.defineProperty(process.stdin, 'isTTY', {
       configurable: true,
       value: true,
@@ -133,6 +135,11 @@ describe('HUD CLI diagnostic (no stdin, no watch mode)', () => {
     consoleErrorSpy.mockRestore();
     if (originalIsTTY) {
       Object.defineProperty(process.stdin, 'isTTY', originalIsTTY);
+    }
+    if (originalOmcHost === undefined) {
+      delete process.env.OMC_HOST;
+    } else {
+      process.env.OMC_HOST = originalOmcHost;
     }
     try { rmSync(tempConfigDir, { recursive: true, force: true }); } catch { /* ignore */ }
   });
@@ -178,6 +185,29 @@ describe('HUD CLI diagnostic (no stdin, no watch mode)', () => {
     expect(output).toContain('statusLine:');
     expect(output).toContain('configured');
     expect(output).toContain('HUD renders automatically inside Claude Code sessions.');
+  });
+
+  it('reads Copilot JSONC settings and reports the native host', async () => {
+    process.env.OMC_HOST = 'copilot';
+    writeFileSync(join(tempConfigDir, 'hud', 'omc-hud.mjs'), '// stub');
+    writeFileSync(
+      join(tempConfigDir, 'settings.json'),
+      `{
+  // native Copilot status line
+  "statusLine": {
+    "type": "command",
+    "command": "node C:/Users/test/.copilot/hud/omc-hud.mjs",
+  },
+}
+`,
+    );
+    const hud = await importHudModule();
+    await hud.main(false, false);
+
+    const output = consoleLogSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
+    expect(output).toContain('statusLine:');
+    expect(output).toContain('configured');
+    expect(output).toContain('HUD renders automatically inside GitHub Copilot CLI sessions.');
   });
 
   it('shows statusLine as NOT configured when settings.json has no statusLine', async () => {

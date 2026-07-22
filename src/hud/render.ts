@@ -454,7 +454,7 @@ export async function render(
     if (lastSkillElement) rendered.set("lastSkill", lastSkillElement);
   }
 
-  if (enabledElements.contextBar) {
+  if (enabledElements.contextBar && context.contextAvailable !== false) {
     const ctx = enabledElements.useBars
       ? renderContextWithBar(
           context.contextPercent,
@@ -526,12 +526,14 @@ export async function render(
     if (mbLines.length > 0) renderedDetail.set("missionBoard", mbLines);
   }
 
-  const ctxWarning = renderContextLimitWarning(
-    context.contextPercent,
-    config.contextLimitWarning.threshold,
-    config.contextLimitWarning.autoCompact,
-  );
-  if (ctxWarning) renderedDetail.set("contextWarning", [ctxWarning]);
+  if (context.contextAvailable !== false) {
+    const ctxWarning = renderContextLimitWarning(
+      context.contextPercent,
+      config.contextLimitWarning.threshold,
+      config.contextLimitWarning.autoCompact,
+    );
+    if (ctxWarning) renderedDetail.set("contextWarning", [ctxWarning]);
+  }
 
   const payloadWarning = renderPayloadLimitWarning(context.payloadEstimate);
   if (payloadWarning) renderedDetail.set("payloadWarning", [payloadWarning]);

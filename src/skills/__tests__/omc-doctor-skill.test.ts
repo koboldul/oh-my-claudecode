@@ -60,7 +60,8 @@ describe('omc-doctor skill GitHub Copilot CLI awareness', () => {
 
   it('has a dedicated Copilot CLI checks section with install/enabled detection', () => {
     expect(content).toContain('## GitHub Copilot CLI checks');
-    expect(content).toContain('oh-my-claudecode@omc');
+    expect(content).toContain('installedPlugins[].cache_path');
+    expect(content).toContain('custom-marketplace installs');
     expect(content).toContain('/plugin install oh-my-claudecode');
     // Copilot recognizes Claude event names; never add camelCase mirrors (double-fire).
     expect(content).toContain('camelCase mirror events');

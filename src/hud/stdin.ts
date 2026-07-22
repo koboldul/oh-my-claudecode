@@ -1,7 +1,7 @@
 /**
  * OMC HUD - Stdin Parser
  *
- * Parse stdin JSON from Claude Code statusline interface.
+ * Parse and normalize stdin JSON from supported statusline hosts.
  * Based on claude-hud reference implementation.
  */
 
@@ -14,6 +14,7 @@ import {
   resolveOmcPath,
 } from '../lib/worktree-paths.js';
 import type { RateLimits, StatuslineStdin } from './types.js';
+import { normalizeStatuslineStdin } from './copilot-stdin.js';
 
 const TRANSIENT_CONTEXT_PERCENT_TOLERANCE = 3;
 
@@ -178,7 +179,7 @@ function readMostRecentSessionCache(root: string): StatuslineStdin | null {
 // ============================================================================
 
 /**
- * Read and parse stdin JSON from Claude Code.
+ * Read, parse, and normalize statusline stdin JSON.
  * Returns null if stdin is not available or invalid.
  */
 export async function readStdin(): Promise<StatuslineStdin | null> {
@@ -201,7 +202,7 @@ export async function readStdin(): Promise<StatuslineStdin | null> {
       return null;
     }
 
-    return JSON.parse(raw) as StatuslineStdin;
+    return normalizeStatuslineStdin(JSON.parse(raw));
   } catch {
     return null;
   }

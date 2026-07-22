@@ -37,6 +37,6 @@ Examples:
 
 - `/oh-my-claudecode:omc-setup`, `/oh-my-claudecode:omc-doctor`, and `/oh-my-claudecode:mcp-setup` remain valid compatibility entrypoints.
 - Prefer `/oh-my-claudecode:setup` in new documentation and user guidance.
-- In a Copilot session, plugin installation is sufficient — verify with `/env`, diagnose with `/oh-my-claudecode:setup doctor`, and update with `copilot plugin update oh-my-claudecode` (then restart Copilot CLI). Do not run `/oh-my-claudecode:omc-setup`'s Claude-only phases (CLAUDE.md, HUD/statusLine) unless the user explicitly asks to configure Claude Code too.
+- In a Copilot session, plugin installation is sufficient for OMC's core surfaces. Verify with `/env`, diagnose with `/oh-my-claudecode:setup doctor`, and update with `copilot plugin update oh-my-claudecode` (then restart Copilot CLI). The optional native HUD is configured with `/oh-my-claudecode:hud setup` under `${COPILOT_HOME:-~/.copilot}`; its bundled helper resolves local, direct, custom-marketplace, and default installs from active-root and installed-plugin metadata. Do not run `/oh-my-claudecode:omc-setup`'s Claude-only phases (CLAUDE.md or Claude HUD/statusLine) unless the user explicitly asks to configure Claude Code too.
 
 Task: {{ARGUMENTS}}

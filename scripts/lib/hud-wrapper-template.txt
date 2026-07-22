@@ -7,18 +7,164 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const { getClaudeConfigDir } = await import(pathToFileURL(join(__dirname, "lib", "config-dir.mjs")).href);
+const configuredPluginRoot = "";
+
+function getCopilotHome() {
+  const configured = process.env.COPILOT_HOME?.trim();
+  if (!configured) return join(homedir(), ".copilot");
+  if (configured === "~") return homedir();
+  if (configured.startsWith("~/") || configured.startsWith("~\\")) {
+    return join(homedir(), configured.slice(2));
+  }
+  return resolve(configured);
+}
+
+function isPathWithin(candidate, parent) {
+  const normalizedCandidate = resolve(candidate);
+  const normalizedParent = resolve(parent);
+  const caseFold = process.platform === "win32"
+    ? (value) => value.toLowerCase()
+    : (value) => value;
+  const foldedCandidate = caseFold(normalizedCandidate);
+  const foldedParent = caseFold(normalizedParent);
+  return foldedCandidate === foldedParent || foldedCandidate.startsWith(`${foldedParent}${sep}`);
+}
 
 function uniquePaths(paths) {
   return [...new Set(paths.filter(Boolean).map((candidate) => resolve(candidate)))];
+}
+
+function parseJsonc(content) {
+  let withoutComments = "";
+  let inString = false;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+
+  for (let index = 0; index < content.length; index += 1) {
+    const char = content[index];
+    const next = content[index + 1];
+    if (lineComment) {
+      if (char === "\n") {
+        lineComment = false;
+        withoutComments += char;
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (char === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      } else if (char === "\n") {
+        withoutComments += char;
+      }
+      continue;
+    }
+    if (inString) {
+      withoutComments += char;
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      withoutComments += char;
+    } else if (char === "/" && next === "/") {
+      lineComment = true;
+      index += 1;
+    } else if (char === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+    } else {
+      withoutComments += char;
+    }
+  }
+
+  let withoutTrailingCommas = "";
+  inString = false;
+  escaped = false;
+  for (let index = 0; index < withoutComments.length; index += 1) {
+    const char = withoutComments[index];
+    if (inString) {
+      withoutTrailingCommas += char;
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      withoutTrailingCommas += char;
+      continue;
+    }
+    if (char === ",") {
+      let nextIndex = index + 1;
+      while (/\s/.test(withoutComments[nextIndex] ?? "")) nextIndex += 1;
+      if (withoutComments[nextIndex] === "}" || withoutComments[nextIndex] === "]") {
+        continue;
+      }
+    }
+    withoutTrailingCommas += char;
+  }
+  return JSON.parse(withoutTrailingCommas);
+}
+
+function resolvePluginPath(value, copilotHome) {
+  if (value === "~") return homedir();
+  if (value.startsWith("~/") || value.startsWith("~\\")) {
+    return join(homedir(), value.slice(2));
+  }
+  return isAbsolute(value) ? resolve(value) : resolve(copilotHome, value);
+}
+
+function getCopilotMetadataRoots(copilotHome) {
+  try {
+    const config = parseJsonc(readFileSync(join(copilotHome, "config.json"), "utf8"));
+    if (!Array.isArray(config?.installedPlugins)) return [];
+    return config.installedPlugins
+      .filter((entry) => entry?.name === "oh-my-claudecode")
+      .sort((left, right) => Number(left?.enabled === false) - Number(right?.enabled === false))
+      .flatMap((entry) => {
+        if (typeof entry.cache_path === "string" && entry.cache_path.trim()) {
+          return [resolvePluginPath(entry.cache_path.trim(), copilotHome)];
+        }
+        if (typeof entry.marketplace === "string" && entry.marketplace.trim()) {
+          return [
+            join(
+              copilotHome,
+              "installed-plugins",
+              entry.marketplace.trim(),
+              "oh-my-claudecode",
+            ),
+          ];
+        }
+        return [];
+      });
+  } catch {
+    return [];
+  }
+}
+
+function getColocatedPluginRoot() {
+  let candidate = __dirname;
+  while (true) {
+    if (existsSync(join(candidate, "bridge", "hud-runtime.mjs"))) {
+      return candidate;
+    }
+    const parent = dirname(candidate);
+    if (parent === candidate) return null;
+    candidate = parent;
+  }
 }
 
 function getGlobalNodeModuleRoots() {
@@ -94,12 +240,78 @@ async function main() {
   let pluginCacheDir = null;
   let lastHudLoadError = null;
   let lastHudLoadTarget = null;
+  const copilotHome = getCopilotHome();
+  const wrapperIsInCopilotHome = isPathWithin(__dirname, copilotHome);
+  const copilotRuntime =
+    wrapperIsInCopilotHome
+    || (
+      process.env.OMC_HOST?.toLowerCase() === "copilot"
+      && !process.env.CLAUDE_CONFIG_DIR
+    );
 
-  // 1. OMC_PLUGIN_ROOT — highest priority (set by `omc --plugin-dir <path>`)
+  if (copilotRuntime) {
+    process.env.OMC_HOST = "copilot";
+    // Existing HUD config readers honor CLAUDE_CONFIG_DIR. Scope that process-local
+    // compatibility variable to COPILOT_HOME so Copilot never reads or writes the
+    // user's Claude Code configuration.
+    process.env.CLAUDE_CONFIG_DIR = copilotHome;
+  }
+
+  if (copilotRuntime) {
+    const canonicalCopilotRoot = join(
+      copilotHome,
+      "installed-plugins",
+      "omc",
+      "oh-my-claudecode",
+    );
+    const copilotPluginRoots = uniquePaths([
+      configuredPluginRoot,
+      getColocatedPluginRoot(),
+      ...getCopilotMetadataRoots(copilotHome),
+      process.env.OMC_PLUGIN_ROOT,
+      process.env.CLAUDE_PLUGIN_ROOT,
+      canonicalCopilotRoot,
+    ]);
+
+    for (const copilotPluginRoot of copilotPluginRoots) {
+      const copilotHudPath = join(
+        copilotPluginRoot,
+        "bridge",
+        "hud-runtime.mjs",
+      );
+      if (existsSync(copilotPluginRoot) && !pluginCacheDir) {
+        pluginCacheDir = copilotPluginRoot;
+      }
+      if (!existsSync(copilotHudPath)) continue;
+      try {
+        await import(pathToFileURL(copilotHudPath).href);
+        return;
+      } catch (error) {
+        lastHudLoadError = error;
+        lastHudLoadTarget = copilotHudPath;
+      }
+    }
+
+    if (lastHudLoadError) {
+      const detail = typeof lastHudLoadError?.message === "string"
+        ? lastHudLoadError.message
+        : String(lastHudLoadError);
+      const targetDetail = lastHudLoadTarget ? ` from ${lastHudLoadTarget}` : "";
+      console.log(`[OMC HUD] HUD import failed${targetDetail}: ${detail}`);
+    }
+    if (pluginCacheDir) {
+      console.log(`[OMC HUD] Copilot plugin HUD runtime is unavailable under ${pluginCacheDir}. Run: copilot plugin update oh-my-claudecode, then restart Copilot CLI`);
+    } else {
+      console.log(`[OMC HUD] Copilot plugin not installed. Checked installed plugin metadata and ${canonicalCopilotRoot}. Install oh-my-claudecode with Copilot's plugin manager, then restart Copilot CLI`);
+    }
+    return;
+  }
+
+  // 1. OMC_PLUGIN_ROOT — highest priority for Claude/local --plugin-dir use.
   try {
     const pluginRootEnv = process.env.OMC_PLUGIN_ROOT;
     if (pluginRootEnv && pluginRootEnv.trim().length > 0) {
-      const envHudPath = join(pluginRootEnv, "dist/hud/index.js");
+      const envHudPath = join(pluginRootEnv, "bridge", "hud-runtime.mjs");
       if (existsSync(envHudPath)) {
         try {
           await import(pathToFileURL(envHudPath).href);
@@ -112,7 +324,7 @@ async function main() {
     }
   } catch { /* fall through to next resolution step */ }
 
-  // 2. Plugin cache (for production installs)
+  // 2. Claude Code plugin cache (for production installs)
   // Respect CLAUDE_CONFIG_DIR so installs under a custom config dir are found
   const configDir = getClaudeConfigDir();
   const pluginCacheBase = join(configDir, "plugins", "cache", "omc", "oh-my-claudecode");
@@ -161,10 +373,10 @@ async function main() {
         pluginCacheVersion = latestInstalledVersion;
         pluginCacheDir = join(pluginCacheBase, latestInstalledVersion);
 
-        // Filter to only versions with built dist/hud/index.js
+        // Filter to only versions with a built dependency-closed HUD runtime.
         // This prevents picking an unbuilt new version after plugin update
         const builtVersions = sortedVersions.filter(version => {
-          const pluginPath = join(pluginCacheBase, version, "dist/hud/index.js");
+          const pluginPath = join(pluginCacheBase, version, "bridge/hud-runtime.mjs");
           return existsSync(pluginPath);
         });
 
@@ -173,7 +385,7 @@ async function main() {
           for (const version of builtVersions) {
             pluginCacheVersion = version;
             pluginCacheDir = join(pluginCacheBase, version);
-            const pluginPath = join(pluginCacheDir, "dist/hud/index.js");
+            const pluginPath = join(pluginCacheDir, "bridge/hud-runtime.mjs");
             let dedupeKey = resolve(pluginPath);
             try {
               dedupeKey = realpathSync(pluginPath);
@@ -197,7 +409,7 @@ async function main() {
   }
 
   // 3. Marketplace clone (for marketplace installs without a populated cache)
-  const marketplaceHudPath = join(configDir, "plugins", "marketplaces", "omc", "dist/hud/index.js");
+  const marketplaceHudPath = join(configDir, "plugins", "marketplaces", "omc", "bridge/hud-runtime.mjs");
   if (existsSync(marketplaceHudPath)) {
     try {
       await import(pathToFileURL(marketplaceHudPath).href);
@@ -213,8 +425,8 @@ async function main() {
   // Tests can disable this fallback to avoid host-global package nondeterminism.
   if (process.env.OMC_HUD_DISABLE_NPM_FALLBACK !== "1") {
     const npmHudPackages = [
-      "oh-my-claude-sisyphus/dist/hud/index.js",
-      "oh-my-claudecode/dist/hud/index.js",
+      "oh-my-claude-sisyphus/bridge/hud-runtime.mjs",
+      "oh-my-claudecode/bridge/hud-runtime.mjs",
     ];
     for (const hudPackage of npmHudPackages) {
       if (await importHudPackage(hudPackage)) {

@@ -2,7 +2,7 @@ import { createHash } from 'crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 
 import { readAutopilotStateForHud } from '../omc-state.js';
 import { renderAutopilot } from '../elements/autopilot.js';
@@ -29,7 +29,7 @@ const profileHash = createHash('sha256').update(canonicalJson({
 
 function workflowState(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const sessionId = '11111111-1111-4111-8111-111111111111';
-  const transcriptRoot = '/tmp/omc-autopilot-profile-transcripts';
+  const transcriptRoot = resolve(tmpdir(), 'omc-autopilot-profile-transcripts');
   const initialIdentity = {
     device: 0,
     inode: 0,
@@ -40,7 +40,7 @@ function workflowState(overrides: Record<string, unknown> = {}): Record<string, 
   };
   const stableIdentity = { ...initialIdentity, size: 1, contentSha256: '1'.repeat(64) };
   const activationBoundary = {
-    transcriptPath: `${transcriptRoot}/${sessionId}.jsonl`,
+    transcriptPath: join(transcriptRoot, `${sessionId}.jsonl`),
     transcriptRoot,
     transcriptBasename: `${sessionId}.jsonl`,
     sessionId,

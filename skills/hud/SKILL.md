@@ -1,7 +1,7 @@
 ---
 name: hud
 description: Configure HUD display options (layout, presets, display elements)
-argument-hint: "[setup|minimal|focused|full|status]"
+argument-hint: "[setup|repair|minimal|focused|full|status|doctor]"
 role: config-writer  # DOCUMENTATION ONLY - This skill writes to ~/.claude/ paths
 scope: ~/.claude/**  # DOCUMENTATION ONLY - Allowed write scope
 level: 2
@@ -11,7 +11,8 @@ level: 2
 
 Configure the OMC HUD (Heads-Up Display) for the statusline.
 
-Note: All `~/.claude/...` paths in this guide respect `CLAUDE_CONFIG_DIR` when that environment variable is set.
+Note: Claude Code paths respect `CLAUDE_CONFIG_DIR`. GitHub Copilot CLI paths
+respect `COPILOT_HOME` and never target the Claude Code configuration.
 
 ## Quick Commands
 
@@ -19,10 +20,56 @@ Note: All `~/.claude/...` paths in this guide respect `CLAUDE_CONFIG_DIR` when t
 |---------|-------------|
 | `/oh-my-claudecode:hud` | Show current HUD status (auto-setup if needed) |
 | `/oh-my-claudecode:hud setup` | Install/repair HUD statusline |
+| `/oh-my-claudecode:hud repair` | Repair an OMC-owned HUD statusline |
 | `/oh-my-claudecode:hud minimal` | Switch to minimal display |
 | `/oh-my-claudecode:hud focused` | Switch to focused display (default) |
 | `/oh-my-claudecode:hud full` | Switch to full display |
 | `/oh-my-claudecode:hud status` | Show detailed HUD status |
+| `/oh-my-claudecode:hud doctor` | Diagnose HUD runtime, ownership, and paths |
+
+## Host Dispatch
+
+Before reading or writing configuration, detect GitHub Copilot CLI using
+`OMC_HOST=copilot`, `COPILOT_CLI`, or `COPILOT_AGENT_SESSION_ID`.
+
+### GitHub Copilot CLI
+
+Use Copilot's native `statusLine`; Qterm and manual terminal integration are not
+required.
+
+1. Resolve the configuration root from `${COPILOT_HOME:-~/.copilot}`.
+2. Resolve the active plugin root from the current/local plugin location first,
+   then `config.json` `installedPlugins[].cache_path`. Use
+   `${COPILOT_HOME:-~/.copilot}/installed-plugins/omc/oh-my-claudecode` only as
+   the final default-marketplace diagnostic fallback.
+3. Run the dependency-closed native helper at
+   `bridge/copilot-hud-setup.mjs`:
+   - `setup` installs missing files or repairs an OMC-owned entry.
+   - `repair` performs the same idempotent ownership-safe repair.
+   - `status` reports configuration without mutation.
+   - `doctor` reports runtime, wrapper, command, and ownership diagnostics.
+4. The helper must preserve JSONC comments and unknown keys in
+   `${COPILOT_HOME:-~/.copilot}/settings.json`.
+5. If `statusLine` is owned by another tool, make no changes. Use `--replace`
+   only after the user explicitly approves replacing that exact third-party
+   command.
+6. After a changed setup, tell the user to restart GitHub Copilot CLI.
+
+For `minimal`, `focused`, and `full`, update only the `omcHud` preference in the
+same Copilot settings file with a JSONC-preserving edit. Leave `statusLine`
+limited to its `{ "type": "command", "command": "..." }` entry.
+
+Never read or write `~/.claude`, `.claude`, or `CLAUDE.md` while handling a
+Copilot-only HUD request.
+
+If the active plugin lacks `bridge/copilot-hud-setup.mjs` or
+`bridge/hud-runtime.mjs`, do not install a stale command. Route to
+`/oh-my-claudecode:setup doctor` and recommend updating the Copilot plugin.
+
+### Claude Code
+
+When Copilot host signals are absent, follow the existing Claude Code setup
+below unchanged.
 
 ## Auto-Setup
 

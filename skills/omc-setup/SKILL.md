@@ -26,7 +26,7 @@ Choose this setup flow when the user wants to **install, refresh, or repair OMC 
 
 In any **GitHub Copilot CLI session**, do **not**:
 - Touch `.claude`, `~/.claude`, or any `CLAUDE.md` file (local or global)
-- Configure HUD/statusLine
+- Configure HUD/statusLine for Claude Code
 - Run any of the Claude-only setup phases below (Phase 1 CLAUDE.md install, Phase 2's HUD/statusLine step, etc.)
 
 ...unless the user **explicitly asks to configure Claude Code too** (e.g. "also set up Claude Code", "configure both hosts"). In that case, run the normal flow below for Claude Code in addition to the Copilot-only guidance.
@@ -34,10 +34,19 @@ In any **GitHub Copilot CLI session**, do **not**:
 For a Copilot session, instead tell the user:
 - **Plugin installation is sufficient.** Copilot loads skills, `agents/*.md`, the `t` MCP server, and `hooks/hooks.json` directly from the installed plugin — no separate setup script is required.
 - **Verify** with `/env` (lists loaded skills, agents, MCP servers, and hooks).
+- **Check the optional native HUD** with `/oh-my-claudecode:hud status`.
+- **Install or repair the native HUD** with `/oh-my-claudecode:hud setup` or
+  `/oh-my-claudecode:hud repair`. These commands operate only on
+  `${COPILOT_HOME:-~/.copilot}/settings.json`, preserve JSONC, and refuse a
+  third-party `statusLine` without explicit replacement approval. The native
+  helper resolves local/direct/custom-marketplace installs before using the
+  default marketplace path as a diagnostic fallback.
 - **Diagnose** with `/oh-my-claudecode:setup doctor` (routes to `/oh-my-claudecode:omc-doctor`).
 - **Update** with Copilot's plugin manager: `copilot plugin update oh-my-claudecode`, then restart Copilot CLI (plugins/hooks reload at startup).
 
-Then stop for the Copilot session — do not proceed to Flag Parsing or Phase Execution below.
+Then stop for the Copilot session — do not proceed to Flag Parsing or Phase
+Execution below. Native Copilot HUD setup does not require Qterm or manual
+terminal integration.
 
 ## Flag Parsing
 

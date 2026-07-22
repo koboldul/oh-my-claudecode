@@ -1,0 +1,37 @@
+{
+  "cwd": "<cwd>",
+  "session_id": "<session-id>",
+  "session_name": null,
+  "transcript_path": "<transcript-path>",
+  "model": { "id": "<model-id>", "display_name": "<model-name>" },
+  "workspace": { "current_dir": "<cwd>" },
+  "username": null,
+  "remote": { "connected": false },
+  "version": "1.0.72-1",
+  "cost": {
+    "total_api_duration_ms": 0,
+    "total_lines_added": 0,
+    "total_lines_removed": 0,
+    "total_duration_ms": 1686,
+    "total_premium_requests": 0
+  },
+  "context_window": {
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "total_cache_read_tokens": 0,
+    "total_cache_write_tokens": 0,
+    "total_reasoning_tokens": 0,
+    "total_tokens": 0,
+    "context_window_size": 1000000,
+    "used_percentage": 0,
+    "remaining_percentage": 100,
+    "remaining_tokens": 1000000,
+    "last_call_input_tokens": 0,
+    "last_call_output_tokens": 0,
+    "current_context_tokens": 0,
+    "displayed_context_limit": 264000,
+    "current_context_used_percentage": 0
+  },
+  "ai_used": { "total_nano_aiu": 0, "formatted": "0" },
+  "allow_all_enabled": false
+}

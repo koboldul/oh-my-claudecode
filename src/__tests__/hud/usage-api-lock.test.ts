@@ -1,13 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
+import { tmpdir } from 'os';
+import { basename, dirname, join } from 'path';
 
-const CLAUDE_CONFIG_DIR = '/tmp/test-claude';
-const CACHE_PATH = `${CLAUDE_CONFIG_DIR}/plugins/oh-my-claudecode/.usage-cache-zai.json`;
+const CLAUDE_CONFIG_DIR = join(tmpdir(), 'test-claude');
+const CACHE_PATH = join(CLAUDE_CONFIG_DIR, 'plugins', 'oh-my-claudecode', '.usage-cache-zai.json');
 const LOCK_PATH = `${CACHE_PATH}.lock`;
 
 function createFsMock(initialFiles: Record<string, string>) {
   const files = new Map(Object.entries(initialFiles));
+  const identities = new Map<string, { dev: number; ino: number; mtimeMs: number }>();
   const directories = new Set<string>([CLAUDE_CONFIG_DIR]);
+  const descriptors = new Map<number, string>();
+  let nextDescriptor = 1;
+  let nextInode = 1;
+  for (const path of files.keys()) {
+    identities.set(path, { dev: 1, ino: nextInode++, mtimeMs: Date.now() });
+  }
 
   const existsSync = vi.fn((path: string) => files.has(String(path)) || directories.has(String(path)));
   const readFileSync = vi.fn((path: string) => {
@@ -16,13 +25,19 @@ function createFsMock(initialFiles: Record<string, string>) {
     return content;
   });
   const writeFileSync = vi.fn((path: string, content: string) => {
-    files.set(String(path), String(content));
+    const normalized = String(path);
+    files.set(normalized, String(content));
+    if (!identities.has(normalized)) {
+      identities.set(normalized, { dev: 1, ino: nextInode++, mtimeMs: Date.now() });
+    }
   });
   const mkdirSync = vi.fn((path: string) => {
     directories.add(String(path));
   });
   const unlinkSync = vi.fn((path: string) => {
-    files.delete(String(path));
+    const normalized = String(path);
+    files.delete(normalized);
+    identities.delete(normalized);
   });
   const openSync = vi.fn((path: string) => {
     const normalized = String(path);
@@ -32,12 +47,57 @@ function createFsMock(initialFiles: Record<string, string>) {
       throw err;
     }
     files.set(normalized, '');
-    return 1;
+    identities.set(normalized, { dev: 1, ino: nextInode++, mtimeMs: Date.now() });
+    const descriptor = nextDescriptor++;
+    descriptors.set(descriptor, normalized);
+    return descriptor;
   });
-  const statSync = vi.fn((path: string) => {
-    if (!files.has(String(path))) throw new Error(`ENOENT: ${path}`);
-    return { mtimeMs: Date.now() };
+  const lstatSync = vi.fn((path: string) => {
+    const normalized = String(path);
+    const identity = identities.get(normalized);
+    if (!identity) throw new Error(`ENOENT: ${path}`);
+    return { ...identity, size: Buffer.byteLength(files.get(normalized) ?? '') };
   });
+  const fstatSync = vi.fn((descriptor: number) => {
+    const path = descriptors.get(descriptor);
+    if (!path) throw new Error(`EBADF: ${descriptor}`);
+    return lstatSync(path);
+  });
+  const writeSync = vi.fn((descriptor: number, buffer: Buffer, offset: number, length: number, position = 0) => {
+    const path = descriptors.get(descriptor);
+    if (!path) throw new Error(`EBADF: ${descriptor}`);
+    const existing = Buffer.from(files.get(path) ?? '');
+    const next = Buffer.alloc(Math.max(existing.length, position + length));
+    existing.copy(next);
+    buffer.copy(next, position, offset, offset + length);
+    files.set(path, next.toString());
+    return length;
+  });
+  const readSync = vi.fn((descriptor: number, buffer: Buffer, offset: number, length: number, position = 0) => {
+    const path = descriptors.get(descriptor);
+    if (!path) throw new Error(`EBADF: ${descriptor}`);
+    const source = Buffer.from(files.get(path) ?? '');
+    return source.copy(buffer, offset, position, position + length);
+  });
+  const closeSync = vi.fn((descriptor: number) => {
+    descriptors.delete(descriptor);
+  });
+  const linkSync = vi.fn((source: string, destination: string) => {
+    if (files.has(destination)) {
+      const err = new Error(`EEXIST: ${destination}`) as NodeJS.ErrnoException;
+      err.code = 'EEXIST';
+      throw err;
+    }
+    const identity = identities.get(source);
+    if (!identity) throw new Error(`ENOENT: ${source}`);
+    files.set(destination, files.get(source) ?? '');
+    identities.set(destination, identity);
+  });
+  const readdirSync = vi.fn((directory: string) =>
+    [...files.keys()]
+      .filter((path) => dirname(path) === directory)
+      .map((path) => basename(path)),
+  );
 
   return {
     files,
@@ -48,14 +108,21 @@ function createFsMock(initialFiles: Record<string, string>) {
       mkdirSync,
       unlinkSync,
       openSync,
-      statSync,
-      writeSync: vi.fn(),
-      closeSync: vi.fn(),
+      statSync: lstatSync,
+      lstatSync,
+      fstatSync,
+      writeSync,
+      readSync,
+      fsyncSync: vi.fn(),
+      closeSync,
+      linkSync,
+      readdirSync,
       renameSync: vi.fn(),
       constants: {
         O_CREAT: 0x40,
         O_EXCL: 0x80,
         O_WRONLY: 0x1,
+        O_RDWR: 0x2,
       },
     },
   };

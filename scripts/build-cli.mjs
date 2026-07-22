@@ -12,8 +12,6 @@ const sharedExternal = [
   'child_process', 'assert', 'module', 'net', 'tls',
   'dns', 'readline', 'tty', 'worker_threads',
   '@ast-grep/napi', 'better-sqlite3',
-  // Avoid bundling jsonc-parser's UMD internals
-  'jsonc-parser',
 ];
 
 const cliConfig = {
@@ -23,6 +21,7 @@ const cliConfig = {
   platform: 'node',
   target: 'node18',
   format: 'cjs',
+  mainFields: ['module', 'main'],
   outfile,
   // Inject import.meta.url polyfill for CJS format
   banner: {
@@ -42,6 +41,7 @@ const teamConfig = {
   platform: 'node',
   target: 'node18',
   format: 'esm',
+  mainFields: ['module', 'main'],
   outfile: teamOutfile,
   external: sharedExternal,
 };

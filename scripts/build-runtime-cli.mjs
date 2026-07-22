@@ -14,6 +14,7 @@ const buildConfig = {
   platform: 'node',
   target: 'node18',
   format: 'cjs',
+  mainFields: ['module', 'main'],
   outfile,
   // Note: platform:'node' auto-externalizes all Node built-in subpaths (fs/promises, etc.)
   external: [
@@ -22,8 +23,6 @@ const buildConfig = {
     'child_process', 'assert', 'module', 'net', 'tls',
     'dns', 'readline', 'tty', 'worker_threads',
     '@ast-grep/napi', 'better-sqlite3',
-    // jsonc-parser has dynamic requires that don't bundle well; we use a custom parser
-    'jsonc-parser',
   ],
 };
 
