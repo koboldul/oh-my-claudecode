@@ -3,14 +3,20 @@
  * Ensures the persistent-mode hook doesn't hang on errors
  */
 
-import { describe, it, expect } from 'vitest';
+import { afterAll, describe, it, expect } from 'vitest';
 import { spawn } from 'child_process';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { stageHookRuntime } from '../../../__tests__/helpers/staged-hook-runtime.js';
 
 const TEMPLATE_HOOK_PATH = join(__dirname, '../../../../templates/hooks/persistent-mode.mjs');
-const SCRIPT_HOOK_PATH = join(__dirname, '../../../../scripts/persistent-mode.mjs');
+const stagedRuntime = stageHookRuntime(['persistent-mode.mjs']);
+const SCRIPT_HOOK_PATH = stagedRuntime.scriptPath('persistent-mode.mjs');
 const TIMEOUT_MS = 3000;
+
+afterAll(() => {
+  stagedRuntime.cleanup();
+});
 
 describe('persistent-mode hook error handling (issue #319)', () => {
   it('should return continue:true on empty valid input without hanging', async () => {
@@ -26,13 +32,24 @@ describe('persistent-mode hook error handling (issue #319)', () => {
     expect(result.timedOut).toBe(false);
   });
 
-  it('should return continue:true on invalid JSON without hanging', async () => {
-    for (const hookPath of [TEMPLATE_HOOK_PATH, SCRIPT_HOOK_PATH]) {
-      const result = await runHook('invalid json{{{', { hookPath });
-      expect(result.timedOut).toBe(false);
-      expect(result.exitCode).toBe(0);
-      expect(JSON.parse(result.output)).toEqual({ continue: true, suppressOutput: true });
-    }
+  it('keeps standalone compatibility but fails closed in the shipped script on invalid JSON', async () => {
+    const template = await runHook('invalid json{{{', {
+      hookPath: TEMPLATE_HOOK_PATH,
+    });
+    expect(template.timedOut).toBe(false);
+    expect(template.exitCode).toBe(0);
+    expect(JSON.parse(template.output)).toEqual({
+      continue: true,
+      suppressOutput: true,
+    });
+
+    const shipped = await runHook('invalid json{{{', {
+      hookPath: SCRIPT_HOOK_PATH,
+    });
+    expect(shipped.timedOut).toBe(false);
+    expect(shipped.exitCode).toBe(2);
+    expect(shipped.output).toBe('');
+    expect(shipped.stderr).toContain('refusing to continue silently');
   });
 
   it('should complete within timeout even on errors', async () => {
@@ -42,40 +59,79 @@ describe('persistent-mode hook error handling (issue #319)', () => {
   });
 
   it('bounds execution when stdin stays open', async () => {
-    for (const hookPath of [TEMPLATE_HOOK_PATH, SCRIPT_HOOK_PATH]) {
-      const result = await runHook('{"cwd":"."}', {
-        hookPath,
-        closeStdin: false,
-        env: { OMC_PERSISTENT_MODE_TIMEOUT_MS: '250' },
-      });
+    const template = await runHook('{"cwd":"."}', {
+      hookPath: TEMPLATE_HOOK_PATH,
+      closeStdin: false,
+      env: { OMC_PERSISTENT_MODE_TIMEOUT_MS: '250' },
+    });
+    expect(template.timedOut).toBe(false);
+    expect(template.exitCode).toBe(0);
+    expect(template.duration).toBeLessThan(TIMEOUT_MS);
+    expect(JSON.parse(template.output)).toEqual({
+      continue: true,
+      suppressOutput: true,
+    });
 
-      expect(result.timedOut).toBe(false);
-      expect(result.exitCode).toBe(0);
-      expect(result.duration).toBeLessThan(TIMEOUT_MS);
-      expect(JSON.parse(result.output)).toEqual({ continue: true, suppressOutput: true });
-    }
+    const shipped = await runHook('{"cwd":"."}', {
+      hookPath: SCRIPT_HOOK_PATH,
+      closeStdin: false,
+      env: { OMC_PERSISTENT_MODE_TIMEOUT_MS: '250' },
+    });
+    expect(shipped.timedOut).toBe(false);
+    expect(shipped.exitCode).toBe(2);
+    expect(shipped.duration).toBeLessThan(TIMEOUT_MS);
+    expect(shipped.output).toBe('');
+    expect(shipped.stderr).toContain('Safety timeout reached');
   });
 
-  it('honors persistent-mode environment skip before reading stdin', async () => {
+  it('keeps template pre-stdin skips while shipped skips use canonical input encoding', async () => {
     const skipEnvs: Array<Record<string, string>> = [
       { DISABLE_OMC: '1' },
       { OMC_SKIP_HOOKS: 'other,persistent-mode' },
       { OMC_SKIP_HOOKS: 'other,stop-continuation' },
     ];
-    for (const hookPath of [TEMPLATE_HOOK_PATH, SCRIPT_HOOK_PATH]) {
-      for (const env of skipEnvs) {
-        const result = await runHook('{"cwd":"."}', {
-          hookPath,
-          closeStdin: false,
-          env,
-        });
+    for (const env of skipEnvs) {
+      const template = await runHook('{"cwd":"."}', {
+        hookPath: TEMPLATE_HOOK_PATH,
+        closeStdin: false,
+        env,
+      });
+      expect(template.timedOut).toBe(false);
+      expect(template.exitCode).toBe(0);
+      expect(template.duration).toBeLessThan(1000);
+      expect(JSON.parse(template.output)).toEqual({
+        continue: true,
+        suppressOutput: true,
+      });
 
-        expect(result.timedOut).toBe(false);
-        expect(result.exitCode).toBe(0);
-        expect(result.duration).toBeLessThan(1000);
-        expect(JSON.parse(result.output)).toEqual({ continue: true, suppressOutput: true });
-      }
+      const shipped = await runHook('{"hook_event_name":"Stop","cwd":"."}', {
+        hookPath: SCRIPT_HOOK_PATH,
+        env,
+      });
+      expect(shipped.timedOut).toBe(false);
+      expect(shipped.exitCode).toBe(0);
+      expect(shipped.duration).toBeLessThan(1000);
+      expect(JSON.parse(shipped.output)).toEqual({
+        continue: true,
+        suppressOutput: true,
+      });
     }
+  });
+
+  it('fails closed when a shipped skip cannot read the canonical input', async () => {
+    const shipped = await runHook('', {
+      hookPath: SCRIPT_HOOK_PATH,
+      closeStdin: false,
+      env: {
+        DISABLE_OMC: '1',
+        OMC_PERSISTENT_MODE_TIMEOUT_MS: '250',
+      },
+    });
+
+    expect(shipped.timedOut).toBe(false);
+    expect(shipped.exitCode).toBe(2);
+    expect(shipped.output).toBe('');
+    expect(shipped.stderr).toContain('Safety timeout reached');
   });
 
   it('keeps the default safety timeout below the shipped Stop hook wrapper kill', () => {

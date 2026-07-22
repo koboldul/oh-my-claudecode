@@ -147,10 +147,19 @@ export interface CanonicalNotificationPayload {
   data?: unknown;
 }
 
+export interface CanonicalGoalSnapshot {
+  objective?: string;
+  status?: string;
+  source?: 'payload' | 'context' | 'transcript';
+}
+
 export interface CanonicalHookEventPayload {
   prompt?: string;
+  userPrompt?: string;
+  promptAliases?: readonly string[];
   initialPrompt?: string;
   promptId?: string;
+  goal?: CanonicalGoalSnapshot;
   source?: string;
   model?: string;
   timestamp?: number;
@@ -158,6 +167,7 @@ export interface CanonicalHookEventPayload {
   parts?: readonly unknown[];
   toolOutput?: unknown;
   toolError?: unknown;
+  contextWindow?: unknown;
   notification?: CanonicalNotificationPayload;
   trigger?: string;
   customInstructions?: string;
@@ -168,6 +178,8 @@ export interface CanonicalHookEventPayload {
   interrupted?: boolean;
   stopHookActive?: boolean;
   lastAssistantMessage?: string;
+  endTurnReason?: string;
+  reason?: string;
   backgroundTasks?: readonly unknown[];
   sessionCrons?: readonly unknown[];
   agentTranscriptPath?: string;
@@ -202,6 +214,12 @@ export interface CanonicalHookEnvelope {
 export interface HookMutation {
   input: unknown;
   requirement: HookMutationRequirement;
+  retryHint?: HookMutationRetryHint;
+}
+
+export interface HookMutationRetryHint {
+  instruction: string;
+  patch?: Readonly<Record<string, unknown>>;
 }
 
 export interface HookEffect {
@@ -233,6 +251,10 @@ export interface HookMutationIntent extends HookMutation {
   callId?: string;
 }
 
+export interface HookMutationRetryIntent extends HookMutationRetryHint {
+  callId?: string;
+}
+
 export interface HookReduction {
   decision: HookDecision;
   reason?: string;
@@ -242,6 +264,7 @@ export interface HookReduction {
   context?: string;
   diagnostics: string[];
   mutations: HookMutationIntent[];
+  mutationRetryHints?: HookMutationRetryIntent[];
   callDecisions: HookCallDecision[];
   effects: HookEffect[];
   stagedEffects: HookEffect[];

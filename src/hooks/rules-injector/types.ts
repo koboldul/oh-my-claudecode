@@ -68,8 +68,22 @@ export interface InjectedRulesData {
   injectedHashes: string[];
   /** Real paths of already injected rules (for symlink deduplication) */
   injectedRealPaths: string[];
+  /** In-flight cross-process delivery reservations */
+  reservations?: InjectedRuleReservation[];
   /** Timestamp of last update */
   updatedAt: number;
+}
+
+export interface InjectedRuleIdentity {
+  contentHash: string;
+  realPath: string;
+}
+
+export interface InjectedRuleReservation {
+  id: string;
+  createdAt: number;
+  expiresAt: number;
+  rules: InjectedRuleIdentity[];
 }
 
 /**
@@ -84,6 +98,21 @@ export interface RuleToInject {
   content: string;
   /** Directory distance */
   distance: number;
+}
+
+/**
+ * Rule staged for delivery but not yet persisted as injected.
+ */
+export interface PlannedRuleToInject extends RuleToInject {
+  /** SHA-256 hash persisted after complete delivery */
+  contentHash: string;
+  /** Real path persisted after complete delivery */
+  realPath: string;
+}
+
+export interface RulesInjectionReservation {
+  reservationId?: string;
+  rules: PlannedRuleToInject[];
 }
 
 /**

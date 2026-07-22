@@ -6,8 +6,8 @@
  * and file permissions so that individual mode modules don't duplicate this logic.
  */
 
-import { closeSync, existsSync, fstatSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from 'fs';
-import { basename, dirname, join } from 'path';
+import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from 'fs';
+import { basename, dirname, join, resolve } from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { spawnSync } from 'child_process';
 import {
@@ -15,121 +15,42 @@ import {
   getOmcRoot,
   resolveStatePath,
   resolveSessionStatePath,
+  resolveSessionStatePaths,
   ensureSessionStateDir,
   ensureOmcDir,
   listSessionIds,
 } from './worktree-paths.js';
 import { atomicWriteJsonSync } from './atomic-write.js';
+import {
+  acquireFileLockSync,
+  releaseFileLockSync,
+  type FileLockHandle,
+} from './file-lock.js';
+import { MODE_CONFIRMATION_SKILL_MAP } from './mode-names.js';
+import {
+  getProcessStartIdentitySync,
+} from '../platform/process-utils.js';
 
 type MutationLockOwner = { version: 1; pid: number; processStart: string; createdAt: string; nonce: string };
-type MutationLock = { fd: number; path: string; owner: MutationLockOwner } | { unlocked: true };
+type MutationLock = FileLockHandle;
 function flockPath(): string | null { return process.env.NODE_ENV === 'test' && process.env.OMC_TEST_FLOCK_AVAILABLE === '0' ? null : existsSync('/usr/bin/flock') ? '/usr/bin/flock' : existsSync('/bin/flock') ? '/bin/flock' : null; }
-const LOCK_REMOVAL_SCRIPT = String.raw`
-const fs = require('fs');
-const [operation, lockPath, expectedRaw] = process.argv.slice(1);
-const keys = ['createdAt', 'nonce', 'pid', 'processStart', 'version'];
-function readOwner() {
-  try {
-    const value = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-    const actual = Object.keys(value).sort();
-    if (actual.length !== keys.length || !actual.every((key, index) => key === keys[index]) || value.version !== 1 || !Number.isSafeInteger(value.pid) || value.pid <= 0 || typeof value.processStart !== 'string' || !/^\d+$/.test(value.processStart) || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt)) || typeof value.nonce !== 'string' || !/^[0-9a-f-]{36}$/i.test(value.nonce)) return null;
-    return value;
-  } catch (error) { if (error && error.code === 'ENOENT') process.exit(0); return null; }
-}
-const owner = readOwner();
-if (!owner) process.exit(3);
-if (operation === 'release') {
-  let expected;
-  try { expected = JSON.parse(expectedRaw); } catch { process.exit(3); }
-  if (owner.pid !== expected.pid || owner.processStart !== expected.processStart || owner.nonce !== expected.nonce) process.exit(4);
-  try { fs.unlinkSync(lockPath); process.exit(0); } catch { process.exit(3); }
-}
-if (process.platform !== 'linux') process.exit(3);
-let currentStart;
-try {
-  const stat = fs.readFileSync('/proc/' + owner.pid + '/stat', 'utf8');
-  const end = stat.lastIndexOf(')');
-  const fields = end >= 0 ? stat.slice(end + 2).trim().split(/\s+/) : [];
-  currentStart = fields[19] && /^\d+$/.test(fields[19]) ? fields[19] : null;
-} catch (error) { currentStart = error && error.code === 'ENOENT' ? 'absent' : null; }
-if (currentStart === null) process.exit(3);
-if (currentStart !== 'absent' && currentStart === owner.processStart) process.exit(2);
-try { fs.unlinkSync(lockPath); process.exit(0); } catch { process.exit(3); }
-`;
 
 function processStartIdentity(pid: number): string | 'absent' | null {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
-  if (process.platform !== 'linux') return pid === process.pid ? String(Math.max(1, Math.floor(Date.now() - process.uptime() * 1000))) : null;
-  if (process.env.NODE_ENV === 'test' && process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(pid)) return null;
+  const identity = getProcessStartIdentitySync(pid);
+  if (identity === null || identity === 'absent') return identity;
+  return identity.match(/\d+$/)?.[0] ?? null;
+}
+
+function acquireLockAt(path: string): MutationLock | null {
   try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const end = stat.lastIndexOf(')');
-    if (end < 0) return null;
-    const fields = stat.slice(end + 2).trim().split(/\s+/);
-    return fields[19] && /^\d+$/.test(fields[19]) ? fields[19] : null;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : null;
-  }
-}
-
-function writeAllSync(fd: number, content: string, label: string): void {
-  const bytes = Buffer.from(content, 'utf-8');
-  let offset = 0;
-  while (offset < bytes.length) {
-    const written = writeSync(fd, bytes, offset, bytes.length - offset);
-    if (!Number.isInteger(written) || written <= 0) {
-      throw new Error(`${label} made no progress`);
-    }
-    offset += written;
-  }
-  if (fstatSync(fd).size !== bytes.length) {
-    throw new Error(`${label} size verification failed`);
-  }
-}
-
-
-function guardedLockRemoval(path: string, operation: 'reclaim' | 'release', owner?: MutationLockOwner): 'retry' | 'live' | 'replaced' | 'unverifiable' {
-  const flock = flockPath();
-  if (!flock) return 'unverifiable';
-  const result = spawnSync(flock, ['-x', `${path}.reclaim.guard`, process.execPath, '-e', LOCK_REMOVAL_SCRIPT, operation, path, owner ? JSON.stringify(owner) : ''], { stdio: 'ignore', timeout: 2000 });
-  if (result.status === 0) return 'retry';
-  if (result.status === 2) return 'live';
-  if (result.status === 4) return 'replaced';
-  return 'unverifiable';
-}
-
-function acquireLockAt(path: string, requireExclusive = false): MutationLock | null {
-  mkdirSync(dirname(path), { recursive: true });
-  if (!flockPath()) return requireExclusive ? null : { unlocked: true };
-  const processStart = processStartIdentity(process.pid);
-  if (!processStart || processStart === 'absent') {
-    console.error(`[omc-lock] state_mutation_lock_owner_unverifiable: ${path}`);
+    return acquireFileLockSync(path, {
+      timeoutMs: 500,
+      retryDelayMs: 10,
+      staleLockMs: 30_000,
+    });
+  } catch {
     return null;
   }
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    const owner: MutationLockOwner = { version: 1, pid: process.pid, processStart, createdAt: new Date().toISOString(), nonce: randomUUID() };
-    const tempPath = `${path}.${process.pid}.${owner.nonce}.tmp`;
-    let fd: number | undefined;
-    try {
-      fd = openSync(tempPath, 'wx', 0o600);
-      writeAllSync(fd, JSON.stringify(owner), 'lock owner publication');
-      fsyncSync(fd);
-      linkSync(tempPath, path);
-      unlinkSync(tempPath);
-      return { fd, path, owner };
-    } catch (error) {
-      if (fd !== undefined) { try { closeSync(fd); } catch { /* best-effort descriptor cleanup */ } }
-      try { unlinkSync(tempPath); } catch { /* best-effort unpublished temp cleanup */ }
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') return null;
-      const disposition = guardedLockRemoval(path, 'reclaim');
-      if (disposition === 'unverifiable') {
-        console.error(`[omc-lock] state_mutation_lock_unverifiable: ${path}`);
-        return null;
-      }
-      if (disposition === 'live') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-    }
-  }
-  return null;
 }
 
 function acquireMutationLock(filePath: string): MutationLock | null {
@@ -137,18 +58,17 @@ function acquireMutationLock(filePath: string): MutationLock | null {
 }
 
 function releaseMutationLock(lock: MutationLock | null): void {
-  if (!lock || 'unlocked' in lock) return;
-  try { closeSync(lock.fd); } catch { /* lock metadata ownership still guards release */ }
-  guardedLockRemoval(lock.path, 'release', lock.owner);
+  if (!lock) return;
+  releaseFileLockSync(lock);
 }
 
 /** Executes a read or mutation against a state file under its mutation lock. */
 export function withStateFileMutationLock<T>(
   filePath: string,
   callback: () => T,
-  requireExclusive = false,
+  _requireExclusive = true,
 ): { acquired: boolean; value: T | undefined } {
-  const lock = acquireLockAt(`${filePath}.mutation.lock`, requireExclusive);
+  const lock = acquireLockAt(`${filePath}.mutation.lock`);
   if (!lock) return { acquired: false, value: undefined };
   try {
     return { acquired: true, value: callback() };
@@ -939,6 +859,244 @@ export function canClearStateForSession(
 ): boolean {
   const ownerSessionId = getStateSessionOwner(state);
   return !ownerSessionId || ownerSessionId === sessionId;
+}
+
+export type ModeConfirmationStatus =
+  | 'written'
+  | 'not-applicable'
+  | 'changed'
+  | 'skipped'
+  | 'failed';
+
+export interface ModeConfirmationResult {
+  modeName: string;
+  status: ModeConfirmationStatus;
+  paths: string[];
+}
+
+export interface ModeConfirmationObservation {
+  path: string;
+  ownerSessionId: string;
+  generation: number | null;
+  confirmationTimestamp: string;
+  digest: string;
+}
+
+function modeConfirmationGeneration(
+  state: Record<string, unknown>,
+): number | null {
+  const meta =
+    state._meta
+    && typeof state._meta === 'object'
+    && !Array.isArray(state._meta)
+      ? state._meta as Record<string, unknown>
+      : null;
+  const value = state.generation ?? meta?.generation;
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= 0
+    ? value
+    : null;
+}
+
+function modeConfirmationTimestamp(
+  state: Record<string, unknown>,
+): string {
+  const value =
+    typeof state.awaiting_confirmation_set_at === 'string'
+    && state.awaiting_confirmation_set_at.trim()
+      ? state.awaiting_confirmation_set_at.trim()
+      : typeof state.started_at === 'string'
+        ? state.started_at.trim()
+        : '';
+  return value;
+}
+
+function modeConfirmationDigest(
+  state: Record<string, unknown>,
+): string {
+  return createHash('sha256')
+    .update(JSON.stringify(state))
+    .digest('hex');
+}
+
+/**
+ * Clear confirmation fields through the mode-state owner lock. Transactional
+ * effects target one exact observed generation; legacy callers retain the
+ * historical root-plus-session behavior.
+ */
+export function confirmModeAwaitingConfirmationLocked(
+  directory: string,
+  modeName: string,
+  sessionId?: string,
+  observation?: ModeConfirmationObservation,
+): ModeConfirmationResult {
+  let paths: string[];
+  try {
+    const resolved = resolveSessionStatePaths(
+      modeName,
+      sessionId || undefined,
+      directory,
+    );
+    if (observation) {
+      const allowedPaths = sessionId
+        ? [resolved.sessionScoped, resolved.legacy]
+        : [resolved.legacy];
+      const allowedPath = allowedPaths.find(
+        (candidate) =>
+          resolve(observation.path) === resolve(candidate),
+      );
+      if (
+        !observation.path
+        || !sessionId
+        || !allowedPath
+        || (
+          observation.ownerSessionId
+          && observation.ownerSessionId !== sessionId
+        )
+      ) {
+        return { modeName, status: 'failed', paths: [] };
+      }
+      paths = [allowedPath];
+    } else {
+      paths = sessionId
+        ? [resolved.sessionScoped, resolved.legacy]
+        : [resolved.legacy];
+    }
+  } catch {
+    return { modeName, status: 'failed', paths: [] };
+  }
+
+  if (observation) {
+    const path = paths[0]!;
+    if (!recoverEmergencyStateFile(path)) {
+      return { modeName, status: 'failed', paths };
+    }
+    if (
+      process.env.NODE_ENV === 'test'
+      && process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_PATH === path
+      && process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_BASE64
+    ) {
+      try {
+        const replacement = JSON.parse(Buffer.from(
+          process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_BASE64,
+          'base64',
+        ).toString('utf8')) as Record<string, unknown>;
+        atomicWriteJsonSync(path, replacement);
+      } finally {
+        delete process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_PATH;
+        delete process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_BASE64;
+      }
+    }
+    const lock = acquireMutationLock(path);
+    if (!lock) return { modeName, status: 'failed', paths };
+    try {
+      if (!existsSync(path)) {
+        return { modeName, status: 'not-applicable', paths };
+      }
+      let current: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+        if (
+          parsed === null
+          || typeof parsed !== 'object'
+          || Array.isArray(parsed)
+        ) {
+          return { modeName, status: 'failed', paths };
+        }
+        current = parsed as Record<string, unknown>;
+      } catch {
+        return { modeName, status: 'failed', paths };
+      }
+      if (current.awaiting_confirmation !== true) {
+        return { modeName, status: 'not-applicable', paths };
+      }
+      if (!observation.ownerSessionId) {
+        return { modeName, status: 'failed', paths };
+      }
+      if (
+        getStateSessionOwner(current) !== observation.ownerSessionId
+        || modeConfirmationGeneration(current) !== observation.generation
+        || modeConfirmationTimestamp(current)
+          !== observation.confirmationTimestamp
+        || modeConfirmationDigest(current) !== observation.digest
+      ) {
+        return { modeName, status: 'changed', paths };
+      }
+
+      const next = { ...current };
+      delete next.awaiting_confirmation;
+      delete next.awaiting_confirmation_set_at;
+      atomicWriteJsonSync(path, next);
+      if (!existsSync(path)) {
+        return { modeName, status: 'written', paths };
+      }
+      try {
+        const verified = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+        if (
+          verified === null
+          || typeof verified !== 'object'
+          || Array.isArray(verified)
+          || (verified as Record<string, unknown>).awaiting_confirmation === true
+        ) {
+          return { modeName, status: 'failed', paths };
+        }
+      } catch {
+        return { modeName, status: 'failed', paths };
+      }
+      return { modeName, status: 'written', paths };
+    } catch {
+      return { modeName, status: 'failed', paths };
+    } finally {
+      releaseMutationLock(lock);
+    }
+  }
+
+  let wrote = false;
+  let failed = false;
+  for (const path of [...new Set(paths.filter(Boolean))]) {
+    try {
+      const result = writeStateFileLockedIf(
+        path,
+        (current) =>
+          current.awaiting_confirmation === true
+          && (!sessionId || canClearStateForSession(current, sessionId)),
+        (current) => {
+          const next = { ...current };
+          delete next.awaiting_confirmation;
+          delete next.awaiting_confirmation_set_at;
+          return next;
+        },
+      );
+      wrote ||= result === 'written';
+      failed ||= result === 'failed';
+    } catch {
+      failed = true;
+    }
+  }
+
+  return {
+    modeName,
+    status: failed ? 'failed' : wrote ? 'written' : 'skipped',
+    paths,
+  };
+}
+
+/**
+ * Confirm every mode owned by a Skill invocation using the shared map.
+ */
+export function confirmSkillModeStatesLocked(
+  directory: string,
+  skillName: string,
+  sessionId?: string,
+): ModeConfirmationResult[] {
+  return (MODE_CONFIRMATION_SKILL_MAP[skillName] ?? []).map((modeName) =>
+    confirmModeAwaitingConfirmationLocked(
+      directory,
+      modeName,
+      sessionId,
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------

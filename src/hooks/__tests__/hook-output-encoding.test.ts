@@ -265,6 +265,7 @@ describe('Copilot 1.0.72-1 hook output encoding', () => {
     'post-tool-use',
     'post-tool-use-failure',
     'notification',
+    'user-prompt-submit',
   ])('emits root additionalContext for native %s output', (hookType) => {
     expect(encodeCopilotHookOutput(
       copilotEnvelope(hookType),
@@ -278,7 +279,6 @@ describe('Copilot 1.0.72-1 hook output encoding', () => {
   });
 
   it.each([
-    'user-prompt-submit',
     'pre-compact',
     'session-end',
   ])('does not invent a context output for native %s', (hookType) => {

@@ -2,11 +2,21 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFil
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
-import { describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it } from 'vitest';
+import { stageHookRuntime } from '../../../__tests__/helpers/staged-hook-runtime.js';
 
-const persistentModeScript = join(process.cwd(), 'scripts', 'persistent-mode.mjs');
-const preToolScript = join(process.cwd(), 'scripts', 'pre-tool-enforcer.mjs');
-const keywordScript = join(process.cwd(), 'scripts', 'keyword-detector.mjs');
+const stagedRuntime = stageHookRuntime([
+  'persistent-mode.mjs',
+  'pre-tool-enforcer.mjs',
+  'keyword-detector.mjs',
+]);
+const persistentModeScript = stagedRuntime.scriptPath('persistent-mode.mjs');
+const preToolScript = stagedRuntime.scriptPath('pre-tool-enforcer.mjs');
+const keywordScript = stagedRuntime.scriptPath('keyword-detector.mjs');
+
+afterAll(() => {
+  stagedRuntime.cleanup();
+});
 
 function runHook(script: string, payload: Record<string, unknown>, env: Record<string, string> = {}) {
   const stdout = execFileSync(process.execPath, [script], {

@@ -1,5 +1,5 @@
 import { createHash } from "crypto";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -7,6 +7,14 @@ import { execSync } from "child_process";
 import { checkPersistentModes, createHookOutput } from "./index.js";
 import { activateUltrawork, deactivateUltrawork } from "../ultrawork/index.js";
 import { initAutopilot } from "../autopilot/index.js";
+import { stageHookRuntime } from "../../__tests__/helpers/staged-hook-runtime.js";
+
+const stagedRuntime = stageHookRuntime(["persistent-mode.mjs"]);
+const persistentModeScriptPath = stagedRuntime.scriptPath("persistent-mode.mjs");
+
+afterAll(() => {
+  stagedRuntime.cleanup();
+});
 
 function writePendingTodo(tempDir: string, content: string): void {
   mkdirSync(join(tempDir, '.claude'), { recursive: true });
@@ -177,7 +185,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
       const state = initAutopilot(tempDir, "Finish the task", sessionId)!;
       state.phase = "planning";
       state.project_path = tempDir;
-      writeFileSync(join(sessionDir, "autopilot-state.json"), JSON.stringify(state));
+      const statePath = join(sessionDir, "autopilot-state.json");
+      writeFileSync(statePath, JSON.stringify(state));
       const now = Date.now();
       writeFileSync(join(sessionDir, "cancel-signal-state.json"), JSON.stringify({
         active: true,
@@ -187,7 +196,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         expires_at: new Date(now + 30_000).toISOString(),
         target_state_sha256: createHash("sha256").update(JSON.stringify(state)).digest("hex"),
       }));
-      process.env.OMC_TEST_FLOCK_AVAILABLE = "0";
+      writeFileSync(`${statePath}.mutation.lock`, "held");
 
       await expect(checkPersistentModes(sessionId, tempDir)).resolves.toMatchObject({
         shouldBlock: true,
@@ -269,7 +278,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
     });
 
     it.each([
-      ['future-dated', 6_000, true],
+      ['future-dated', 30_001, true],
       ['stale', -30_001, true],
       ['fresh', 0, false],
     ])('applies requested_at freshness to an exact-digest active legacy autopilot cancellation (%s)', async (_name, offsetMs, shouldBlock) => {
@@ -297,7 +306,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
     });
 
     it.each([
-      ['future-dated', 6_000, true],
+      ['future-dated', 30_001, true],
       ['stale', -30_001, true],
       ['fresh', 0, false],
     ])('applies requested_at freshness to requested_at-only non-autopilot cancellation (%s)', async (_name, offsetMs, shouldBlock) => {
@@ -368,7 +377,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
   });
 
   describe("persistent-mode.mjs script session isolation", () => {
-    const scriptPath = join(process.cwd(), "scripts", "persistent-mode.mjs");
+    const scriptPath = persistentModeScriptPath;
 
     function runPersistentModeScript(
       input: Record<string, unknown>,
@@ -377,7 +386,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         const result = execSync(`node "${scriptPath}"`, {
           encoding: "utf-8",
           timeout: 5000,
-          input: JSON.stringify(input),
+          input: JSON.stringify({ hook_event_name: "Stop", ...input }),
           env: { ...process.env, NODE_ENV: "test" },
         });
         // The script may output multiple lines (stderr + stdout)
@@ -671,7 +680,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
   });
 
   describe("session key alias compatibility (sessionId/session_id/sessionid)", () => {
-    const scriptPath = join(process.cwd(), "scripts", "persistent-mode.mjs");
+    const scriptPath = persistentModeScriptPath;
 
     function runPersistentModeScript(
       input: Record<string, unknown>,
@@ -680,7 +689,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         const result = execSync(`node "${scriptPath}"`, {
           encoding: "utf-8",
           timeout: 5000,
-          input: JSON.stringify(input),
+          input: JSON.stringify({ hook_event_name: "Stop", ...input }),
           env: { ...process.env, NODE_ENV: "test" },
         });
         const lines = result.trim().split("\n");
@@ -760,15 +769,15 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
       expect(output.reason).toContain("ULTRAWORK");
     });
 
-    it("should prefer sessionId over session_id when both provided", () => {
-      const correctSession = "correct-session";
-      const wrongSession = "wrong-session";
-      createUltraworkState(tempDir, correctSession, "Correct task");
+    it("should prefer Claude session_id over the sessionId fallback", () => {
+      const claudeSession = "claude-session";
+      const fallbackSession = "fallback-session";
+      createUltraworkState(tempDir, claudeSession, "Claude task");
 
       const output = runPersistentModeScript({
         directory: tempDir,
-        sessionId: correctSession,  // This should be used
-        session_id: wrongSession,   // This should be ignored
+        sessionId: fallbackSession,
+        session_id: claudeSession,
       });
 
       expect(output.decision).toBe("block");
@@ -821,7 +830,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
   });
 
   describe("project isolation (project_path)", () => {
-    const scriptPath = join(process.cwd(), "scripts", "persistent-mode.mjs");
+    const scriptPath = persistentModeScriptPath;
 
     function runPersistentModeScript(
       input: Record<string, unknown>,
@@ -830,7 +839,7 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         const result = execSync(`node "${scriptPath}"`, {
           encoding: "utf-8",
           timeout: 5000,
-          input: JSON.stringify(input),
+          input: JSON.stringify({ hook_event_name: "Stop", ...input }),
           env: { ...process.env, NODE_ENV: "test" },
         });
         const lines = result.trim().split("\n");

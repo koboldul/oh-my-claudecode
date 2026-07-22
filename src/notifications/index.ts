@@ -113,7 +113,346 @@ import { getCurrentTmuxSession } from "./tmux.js";
 import { getHookConfig, resolveEventTemplate } from "./hook-config.js";
 import { interpolateTemplate } from "./template-engine.js";
 import { basename, join } from "path";
-import { getOmcRoot } from "../lib/worktree-paths.js";
+import { existsSync, readFileSync } from "fs";
+import { randomUUID } from "crypto";
+import { getOmcRoot, getSessionStateDir } from "../lib/worktree-paths.js";
+import { atomicWriteJsonSync } from "../lib/atomic-write.js";
+import { withStateFileMutationLock } from "../lib/mode-state-io.js";
+
+const NOTIFICATION_RECEIPT_FILE = "notification-delivery-receipts.json";
+export const NOTIFICATION_PROVISIONAL_LEASE_MS = 30_000;
+
+interface NotificationReceiptEntry {
+  claimed_at_ms: number;
+  lease_expires_at_ms?: number;
+  session_id: string;
+  event: NotificationEvent;
+  delivery_status?: "provisional" | "queued" | "retryable";
+  claim_id?: string;
+  queued_at_ms?: number;
+  retryable_at_ms?: number;
+}
+
+interface NotificationReceiptState {
+  version: 2;
+  receipts: Record<string, NotificationReceiptEntry>;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function isNotificationReceiptState(
+  value: unknown,
+  sessionId: string,
+): value is NotificationReceiptState {
+  if (!isPlainRecord(value) || value.version !== 2) return false;
+  if (!isPlainRecord(value.receipts)) return false;
+  return Object.entries(value.receipts).every(([intentId, receipt]) => {
+    if (
+      intentId.length === 0
+      || !isPlainRecord(receipt)
+      || typeof receipt.claimed_at_ms !== "number"
+      || !Number.isFinite(receipt.claimed_at_ms)
+      || receipt.session_id !== sessionId
+      || typeof receipt.event !== "string"
+      || receipt.event.length === 0
+    ) {
+      return false;
+    }
+    if (receipt.delivery_status === undefined) {
+      return receipt.claim_id === undefined
+        && receipt.lease_expires_at_ms === undefined
+        && receipt.queued_at_ms === undefined
+        && receipt.retryable_at_ms === undefined;
+    }
+    if (
+      !["provisional", "queued", "retryable"]
+        .includes(String(receipt.delivery_status))
+      || typeof receipt.claim_id !== "string"
+      || receipt.claim_id.length === 0
+    ) {
+      return false;
+    }
+    if (
+      receipt.lease_expires_at_ms !== undefined
+      && (
+        typeof receipt.lease_expires_at_ms !== "number"
+        || !Number.isFinite(receipt.lease_expires_at_ms)
+      )
+    ) {
+      return false;
+    }
+    if (receipt.delivery_status === "queued") {
+      return typeof receipt.queued_at_ms === "number"
+        && Number.isFinite(receipt.queued_at_ms)
+        && receipt.lease_expires_at_ms === undefined
+        && receipt.retryable_at_ms === undefined;
+    }
+    if (receipt.delivery_status === "retryable") {
+      return typeof receipt.retryable_at_ms === "number"
+        && Number.isFinite(receipt.retryable_at_ms)
+        && receipt.lease_expires_at_ms === undefined
+        && receipt.queued_at_ms === undefined;
+    }
+    return receipt.queued_at_ms === undefined
+      && receipt.retryable_at_ms === undefined;
+  });
+}
+
+export interface NotifyOnceResult {
+  status: "sent" | "duplicate" | "skipped" | "failed";
+}
+
+function notificationReceiptPath(
+  sessionId: string,
+  projectPath: string,
+): string {
+  return join(
+    getSessionStateDir(sessionId, projectPath),
+    NOTIFICATION_RECEIPT_FILE,
+  );
+}
+
+export function claimNotificationReceipt(
+  intentId: string,
+  event: NotificationEvent,
+  sessionId: string,
+  projectPath: string,
+  nowMs: number,
+): "claimed" | "duplicate" | "failed" {
+  try {
+    const receiptPath = notificationReceiptPath(sessionId, projectPath);
+    const locked = withStateFileMutationLock(receiptPath, () => {
+      let state: NotificationReceiptState = { version: 2, receipts: {} };
+      if (existsSync(receiptPath)) {
+        try {
+          const parsed = JSON.parse(readFileSync(receiptPath, "utf8"));
+          if (!isNotificationReceiptState(parsed, sessionId)) {
+            return "failed" as const;
+          }
+          state = parsed;
+        } catch {
+          return "failed" as const;
+        }
+      }
+
+      const receipts = { ...state.receipts };
+      if (receipts[intentId]) return "duplicate" as const;
+
+      receipts[intentId] = {
+        claimed_at_ms: nowMs,
+        session_id: sessionId,
+        event,
+      };
+      atomicWriteJsonSync(receiptPath, {
+        version: 2,
+        receipts,
+      } satisfies NotificationReceiptState);
+      return "claimed" as const;
+    });
+
+    return locked.acquired && locked.value
+      ? locked.value
+      : "failed";
+  } catch {
+    return "failed";
+  }
+}
+
+export type ProvisionalNotificationReceiptClaim =
+  | { status: "claimed"; claimId: string }
+  | { status: "duplicate" }
+  | { status: "failed" };
+
+function boundedProvisionalLeaseExpiry(
+  receipt: NotificationReceiptEntry,
+): number {
+  const maximum = receipt.claimed_at_ms
+    + NOTIFICATION_PROVISIONAL_LEASE_MS;
+  if (!Number.isFinite(maximum)) return receipt.claimed_at_ms;
+  return Math.min(
+    receipt.lease_expires_at_ms ?? maximum,
+    maximum,
+  );
+}
+
+export function claimProvisionalNotificationReceipt(
+  intentId: string,
+  event: NotificationEvent,
+  sessionId: string,
+  projectPath: string,
+  nowMs: number,
+): ProvisionalNotificationReceiptClaim {
+  if (
+    !intentId
+    || !projectPath
+    || !Number.isFinite(nowMs)
+  ) {
+    return { status: "failed" };
+  }
+  const claimId = randomUUID();
+  try {
+    const receiptPath = notificationReceiptPath(sessionId, projectPath);
+    const locked = withStateFileMutationLock(receiptPath, () => {
+      let state: NotificationReceiptState = { version: 2, receipts: {} };
+      if (existsSync(receiptPath)) {
+        try {
+          const parsed = JSON.parse(readFileSync(receiptPath, "utf8"));
+          if (!isNotificationReceiptState(parsed, sessionId)) {
+            return { status: "failed" as const };
+          }
+          state = parsed;
+        } catch {
+          return { status: "failed" as const };
+        }
+      }
+
+      const current = state.receipts[intentId];
+      if (current) {
+        if (current.delivery_status === "provisional") {
+          if (nowMs < boundedProvisionalLeaseExpiry(current)) {
+            return { status: "duplicate" as const };
+          }
+        } else if (current.delivery_status !== "retryable") {
+          return { status: "duplicate" as const };
+        }
+      }
+      const leaseExpiresAtMs = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        nowMs + NOTIFICATION_PROVISIONAL_LEASE_MS,
+      );
+      atomicWriteJsonSync(receiptPath, {
+        version: 2,
+        receipts: {
+          ...state.receipts,
+          [intentId]: {
+            claimed_at_ms: nowMs,
+            lease_expires_at_ms: leaseExpiresAtMs,
+            session_id: sessionId,
+            event,
+            delivery_status: "provisional",
+            claim_id: claimId,
+          },
+        },
+      } satisfies NotificationReceiptState);
+      return { status: "claimed" as const, claimId };
+    });
+    return locked.acquired && locked.value
+      ? locked.value
+      : { status: "failed" };
+  } catch {
+    return { status: "failed" };
+  }
+}
+
+export function finalizeNotificationReceiptQueued(
+  intentId: string,
+  sessionId: string,
+  projectPath: string,
+  claimId: string,
+  nowMs: number,
+): "finalized" | "changed" | "failed" {
+  try {
+    const receiptPath = notificationReceiptPath(sessionId, projectPath);
+    const locked = withStateFileMutationLock(receiptPath, () => {
+      if (!existsSync(receiptPath)) return "changed" as const;
+      let state: NotificationReceiptState;
+      try {
+        const parsed = JSON.parse(readFileSync(receiptPath, "utf8"));
+        if (!isNotificationReceiptState(parsed, sessionId)) {
+          return "failed" as const;
+        }
+        state = parsed;
+      } catch {
+        return "failed" as const;
+      }
+      const current = state.receipts[intentId];
+      if (
+        !current
+        || current.claim_id !== claimId
+        || (
+          current.delivery_status !== "provisional"
+          && current.delivery_status !== "queued"
+        )
+      ) {
+        return "changed" as const;
+      }
+      if (current.delivery_status === "queued") return "finalized" as const;
+
+      const queued = { ...current };
+      delete queued.lease_expires_at_ms;
+      atomicWriteJsonSync(receiptPath, {
+        version: 2,
+        receipts: {
+          ...state.receipts,
+          [intentId]: {
+            ...queued,
+            delivery_status: "queued",
+            queued_at_ms: nowMs,
+          },
+        },
+      } satisfies NotificationReceiptState);
+      return "finalized" as const;
+    });
+    return locked.acquired && locked.value ? locked.value : "failed";
+  } catch {
+    return "failed";
+  }
+}
+
+export function markNotificationReceiptRetryable(
+  intentId: string,
+  sessionId: string,
+  projectPath: string,
+  claimId: string,
+  nowMs: number,
+): "retryable" | "changed" | "failed" {
+  try {
+    const receiptPath = notificationReceiptPath(sessionId, projectPath);
+    const locked = withStateFileMutationLock(receiptPath, () => {
+      if (!existsSync(receiptPath)) return "changed" as const;
+      let state: NotificationReceiptState;
+      try {
+        const parsed = JSON.parse(readFileSync(receiptPath, "utf8"));
+        if (!isNotificationReceiptState(parsed, sessionId)) {
+          return "failed" as const;
+        }
+        state = parsed;
+      } catch {
+        return "failed" as const;
+      }
+      const current = state.receipts[intentId];
+      if (
+        !current
+        || current.delivery_status !== "provisional"
+        || current.claim_id !== claimId
+      ) {
+        return "changed" as const;
+      }
+      const retryable = { ...current };
+      delete retryable.lease_expires_at_ms;
+      atomicWriteJsonSync(receiptPath, {
+        version: 2,
+        receipts: {
+          ...state.receipts,
+          [intentId]: {
+            ...retryable,
+            delivery_status: "retryable",
+            retryable_at_ms: nowMs,
+          },
+        },
+      } satisfies NotificationReceiptState);
+      return "retryable" as const;
+    });
+    return locked.acquired && locked.value ? locked.value : "failed";
+  } catch {
+    return "failed";
+  }
+}
 
 /**
  * High-level notification function.
@@ -289,6 +628,39 @@ export async function notify(
     );
     return null;
   }
+}
+
+/**
+ * At-most-once notification dispatch guarded by a durable owner receipt.
+ * The receipt is claimed before external dispatch, so a crash may suppress a
+ * retry but can never duplicate an interactive notification.
+ */
+export async function notifyOnce(
+  intentId: string,
+  event: NotificationEvent,
+  data: Partial<NotificationPayload> & {
+    sessionId: string;
+    projectPath: string;
+    profileName?: string;
+  },
+  nowMs = Date.now(),
+): Promise<NotifyOnceResult> {
+  if (!intentId || !data.projectPath) return { status: "failed" };
+  const claim = claimNotificationReceipt(
+    intentId,
+    event,
+    data.sessionId,
+    data.projectPath,
+    nowMs,
+  );
+  if (claim === "duplicate") return { status: "duplicate" };
+  if (claim === "failed") return { status: "failed" };
+
+  const result = await notify(event, data);
+  if (!result) return { status: "skipped" };
+  return {
+    status: result.anySuccess ? "sent" : "skipped",
+  };
 }
 
 // ============================================================================

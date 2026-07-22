@@ -19,6 +19,7 @@ import {
   COPILOT_1072_CAPABILITIES,
   formatUnknownError,
   type CanonicalAgentRef,
+  type CanonicalGoalSnapshot,
   type CanonicalHookEventPayload,
   type CanonicalHookEnvelope,
   type CanonicalNotificationPayload,
@@ -146,7 +147,10 @@ const COPILOT_ENVELOPE_MARKERS = new Set([
 
 const COPILOT_TOOL_ALIASES: Readonly<Record<string, string>> = {
   agent: 'Task',
+  apply_patch: 'Edit',
+  ask_user: 'AskUserQuestion',
   bash: 'Bash',
+  create: 'Write',
   edit: 'Edit',
   glob: 'Glob',
   grep: 'Grep',
@@ -155,7 +159,12 @@ const COPILOT_TOOL_ALIASES: Readonly<Record<string, string>> = {
   read: 'Read',
   rg: 'Grep',
   skill: 'Skill',
+  str_replace_editor: 'Edit',
   task: 'Task',
+  update_todo: 'TodoWrite',
+  view: 'Read',
+  web_fetch: 'WebFetch',
+  web_search: 'WebSearch',
   write: 'Write',
 };
 
@@ -221,6 +230,30 @@ function firstStringField(
   return undefined;
 }
 
+function normalizeLastAssistantMessage(
+  input: Record<string, unknown>,
+): string | undefined {
+  if (hasOwn(input, 'last_assistant_message')) {
+    const value = input.last_assistant_message;
+    return typeof value === 'string' ? value.trim() : '';
+  }
+
+  for (const key of [
+    'lastAssistantMessage',
+    'message',
+    'output',
+    'response',
+    'text',
+  ]) {
+    const value = input[key];
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+
+  return undefined;
+}
+
 function firstNumberField(
   input: Record<string, unknown>,
   keys: readonly string[],
@@ -265,19 +298,92 @@ function hostFieldKeys(
     : [camelCase, snakeCase, ...fallbacks];
 }
 
+function normalizeGoalSnapshot(
+  raw: Record<string, unknown>,
+): CanonicalGoalSnapshot | undefined {
+  const context = isRecord(raw.context) ? raw.context : undefined;
+  const candidates: Array<{
+    value: unknown;
+    source: CanonicalGoalSnapshot['source'];
+  }> = [
+    { value: raw.goal, source: 'payload' },
+    { value: raw.claude_goal, source: 'payload' },
+    { value: raw.claudeGoal, source: 'payload' },
+    { value: raw.goal_state, source: 'payload' },
+    { value: raw.goalState, source: 'payload' },
+    { value: raw.codex_goal, source: 'payload' },
+    { value: raw.codexGoal, source: 'payload' },
+    { value: context?.goal, source: 'context' },
+    { value: context?.claude_goal, source: 'context' },
+    { value: context?.claudeGoal, source: 'context' },
+  ];
+
+  for (const candidate of candidates) {
+    const value = isRecord(candidate.value) && isRecord(candidate.value.goal)
+      ? candidate.value.goal
+      : candidate.value;
+    if (!isRecord(value)) continue;
+
+    const objective = firstStringField(
+      value,
+      ['objective', 'condition', 'prompt', 'description'],
+    );
+    const status = firstStringField(value, ['status', 'state']);
+    if (objective === undefined && status === undefined) continue;
+
+    return {
+      ...(objective !== undefined ? { objective } : {}),
+      ...(status !== undefined ? { status } : {}),
+      source: candidate.source,
+    };
+  }
+
+  return undefined;
+}
+
 function normalizeEventPayload(
   raw: Record<string, unknown>,
   host: HookHost,
   hookType: string,
 ): CanonicalHookEventPayload {
   const prompt = firstStringField(raw, ['prompt']);
+  const userPrompt = firstStringField(
+    raw,
+    hostFieldKeys(host, 'user_prompt', 'userPrompt'),
+  );
   const initialPrompt = firstStringField(raw, ['initialPrompt', 'initial_prompt']);
   const promptId = firstStringField(raw, hostFieldKeys(host, 'prompt_id', 'promptId'));
+  const message = firstDefinedField(raw, ['message']);
+  const messagePrompt = isRecord(message)
+    ? firstStringField(message, ['content'])
+    : typeof message === 'string' && message.length > 0
+      ? message
+      : undefined;
+  const parts = firstArrayField(raw, ['parts']);
+  const partsPrompt = parts
+    ?.flatMap((part) =>
+      isRecord(part)
+      && part.type === 'text'
+      && typeof part.text === 'string'
+      && part.text.length > 0
+        ? [part.text]
+        : [])
+    .join(' ');
+  const promptAliases = [...new Set(
+    [
+      prompt,
+      userPrompt,
+      initialPrompt,
+      messagePrompt,
+      partsPrompt || undefined,
+    ].filter(
+      (value): value is string => value !== undefined,
+    ),
+  )];
+  const goal = normalizeGoalSnapshot(raw);
   const source = firstStringField(raw, ['source']);
   const model = firstStringField(raw, hostFieldKeys(host, 'model_id', 'modelId', 'model'));
   const timestamp = firstNumberField(raw, ['timestamp']);
-  const message = firstDefinedField(raw, ['message']);
-  const parts = firstArrayField(raw, ['parts']);
   const toolOutput = firstDefinedField(
     raw,
     host === 'claude'
@@ -285,6 +391,10 @@ function normalizeEventPayload(
       : ['toolResult', 'toolOutput', 'toolResponse', 'tool_response', 'output', 'result'],
   );
   const toolError = firstDefinedField(raw, ['error', 'toolError', 'tool_error']);
+  const contextWindow = firstDefinedField(
+    raw,
+    hostFieldKeys(host, 'context_window', 'contextWindow'),
+  );
   const trigger = firstStringField(raw, ['trigger']);
   const customInstructions = firstStringField(
     raw,
@@ -310,10 +420,12 @@ function normalizeEventPayload(
     raw,
     hostFieldKeys(host, 'stop_hook_active', 'stopHookActive'),
   );
-  const lastAssistantMessage = firstStringField(
+  const lastAssistantMessage = normalizeLastAssistantMessage(raw);
+  const endTurnReason = firstStringField(
     raw,
-    hostFieldKeys(host, 'last_assistant_message', 'lastAssistantMessage'),
+    hostFieldKeys(host, 'end_turn_reason', 'endTurnReason'),
   );
+  const reason = firstStringField(raw, ['reason']);
   const backgroundTasks = firstArrayField(
     raw,
     hostFieldKeys(host, 'background_tasks', 'backgroundTasks'),
@@ -367,8 +479,11 @@ function normalizeEventPayload(
 
   return {
     ...(prompt !== undefined ? { prompt } : {}),
+    ...(userPrompt !== undefined ? { userPrompt } : {}),
+    ...(promptAliases.length > 0 ? { promptAliases } : {}),
     ...(initialPrompt !== undefined ? { initialPrompt } : {}),
     ...(promptId !== undefined ? { promptId } : {}),
+    ...(goal !== undefined ? { goal } : {}),
     ...(source !== undefined ? { source } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(timestamp !== undefined ? { timestamp } : {}),
@@ -376,6 +491,7 @@ function normalizeEventPayload(
     ...(parts !== undefined ? { parts } : {}),
     ...(toolOutput !== undefined ? { toolOutput } : {}),
     ...(toolError !== undefined ? { toolError } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
     ...(notification !== undefined ? { notification } : {}),
     ...(trigger !== undefined ? { trigger } : {}),
     ...(customInstructions !== undefined ? { customInstructions } : {}),
@@ -386,6 +502,8 @@ function normalizeEventPayload(
     ...(interrupted !== undefined ? { interrupted } : {}),
     ...(stopHookActive !== undefined ? { stopHookActive } : {}),
     ...(lastAssistantMessage !== undefined ? { lastAssistantMessage } : {}),
+    ...(endTurnReason !== undefined ? { endTurnReason } : {}),
+    ...(reason !== undefined ? { reason } : {}),
     ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
     ...(sessionCrons !== undefined ? { sessionCrons } : {}),
     ...(agentTranscriptPath !== undefined ? { agentTranscriptPath } : {}),
@@ -786,9 +904,15 @@ function decodeSingleToolCall(
 
   if (host === 'copilot' && hasOwn(raw, 'toolArgs')) {
     rawArgs = raw.toolArgs;
-    const parsedArgs = parseSerializedArgs(rawArgs, 0, hostId);
-    input = parsedArgs.input;
-    if (parsedArgs.issue) issues.push(parsedArgs.issue);
+    if (typeof rawArgs === 'string') {
+      try {
+        input = JSON.parse(rawArgs) as unknown;
+      } catch {
+        input = rawArgs;
+      }
+    } else {
+      input = rawArgs;
+    }
   } else {
     input = host === 'claude'
       ? raw.tool_input ?? raw.toolInput
@@ -876,8 +1000,12 @@ export function normalizeHookEnvelope(raw: unknown, hookType?: string): Canonica
 
   const canonicalHookType = inferHookType(raw, hookType);
   const sessionId = detected.host === 'claude'
-    ? stringField(raw, 'session_id') ?? stringField(raw, 'sessionId')
-    : stringField(raw, 'sessionId') ?? stringField(raw, 'session_id');
+    ? stringField(raw, 'session_id')
+      ?? stringField(raw, 'sessionId')
+      ?? stringField(raw, 'sessionid')
+    : stringField(raw, 'sessionId')
+      ?? stringField(raw, 'session_id')
+      ?? stringField(raw, 'sessionid');
   const directory = stringField(raw, 'cwd') ?? stringField(raw, 'directory');
   const rawTranscriptPath = detected.host === 'claude'
     ? stringField(raw, 'transcript_path') ?? stringField(raw, 'transcriptPath')
@@ -916,8 +1044,10 @@ export function normalizeHookEnvelope(raw: unknown, hookType?: string): Canonica
   }
 
   const hostDecision =
-    normalizeHostDecision(raw.hostDecision)
-    ?? normalizeHostDecision(raw.nativeDecision);
+    detected.host === 'copilot' && canonicalHookType === 'permission-request'
+      ? undefined
+      : normalizeHostDecision(raw.hostDecision)
+        ?? normalizeHostDecision(raw.nativeDecision);
 
   return {
     ...detected,

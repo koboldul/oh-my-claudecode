@@ -34,6 +34,20 @@ export const DEPRECATED_MODE_NAMES = {
 export type ModeName = typeof MODE_NAMES[keyof typeof MODE_NAMES];
 
 /**
+ * Skill invocations that confirm a previously armed mode. Ultragoal remains
+ * outside ModeName but participates in the same confirmation-state contract.
+ */
+export const MODE_CONFIRMATION_SKILL_MAP: Readonly<
+  Record<string, readonly string[]>
+> = {
+  ralph: ['ralph', 'ultrawork'],
+  ultragoal: ['ultragoal'],
+  ultrawork: ['ultrawork'],
+  autopilot: ['autopilot'],
+  ralplan: ['ralplan'],
+};
+
+/**
  * All mode names as an array (useful for iteration).
  * Order matches the canonical ExecutionMode union in mode-registry/types.ts.
  */

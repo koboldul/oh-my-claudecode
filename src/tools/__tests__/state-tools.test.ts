@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'crypto';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync, existsSync, lstatSync } from 'fs';
 import { tmpdir } from 'os';
-import { basename, dirname, join } from 'path';
+import { basename, dirname, join, resolve } from 'path';
 import {
   stateReadTool,
   stateWriteTool,
@@ -11,8 +11,9 @@ import {
   stateGetStatusTool,
 } from '../state-tools.js';
 import { emergencyMutateStateFileIf } from '../../lib/mode-state-io.js';
+import { getProcessStartIdentitySync } from '../../platform/process-utils.js';
 
-const TEST_DIR = '/tmp/state-tools-test';
+const TEST_DIR = resolve(tmpdir(), 'state-tools-test');
 
 // Mock validateWorkingDirectory to allow test directory
 vi.mock('../../lib/worktree-paths.js', async () => {
@@ -26,16 +27,27 @@ vi.mock('../../lib/worktree-paths.js', async () => {
 });
 
 function liveLockOwner() {
-  const stat = readFileSync(`/proc/${process.pid}/stat`, 'utf8');
-  const processStart = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/)[19];
-  return JSON.stringify({ version: 1, pid: process.pid, processStart, createdAt: new Date().toISOString(), nonce: randomUUID() });
+  const processStartIdentity = getProcessStartIdentitySync(process.pid);
+  if (
+    processStartIdentity === null
+    || processStartIdentity === 'absent'
+  ) {
+    throw new Error('current process identity unavailable');
+  }
+  return JSON.stringify({
+    version: 2,
+    pid: process.pid,
+    processStartIdentity,
+    nonce: randomUUID(),
+    timestamp: Date.now(),
+  });
 }
 
 function portableWorkflowState(sessionId: string): Record<string, unknown> {
-  const transcriptRoot = '/tmp/state-tools-transcripts';
+  const transcriptRoot = resolve(tmpdir(), 'state-tools-transcripts');
   const fileIdentity = { device: 0, inode: 0, size: 0, mtimeNs: '0', ctimeNs: '0', contentSha256: '0'.repeat(64) };
   const activationBoundary = {
-    transcriptPath: `${transcriptRoot}/${sessionId}.jsonl`,
+    transcriptPath: join(transcriptRoot, `${sessionId}.jsonl`),
     transcriptRoot,
     transcriptBasename: `${sessionId}.jsonl`,
     sessionId,
@@ -67,6 +79,20 @@ function portableWorkflowState(sessionId: string): Record<string, unknown> {
   };
 
 }
+
+function setTestHome(home: string): () => void {
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  return () => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+  };
+}
+
 function completedPortableWorkflowState(sessionId: string): Record<string, unknown> {
   const state = portableWorkflowState(sessionId);
   const tracking = state.pipelineTracking as Record<string, unknown>;
@@ -138,6 +164,24 @@ describe('state-tools', () => {
       });
 
       expect(result.content[0].text).toContain('No state found');
+    });
+
+    it('does not fall back to aggregate skill state for an invalid session ID', async () => {
+      await stateWriteTool.handler({
+        mode: 'skill-active',
+        active: true,
+        state: { skill_name: 'aggregate-secret' },
+        workingDirectory: TEST_DIR,
+      });
+
+      const result = await stateReadTool.handler({
+        mode: 'skill-active',
+        session_id: '../invalid',
+        workingDirectory: TEST_DIR,
+      });
+
+      expect(result.content[0].text).toContain('No state found');
+      expect(result.content[0].text).not.toContain('aggregate-secret');
     });
     it('redacts every malformed named marker without exposing private state', async () => {
       const sessionId = 'named-read-redaction';
@@ -267,6 +311,81 @@ describe('state-tools', () => {
       });
 
       expect(result.content[0].text).toContain(`"sessionId": "${sessionId}"`);
+    });
+
+    it('writes skill-active state through matching root and session ledgers', async () => {
+      const sessionId = 'skill-owner-write';
+      const result = await stateWriteTool.handler({
+        mode: 'skill-active',
+        state: {
+          version: 2,
+          active_skills: {
+            autopilot: {
+              skill_name: 'autopilot',
+              started_at: '2026-04-17T12:00:00.000Z',
+              completed_at: null,
+              session_id: sessionId,
+              mode_state_path: 'autopilot-state.json',
+              initialized_mode: 'autopilot',
+              initialized_state_path: '',
+              initialized_session_state_path: '',
+            },
+          },
+        },
+        session_id: sessionId,
+        workingDirectory: TEST_DIR,
+      });
+      const rootPath = join(
+        TEST_DIR,
+        '.omc',
+        'state',
+        'skill-active-state.json',
+      );
+      const sessionPath = join(
+        TEST_DIR,
+        '.omc',
+        'state',
+        'sessions',
+        sessionId,
+        'skill-active-state.json',
+      );
+      const root = JSON.parse(readFileSync(rootPath, 'utf8'));
+      const session = JSON.parse(readFileSync(sessionPath, 'utf8'));
+
+      expect(result.isError).toBeUndefined();
+      expect(root.session_ledgers[sessionId].active_skills.autopilot)
+        .toMatchObject({ session_id: sessionId, completed_at: null });
+      expect(session.active_skills.autopilot)
+        .toEqual(root.session_ledgers[sessionId].active_skills.autopilot);
+      expect(session.generation)
+        .toBe(root.session_ledgers[sessionId].generation);
+    });
+
+    it('fails closed on an invalid skill-active write session ID', async () => {
+      await stateWriteTool.handler({
+        mode: 'skill-active',
+        active: true,
+        state: { skill_name: 'preserved-root' },
+        workingDirectory: TEST_DIR,
+      });
+      const rootPath = join(
+        TEST_DIR,
+        '.omc',
+        'state',
+        'skill-active-state.json',
+      );
+      const before = readFileSync(rootPath, 'utf8');
+
+      const result = await stateWriteTool.handler({
+        mode: 'skill-active',
+        active: true,
+        state: { skill_name: 'must-not-land' },
+        session_id: '../invalid',
+        workingDirectory: TEST_DIR,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(readFileSync(rootPath, 'utf8')).toBe(before);
     });
     it('creates a missing generic autopilot pause state', async () => {
       const sessionId = 'missing-generic-pause';
@@ -741,9 +860,8 @@ describe('state-tools', () => {
     });
 
     it('signals and clears the home-global autopilot fallback during broad clear', async () => {
-      const previousHome = process.env.HOME;
       const home = join(TEST_DIR, 'home-global');
-      process.env.HOME = home;
+      const restoreHome = setTestHome(home);
       try {
         const statePath = join(home, '.omc', 'state', 'autopilot-state.json');
         mkdirSync(dirname(statePath), { recursive: true });
@@ -757,14 +875,12 @@ describe('state-tools', () => {
         expect(signal.target_workflow_run_id).toBeUndefined();
         expect(signal.target_state_sha256).toMatch(/^[a-f0-9]{64}$/);
       } finally {
-        if (previousHome === undefined) delete process.env.HOME;
-        else process.env.HOME = previousHome;
+        restoreHome();
       }
     });
     it('recovers a same-project shared-session clear transaction with no primary during broad clear', async () => {
-      const previousHome = process.env.HOME;
       const home = join(TEST_DIR, 'home-shared-session-clear-intent');
-      process.env.HOME = home;
+      const restoreHome = setTestHome(home);
       try {
         const statePath = join(home, '.omc', 'state', 'sessions', 'project-a-clear', 'autopilot-state.json');
         mkdirSync(dirname(statePath), { recursive: true });
@@ -780,14 +896,12 @@ describe('state-tools', () => {
         expect(existsSync(statePath)).toBe(false);
         expect(existsSync(`${statePath}.emergency-journal.json`)).toBe(false);
       } finally {
-        if (previousHome === undefined) delete process.env.HOME;
-        else process.env.HOME = previousHome;
+        restoreHome();
       }
     });
     it('preserves a foreign dead publication temp beside an authorized home-global state', async () => {
-      const previousHome = process.env.HOME;
       const home = join(TEST_DIR, 'home-global-foreign-temp');
-      process.env.HOME = home;
+      const restoreHome = setTestHome(home);
       try {
         const statePath = join(home, '.omc', 'state', 'autopilot-state.json');
         const foreignTemp = `${statePath}.emergency-quarantine.${randomUUID()}.payload.999999999.1.${randomUUID()}.tmp`;
@@ -801,15 +915,13 @@ describe('state-tools', () => {
         expect(readFileSync(statePath, 'utf8')).toBe(primary);
         expect(existsSync(foreignTemp)).toBe(true);
       } finally {
-        if (previousHome === undefined) delete process.env.HOME;
-        else process.env.HOME = previousHome;
+        restoreHome();
       }
     });
 
     it('preserves a malformed journal beside an authorized shared-session state', async () => {
-      const previousHome = process.env.HOME;
       const home = join(TEST_DIR, 'home-shared-session-malformed-journal');
-      process.env.HOME = home;
+      const restoreHome = setTestHome(home);
       try {
         const statePath = join(home, '.omc', 'state', 'sessions', 'project-a', 'autopilot-state.json');
         const journalPath = `${statePath}.emergency-journal.json`;
@@ -823,16 +935,14 @@ describe('state-tools', () => {
         expect(readFileSync(statePath, 'utf8')).toBe(primary);
         expect(readFileSync(journalPath, 'utf8')).toBe('{"version":1');
       } finally {
-        if (previousHome === undefined) delete process.env.HOME;
-        else process.env.HOME = previousHome;
+        restoreHome();
       }
     });
 
 
     it('preserves an unrelated-project home-global autopilot fallback without signaling', async () => {
-      const previousHome = process.env.HOME;
       const home = join(TEST_DIR, 'home-unrelated');
-      process.env.HOME = home;
+      const restoreHome = setTestHome(home);
       try {
         const statePath = join(home, '.omc', 'state', 'autopilot-state.json');
         mkdirSync(dirname(statePath), { recursive: true });
@@ -844,14 +954,12 @@ describe('state-tools', () => {
         expect(readFileSync(statePath, 'utf8')).toBe(raw);
         expect(existsSync(join(dirname(statePath), 'cancel-signal-state.json'))).toBe(false);
       } finally {
-        if (previousHome === undefined) delete process.env.HOME;
-        else process.env.HOME = previousHome;
+        restoreHome();
       }
     });
     it('preserves unrelated shared-session autopilot state and emergency artifacts during broad clear', async () => {
-      const previousHome = process.env.HOME;
       const home = join(TEST_DIR, 'home-shared-session-projects');
-      process.env.HOME = home;
+      const restoreHome = setTestHome(home);
       try {
         const projectAPath = join(home, '.omc', 'state', 'sessions', 'project-a-named', 'autopilot-state.json');
         const projectALegacyPath = join(home, '.omc', 'state', 'sessions', 'project-a-legacy', 'autopilot-state.json');
@@ -906,8 +1014,7 @@ describe('state-tools', () => {
           expect(readFileSync(join(dirname(projectBRecoveryPath), name))).toEqual(contents);
         }
       } finally {
-        if (previousHome === undefined) delete process.env.HOME;
-        else process.env.HOME = previousHome;
+        restoreHome();
       }
     });
 
@@ -1270,6 +1377,53 @@ describe('state-tools', () => {
         workingDirectory: TEST_DIR,
       });
       // stateReadTool returning "No state found" is authoritative proof the file is gone
+      expect(readResult.content[0].text).toContain('No state found');
+    });
+
+    it('clears both skill-active session state and its root repair ledger', async () => {
+      const sessionId = 'skill-clear-owner';
+      await stateWriteTool.handler({
+        mode: 'skill-active',
+        active: true,
+        state: { skill_name: 'sciomc', reinforcement_count: 2 },
+        session_id: sessionId,
+        workingDirectory: TEST_DIR,
+      });
+      const rootPath = join(
+        TEST_DIR,
+        '.omc',
+        'state',
+        'skill-active-state.json',
+      );
+      const sessionPath = join(
+        TEST_DIR,
+        '.omc',
+        'state',
+        'sessions',
+        sessionId,
+        'skill-active-state.json',
+      );
+      expect(existsSync(rootPath)).toBe(true);
+      expect(existsSync(sessionPath)).toBe(true);
+
+      const result = await stateClearTool.handler({
+        mode: 'skill-active',
+        session_id: sessionId,
+        workingDirectory: TEST_DIR,
+      });
+
+      expect(result.isError).toBeUndefined();
+      expect(existsSync(sessionPath)).toBe(false);
+      if (existsSync(rootPath)) {
+        const root = JSON.parse(readFileSync(rootPath, 'utf8'));
+        expect(root.session_ledgers?.[sessionId]).toBeUndefined();
+        expect(root.support_skill?.session_id).not.toBe(sessionId);
+      }
+      const readResult = await stateReadTool.handler({
+        mode: 'skill-active',
+        session_id: sessionId,
+        workingDirectory: TEST_DIR,
+      });
       expect(readResult.content[0].text).toContain('No state found');
     });
 

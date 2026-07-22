@@ -1,7 +1,7 @@
 /**
  * Skill Active State Management (v2 mixed schema)
  *
- * `skill-active-state.json` is a dual-copy workflow ledger:
+ * `skill-active-state.json` is a root aggregate plus session-local ledger:
  *
  *   {
  *     "version": 2,
@@ -24,24 +24,29 @@
  *   }
  *
  * HARD INVARIANTS:
- *   1. `writeSkillActiveStateCopies()` is the only helper allowed to persist
- *      workflow-slot state. Every workflow-slot write, confirm, tombstone, TTL
- *      pruning, and hard-clear must update BOTH
- *        - `.omc/state/skill-active-state.json`
- *        - `.omc/state/sessions/{sessionId}/skill-active-state.json`
- *      together through this single helper.
- *   2. Support-skill writes go through the same helper so the shared file
- *      never drops the `active_skills` branch.
- *   3. The session copy is authoritative for session-local reads; the root
- *      copy is authoritative for cross-session aggregation.
+ *   1. Every ledger read-modify-write goes through
+ *      `mutateSkillActiveStateLocked()`.
+ *   2. Session files contain only their own workflow/support state.
+ *   3. The root file retains per-session ledgers for repair and exposes a
+ *      legacy aggregate projection without feeding it back into sessions.
+ *   4. Seen intent IDs are bounded and copied with a verified generation.
  */
 
-import { existsSync, readFileSync, unlinkSync } from 'fs';
+import {
+  existsSync,
+  readFileSync,
+  realpathSync,
+  readdirSync,
+  unlinkSync,
+} from 'fs';
+import { dirname, join, normalize, resolve } from 'path';
 import {
   resolveStatePath,
   resolveSessionStatePath,
+  resolveToWorktreeRoot,
 } from '../../lib/worktree-paths.js';
 import { atomicWriteJsonSync } from '../../lib/atomic-write.js';
+import { withStateFileMutationLock } from '../../lib/mode-state-io.js';
 import { readTrackingState, getStaleAgents } from '../subagent-tracker/index.js';
 
 // ---------------------------------------------------------------------------
@@ -51,6 +56,8 @@ import { readTrackingState, getStaleAgents } from '../subagent-tracker/index.js'
 export const SKILL_ACTIVE_STATE_MODE = 'skill-active';
 export const SKILL_ACTIVE_STATE_FILE = 'skill-active-state.json';
 export const WORKFLOW_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+export const SKILL_SEEN_INTENT_LIMIT = 128;
+const SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/;
 
 /**
  * Canonical workflow skills — the only skills that get workflow slots.
@@ -178,6 +185,7 @@ export interface SkillActiveState {
   reinforcement_count: number;
   max_reinforcements: number;
   stale_ttl_ms: number;
+  last_intent_id?: string;
 }
 
 /** A single workflow-slot entry keyed by canonical workflow skill name. */
@@ -206,8 +214,25 @@ export interface ActiveSkillSlot {
 /** v2 mixed schema. */
 export interface SkillActiveStateV2 {
   version: 2;
+  generation?: number;
+  seen_intents?: string[];
   active_skills: Record<string, ActiveSkillSlot>;
   support_skill?: SkillActiveState | null;
+  global_ledger?: SkillSessionLedger;
+  session_ledgers?: Record<string, SkillSessionLedger>;
+  session_tombstones?: Record<string, number>;
+}
+
+export interface SkillSessionLedger {
+  generation: number;
+  seen_intents: string[];
+  active_skills: Record<string, ActiveSkillSlot>;
+  support_skill?: SkillActiveState | null;
+}
+
+export function isWorkflowSkillCompleted(slot: ActiveSkillSlot): boolean {
+  return typeof slot.completed_at === 'string'
+    && slot.completed_at.trim().length > 0;
 }
 
 export interface WriteSkillActiveStateCopiesOptions {
@@ -228,16 +253,239 @@ export function emptySkillActiveStateV2(): SkillActiveStateV2 {
 }
 
 function isEmptyV2(state: SkillActiveStateV2): boolean {
-  return Object.keys(state.active_skills).length === 0 && !state.support_skill;
+  return Object.keys(state.active_skills).length === 0
+    && !state.support_skill
+    && (state.seen_intents?.length ?? 0) === 0
+    && Object.keys(state.session_ledgers ?? {}).length === 0
+    && Object.keys(state.session_tombstones ?? {}).length === 0
+    && !state.global_ledger;
+}
+
+export class SkillStateCorruptionError extends Error {
+  readonly path: string;
+
+  constructor(path: string) {
+    super(`Corrupt skill-active state: ${path}`);
+    this.name = 'SkillStateCorruptionError';
+    this.path = path;
+  }
+}
+
+type SkillStateFileRead =
+  | { status: 'missing' }
+  | { status: 'valid'; raw: unknown }
+  | { status: 'corrupt' };
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value);
+}
+
+function isValidActiveSkillsShape(value: unknown): boolean {
+  return value === undefined
+    || (
+      isPlainRecord(value)
+      && Object.values(value).every((slot) => isPlainRecord(slot))
+    );
+}
+
+function isValidSupportSkillShape(value: unknown): boolean {
+  return value === undefined || value === null || isPlainRecord(value);
+}
+
+function isValidSessionLedgerShape(value: unknown): boolean {
+  if (!isPlainRecord(value)) return false;
+  return isValidActiveSkillsShape(value.active_skills)
+    && isValidSupportSkillShape(value.support_skill)
+    && (
+      value.generation === undefined
+      || (
+        typeof value.generation === 'number'
+        && Number.isSafeInteger(value.generation)
+        && value.generation >= 0
+      )
+    )
+    && (
+      value.seen_intents === undefined
+      || Array.isArray(value.seen_intents)
+    );
+}
+
+function isValidSkillStatePayload(value: unknown): boolean {
+  if (!isPlainRecord(value)) return false;
+  const { _meta: _meta, ...state } = value;
+  void _meta;
+  const looksV2 =
+    state.version === 2
+    || 'active_skills' in state
+    || 'support_skill' in state
+    || 'global_ledger' in state
+    || 'session_ledgers' in state
+    || 'session_tombstones' in state;
+  if (looksV2) {
+    if (state.version !== undefined && state.version !== 2) return false;
+    if (
+      state.generation !== undefined
+      && (
+        typeof state.generation !== 'number'
+        || !Number.isSafeInteger(state.generation)
+        || state.generation < 0
+      )
+    ) {
+      return false;
+    }
+    if (!isValidActiveSkillsShape(state.active_skills)) return false;
+    if (!isValidSupportSkillShape(state.support_skill)) return false;
+    if (
+      state.global_ledger !== undefined
+      && !isValidSessionLedgerShape(state.global_ledger)
+    ) {
+      return false;
+    }
+    if (state.session_ledgers !== undefined) {
+      if (!isPlainRecord(state.session_ledgers)) return false;
+      if (
+        !Object.entries(state.session_ledgers).every(
+          ([sessionId, ledger]) =>
+            SESSION_ID_PATTERN.test(sessionId)
+            && isValidSessionLedgerShape(ledger),
+        )
+      ) {
+        return false;
+      }
+    }
+    if (state.session_tombstones !== undefined) {
+      if (!isPlainRecord(state.session_tombstones)) return false;
+      if (
+        !Object.entries(state.session_tombstones).every(
+          ([sessionId, generation]) =>
+            SESSION_ID_PATTERN.test(sessionId)
+            && typeof generation === 'number'
+            && Number.isSafeInteger(generation)
+            && generation >= 0,
+        )
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return typeof state.active === 'boolean'
+    && typeof state.skill_name === 'string';
+}
+
+function inspectSkillStateFile(path: string): SkillStateFileRead {
+  if (!existsSync(path)) return { status: 'missing' };
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf-8')) as unknown;
+    return isValidSkillStatePayload(raw)
+      ? { status: 'valid', raw }
+      : { status: 'corrupt' };
+  } catch {
+    return { status: 'corrupt' };
+  }
 }
 
 function readRawFromPath(path: string): unknown {
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(readFileSync(path, 'utf-8'));
-  } catch {
-    return null;
+  const inspected = inspectSkillStateFile(path);
+  if (inspected.status === 'missing') return null;
+  if (inspected.status === 'corrupt') {
+    throw new SkillStateCorruptionError(path);
   }
+  return inspected.raw;
+}
+
+function isLegacyScalarSkillState(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const state = raw as Record<string, unknown>;
+  return state.version !== 2
+    && typeof state.active === 'boolean'
+    && typeof state.skill_name === 'string'
+    && !('active_skills' in state)
+    && !('support_skill' in state);
+}
+
+function normalizedGeneration(value: unknown): number {
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= 0
+    ? value
+    : 0;
+}
+
+function nextSkillGeneration(generation: number): number | null {
+  return generation < Number.MAX_SAFE_INTEGER
+    ? generation + 1
+    : null;
+}
+
+function normalizeSeenIntents(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(
+    value.filter(
+      (intent): intent is string =>
+        typeof intent === 'string' && intent.length > 0,
+    ),
+  )].slice(-SKILL_SEEN_INTENT_LIMIT);
+}
+
+function normalizeActiveSkills(
+  value: unknown,
+): Record<string, ActiveSkillSlot> {
+  const activeSkills: Record<string, ActiveSkillSlot> = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return activeSkills;
+  }
+  for (const [name, slot] of Object.entries(
+    value as Record<string, unknown>,
+  )) {
+    if (slot && typeof slot === 'object' && !Array.isArray(slot)) {
+      activeSkills[name] = { ...(slot as ActiveSkillSlot) };
+    }
+  }
+  return activeSkills;
+}
+
+function normalizeSupportSkill(value: unknown): SkillActiveState | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? { ...(value as SkillActiveState) }
+    : null;
+}
+
+function normalizeSessionLedger(value: unknown): SkillSessionLedger {
+  const record =
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  const supportSkill = normalizeSupportSkill(record.support_skill);
+  return {
+    generation: normalizedGeneration(record.generation),
+    seen_intents: normalizeSeenIntents([
+      ...(Array.isArray(record.seen_intents) ? record.seen_intents : []),
+      ...(supportSkill?.last_intent_id
+        ? [supportSkill.last_intent_id]
+        : []),
+    ]),
+    active_skills: normalizeActiveSkills(record.active_skills),
+    support_skill: supportSkill,
+  };
+}
+
+function stateFromLedger(ledger: SkillSessionLedger): SkillActiveStateV2 {
+  return {
+    version: 2,
+    generation: ledger.generation,
+    seen_intents: [...ledger.seen_intents],
+    active_skills: { ...ledger.active_skills },
+    support_skill: ledger.support_skill
+      ? { ...ledger.support_skill }
+      : null,
+  };
+}
+
+function ledgerFromState(state: SkillActiveStateV2): SkillSessionLedger {
+  return normalizeSessionLedger(state);
 }
 
 /**
@@ -257,22 +505,65 @@ function normalizeToV2(raw: unknown): SkillActiveStateV2 {
   const state = rest as Record<string, unknown>;
 
   const looksV2 =
-    state.version === 2 || 'active_skills' in state || 'support_skill' in state;
+    state.version === 2
+    || 'active_skills' in state
+    || 'support_skill' in state
+    || 'global_ledger' in state
+    || 'session_ledgers' in state
+    || 'session_tombstones' in state;
   if (looksV2) {
-    const active_skills: Record<string, ActiveSkillSlot> = {};
-    const raw_slots = state.active_skills;
-    if (raw_slots && typeof raw_slots === 'object' && !Array.isArray(raw_slots)) {
-      for (const [name, slot] of Object.entries(raw_slots as Record<string, unknown>)) {
-        if (slot && typeof slot === 'object') {
-          active_skills[name] = slot as ActiveSkillSlot;
+    const sessionLedgers: Record<string, SkillSessionLedger> = {};
+    const sessionTombstones: Record<string, number> = {};
+    if (
+      state.session_ledgers
+      && typeof state.session_ledgers === 'object'
+      && !Array.isArray(state.session_ledgers)
+    ) {
+      for (const [sessionId, ledger] of Object.entries(
+        state.session_ledgers as Record<string, unknown>,
+      )) {
+        if (SESSION_ID_PATTERN.test(sessionId)) {
+          sessionLedgers[sessionId] = sanitizeLedgerForSession(
+            normalizeSessionLedger(ledger),
+            sessionId,
+          );
         }
       }
     }
-    const support_skill =
-      state.support_skill && typeof state.support_skill === 'object'
-        ? (state.support_skill as SkillActiveState)
-        : null;
-    return { version: 2, active_skills, support_skill };
+    if (
+      state.session_tombstones
+      && typeof state.session_tombstones === 'object'
+      && !Array.isArray(state.session_tombstones)
+    ) {
+      for (const [sessionId, generation] of Object.entries(
+        state.session_tombstones as Record<string, unknown>,
+      )) {
+        if (
+          SESSION_ID_PATTERN.test(sessionId)
+          && typeof generation === 'number'
+          && Number.isSafeInteger(generation)
+          && generation >= 0
+        ) {
+          sessionTombstones[sessionId] = generation;
+        }
+      }
+    }
+    return {
+      version: 2,
+      generation: normalizedGeneration(state.generation),
+      seen_intents: normalizeSeenIntents(state.seen_intents),
+      active_skills: normalizeActiveSkills(state.active_skills),
+      support_skill: normalizeSupportSkill(state.support_skill),
+      ...(state.global_ledger
+        ? { global_ledger: normalizeSessionLedger(state.global_ledger) }
+        : {}),
+      ...(Object.keys(sessionLedgers).length > 0
+        ? { session_ledgers: sessionLedgers }
+        : {}),
+      ...(Object.keys(sessionTombstones).length > 0
+        ? { session_tombstones: sessionTombstones }
+        : {}),
+    };
   }
 
   // Legacy scalar shape → fold into support_skill.
@@ -375,11 +666,11 @@ export function pruneExpiredWorkflowSkillTombstones(
   const next: Record<string, ActiveSkillSlot> = {};
   let changed = false;
   for (const [name, slot] of Object.entries(state.active_skills)) {
-    if (!slot.completed_at) {
+    if (!isWorkflowSkillCompleted(slot)) {
       next[name] = slot;
       continue;
     }
-    const tombstonedAt = new Date(slot.completed_at).getTime();
+    const tombstonedAt = new Date(slot.completed_at!).getTime();
     if (!Number.isFinite(tombstonedAt)) {
       // Malformed timestamp — keep defensively rather than silently drop.
       next[name] = slot;
@@ -407,13 +698,15 @@ export function pruneExpiredWorkflowSkillTombstones(
 export function resolveAuthoritativeWorkflowSkill(
   state: SkillActiveStateV2,
 ): ActiveSkillSlot | null {
-  const live = Object.values(state.active_skills).filter((s) => !s.completed_at);
+  const live = Object.values(state.active_skills).filter(
+    (slot) => !isWorkflowSkillCompleted(slot),
+  );
   if (live.length === 0) return null;
 
   const isLiveAncestor = (name: string | null | undefined): boolean => {
     if (!name) return false;
     const parent = state.active_skills[name];
-    return !!parent && !parent.completed_at;
+    return !!parent && !isWorkflowSkillCompleted(parent);
   };
 
   const roots = live.filter((s) => !isLiveAncestor(s.parent_skill ?? null));
@@ -438,7 +731,7 @@ export function isWorkflowSkillLive(
 ): boolean {
   const normalized = skillName.toLowerCase().replace(/^oh-my-claudecode:/, '');
   const slot = state.active_skills[normalized];
-  return !!slot && !slot.completed_at;
+  return !!slot && !isWorkflowSkillCompleted(slot);
 }
 
 /**
@@ -454,8 +747,8 @@ export function isWorkflowSkillTombstoned(
 ): boolean {
   const normalized = skillName.toLowerCase().replace(/^oh-my-claudecode:/, '');
   const slot = state.active_skills[normalized];
-  if (!slot || !slot.completed_at) return false;
-  const tombstonedAt = new Date(slot.completed_at).getTime();
+  if (!slot || !isWorkflowSkillCompleted(slot)) return false;
+  const tombstonedAt = new Date(slot.completed_at!).getTime();
   if (!Number.isFinite(tombstonedAt)) return true;
   return now - tombstonedAt < ttlMs;
 }
@@ -463,6 +756,662 @@ export function isWorkflowSkillTombstoned(
 // ---------------------------------------------------------------------------
 // Read / Write I/O
 // ---------------------------------------------------------------------------
+
+function rawStateSessionOwner(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const record = raw as Record<string, unknown>;
+  const meta =
+    record._meta && typeof record._meta === 'object'
+      ? record._meta as Record<string, unknown>
+      : null;
+  const owner = meta?.sessionId ?? record.session_id;
+  return typeof owner === 'string' && owner.length > 0 ? owner : undefined;
+}
+
+function migrateLegacyRootLedger(
+  root: SkillActiveStateV2,
+  raw: unknown,
+): SkillActiveStateV2 {
+  if (
+    root.global_ledger
+    || Object.keys(root.session_ledgers ?? {}).length > 0
+    || Object.keys(root.session_tombstones ?? {}).length > 0
+  ) {
+    return root;
+  }
+  const legacyLedger = ledgerFromState(root);
+  if (
+    Object.keys(legacyLedger.active_skills).length === 0
+    && !legacyLedger.support_skill
+    && legacyLedger.seen_intents.length === 0
+  ) {
+    return root;
+  }
+  const owner = rawStateSessionOwner(raw);
+  if (owner && SESSION_ID_PATTERN.test(owner)) {
+    return {
+      ...root,
+      session_ledgers: {
+        [owner]: sanitizeLedgerForSession(legacyLedger, owner),
+      },
+    };
+  }
+  return {
+    ...root,
+    global_ledger: legacyLedger,
+  };
+}
+
+function sanitizeSessionLedger(
+  state: SkillActiveStateV2,
+  sessionId: string,
+): SkillActiveStateV2 {
+  const activeSkills = Object.fromEntries(
+    Object.entries(state.active_skills).flatMap(([name, slot]) => {
+      if (slot.session_id && slot.session_id !== sessionId) return [];
+      return [[name, {
+        ...slot,
+        session_id: sessionId,
+      } satisfies ActiveSkillSlot]];
+    }),
+  );
+  const support =
+    state.support_skill
+    && (
+      !state.support_skill.session_id
+      || state.support_skill.session_id === sessionId
+    )
+      ? {
+          ...state.support_skill,
+          session_id: sessionId,
+        }
+      : null;
+  return {
+    version: 2,
+    generation: normalizedGeneration(state.generation),
+    seen_intents: normalizeSeenIntents(state.seen_intents),
+    active_skills: activeSkills,
+    support_skill: support,
+  };
+}
+
+function sanitizeLedgerForSession(
+  ledger: SkillSessionLedger,
+  sessionId: string,
+): SkillSessionLedger {
+  return ledgerFromState(
+    sanitizeSessionLedger(stateFromLedger(ledger), sessionId),
+  );
+}
+
+function comparableLedger(ledger: SkillSessionLedger): unknown {
+  return {
+    generation: ledger.generation,
+    seen_intents: ledger.seen_intents,
+    active_skills: Object.fromEntries(
+      Object.entries(ledger.active_skills)
+        .sort(([left], [right]) => left.localeCompare(right)),
+    ),
+    support_skill: ledger.support_skill ?? null,
+  };
+}
+
+function ledgersEqual(
+  left: SkillSessionLedger | undefined,
+  right: SkillSessionLedger | undefined,
+): boolean {
+  if (!left || !right) return left === right;
+  return JSON.stringify(comparableLedger(left))
+    === JSON.stringify(comparableLedger(right));
+}
+
+function selectAuthoritativeLedger(
+  rootLedger: SkillSessionLedger | undefined,
+  sessionLedger: SkillSessionLedger | undefined,
+  tombstoneGeneration?: number,
+): SkillSessionLedger {
+  const highestLiveGeneration = Math.max(
+    rootLedger?.generation ?? 0,
+    sessionLedger?.generation ?? 0,
+  );
+  if (
+    tombstoneGeneration !== undefined
+    && tombstoneGeneration >= highestLiveGeneration
+  ) {
+    return {
+      generation: tombstoneGeneration,
+      seen_intents: [],
+      active_skills: {},
+      support_skill: null,
+    };
+  }
+  if (!rootLedger) return sessionLedger ?? normalizeSessionLedger(null);
+  if (!sessionLedger) return rootLedger;
+  if (rootLedger.generation > sessionLedger.generation) return rootLedger;
+  return sessionLedger;
+}
+
+function slotProjectionTime(slot: ActiveSkillSlot): number {
+  const timestamps = isWorkflowSkillCompleted(slot)
+    ? [slot.completed_at]
+    : [slot.started_at, slot.last_confirmed_at];
+  return timestamps.reduce((latest, timestamp) => {
+    const parsed = typeof timestamp === 'string'
+      ? Date.parse(timestamp)
+      : Number.NaN;
+    return Number.isFinite(parsed) ? Math.max(latest, parsed) : latest;
+  }, Number.NEGATIVE_INFINITY);
+}
+
+function preferProjectedSlot(
+  current: ActiveSkillSlot | undefined,
+  candidate: ActiveSkillSlot,
+): ActiveSkillSlot {
+  if (!current) return candidate;
+  const currentTime = slotProjectionTime(current);
+  const candidateTime = slotProjectionTime(candidate);
+  if (candidateTime !== currentTime) {
+    return candidateTime > currentTime ? candidate : current;
+  }
+
+  const currentCompleted = isWorkflowSkillCompleted(current);
+  const candidateCompleted = isWorkflowSkillCompleted(candidate);
+  if (currentCompleted !== candidateCompleted) {
+    return candidateCompleted ? current : candidate;
+  }
+
+  return candidate.session_id.localeCompare(current.session_id) > 0
+    ? candidate
+    : current;
+}
+
+function aggregateRootProjection(
+  root: SkillActiveStateV2,
+): SkillActiveStateV2 {
+  const ledgers = [
+    ...(root.global_ledger
+      ? [{ key: '', ledger: root.global_ledger }]
+      : []),
+    ...Object.entries(root.session_ledgers ?? {}).map(
+      ([key, ledger]) => ({ key, ledger }),
+    ),
+  ].sort((left, right) => left.key.localeCompare(right.key));
+  const activeSkills: Record<string, ActiveSkillSlot> = {};
+  let supportSkill: SkillActiveState | null = null;
+  for (const { ledger } of ledgers) {
+    for (const [skillName, slot] of Object.entries(ledger.active_skills)) {
+      activeSkills[skillName] = preferProjectedSlot(
+        activeSkills[skillName],
+        slot,
+      );
+    }
+    if (ledger.support_skill) {
+      supportSkill = ledger.support_skill;
+    }
+  }
+  return {
+    ...root,
+    version: 2,
+    generation: ledgers.reduce(
+      (highest, { ledger }) => Math.max(highest, ledger.generation),
+      Math.max(
+        normalizedGeneration(root.generation),
+        ...Object.values(root.session_tombstones ?? {}),
+      ),
+    ),
+    seen_intents: root.global_ledger?.seen_intents ?? [],
+    active_skills: activeSkills,
+    support_skill: supportSkill,
+  };
+}
+
+function appendSeenIntent(
+  seenIntents: readonly string[],
+  intentId: string | undefined,
+): string[] {
+  if (!intentId) return normalizeSeenIntents(seenIntents);
+  return normalizeSeenIntents([
+    ...seenIntents.filter((candidate) => candidate !== intentId),
+    intentId,
+  ]);
+}
+
+function writeSkillLedgerFile(
+  path: string,
+  state: SkillActiveStateV2 | null,
+  sessionId?: string,
+): boolean {
+  if (!state || isEmptyV2(state)) {
+    if (!existsSync(path)) return true;
+    try {
+      unlinkSync(path);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    atomicWriteJsonSync(path, {
+      ...state,
+      version: 2,
+      _meta: {
+        written_at: new Date().toISOString(),
+        mode: SKILL_ACTIVE_STATE_MODE,
+        generation: normalizedGeneration(state.generation),
+        ...(sessionId ? { sessionId } : {}),
+      },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface SessionLedgerCommitObservation {
+  rootState: SkillActiveStateV2;
+  rootLedger: SkillSessionLedger | undefined;
+  sessionLedger: SkillSessionLedger | undefined;
+  tombstoneGeneration: number | undefined;
+}
+
+function observeSessionLedgerCommit(
+  rootPath: string,
+  sessionPath: string,
+  sessionId: string,
+): SessionLedgerCommitObservation {
+  const rootRaw = readRawFromPath(rootPath);
+  const rootState = migrateLegacyRootLedger(
+    normalizeToV2(rootRaw),
+    rootRaw,
+  );
+  const sessionRaw = readRawFromPath(sessionPath);
+  return {
+    rootState,
+    rootLedger: rootState.session_ledgers?.[sessionId],
+    tombstoneGeneration: rootState.session_tombstones?.[sessionId],
+    sessionLedger: sessionRaw === null
+      ? undefined
+      : ledgerFromState(sanitizeSessionLedger(
+          normalizeToV2(sessionRaw),
+          sessionId,
+        )),
+  };
+}
+
+function comparableRootState(state: SkillActiveStateV2): unknown {
+  const sessionLedgers = Object.fromEntries(
+    Object.entries(state.session_ledgers ?? {})
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([sessionId, ledger]) => [
+        sessionId,
+        comparableLedger(ledger),
+      ]),
+  );
+  return {
+    generation: normalizedGeneration(state.generation),
+    seen_intents: normalizeSeenIntents(state.seen_intents),
+    active_skills: Object.fromEntries(
+      Object.entries(state.active_skills)
+        .sort(([left], [right]) => left.localeCompare(right)),
+    ),
+    support_skill: state.support_skill ?? null,
+    global_ledger: state.global_ledger
+      ? comparableLedger(state.global_ledger)
+      : null,
+    session_ledgers: sessionLedgers,
+    session_tombstones: Object.fromEntries(
+      Object.entries(state.session_tombstones ?? {})
+        .sort(([left], [right]) => left.localeCompare(right)),
+    ),
+  };
+}
+
+function normalizedRootState(raw: unknown): SkillActiveStateV2 {
+  return aggregateRootProjection(
+    migrateLegacyRootLedger(normalizeToV2(raw), raw),
+  );
+}
+
+function rootStatesEqual(
+  left: SkillActiveStateV2,
+  right: SkillActiveStateV2,
+): boolean {
+  return JSON.stringify(comparableRootState(left))
+    === JSON.stringify(comparableRootState(right));
+}
+
+export interface MutateSkillActiveStateLockedOptions {
+  intentId?: string;
+  rootState?: SkillActiveStateV2 | null;
+}
+
+export interface MutateSkillActiveStateLockedResult {
+  status: 'written' | 'skipped' | 'repaired' | 'failed';
+  state?: SkillActiveStateV2;
+}
+
+/**
+ * The single owner for skill-ledger read-modify-write transactions.
+ * Session-local state never borrows root aggregate fields. The root retains a
+ * per-session repair copy with a matching generation and bounded intent set.
+ */
+export function mutateSkillActiveStateLocked(
+  directory: string,
+  sessionId: string | undefined,
+  mutate: (current: SkillActiveStateV2) => SkillActiveStateV2,
+  options: MutateSkillActiveStateLockedOptions = {},
+): MutateSkillActiveStateLockedResult {
+  if (sessionId && !SESSION_ID_PATTERN.test(sessionId)) {
+    return { status: 'failed' };
+  }
+  const rootPath = resolveStatePath('skill-active', directory);
+  try {
+    const locked = withStateFileMutationLock(rootPath, () => {
+      const rootRaw = readRawFromPath(rootPath);
+      let root = migrateLegacyRootLedger(normalizeToV2(rootRaw), rootRaw);
+
+      if (!sessionId) {
+        const currentLedger =
+          root.global_ledger ?? normalizeSessionLedger(null);
+        const current = stateFromLedger(currentLedger);
+        const duplicate =
+          !!options.intentId
+          && currentLedger.seen_intents.includes(options.intentId);
+        if (duplicate && options.rootState === undefined) {
+          return { status: 'skipped' as const, state: current };
+        }
+        const mutationResult = duplicate ? current : mutate(current);
+        const explicitNoop = !duplicate && mutationResult === current;
+        if (explicitNoop && options.rootState === undefined) {
+          return { status: 'skipped' as const, state: current };
+        }
+        const mutated = duplicate || explicitNoop
+          ? current
+          : normalizeToV2(mutationResult);
+        const contentChanged = !ledgersEqual(
+          currentLedger,
+          ledgerFromState({
+            ...mutated,
+            generation: currentLedger.generation,
+            seen_intents: currentLedger.seen_intents,
+          }),
+        );
+        if (
+          !contentChanged
+          && !options.intentId
+          && options.rootState === undefined
+        ) {
+          return {
+            status: 'skipped' as const,
+            state: current,
+          };
+        }
+        let nextLedger: SkillSessionLedger = currentLedger;
+        if (!duplicate && !explicitNoop && contentChanged) {
+          const generation = nextSkillGeneration(currentLedger.generation);
+          if (generation === null) {
+            return { status: 'failed' as const };
+          }
+          nextLedger = {
+            ...ledgerFromState(mutated),
+            generation,
+            seen_intents: appendSeenIntent(
+              currentLedger.seen_intents,
+              options.intentId,
+            ),
+          };
+        }
+        const globalIsEmpty =
+          Object.keys(nextLedger.active_skills).length === 0
+          && !nextLedger.support_skill
+          && nextLedger.seen_intents.length === 0;
+        const mutatedRoot = aggregateRootProjection({
+          ...root,
+          global_ledger: globalIsEmpty ? undefined : nextLedger,
+        });
+        const desiredRoot =
+          options.rootState === undefined
+            ? mutatedRoot
+            : options.rootState === null
+              ? null
+              : normalizedRootState(options.rootState);
+        const writeSucceeded = writeSkillLedgerFile(
+          rootPath,
+          desiredRoot && !isEmptyV2(desiredRoot) ? desiredRoot : null,
+        );
+        const persistedRead = inspectSkillStateFile(rootPath);
+        const committed = desiredRoot === null || isEmptyV2(desiredRoot)
+          ? persistedRead.status === 'missing'
+          : persistedRead.status === 'valid'
+            && rootStatesEqual(
+              normalizedRootState(persistedRead.raw),
+              desiredRoot,
+            );
+        if (!committed) {
+          return { status: 'failed' as const };
+        }
+        return {
+          status:
+            duplicate || explicitNoop || !writeSucceeded
+              ? 'repaired' as const
+              : 'written' as const,
+          state: stateFromLedger(nextLedger),
+        };
+      }
+
+      const sessionPath = resolveSessionStatePath(
+        'skill-active',
+        sessionId,
+        directory,
+      );
+      const sessionExists = existsSync(sessionPath);
+      const rootLedger = root.session_ledgers?.[sessionId];
+      const sessionRaw = sessionExists
+        ? readRawFromPath(sessionPath)
+        : null;
+      const sessionLedger = sessionRaw !== null
+        ? ledgerFromState(sanitizeSessionLedger(
+            normalizeToV2(sessionRaw),
+            sessionId,
+          ))
+        : undefined;
+      const authoritative = selectAuthoritativeLedger(
+        rootLedger,
+        sessionLedger,
+        root.session_tombstones?.[sessionId],
+      );
+      const copiesMatch =
+        ledgersEqual(rootLedger, authoritative)
+        && ledgersEqual(sessionLedger, authoritative);
+      const current = sanitizeSessionLedger(
+        stateFromLedger(authoritative),
+        sessionId,
+      );
+      const duplicate =
+        !!options.intentId
+        && authoritative.seen_intents.includes(options.intentId);
+      const mutationResult = duplicate ? current : mutate(current);
+      const explicitNoop = !duplicate && mutationResult === current;
+      const mutated = duplicate || explicitNoop
+        ? current
+        : sanitizeSessionLedger(normalizeToV2(mutationResult), sessionId);
+      const candidateLedger = ledgerFromState({
+        ...mutated,
+        generation: authoritative.generation,
+        seen_intents: authoritative.seen_intents,
+      });
+      const contentChanged = !ledgersEqual(
+        authoritative,
+        candidateLedger,
+      );
+      if (
+        !contentChanged
+        && !options.intentId
+        && options.rootState === undefined
+        && (
+          isLegacyScalarSkillState(rootRaw)
+          || isLegacyScalarSkillState(sessionRaw)
+        )
+      ) {
+        return { status: 'skipped' as const, state: current };
+      }
+      if (
+        (duplicate || explicitNoop)
+        && copiesMatch
+        && options.rootState === undefined
+      ) {
+        return { status: 'skipped' as const, state: current };
+      }
+      if (
+        !contentChanged
+        && !options.intentId
+        && copiesMatch
+        && options.rootState === undefined
+      ) {
+        return { status: 'skipped' as const, state: current };
+      }
+
+      let nextLedger: SkillSessionLedger = authoritative;
+      if (!duplicate && !explicitNoop) {
+        const generation = nextSkillGeneration(Math.max(
+          rootLedger?.generation ?? 0,
+          sessionLedger?.generation ?? 0,
+          root.session_tombstones?.[sessionId] ?? 0,
+        ));
+        if (generation === null) {
+          return { status: 'failed' as const };
+        }
+        nextLedger = {
+          ...ledgerFromState(mutated),
+          generation,
+          seen_intents: appendSeenIntent(
+            authoritative.seen_intents,
+            options.intentId,
+          ),
+        };
+      }
+      const sessionLedgers = {
+        ...(root.session_ledgers ?? {}),
+      };
+      const sessionTombstones = {
+        ...(root.session_tombstones ?? {}),
+      };
+      const localIsEmpty =
+        Object.keys(nextLedger.active_skills).length === 0
+        && !nextLedger.support_skill
+        && nextLedger.seen_intents.length === 0;
+      if (localIsEmpty) {
+        delete sessionLedgers[sessionId];
+        if (!duplicate && !explicitNoop) delete sessionTombstones[sessionId];
+      } else {
+        sessionLedgers[sessionId] = nextLedger;
+        delete sessionTombstones[sessionId];
+      }
+
+      root = aggregateRootProjection({
+        ...root,
+        session_ledgers:
+          Object.keys(sessionLedgers).length > 0
+            ? sessionLedgers
+            : undefined,
+        session_tombstones:
+          Object.keys(sessionTombstones).length > 0
+            ? sessionTombstones
+            : undefined,
+      });
+      const nextSessionState = localIsEmpty
+        ? null
+        : stateFromLedger(nextLedger);
+      const desiredRoot =
+        options.rootState === undefined
+          ? root
+          : options.rootState === null
+            ? null
+            : normalizedRootState(options.rootState);
+      const expectedLedger = localIsEmpty ? undefined : nextLedger;
+      let authoritativeCommitVisible = false;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const rootWriteSucceeded = writeSkillLedgerFile(
+          rootPath,
+          desiredRoot && !isEmptyV2(desiredRoot) ? desiredRoot : null,
+        );
+        const sessionWriteSucceeded = writeSkillLedgerFile(
+          sessionPath,
+          nextSessionState,
+          sessionId,
+        );
+        const observation = observeSessionLedgerCommit(
+          rootPath,
+          sessionPath,
+          sessionId,
+        );
+        const sessionMatches = ledgersEqual(
+          observation.sessionLedger,
+          expectedLedger,
+        );
+        const rootMatches =
+          options.rootState === null
+            ? !existsSync(rootPath)
+            : options.rootState !== undefined && desiredRoot
+              ? rootStatesEqual(observation.rootState, desiredRoot)
+              : ledgersEqual(observation.rootLedger, expectedLedger);
+        if (rootMatches && sessionMatches) {
+          return {
+            status:
+              duplicate
+              || explicitNoop
+              || (!copiesMatch && !contentChanged)
+              || !rootWriteSucceeded
+              || !sessionWriteSucceeded
+                ? 'repaired' as const
+                : 'written' as const,
+            state: nextSessionState ?? emptySkillActiveStateV2(),
+          };
+        }
+        if (expectedLedger) {
+          authoritativeCommitVisible ||= ledgersEqual(
+            selectAuthoritativeLedger(
+              observation.rootLedger,
+              observation.sessionLedger,
+              observation.tombstoneGeneration,
+            ),
+            expectedLedger,
+          );
+        } else if (options.rootState !== undefined) {
+          authoritativeCommitVisible ||= sessionMatches || rootMatches;
+        } else {
+          const observed = selectAuthoritativeLedger(
+            observation.rootLedger,
+            observation.sessionLedger,
+            observation.tombstoneGeneration,
+          );
+          authoritativeCommitVisible ||=
+            Object.keys(observed.active_skills).length === 0
+            && !observed.support_skill
+            && observed.seen_intents.length === 0
+            && (
+              observation.tombstoneGeneration !== undefined
+              || (
+                observation.rootLedger === undefined
+                && observation.sessionLedger === undefined
+              )
+            );
+        }
+      }
+      return authoritativeCommitVisible
+        ? {
+            status: 'repaired' as const,
+            state: nextSessionState ?? emptySkillActiveStateV2(),
+          }
+        : { status: 'failed' as const };
+    });
+    return locked.acquired && locked.value
+      ? locked.value
+      : { status: 'failed' };
+  } catch {
+    return { status: 'failed' };
+  }
+}
 
 /**
  * Read the v2 mixed-schema workflow ledger, normalizing legacy scalar state
@@ -483,43 +1432,35 @@ export function readSkillActiveStateNormalized(
   directory: string,
   sessionId?: string,
 ): SkillActiveStateV2 {
-  const rootPath = resolveStatePath('skill-active', directory);
-  const sessionPath = sessionId
-    ? resolveSessionStatePath('skill-active', sessionId, directory)
-    : null;
-
-  const sessionExists = !!(sessionPath && existsSync(sessionPath));
-  const rootExists = existsSync(rootPath);
-
-  const sessionV2 = sessionExists ? normalizeToV2(readRawFromPath(sessionPath!)) : null;
-  const rootV2 = rootExists ? normalizeToV2(readRawFromPath(rootPath)) : null;
-
-  // Divergence detection — best-effort; logged but non-fatal.
-  if (sessionV2 && rootV2 && sessionId) {
-    for (const [name, sessSlot] of Object.entries(sessionV2.active_skills)) {
-      const rootSlot = rootV2.active_skills[name];
-      if (!rootSlot) continue;
-      if (sessSlot.session_id !== sessionId) continue;
-      if (JSON.stringify(sessSlot) !== JSON.stringify(rootSlot)) {
-        // Non-fatal — next writeSkillActiveStateCopies() call will re-sync.
-        console.warn(
-          `[skill-active] copy drift detected for slot "${name}" in session ${sessionId}; ` +
-          'next mutation will reconcile via writeSkillActiveStateCopies().',
-        );
-        break;
-      }
-    }
+  if (sessionId && !SESSION_ID_PATTERN.test(sessionId)) {
+    return emptySkillActiveStateV2();
   }
-
-  // Session copy authoritative for session-local reads.
-  if (sessionV2) return sessionV2;
-
-  // sessionId provided but no session copy — do NOT fall back to root to
-  // prevent cross-session state leakage (#456).
-  if (sessionId) return emptySkillActiveStateV2();
-
-  // Legacy/global path: read root.
-  return rootV2 ?? emptySkillActiveStateV2();
+  const rootPath = resolveStatePath('skill-active', directory);
+  const rootRaw = readRawFromPath(rootPath);
+  const root = migrateLegacyRootLedger(normalizeToV2(rootRaw), rootRaw);
+  if (!sessionId) {
+    return aggregateRootProjection(root);
+  }
+  const sessionPath = resolveSessionStatePath(
+    'skill-active',
+    sessionId,
+    directory,
+  );
+  const sessionLedger = existsSync(sessionPath)
+    ? ledgerFromState(sanitizeSessionLedger(
+        normalizeToV2(readRawFromPath(sessionPath)),
+        sessionId,
+      ))
+    : undefined;
+  const rootLedger = root.session_ledgers?.[sessionId];
+  return sanitizeSessionLedger(
+    stateFromLedger(selectAuthoritativeLedger(
+      rootLedger,
+      sessionLedger,
+      root.session_tombstones?.[sessionId],
+    )),
+    sessionId,
+  );
 }
 
 /**
@@ -539,48 +1480,378 @@ export function writeSkillActiveStateCopies(
   sessionId?: string,
   options?: WriteSkillActiveStateCopiesOptions,
 ): boolean {
-  const rootPath = resolveStatePath('skill-active', directory);
-  const sessionPath = sessionId
-    ? resolveSessionStatePath('skill-active', sessionId, directory)
-    : null;
+  const result = mutateSkillActiveStateLocked(
+    directory,
+    sessionId,
+    () => nextState,
+    {
+      ...(options?.rootState !== undefined
+        ? { rootState: options.rootState }
+        : {}),
+    },
+  );
+  return result.status !== 'failed';
+}
 
-  // Root defaults to the same payload as session. Explicit `null` deletes root.
-  const rootState: SkillActiveStateV2 | null =
-    options?.rootState === undefined ? nextState : options.rootState;
+interface SkillStateLocation {
+  rootPath: string;
+  sessionPath?: string;
+}
 
-  const writeOrRemove = (filePath: string, payload: SkillActiveStateV2 | null): boolean => {
-    const shouldRemove = payload === null || isEmptyV2(payload);
-    if (shouldRemove) {
-      if (!existsSync(filePath)) return true;
-      try {
-        unlinkSync(filePath);
-        return true;
-      } catch {
-        return false;
-      }
-    }
+function normalizedPathKey(path: string): string {
+  let canonicalPath = path;
+  try {
+    canonicalPath = realpathSync.native(path);
+  } catch {
     try {
-      const envelope: Record<string, unknown> = {
-        ...payload,
-        version: 2,
-        _meta: {
-          written_at: new Date().toISOString(),
-          mode: SKILL_ACTIVE_STATE_MODE,
-          ...(sessionId ? { sessionId } : {}),
-        },
-      };
-      atomicWriteJsonSync(filePath, envelope);
-      return true;
+      canonicalPath = join(
+        realpathSync.native(dirname(path)),
+        path.slice(dirname(path).length + 1),
+      );
     } catch {
-      return false;
+      canonicalPath = path;
     }
-  };
-
-  let ok = writeOrRemove(rootPath, rootState);
-  if (sessionPath) {
-    ok = writeOrRemove(sessionPath, nextState) && ok;
   }
-  return ok;
+  const normalizedPath = normalize(resolve(canonicalPath));
+  return process.platform === 'win32'
+    ? normalizedPath.toLowerCase()
+    : normalizedPath;
+}
+
+function skillStateLocations(
+  directory: string,
+  sessionId?: string,
+): SkillStateLocation[] {
+  const canonicalRoot = resolveStatePath('skill-active', directory);
+  const worktreeRoot = resolveToWorktreeRoot(directory);
+  const localRoot = join(
+    worktreeRoot,
+    '.omc',
+    'state',
+    SKILL_ACTIVE_STATE_FILE,
+  );
+  const locations = new Map<string, SkillStateLocation>();
+  for (const rootPath of [canonicalRoot, localRoot]) {
+    const key = normalizedPathKey(rootPath);
+    locations.set(key, {
+      rootPath,
+      ...(sessionId
+        ? {
+            sessionPath: rootPath === canonicalRoot
+              ? resolveSessionStatePath(
+                  'skill-active',
+                  sessionId,
+                  directory,
+                )
+              : join(
+                  dirname(rootPath),
+                  'sessions',
+                  sessionId,
+                  SKILL_ACTIVE_STATE_FILE,
+                ),
+          }
+        : {}),
+    });
+  }
+  return [...locations.values()]
+    .sort((left, right) => left.rootPath.localeCompare(right.rootPath));
+}
+
+function withSkillStateOwnerLocks<T>(
+  rootPaths: readonly string[],
+  callback: () => T,
+): { acquired: boolean; value: T | undefined } {
+  const unique = [...new Map(
+    rootPaths.map((rootPath) => [normalizedPathKey(rootPath), rootPath]),
+  ).values()].sort((left, right) => left.localeCompare(right));
+  const acquireAt = (
+    index: number,
+  ): { acquired: boolean; value: T | undefined } => {
+    if (index >= unique.length) {
+      return { acquired: true, value: callback() };
+    }
+    const locked = withStateFileMutationLock(
+      unique[index],
+      () => acquireAt(index + 1),
+    );
+    return locked.acquired && locked.value?.acquired
+      ? locked.value
+      : { acquired: false, value: undefined };
+  };
+  return acquireAt(0);
+}
+
+function removeFileVerified(path: string): boolean {
+  if (!existsSync(path)) return true;
+  if (
+    process.env.OMC_TEST_SKILL_CLEAR_UNLINK_FAILURE_PATH
+    && normalizedPathKey(
+      process.env.OMC_TEST_SKILL_CLEAR_UNLINK_FAILURE_PATH,
+    ) === normalizedPathKey(path)
+  ) {
+    return false;
+  }
+  try {
+    unlinkSync(path);
+  } catch {
+    return false;
+  }
+  return !existsSync(path);
+}
+
+type SessionDirectoryRead =
+  | { status: 'missing'; sessionIds: [] }
+  | { status: 'valid'; sessionIds: string[] }
+  | { status: 'failed'; sessionIds: [] };
+
+function sessionIdsAtRoot(rootPath: string): SessionDirectoryRead {
+  const sessionsPath = join(dirname(rootPath), 'sessions');
+  try {
+    return {
+      status: 'valid',
+      sessionIds: readdirSync(sessionsPath, { withFileTypes: true })
+        .filter(
+          (entry) =>
+            entry.isDirectory() && SESSION_ID_PATTERN.test(entry.name),
+        )
+        .map((entry) => entry.name),
+    };
+  } catch (error) {
+    return (
+      error
+      && typeof error === 'object'
+      && 'code' in error
+      && (error as { code?: string }).code === 'ENOENT'
+    )
+      ? { status: 'missing', sessionIds: [] }
+      : { status: 'failed', sessionIds: [] };
+  }
+}
+
+/** Clear every root and session skill ledger under the shared owner lock. */
+export function clearAllSkillActiveStateLocked(directory: string): boolean {
+  try {
+    const locations = skillStateLocations(directory);
+    const locked = withSkillStateOwnerLocks(
+      locations.map(({ rootPath }) => rootPath),
+      () => {
+        const preflight = locations.map(({ rootPath }) => ({
+          rootPath,
+          rootRead: inspectSkillStateFile(rootPath),
+          sessions: sessionIdsAtRoot(rootPath),
+        }));
+        if (preflight.some(
+          ({ rootRead, sessions }) =>
+            rootRead.status === 'corrupt'
+            || sessions.status === 'failed',
+        )) {
+          return false;
+        }
+        const sessionReads = preflight.flatMap(
+          ({ rootPath, sessions }) => sessions.sessionIds.map((sessionId) => {
+            const sessionPath = join(
+              dirname(rootPath),
+              'sessions',
+              sessionId,
+              SKILL_ACTIVE_STATE_FILE,
+            );
+            return {
+              sessionPath,
+              read: inspectSkillStateFile(sessionPath),
+            };
+          }),
+        );
+        if (sessionReads.some(({ read }) => read.status === 'corrupt')) {
+          return false;
+        }
+
+        for (const { sessionPath } of sessionReads) {
+          if (!removeFileVerified(sessionPath)) return false;
+        }
+        for (const { rootPath } of preflight) {
+          if (!removeFileVerified(rootPath)) return false;
+        }
+        return preflight.every(({ rootPath }) => {
+          if (existsSync(rootPath)) return false;
+          const sessions = sessionIdsAtRoot(rootPath);
+          return sessions.status !== 'failed'
+            && sessions.sessionIds.every((sessionId) =>
+              !existsSync(join(
+                dirname(rootPath),
+                'sessions',
+                sessionId,
+                SKILL_ACTIVE_STATE_FILE,
+              )),
+            );
+        });
+      }
+    );
+    return locked.acquired && locked.value === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Clear one session ledger and both repair copies under the root owner lock. */
+export function clearSkillActiveSessionStateLocked(
+  directory: string,
+  sessionId: string,
+): boolean {
+  if (!SESSION_ID_PATTERN.test(sessionId)) return false;
+  try {
+    const locations = skillStateLocations(directory, sessionId);
+    const locked = withSkillStateOwnerLocks(
+      locations.map(({ rootPath }) => rootPath),
+      () => {
+        const preflight = locations.map(({ rootPath, sessionPath }) => ({
+          rootPath,
+          sessionPath: sessionPath!,
+          rootRead: inspectSkillStateFile(rootPath),
+          sessionRead: sessionPath
+            ? inspectSkillStateFile(sessionPath)
+            : { status: 'missing' as const },
+        }));
+        if (preflight.some(
+          ({ rootRead, sessionRead }) =>
+            rootRead.status === 'corrupt'
+            || sessionRead.status === 'corrupt',
+        )) {
+          return false;
+        }
+
+        const observed = preflight.map((entry) => {
+          const root = entry.rootRead.status === 'valid'
+            ? migrateLegacyRootLedger(
+                normalizeToV2(entry.rootRead.raw),
+                entry.rootRead.raw,
+              )
+            : emptySkillActiveStateV2();
+          const sessionLedger = entry.sessionRead.status === 'valid'
+            ? ledgerFromState(sanitizeSessionLedger(
+                normalizeToV2(entry.sessionRead.raw),
+                sessionId,
+              ))
+            : undefined;
+          return {
+            ...entry,
+            root,
+            rootLedger: root.session_ledgers?.[sessionId],
+            sessionLedger,
+            tombstoneGeneration: root.session_tombstones?.[sessionId],
+          };
+        });
+        const hasState = observed.some((entry) =>
+          entry.rootLedger !== undefined
+          || entry.sessionLedger !== undefined
+          || entry.tombstoneGeneration !== undefined,
+        );
+        if (!hasState) return true;
+
+        const clearGeneration = nextSkillGeneration(Math.max(
+          ...observed.flatMap((entry) => [
+            entry.rootLedger?.generation ?? 0,
+            entry.sessionLedger?.generation ?? 0,
+            entry.tombstoneGeneration ?? 0,
+          ]),
+        ));
+        if (clearGeneration === null) return false;
+
+        for (const entry of observed) {
+          if (
+            entry.rootLedger === undefined
+            && entry.sessionLedger === undefined
+            && entry.tombstoneGeneration === undefined
+          ) {
+            continue;
+          }
+          const sessionLedgers = { ...(entry.root.session_ledgers ?? {}) };
+          const sessionTombstones = {
+            ...(entry.root.session_tombstones ?? {}),
+            [sessionId]: clearGeneration,
+          };
+          delete sessionLedgers[sessionId];
+          const stagedRoot = aggregateRootProjection({
+            ...entry.root,
+            session_ledgers:
+              Object.keys(sessionLedgers).length > 0
+                ? sessionLedgers
+                : undefined,
+            session_tombstones: sessionTombstones,
+          });
+          if (!writeSkillLedgerFile(entry.rootPath, stagedRoot)) return false;
+          const stagedRead = inspectSkillStateFile(entry.rootPath);
+          if (
+            stagedRead.status !== 'valid'
+            || normalizedRootState(stagedRead.raw)
+              .session_tombstones?.[sessionId] !== clearGeneration
+          ) {
+            return false;
+          }
+        }
+
+        for (const entry of observed) {
+          if (!removeFileVerified(entry.sessionPath)) {
+            continue;
+          }
+          const rootRead = inspectSkillStateFile(entry.rootPath);
+          if (rootRead.status !== 'valid') continue;
+          const root = normalizedRootState(rootRead.raw);
+          if (root.session_tombstones?.[sessionId] !== clearGeneration) {
+            continue;
+          }
+          const sessionTombstones = { ...(root.session_tombstones ?? {}) };
+          delete sessionTombstones[sessionId];
+          const cleanedRoot = aggregateRootProjection({
+            ...root,
+            session_tombstones:
+              Object.keys(sessionTombstones).length > 0
+                ? sessionTombstones
+                : undefined,
+          });
+          writeSkillLedgerFile(
+            entry.rootPath,
+            isEmptyV2(cleanedRoot) ? null : cleanedRoot,
+          );
+        }
+
+        return observed.every((entry) => {
+          const rootRead = inspectSkillStateFile(entry.rootPath);
+          const sessionRead = inspectSkillStateFile(entry.sessionPath);
+          if (
+            rootRead.status === 'corrupt'
+            || sessionRead.status === 'corrupt'
+          ) {
+            return false;
+          }
+          const root = rootRead.status === 'valid'
+            ? normalizedRootState(rootRead.raw)
+            : emptySkillActiveStateV2();
+          const rootLedger = root.session_ledgers?.[sessionId];
+          const sessionLedger = sessionRead.status === 'valid'
+            ? ledgerFromState(sanitizeSessionLedger(
+                normalizeToV2(sessionRead.raw),
+                sessionId,
+              ))
+            : undefined;
+          const tombstoneGeneration =
+            root.session_tombstones?.[sessionId];
+          if (!rootLedger && !sessionLedger) return true;
+          const authoritative = selectAuthoritativeLedger(
+            rootLedger,
+            sessionLedger,
+            tombstoneGeneration,
+          );
+          return tombstoneGeneration !== undefined
+            && Object.keys(authoritative.active_skills).length === 0
+            && !authoritative.support_skill
+            && authoritative.seen_intents.length === 0;
+        });
+      },
+    );
+    return locked.acquired && locked.value === true;
+  } catch {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -628,39 +1899,120 @@ export function writeSkillActiveState(
   const config = PROTECTION_CONFIGS[protection];
   const now = new Date().toISOString();
   const normalized = skillName.toLowerCase().replace(/^oh-my-claudecode:/, '');
+  let support: SkillActiveState | null = null;
+  const result = mutateSkillActiveStateLocked(
+    directory,
+    sessionId,
+    (current) => {
+      const existing = current.support_skill;
+      if (
+        existing
+        && existing.active
+        && existing.skill_name !== normalized
+      ) {
+        return current;
+      }
+      support = {
+        active: true,
+        skill_name: normalized,
+        session_id: sessionId,
+        started_at: now,
+        last_checked_at: now,
+        reinforcement_count: 0,
+        max_reinforcements: config.maxReinforcements,
+        stale_ttl_ms: config.staleTtlMs,
+      };
+      return { ...current, support_skill: support };
+    },
+  );
+  if (result.status === 'failed') return null;
+  const committed = result.state?.support_skill;
+  return committed?.active && committed.skill_name === normalized
+    ? committed
+    : null;
+}
 
-  const existingV2 = readSkillActiveStateNormalized(directory, sessionId);
-  const existing = existingV2.support_skill;
+export interface UpsertSupportSkillLockedOptions {
+  observedAt?: string;
+  intentId?: string;
+}
 
-  // Nesting guard: a DIFFERENT support skill already owns the slot — skip.
-  // Same skill re-invocation is allowed (idempotent refresh).
-  if (existing && existing.active && existing.skill_name !== normalized) {
-    return null;
-  }
+export interface UpsertSupportSkillLockedResult {
+  status: 'written' | 'skipped' | 'repaired' | 'failed';
+  state?: SkillActiveState;
+}
 
-  const support: SkillActiveState = {
-    active: true,
-    skill_name: normalized,
-    session_id: sessionId,
-    started_at: now,
-    last_checked_at: now,
-    reinforcement_count: 0,
-    max_reinforcements: config.maxReinforcements,
-    stale_ttl_ms: config.staleTtlMs,
+/**
+ * Locked semantic update for the support_skill branch. The full v2 ledger is
+ * re-read under the root owner lock, workflow slots are preserved, and root
+ * plus session copies are written together through the canonical copier.
+ */
+export function upsertSupportSkillActiveStateLocked(
+  directory: string,
+  skillName: string,
+  sessionId?: string,
+  rawSkillName?: string,
+  options: UpsertSupportSkillLockedOptions = {},
+): UpsertSupportSkillLockedResult {
+  const protection = getSkillProtection(skillName, rawSkillName);
+  if (protection === 'none') return { status: 'skipped' };
+
+  const normalized = skillName
+    .toLowerCase()
+    .replace(/^oh-my-claudecode:/, '');
+  const config = PROTECTION_CONFIGS[protection];
+  const observedAt = options.observedAt ?? new Date().toISOString();
+  const result = mutateSkillActiveStateLocked(
+    directory,
+    sessionId,
+    (current) => {
+      const existing = current.support_skill;
+      if (
+        existing?.active
+        && existing.skill_name !== normalized
+      ) {
+        return current;
+      }
+      const support: SkillActiveState = {
+        active: true,
+        skill_name: normalized,
+        session_id: sessionId,
+        started_at: observedAt,
+        last_checked_at: observedAt,
+        reinforcement_count: 0,
+        max_reinforcements: config.maxReinforcements,
+        stale_ttl_ms: config.staleTtlMs,
+        ...(options.intentId ? { last_intent_id: options.intentId } : {}),
+      };
+      return {
+        ...current,
+        support_skill: support,
+      };
+    },
+    {
+      ...(options.intentId ? { intentId: options.intentId } : {}),
+    },
+  );
+  return {
+    status: result.status,
+    ...(result.state?.support_skill
+      ? { state: result.state.support_skill }
+      : {}),
   };
-
-  const nextV2: SkillActiveStateV2 = { ...existingV2, support_skill: support };
-  const ok = writeSkillActiveStateCopies(directory, nextV2, sessionId);
-  return ok ? support : null;
 }
 
 /**
  * Clear support-skill state while preserving workflow slots.
  */
 export function clearSkillActiveState(directory: string, sessionId?: string): boolean {
-  const existingV2 = readSkillActiveStateNormalized(directory, sessionId);
-  const nextV2: SkillActiveStateV2 = { ...existingV2, support_skill: null };
-  return writeSkillActiveStateCopies(directory, nextV2, sessionId);
+  return mutateSkillActiveStateLocked(
+    directory,
+    sessionId,
+    (current) =>
+      current.support_skill
+        ? { ...current, support_skill: null }
+        : current,
+  ).status !== 'failed';
 }
 
 export function isSkillStateStale(state: SkillActiveState): boolean {
@@ -683,8 +2035,8 @@ export function isSkillStateStale(state: SkillActiveState): boolean {
 /**
  * Stop-hook integration for support skills.
  *
- * Reinforcement increments go through `writeSkillActiveStateCopies()` so the
- * workflow-slot ledger is never clobbered by support-skill writes.
+ * Reinforcement updates go through the skill-state owner so workflow and
+ * support-skill writers cannot clobber each other.
  */
 export function checkSkillActiveState(
   directory: string,
@@ -701,18 +2053,6 @@ export function checkSkillActiveState(
     return { shouldBlock: false, message: '' };
   }
 
-  // Staleness check
-  if (isSkillStateStale(state)) {
-    clearSkillActiveState(directory, sessionId);
-    return { shouldBlock: false, message: '' };
-  }
-
-  // Reinforcement limit check
-  if (state.reinforcement_count >= state.max_reinforcements) {
-    clearSkillActiveState(directory, sessionId);
-    return { shouldBlock: false, message: '' };
-  }
-
   // Orchestrators are allowed to go idle while delegated work is still active.
   const trackingState = readTrackingState(directory);
   const staleIds = new Set(getStaleAgents(trackingState).map((a) => a.agent_id));
@@ -720,35 +2060,66 @@ export function checkSkillActiveState(
     (a) => a.status === 'running' && !staleIds.has(a.agent_id),
   );
   if (nonStaleRunning.length > 0) {
-    if (state.reinforcement_count > 0) {
-      const resetSupport: SkillActiveState = {
-        ...state,
-        reinforcement_count: 0,
-        last_checked_at: new Date().toISOString(),
+    mutateSkillActiveStateLocked(directory, sessionId, (current) => {
+      const support = current.support_skill;
+      if (
+        !support?.active
+        || (sessionId
+          && support.session_id
+          && support.session_id !== sessionId)
+      ) {
+        return current;
+      }
+      if (
+        isSkillStateStale(support)
+        || support.reinforcement_count >= support.max_reinforcements
+      ) {
+        return { ...current, support_skill: null };
+      }
+      if (support.reinforcement_count === 0) return current;
+      return {
+        ...current,
+        support_skill: {
+          ...support,
+          reinforcement_count: 0,
+          last_checked_at: new Date().toISOString(),
+        },
       };
-      const v2 = readSkillActiveStateNormalized(directory, sessionId);
-      writeSkillActiveStateCopies(
-        directory,
-        { ...v2, support_skill: resetSupport },
-        sessionId,
-      );
-    }
+    });
     return { shouldBlock: false, message: '', skillName: state.skill_name };
   }
 
-  // Block the stop and increment reinforcement count.
-  const incremented: SkillActiveState = {
-    ...state,
-    reinforcement_count: state.reinforcement_count + 1,
-    last_checked_at: new Date().toISOString(),
-  };
-  const v2 = readSkillActiveStateNormalized(directory, sessionId);
-  const ok = writeSkillActiveStateCopies(
+  const result = mutateSkillActiveStateLocked(
     directory,
-    { ...v2, support_skill: incremented },
     sessionId,
+    (current) => {
+      const support = current.support_skill;
+      if (
+        !support?.active
+        || (sessionId
+          && support.session_id
+          && support.session_id !== sessionId)
+      ) {
+        return current;
+      }
+      if (
+        isSkillStateStale(support)
+        || support.reinforcement_count >= support.max_reinforcements
+      ) {
+        return { ...current, support_skill: null };
+      }
+      const incremented: SkillActiveState = {
+        ...support,
+        reinforcement_count: support.reinforcement_count + 1,
+        last_checked_at: new Date().toISOString(),
+      };
+      return { ...current, support_skill: incremented };
+    },
   );
-  if (!ok) {
+  const incremented = result.status === 'written'
+    ? result.state?.support_skill
+    : null;
+  if (!incremented) {
     return { shouldBlock: false, message: '' };
   }
 

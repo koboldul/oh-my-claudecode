@@ -131,6 +131,23 @@ describe('canonical hook protocol normalization', () => {
     expect(canonicalToolName('claude', 'proxy_Bash')).toBe('Bash');
   });
 
+  it.each([
+    ['view', 'Read'],
+    ['create', 'Write'],
+    ['edit', 'Edit'],
+    ['str_replace_editor', 'Edit'],
+    ['apply_patch', 'Edit'],
+    ['grep', 'Grep'],
+    ['rg', 'Grep'],
+    ['glob', 'Glob'],
+    ['web_fetch', 'WebFetch'],
+    ['web_search', 'WebSearch'],
+    ['ask_user', 'AskUserQuestion'],
+    ['update_todo', 'TodoWrite'],
+  ])('maps native Copilot tool %s to canonical %s', (nativeName, canonicalName) => {
+    expect(canonicalToolName('copilot', nativeName)).toBe(canonicalName);
+  });
+
   it('uses a deterministic semantic fingerprint', () => {
     const first = stableCallFingerprint('rg', {
       pattern: 'needle',
@@ -319,6 +336,26 @@ describe('canonical hook protocol normalization', () => {
       correlatedMutationOutput: false,
       singletonMutationOutput: true,
     });
+  });
+
+  it('accepts native Copilot singleton toolArgs without serialized JSON', () => {
+    const envelope = normalizeHookEnvelope({
+      sessionId: 'session',
+      toolName: 'view',
+      toolArgs: { path: 'README.md' },
+    }, 'pre-tool-use');
+
+    expect(envelope.toolCalls).toEqual([
+      expect.objectContaining({
+        nativeName: 'view',
+        canonicalName: 'Read',
+        input: { path: 'README.md' },
+        rawArgs: { path: 'README.md' },
+        status: 'valid',
+        malformed: false,
+      }),
+    ]);
+    expect(envelope.issues).toEqual([]);
   });
 
   it('normalizes Copilot lifecycle agent fields without inventing an ID', () => {

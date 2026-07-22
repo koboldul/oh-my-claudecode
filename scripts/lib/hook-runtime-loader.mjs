@@ -1,7 +1,7 @@
 import { existsSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const requireFromLoader = createRequire(import.meta.url);
 const loaderDirectory = dirname(fileURLToPath(import.meta.url));
@@ -13,9 +13,17 @@ export const REQUIRED_HOOK_RUNTIME_EXPORTS = Object.freeze([
   'runHookJson',
   'reduceHookEvaluations',
   'encodeHookOutput',
+  'encodeLegacyCompatibleHookOutput',
   'buildLegacyProcessorInput',
   'normalizeLegacyHookInput',
   'adaptLegacyHookOutput',
+  'loadPreToolBatchSnapshot',
+  'planPreToolBatch',
+  'reserveAndPlanPreToolBatch',
+  'commitPreToolEffects',
+  'finalizePreToolReduction',
+  'encodePreToolEnforcerOutput',
+  'runHookNotificationChild',
 ]);
 
 export const CRITICAL_HOOK_FAILURE_EXIT_CODE = 2;
@@ -54,6 +62,18 @@ export function resolveHookRuntimePath({
     resolve(requireNonEmptyPath(root, 'pluginRoot')),
     'bridge',
     'hook-runtime.cjs',
+  );
+}
+
+export function resolveHookNotificationChildPath({
+  pluginRoot,
+} = {}) {
+  const root = pluginRoot ?? scriptRelativePluginRoot;
+  return join(
+    resolve(requireNonEmptyPath(root, 'pluginRoot')),
+    'scripts',
+    'lib',
+    'notification-child.cjs',
   );
 }
 
@@ -122,6 +142,112 @@ export function loadHookRuntime(options = {}) {
   return validateHookRuntimeExports(runtime, bundlePath);
 }
 
+export async function loadHookRuntimeAsync(options = {}) {
+  const bundlePath = resolveHookRuntimePath(options);
+
+  if (!existsSync(bundlePath)) {
+    throw new HookRuntimeLoadError(
+      `Canonical hook runtime bundle is missing at "${bundlePath}".`,
+      bundlePath,
+    );
+  }
+
+  let bundleStat;
+  try {
+    bundleStat = statSync(bundlePath);
+  } catch (error) {
+    throw new HookRuntimeLoadError(
+      `Canonical hook runtime bundle cannot be inspected at "${bundlePath}".`,
+      bundlePath,
+      { cause: error },
+    );
+  }
+  if (!bundleStat.isFile()) {
+    throw new HookRuntimeLoadError(
+      `Canonical hook runtime bundle is not a file at "${bundlePath}".`,
+      bundlePath,
+    );
+  }
+
+  let namespace;
+  try {
+    namespace = await import(pathToFileURL(bundlePath).href);
+  } catch (error) {
+    throw new HookRuntimeLoadError(
+      `Canonical hook runtime bundle failed to load from "${bundlePath}".`,
+      bundlePath,
+      { cause: error },
+    );
+  }
+
+  return validateHookRuntimeExports(
+    namespace.default ?? namespace,
+    bundlePath,
+  );
+}
+
+export function describeHookRunFailure(runtime, result) {
+  if (typeof runtime.describeHookRunFailure === 'function') {
+    return runtime.describeHookRunFailure(result);
+  }
+
+  const failures = [];
+  for (const issue of result?.envelope?.issues ?? []) {
+    if (issue?.severity === 'safety' || issue?.batchSafety === true) {
+      failures.push(
+        issue.message || issue.code || 'hook input normalization failed',
+      );
+    }
+  }
+  for (const evaluation of result?.evaluations ?? []) {
+    if (evaluation?.source === 'adapter' && evaluation?.decision === 'deny') {
+      failures.push(
+        evaluation.reason || 'legacy processor adapter failed',
+      );
+    }
+  }
+  for (const decision of result?.reduction?.callDecisions ?? []) {
+    if (decision?.source === 'adapter' && decision?.decision === 'deny') {
+      failures.push(decision.reason || 'hook reduction failed');
+    }
+  }
+  if (result?.reduction?.decision && result.reduction.decision !== 'pass') {
+    failures.push(
+      result.reduction.reason
+      || `unexpected ${result.reduction.decision} reduction`,
+    );
+  }
+
+  return failures.length > 0
+    ? [...new Set(failures)].join('; ')
+    : undefined;
+}
+
+export function encodeLegacyCompatibleHookOutput(
+  runtime,
+  result,
+  legacyOutput,
+) {
+  if (typeof runtime.encodeLegacyCompatibleHookOutput === 'function') {
+    return runtime.encodeLegacyCompatibleHookOutput(
+      result.envelope,
+      result.reduction,
+      legacyOutput,
+    );
+  }
+
+  if (
+    result.envelope.host === 'claude'
+    && typeof legacyOutput === 'object'
+    && legacyOutput !== null
+    && !Array.isArray(legacyOutput)
+  ) {
+    return legacyOutput;
+  }
+
+  return runtime.encodeHookOutput(result.envelope, result.reduction);
+}
+
 function formatFailureDetail(error) {
   try {
     if (error instanceof Error && error.message) return error.message;
@@ -167,14 +293,16 @@ export function surfaceCriticalHookFailure(error, {
 
 /**
  * Surface an optional/advisory failure while allowing the host to continue.
- * The diagnostic remains visible on stderr, while stdout uses only the minimal
- * legacy continuation marker rather than duplicating host encoding logic.
+ * The runtime is unavailable here, so stdout uses only the trusted OMC_HOST
+ * value established by run.cjs: Copilot receives its empty pass object while
+ * Claude and direct/unknown callers retain the legacy continuation marker.
  */
 export function surfaceOptionalHookFailure(error, {
   hookName,
   stdout = process.stdout,
   stderr = process.stderr,
   processRef = process,
+  env = process.env,
 } = {}) {
   const message = failureMessage(
     hookName,
@@ -182,7 +310,10 @@ export function surfaceOptionalHookFailure(error, {
     'continuing without optional hook behavior',
   );
   writeLine(stderr, message);
-  writeLine(stdout, JSON.stringify({ continue: true }));
+  writeLine(
+    stdout,
+    JSON.stringify(env?.OMC_HOST === 'copilot' ? {} : { continue: true }),
+  );
   processRef.exitCode = OPTIONAL_HOOK_FAILURE_EXIT_CODE;
   return OPTIONAL_HOOK_FAILURE_EXIT_CODE;
 }

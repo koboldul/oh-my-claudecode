@@ -7,7 +7,12 @@ import {
 } from './hook-runtime.js';
 import type {
   HookExecutionUnit,
+  HookRunResult,
 } from './hook-runtime.js';
+import {
+  encodeHookOutput,
+  type EncodedHookOutput,
+} from './hook-output.js';
 import type {
   CanonicalAgentRef,
   CanonicalHookEnvelope,
@@ -17,6 +22,7 @@ import type {
   HookEvaluation,
   HookHost,
   HookMutationRequirement,
+  HookReduction,
   HookContract,
   HookType,
   ShellDialect,
@@ -38,9 +44,24 @@ export interface LegacyProcessorInput extends CanonicalHookEventPayload {
   eventPayload: CanonicalHookEventPayload;
   originalIndex: number;
   sessionId?: string;
+  session_id?: string;
   directory?: string;
+  cwd?: string;
   transcriptPath?: string;
+  transcript_path?: string;
   stopReason?: string;
+  stop_reason?: string;
+  end_turn_reason?: string;
+  stop_hook_active?: boolean;
+  last_assistant_message?: string;
+  user_requested?: boolean;
+  hook_event_name?: string;
+  permission_mode?: string;
+  custom_instructions?: string;
+  user_prompt?: string;
+  initial_prompt?: string;
+  prompt_id?: string;
+  reason?: string;
   agent?: CanonicalAgentRef;
   agentId?: string;
   agentName?: string;
@@ -75,6 +96,7 @@ export interface LegacyHookSpecificOutput {
 
 export interface LegacyHookOutput {
   continue?: boolean;
+  suppressOutput?: boolean;
   reason?: string;
   decision?: HookDecision | 'block';
   message?: string;
@@ -84,6 +106,30 @@ export interface LegacyHookOutput {
   effects?: readonly HookEffect[];
   hookSpecificOutput?: LegacyHookSpecificOutput;
   [key: string]: unknown;
+}
+
+const LEGACY_HOOK_EVENT_NAMES: Readonly<Record<string, string>> = {
+  notification: 'Notification',
+  'permission-request': 'PermissionRequest',
+  'post-tool-use': 'PostToolUse',
+  'post-tool-use-failure': 'PostToolUseFailure',
+  'pre-compact': 'PreCompact',
+  'pre-tool-use': 'PreToolUse',
+  'session-end': 'SessionEnd',
+  'session-start': 'SessionStart',
+  stop: 'Stop',
+  'subagent-start': 'SubagentStart',
+  'subagent-stop': 'SubagentStop',
+  'user-prompt-submit': 'UserPromptSubmit',
+};
+
+function primaryPrompt(
+  eventPayload: CanonicalHookEventPayload,
+): string | undefined {
+  return eventPayload.prompt
+    ?? eventPayload.userPrompt
+    ?? eventPayload.initialPrompt
+    ?? eventPayload.promptAliases?.[0];
 }
 
 /**
@@ -109,30 +155,80 @@ export function buildLegacyProcessorInput(
   options: LegacyProcessorInputOptions = {},
 ): LegacyProcessorInput {
   const call = unit.call;
+  const eventPayload = envelope.eventPayload;
   const toolName = call
     ? options.toolNameSource === 'native'
       ? call.nativeName
       : call.canonicalName
     : undefined;
+  const prompt = primaryPrompt(eventPayload);
+  const hookEventName = LEGACY_HOOK_EVENT_NAMES[envelope.hookType];
 
   return {
-    ...envelope.eventPayload,
+    ...eventPayload,
+    ...(prompt !== undefined ? { prompt } : {}),
     host: envelope.host,
     contract: envelope.contract,
     hookType: envelope.hookType,
-    eventPayload: envelope.eventPayload,
+    eventPayload,
     originalIndex: unit.originalIndex,
     ...(envelope.sessionId !== undefined
-      ? { sessionId: envelope.sessionId }
+      ? {
+          sessionId: envelope.sessionId,
+          session_id: envelope.sessionId,
+        }
       : {}),
     ...(envelope.directory !== undefined
-      ? { directory: envelope.directory }
+      ? {
+          directory: envelope.directory,
+          cwd: envelope.directory,
+        }
       : {}),
     ...(envelope.transcriptPath !== undefined
-      ? { transcriptPath: envelope.transcriptPath }
+      ? {
+          transcriptPath: envelope.transcriptPath,
+          transcript_path: envelope.transcriptPath,
+        }
       : {}),
     ...(envelope.stopReason !== undefined
-      ? { stopReason: envelope.stopReason }
+      ? {
+          stopReason: envelope.stopReason,
+          stop_reason: envelope.stopReason,
+        }
+      : {}),
+    ...(eventPayload.endTurnReason !== undefined
+      ? { end_turn_reason: eventPayload.endTurnReason }
+      : {}),
+    ...(eventPayload.stopHookActive !== undefined
+      ? { stop_hook_active: eventPayload.stopHookActive }
+      : {}),
+    ...(eventPayload.lastAssistantMessage !== undefined
+      ? { last_assistant_message: eventPayload.lastAssistantMessage }
+      : {}),
+    ...(eventPayload.userRequested !== undefined
+      ? { user_requested: eventPayload.userRequested }
+      : {}),
+    ...(hookEventName !== undefined
+      ? { hook_event_name: hookEventName }
+      : {}),
+    ...(eventPayload.permissionMode !== undefined
+      ? { permission_mode: eventPayload.permissionMode }
+      : {}),
+    ...(eventPayload.customInstructions !== undefined
+      ? { custom_instructions: eventPayload.customInstructions }
+      : {}),
+    ...(eventPayload.userPrompt !== undefined
+      ? { user_prompt: eventPayload.userPrompt }
+      : {}),
+    ...(eventPayload.initialPrompt !== undefined
+      ? { initial_prompt: eventPayload.initialPrompt }
+      : {}),
+    ...(eventPayload.promptId !== undefined
+      ? { prompt_id: eventPayload.promptId }
+      : {}),
+    ...(eventPayload.sessionEndReason !== undefined
+      || eventPayload.reason !== undefined
+      ? { reason: eventPayload.sessionEndReason ?? eventPayload.reason }
       : {}),
     ...(envelope.agent !== undefined
       ? {
@@ -169,6 +265,70 @@ export function buildLegacyProcessorInput(
   };
 }
 
+export function describeHookRunFailure(
+  result: HookRunResult,
+): string | undefined {
+  const failures: string[] = [];
+
+  for (const issue of result.envelope.issues) {
+    if (issue.severity === 'safety' || issue.batchSafety === true) {
+      failures.push(
+        issue.message || issue.code || 'hook input normalization failed',
+      );
+    }
+  }
+
+  for (const evaluation of result.evaluations) {
+    if (evaluation.source === 'adapter' && evaluation.decision === 'deny') {
+      failures.push(
+        evaluation.reason || 'legacy processor adapter failed',
+      );
+    }
+  }
+
+  for (const decision of result.reduction.callDecisions) {
+    if (decision.source === 'adapter' && decision.decision === 'deny') {
+      failures.push(decision.reason || 'hook reduction failed');
+    }
+  }
+
+  if (result.reduction.decision !== 'pass') {
+    failures.push(
+      result.reduction.reason
+      || `unexpected ${result.reduction.decision} reduction`,
+    );
+  }
+
+  return failures.length > 0
+    ? [...new Set(failures)].join('; ')
+    : undefined;
+}
+
+/**
+ * Preserve the shipped Claude presentation while using canonical host
+ * encoding for Copilot. Host selection comes only from the normalized
+ * envelope; wrappers must not re-detect the host from raw payload fields.
+ */
+export function encodeLegacyCompatibleHookOutput(
+  envelope: CanonicalHookEnvelope,
+  reduction: HookReduction,
+  legacyOutput: unknown,
+): EncodedHookOutput {
+  if (envelope.host === 'copilot') {
+    return encodeHookOutput(envelope, reduction);
+  }
+
+  if (
+    typeof legacyOutput === 'object'
+    && legacyOutput !== null
+    && !Array.isArray(legacyOutput)
+  ) {
+    return legacyOutput as EncodedHookOutput;
+  }
+
+  return encodeHookOutput(envelope, reduction);
+}
+
 /**
  * Typed compatibility adapter for processors that still return legacy hook
  * output objects. Canonical interpretation remains owned by hook-runtime.ts.
@@ -203,7 +363,6 @@ export {
   encodeClaudeHookOutput,
   encodeCopilotHookOutput,
   encodeHookOutput,
-  type EncodedHookOutput,
 } from './hook-output.js';
 
 export {
@@ -211,5 +370,8 @@ export {
   COPILOT_1072_CAPABILITIES,
   formatUnknownError,
 } from './hook-protocol.js';
+
+export * from './pre-tool-enforcer/index.js';
+export { runHookNotificationChild } from './background-notifications.js';
 
 export type * from './hook-protocol.js';

@@ -205,6 +205,18 @@ function resolveSuperprojectRoot(cwd: string): string | null {
   return anchor;
 }
 
+function hasGitMetadataAncestor(directory: string): boolean {
+  if (process.env.GIT_DIR || process.env.GIT_WORK_TREE) return true;
+
+  let probe = resolve(directory);
+  while (true) {
+    if (existsSync(join(probe, '.git'))) return true;
+    const parent = dirname(probe);
+    if (parent === probe) return false;
+    probe = parent;
+  }
+}
+
 /**
  * Resolve the state-anchor root for an optional worktreeRoot argument.
  *
@@ -221,7 +233,11 @@ function resolveSuperprojectRoot(cwd: string): string | null {
  * collapse separately-scoped state dirs into one and corrupt them.
  */
 function resolveStateAnchorRoot(worktreeRoot?: string): string {
-  if (worktreeRoot) return resolveSuperprojectRoot(worktreeRoot) || worktreeRoot;
+  if (worktreeRoot) {
+    return hasGitMetadataAncestor(worktreeRoot)
+      ? resolveSuperprojectRoot(worktreeRoot) || worktreeRoot
+      : worktreeRoot;
+  }
   return getWorktreeRoot() || process.cwd();
 }
 
@@ -1053,17 +1069,25 @@ export function resolveToWorktreeRoot(directory?: string): string {
   // worktrees are unaffected: with no superproject the two resolvers are equal.
   // See PR #3350 Codex review (hook normalization / submodule identity).
   const resolveRoot = process.env.OMC_STATE_DIR ? getGitTopLevel : getWorktreeRoot;
+  const processDirectory = resolve(process.cwd());
   if (directory) {
     const resolved = resolve(directory);
+    if (resolved === processDirectory && !hasGitMetadataAncestor(resolved)) {
+      console.error('[worktree] non-git directory provided, falling back to process root', {
+        directory: resolved,
+      });
+      return processDirectory;
+    }
     const root = resolveRoot(resolved);
     if (root) return root;
 
     console.error('[worktree] non-git directory provided, falling back to process root', {
       directory: resolved,
     });
+    if (resolved === processDirectory) return processDirectory;
   }
   // Fallback: derive from process CWD (the MCP server / CLI entry point)
-  return resolveRoot(process.cwd()) || process.cwd();
+  return resolveRoot(processDirectory) || processDirectory;
 }
 
 // ============================================================================
@@ -1143,12 +1167,16 @@ export function resolveTranscriptPath(transcriptPath: string | undefined, cwd?: 
   // transcript path encodes the worktree CWD, but the file lives under
   // the main repo's encoded path. Use `git rev-parse --git-common-dir`
   // to find the main repo root and re-encode.
+  const worktreeTop = getGitTopLevel(effectiveCwd);
+  if (!worktreeTop) return transcriptPath;
+
   try {
     const gitCommonDir = execFileSync('git', ['rev-parse', '--git-common-dir'], {
       cwd: effectiveCwd,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      timeout: 5000,
     }).trim();
 
     const absoluteCommonDir = resolve(effectiveCwd, gitCommonDir);
@@ -1162,14 +1190,14 @@ export function resolveTranscriptPath(transcriptPath: string | undefined, cwd?: 
     // ecryptfs $HOME on Linux, autofs /home, etc.)
     try { mainRepoRoot = realpathSync(mainRepoRoot); } catch { /* keep as-is */ }
 
-    const worktreeTop = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-      cwd: effectiveCwd,
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    }).trim();
+    let canonicalWorktreeTop = worktreeTop;
+    try {
+      canonicalWorktreeTop = realpathSync(canonicalWorktreeTop);
+    } catch {
+      // Keep Git's resolved top-level when the filesystem cannot canonicalize it.
+    }
 
-    if (mainRepoRoot !== worktreeTop) {
+    if (mainRepoRoot !== canonicalWorktreeTop) {
       // basename handles `\` (Windows transcript_path) and `/` (POSIX).
       const sessionFile = basename(transcriptPath);
       if (sessionFile) {

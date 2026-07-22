@@ -15,7 +15,11 @@ import type {
   NotificationPlatform,
 } from "./types.js";
 
-const DEFAULT_CONFIG_PATH = join(getClaudeConfigDir(), "omc_config.hook.json");
+export function getHookNotificationConfigPath(): string {
+  return join(getClaudeConfigDir(), "omc_config.hook.json");
+}
+
+const DEFAULT_CONFIG_PATH = getHookNotificationConfigPath();
 
 /** Cached hook config. `undefined` = not yet read, `null` = read but absent/disabled. */
 let cachedConfig: HookNotificationConfig | null | undefined;

@@ -10,12 +10,15 @@ const COPILOT_CONTEXT_OUTPUT_EVENTS = new Set([
   'posttoolusefailure',
   'sessionstart',
   'subagentstart',
+  'userpromptsubmit',
 ]);
 
 const CLAUDE_CONTEXT_EVENT_NAMES: Readonly<Record<string, string>> = {
   posttooluse: 'PostToolUse',
   posttoolusefailure: 'PostToolUseFailure',
   sessionstart: 'SessionStart',
+  setupinit: 'Setup',
+  setupmaintenance: 'Setup',
   subagentstart: 'SubagentStart',
   userpromptsubmit: 'UserPromptSubmit',
 };

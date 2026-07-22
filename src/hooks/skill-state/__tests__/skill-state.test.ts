@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -9,6 +9,8 @@ import {
   readSkillActiveState,
   writeSkillActiveState,
   clearSkillActiveState,
+  mutateSkillActiveStateLocked,
+  SkillStateCorruptionError,
   isSkillStateStale,
   checkSkillActiveState,
   readSkillActiveStateNormalized,
@@ -61,6 +63,7 @@ describe('skill-state', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -248,6 +251,47 @@ describe('skill-state', () => {
       expect(readBack!.skill_name).toBe('plan');
     });
 
+    it('returns committed support state for an idempotent write', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-17T12:00:00.000Z'));
+      expect(writeSkillActiveState(tempDir, 'plan', 'session-1'))
+        .not.toBeNull();
+
+      const replay = writeSkillActiveState(tempDir, 'plan', 'session-1');
+
+      expect(replay).toMatchObject({
+        active: true,
+        skill_name: 'plan',
+        session_id: 'session-1',
+      });
+    });
+
+    it('returns committed support state after repairing a missing copy', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-04-17T12:00:00.000Z'));
+      expect(writeSkillActiveState(tempDir, 'plan', 'session-1'))
+        .not.toBeNull();
+      rmSync(
+        join(
+          tempDir,
+          '.omc',
+          'state',
+          'sessions',
+          'session-1',
+          'skill-active-state.json',
+        ),
+        { force: true },
+      );
+
+      const repaired = writeSkillActiveState(tempDir, 'plan', 'session-1');
+
+      expect(repaired).toMatchObject({
+        active: true,
+        skill_name: 'plan',
+        session_id: 'session-1',
+      });
+    });
+
     it('does not overwrite when mcp-setup is invoked inside omc-setup (canonical nesting scenario)', () => {
       writeSkillActiveState(tempDir, 'omc-setup', 'session-1');
       const child = writeSkillActiveState(tempDir, 'mcp-setup', 'session-1');
@@ -295,11 +339,12 @@ describe('skill-state', () => {
       expect(state!.active).toBe(true);
     });
 
-    it('returns null for invalid JSON', () => {
+    it('distinguishes corrupt JSON from missing skill state', () => {
       const stateDir = join(tempDir, '.omc', 'state', 'sessions', 'session-1');
       mkdirSync(stateDir, { recursive: true });
       writeFileSync(join(stateDir, 'skill-active-state.json'), 'not json');
-      expect(readSkillActiveState(tempDir, 'session-1')).toBeNull();
+      expect(() => readSkillActiveState(tempDir, 'session-1'))
+        .toThrow(SkillStateCorruptionError);
     });
   });
 
@@ -477,10 +522,18 @@ describe('skill-state', () => {
       // Manually make the state stale
       const state = readSkillActiveState(tempDir, 'session-1')!;
       const past = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-      state.started_at = past;
-      state.last_checked_at = past;
-      const statePath = join(tempDir, '.omc', 'state', 'sessions', 'session-1', 'skill-active-state.json');
-      writeFileSync(statePath, JSON.stringify(state, null, 2));
+      expect(mutateSkillActiveStateLocked(
+        tempDir,
+        'session-1',
+        (current) => ({
+          ...current,
+          support_skill: {
+            ...state,
+            started_at: past,
+            last_checked_at: past,
+          },
+        }),
+      ).status).toBe('written');
 
       const result = checkSkillActiveState(tempDir, 'session-1');
       expect(result.shouldBlock).toBe(false);
@@ -675,6 +728,45 @@ describe('skill-state', () => {
       const result = writeSkillActiveStateCopies(tempDir, state, sessionId);
       expect(result).toBe(true);
     });
+
+    it('honors rootState:null while retaining the session copy', () => {
+      const sessionId = 'root-delete-session';
+      const state = upsertWorkflowSkillSlot(
+        emptySkillActiveStateV2(),
+        'ralph',
+        { session_id: sessionId },
+      );
+
+      expect(writeSkillActiveStateCopies(
+        tempDir,
+        state,
+        sessionId,
+        { rootState: null },
+      )).toBe(true);
+      expect(existsSync(rootFilePath(tempDir))).toBe(false);
+      expect(existsSync(sessionFilePath(tempDir, sessionId))).toBe(true);
+      expect(readSkillActiveStateNormalized(
+        tempDir,
+        sessionId,
+      ).active_skills.ralph).toBeDefined();
+    });
+
+    it('honors rootState:null for no-session writes', () => {
+      const initial = upsertWorkflowSkillSlot(
+        emptySkillActiveStateV2(),
+        'autopilot',
+      );
+      expect(writeSkillActiveStateCopies(tempDir, initial)).toBe(true);
+      expect(existsSync(rootFilePath(tempDir))).toBe(true);
+
+      expect(writeSkillActiveStateCopies(
+        tempDir,
+        initial,
+        undefined,
+        { rootState: null },
+      )).toBe(true);
+      expect(existsSync(rootFilePath(tempDir))).toBe(false);
+    });
   });
 
   // -----------------------------------------------------------------------
@@ -685,6 +777,59 @@ describe('skill-state', () => {
       const state = readSkillActiveStateNormalized(tempDir, 'no-session');
       expect(state.version).toBe(2);
       expect(Object.keys(state.active_skills)).toHaveLength(0);
+    });
+
+    it('fails closed without overwriting a corrupt root ledger', () => {
+      const rootPath = join(
+        tempDir,
+        '.omc',
+        'state',
+        'skill-active-state.json',
+      );
+      mkdirSync(join(tempDir, '.omc', 'state'), { recursive: true });
+      writeFileSync(rootPath, '{corrupt-root');
+
+      const result = mutateSkillActiveStateLocked(
+        tempDir,
+        'corrupt-root-session',
+        (current) => upsertWorkflowSkillSlot(current, 'ralph', {
+          session_id: 'corrupt-root-session',
+        }),
+      );
+
+      expect(result.status).toBe('failed');
+      expect(readFileSync(rootPath, 'utf8')).toBe('{corrupt-root');
+    });
+
+    it('fails closed without replacing a corrupt session ledger', () => {
+      const sessionId = 'corrupt-session-ledger';
+      const state = upsertWorkflowSkillSlot(
+        emptySkillActiveStateV2(),
+        'ralph',
+        { session_id: sessionId },
+      );
+      expect(writeSkillActiveStateCopies(tempDir, state, sessionId))
+        .toBe(true);
+      const sessionPath = join(
+        tempDir,
+        '.omc',
+        'state',
+        'sessions',
+        sessionId,
+        'skill-active-state.json',
+      );
+      writeFileSync(sessionPath, '{corrupt-session');
+
+      const result = mutateSkillActiveStateLocked(
+        tempDir,
+        sessionId,
+        (current) => upsertWorkflowSkillSlot(current, 'autopilot', {
+          session_id: sessionId,
+        }),
+      );
+
+      expect(result.status).toBe('failed');
+      expect(readFileSync(sessionPath, 'utf8')).toBe('{corrupt-session');
     });
 
     it('normalizes v1 scalar payload into support_skill branch', () => {
@@ -706,6 +851,90 @@ describe('skill-state', () => {
       expect(normalized.version).toBe(2);
       expect(normalized.support_skill?.skill_name).toBe('plan');
       expect(Object.keys(normalized.active_skills)).toHaveLength(0);
+    });
+
+    it('preserves legacy session bytes on a semantic no-op', () => {
+      const sessionId = 'legacy-noop-session';
+      const rootPath = join(
+        tempDir,
+        '.omc',
+        'state',
+        'skill-active-state.json',
+      );
+      const sessionDir = join(
+        tempDir,
+        '.omc',
+        'state',
+        'sessions',
+        sessionId,
+      );
+      const sessionPath = join(sessionDir, 'skill-active-state.json');
+      const legacy = `${JSON.stringify({
+        active: true,
+        skill_name: 'plan',
+        session_id: sessionId,
+        started_at: '2026-07-21T00:00:00.000Z',
+        last_checked_at: '2026-07-21T00:00:00.000Z',
+        reinforcement_count: 0,
+        max_reinforcements: 5,
+        stale_ttl_ms: 15 * 60 * 1000,
+      }, null, 4)}\n`;
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(sessionPath, legacy);
+
+      const result = mutateSkillActiveStateLocked(
+        tempDir,
+        sessionId,
+        current => current,
+      );
+
+      expect(result.status).toBe('skipped');
+      expect(readFileSync(sessionPath, 'utf8')).toBe(legacy);
+      expect(existsSync(rootPath)).toBe(false);
+    });
+
+    it('migrates legacy session state when a real mutation occurs', () => {
+      const sessionId = 'legacy-mutation-session';
+      const sessionDir = join(
+        tempDir,
+        '.omc',
+        'state',
+        'sessions',
+        sessionId,
+      );
+      const sessionPath = join(sessionDir, 'skill-active-state.json');
+      mkdirSync(sessionDir, { recursive: true });
+      writeFileSync(sessionPath, JSON.stringify({
+        active: true,
+        skill_name: 'plan',
+        session_id: sessionId,
+        started_at: '2026-07-21T00:00:00.000Z',
+        last_checked_at: '2026-07-21T00:00:00.000Z',
+        reinforcement_count: 0,
+        max_reinforcements: 5,
+        stale_ttl_ms: 15 * 60 * 1000,
+      }, null, 2));
+
+      const result = mutateSkillActiveStateLocked(
+        tempDir,
+        sessionId,
+        current => ({
+          ...current,
+          support_skill: current.support_skill
+            ? {
+                ...current.support_skill,
+                reinforcement_count: 1,
+              }
+            : null,
+        }),
+      );
+      const persisted = JSON.parse(
+        readFileSync(sessionPath, 'utf8'),
+      ) as SkillActiveStateV2;
+
+      expect(result.status).toBe('written');
+      expect(persisted.version).toBe(2);
+      expect(persisted.support_skill?.reinforcement_count).toBe(1);
     });
 
     it('session copy is authoritative for session-local reads', () => {

@@ -49,8 +49,16 @@ describe('canonical hook runtime bundle', () => {
           'reduceHookEvaluations',
           'encodeHookOutput',
           'buildLegacyProcessorInput',
+          'describeHookRunFailure',
+          'encodeLegacyCompatibleHookOutput',
           'normalizeLegacyHookInput',
           'adaptLegacyHookOutput',
+          'loadPreToolBatchSnapshot',
+          'planPreToolBatch',
+          'reserveAndPlanPreToolBatch',
+          'commitPreToolEffects',
+          'finalizePreToolReduction',
+          'encodePreToolEnforcerOutput',
         ];
 
         for (const name of requiredExports) {

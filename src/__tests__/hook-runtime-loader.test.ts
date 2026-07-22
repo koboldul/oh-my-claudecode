@@ -1,9 +1,10 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -19,6 +20,12 @@ const LOADER_PATH = join(
   'lib',
   'hook-runtime-loader.mjs',
 );
+const NOTIFICATION_CHILD_PATH = join(
+  REPO_ROOT,
+  'scripts',
+  'lib',
+  'notification-child.cjs',
+);
 
 interface HookRuntimeLoaderModule {
   REQUIRED_HOOK_RUNTIME_EXPORTS: readonly string[];
@@ -26,6 +33,13 @@ interface HookRuntimeLoaderModule {
     pluginRoot?: string;
     testBundlePath?: string;
   }): Record<string, unknown>;
+  loadHookRuntimeAsync(options?: {
+    pluginRoot?: string;
+    testBundlePath?: string;
+  }): Promise<Record<string, unknown>>;
+  resolveHookNotificationChildPath(options?: {
+    pluginRoot?: string;
+  }): string;
 }
 
 const loader = await import(
@@ -71,6 +85,67 @@ function validBundleSource(marker = 'loaded'): string {
   return `module.exports = {\n  ${functions.join(',\n  ')},\n  marker: ${JSON.stringify(marker)}\n};\n`;
 }
 
+function buildNotificationMarkerRuntime(
+  fixture: ReturnType<typeof makeTempPluginRoot>,
+  markerPath: string,
+): {
+  childPath: string;
+  runtimePath: string;
+} {
+  const childPath = loader.resolveHookNotificationChildPath({
+    pluginRoot: fixture.pluginRoot,
+  });
+  mkdirSync(dirname(childPath), { recursive: true });
+  copyFileSync(NOTIFICATION_CHILD_PATH, childPath);
+  const build = spawnSync(
+    process.execPath,
+    [
+      join(REPO_ROOT, 'scripts', 'build-hook-runtime.mjs'),
+      '--outfile',
+      fixture.bundlePath,
+    ],
+    {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+    },
+  );
+  expect(build.status, build.stderr).toBe(0);
+
+  const runtimePath = join(
+    dirname(fixture.bundlePath),
+    'notification-marker-runtime.cjs',
+  );
+  writeFileSync(
+    runtimePath,
+    [
+      "'use strict';",
+      `const base = require(${JSON.stringify(fixture.bundlePath)});`,
+      "const { appendFileSync } = require('node:fs');",
+      'module.exports = {',
+      '  ...base,',
+      '  async runHookNotificationChild(event, data) {',
+      `    appendFileSync(${JSON.stringify(markerPath)},`,
+      "      `${event}:${data.sessionId}\\n`, 'utf8');",
+      '  },',
+      '};',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  return { childPath, runtimePath };
+}
+
+function waitForChildExit(
+  child: ReturnType<typeof spawn>,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (code, signal) => {
+      resolve({ code, signal });
+    });
+  });
+}
+
 function runLoaderProbe(
   loaderPath: string,
   body: string,
@@ -86,6 +161,9 @@ function runLoaderProbe(
   };
   if (!Object.hasOwn(envOverrides, 'CLAUDE_PLUGIN_ROOT')) {
     delete env.CLAUDE_PLUGIN_ROOT;
+  }
+  if (!Object.hasOwn(envOverrides, 'OMC_HOST')) {
+    delete env.OMC_HOST;
   }
 
   return spawnSync(
@@ -109,6 +187,199 @@ function runLoaderProbe(
 }
 
 describe('hook runtime loader', () => {
+  it('requires the shipped wrapper runtime exports', () => {
+    expect(loader.REQUIRED_HOOK_RUNTIME_EXPORTS).toEqual(
+      expect.arrayContaining([
+        'encodeLegacyCompatibleHookOutput',
+        'loadPreToolBatchSnapshot',
+        'planPreToolBatch',
+        'reserveAndPlanPreToolBatch',
+        'commitPreToolEffects',
+        'finalizePreToolReduction',
+        'encodePreToolEnforcerOutput',
+        'runHookNotificationChild',
+      ]),
+    );
+  });
+
+  it('bundles every required runtime export from the TypeScript entrypoint', () => {
+    const fixture = makeTempPluginRoot();
+    const result = spawnSync(
+      process.execPath,
+      [
+        join(REPO_ROOT, 'scripts', 'build-hook-runtime.mjs'),
+        '--outfile',
+        fixture.bundlePath,
+      ],
+      {
+        cwd: REPO_ROOT,
+        encoding: 'utf8',
+      },
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    const runtime = loader.loadHookRuntime({
+      testBundlePath: fixture.bundlePath,
+    });
+    for (const name of loader.REQUIRED_HOOK_RUNTIME_EXPORTS) {
+      expect(runtime[name], name).toBeTypeOf('function');
+    }
+  });
+
+  it('loads and validates a CommonJS runtime asynchronously', async () => {
+    const fixture = makeTempPluginRoot();
+    writeFileSync(fixture.bundlePath, validBundleSource('async-loaded'));
+
+    await expect(loader.loadHookRuntimeAsync({
+      testBundlePath: fixture.bundlePath,
+    })).resolves.toMatchObject({ marker: 'async-loaded' });
+  });
+
+  it('does not invoke the bundled notification runner without an IPC gate', () => {
+    const fixture = makeTempPluginRoot();
+    const markerPath = join(fixture.container, 'no-gate.log');
+    const { childPath, runtimePath } =
+      buildNotificationMarkerRuntime(fixture, markerPath);
+    const result = spawnSync(
+      process.execPath,
+      [
+        childPath,
+        runtimePath,
+        JSON.stringify('ask-user-question'),
+        JSON.stringify({
+          sessionId: 'bundle-notification-session',
+          projectPath: fixture.pluginRoot,
+          question: 'Continue?',
+        }),
+        'no-gate-intent',
+        'no-gate-claim',
+      ],
+      {
+        cwd: fixture.pluginRoot,
+        encoding: 'utf8',
+        timeout: 10_000,
+        windowsHide: true,
+      },
+    );
+
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
+  it('does not invoke the bundled notification runner for a wrong gate', async () => {
+    const fixture = makeTempPluginRoot();
+    const markerPath = join(fixture.container, 'wrong-gate.log');
+    const { childPath, runtimePath } =
+      buildNotificationMarkerRuntime(fixture, markerPath);
+    const child = spawn(
+      process.execPath,
+      [
+        childPath,
+        runtimePath,
+        JSON.stringify('ask-user-question'),
+        JSON.stringify({
+          sessionId: 'bundle-notification-session',
+          projectPath: fixture.pluginRoot,
+          question: 'Continue?',
+        }),
+        'expected-intent',
+        'expected-claim',
+      ],
+      {
+        cwd: fixture.pluginRoot,
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+        windowsHide: true,
+      },
+    );
+    child.once('spawn', () => {
+      child.send({
+        type: 'omc.notification.dispatch.v1',
+        intentId: 'wrong-intent',
+        claimId: 'expected-claim',
+      }, () => {
+        if (child.connected) child.disconnect();
+      });
+    });
+    const result = await waitForChildExit(child);
+
+    expect(result).toEqual({ code: 0, signal: null });
+    expect(existsSync(markerPath)).toBe(false);
+  });
+
+  it('does not invoke the bundled notification runner when the IPC gate times out', async () => {
+    const fixture = makeTempPluginRoot();
+    const markerPath = join(fixture.container, 'gate-timeout.log');
+    const { childPath, runtimePath } =
+      buildNotificationMarkerRuntime(fixture, markerPath);
+    const child = spawn(
+      process.execPath,
+      [
+        childPath,
+        runtimePath,
+        JSON.stringify('ask-user-question'),
+        JSON.stringify({
+          sessionId: 'bundle-notification-session',
+          projectPath: fixture.pluginRoot,
+          question: 'Continue?',
+        }),
+        'timeout-intent',
+        'timeout-claim',
+      ],
+      {
+        cwd: fixture.pluginRoot,
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+        windowsHide: true,
+      },
+    );
+    const result = await waitForChildExit(child);
+
+    expect(result).toEqual({ code: 0, signal: null });
+    expect(existsSync(markerPath)).toBe(false);
+  }, 10_000);
+
+  it('invokes the bundled notification runner once for the matching gate', async () => {
+    const fixture = makeTempPluginRoot();
+    const markerPath = join(fixture.container, 'matching-gate.log');
+    const { childPath, runtimePath } =
+      buildNotificationMarkerRuntime(fixture, markerPath);
+    const child = spawn(
+      process.execPath,
+      [
+        childPath,
+        runtimePath,
+        JSON.stringify('ask-user-question'),
+        JSON.stringify({
+          sessionId: 'bundle-notification-session',
+          projectPath: fixture.pluginRoot,
+          question: 'Continue?',
+        }),
+        'matching-intent',
+        'matching-claim',
+      ],
+      {
+        cwd: fixture.pluginRoot,
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+        windowsHide: true,
+      },
+    );
+    child.once('spawn', () => {
+      child.send({
+        type: 'omc.notification.dispatch.v1',
+        intentId: 'matching-intent',
+        claimId: 'matching-claim',
+      }, () => {
+        if (child.connected) child.disconnect();
+      });
+    });
+    const result = await waitForChildExit(child);
+
+    expect(result).toEqual({ code: 0, signal: null });
+    expect(readFileSync(markerPath, 'utf8')).toBe(
+      'ask-user-question:bundle-notification-session\n',
+    );
+  });
+
   it('loads the plugin-relative bundle from a path with spaces without node_modules', () => {
     const fixture = makeTempPluginRoot();
     writeFileSync(fixture.bundlePath, validBundleSource('plugin-relative'));
@@ -253,23 +524,33 @@ describe('hook runtime loader', () => {
     },
   );
 
-  it('emits a visible fail-open output for an optional hook failure', () => {
-    const fixture = makeTempPluginRoot();
-    const result = runLoaderProbe(
-      fixture.loaderPath,
-      `
-        loader.surfaceOptionalHookFailure(
-          new Error('bundle unavailable'),
-          { hookName: 'sessionStart' },
-        );
-      `,
-    );
+  it.each([
+    ['unset', undefined, '{"continue":true}\n'],
+    ['claude', 'claude', '{"continue":true}\n'],
+    ['copilot', 'copilot', '{}\n'],
+    ['unknown', 'custom-host', '{"continue":true}\n'],
+  ])(
+    'emits the %s host fail-open output for an optional hook failure',
+    (_label, host, expectedStdout) => {
+      const fixture = makeTempPluginRoot();
+      const result = runLoaderProbe(
+        fixture.loaderPath,
+        `
+          loader.surfaceOptionalHookFailure(
+            new Error('bundle unavailable'),
+            { hookName: 'sessionStart' },
+          );
+        `,
+        [],
+        host === undefined ? {} : { OMC_HOST: host },
+      );
 
-    expect(result.status).toBe(0);
-    expect(JSON.parse(result.stdout)).toEqual({ continue: true });
-    expect(result.stderr).toContain('[sessionStart]');
-    expect(result.stderr).toContain(
-      'continuing without optional hook behavior',
-    );
-  });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe(expectedStdout);
+      expect(result.stderr).toContain('[sessionStart]');
+      expect(result.stderr).toContain(
+        'continuing without optional hook behavior',
+      );
+    },
+  );
 });

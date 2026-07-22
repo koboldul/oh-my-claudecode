@@ -140,17 +140,105 @@ if (currentStart !== 'absent' && currentStart === owner.processStart) process.ex
 try { fs.unlinkSync(lockPath); process.exit(0); } catch { process.exit(3); }
 `;
 
+function parseWindowsProcessStartIdentity(value) {
+  const match = String(value).match(/(\d{14})\.(\d{6})([+-])(\d{3})/);
+  if (!match) return null;
+  const compact = match[1];
+  const year = Number(compact.slice(0, 4));
+  const month = Number(compact.slice(4, 6));
+  const day = Number(compact.slice(6, 8));
+  const hour = Number(compact.slice(8, 10));
+  const minute = Number(compact.slice(10, 12));
+  const second = Number(compact.slice(12, 14));
+  const microseconds = Number(match[2]);
+  const offsetMinutes = Number(match[4]) * (match[3] === '-' ? -1 : 1);
+  const wallClockMs = Date.UTC(year, month - 1, day, hour, minute, second);
+  const verified = new Date(wallClockMs);
+  if (
+    year < 1601 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    !Number.isSafeInteger(microseconds) ||
+    !Number.isSafeInteger(offsetMinutes) ||
+    verified.getUTCFullYear() !== year ||
+    verified.getUTCMonth() !== month - 1 ||
+    verified.getUTCDate() !== day ||
+    verified.getUTCHours() !== hour ||
+    verified.getUTCMinutes() !== minute ||
+    verified.getUTCSeconds() !== second
+  ) return null;
+  const epochMilliseconds = wallClockMs - offsetMinutes * 60_000;
+  return (BigInt(epochMilliseconds) * 1_000n + BigInt(microseconds)).toString();
+}
+
+function lookupProcessStartIdentity(pid) {
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const end = stat.lastIndexOf(')');
+      if (end < 0) return null;
+      const fields = stat.slice(end + 2).trim().split(/\s+/);
+      return fields[19] && /^\d+$/.test(fields[19]) ? fields[19] : null;
+    } catch (error) { return error?.code === 'ENOENT' ? 'absent' : null; }
+  }
+  if (process.platform === 'darwin') {
+    const result = spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf8',
+      env: { ...process.env, LC_ALL: 'C' },
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1000,
+      windowsHide: true,
+    });
+    const value = new Date(String(result.stdout ?? '').trim()).getTime();
+    if (result.status === 0 && Number.isFinite(value)) return String(value);
+  } else if (process.platform === 'win32') {
+    const result = spawnSync(
+      'powershell',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `$p = [System.Diagnostics.Process]::GetProcessById(${pid}); `
+          + '[System.Management.ManagementDateTimeConverter]'
+          + '::ToDmtfDateTime([datetime]$p.StartTime)',
+      ],
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 5000,
+        windowsHide: true,
+      },
+    );
+    const identity = parseWindowsProcessStartIdentity(result.stdout);
+    if (result.status === 0 && identity) return identity;
+  }
+  try {
+    process.kill(pid, 0);
+    return null;
+  } catch (error) {
+    return error?.code === 'ESRCH' ? 'absent' : null;
+  }
+}
+
+let currentProcessStartIdentity;
+let currentProcessStartIdentityResolved = false;
+
 function processStartIdentity(pid) {
   if (process.env.NODE_ENV === 'test' && process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(pid)) return null;
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
-  if (process.platform !== 'linux') return pid === process.pid ? String(Math.max(1, Math.floor(Date.now() - process.uptime() * 1000))) : null;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const end = stat.lastIndexOf(')');
-    if (end < 0) return null;
-    const fields = stat.slice(end + 2).trim().split(/\s+/);
-    return fields[19] && /^\d+$/.test(fields[19]) ? fields[19] : null;
-  } catch (error) { return error?.code === 'ENOENT' ? 'absent' : null; }
+  if (pid === process.pid) {
+    if (!currentProcessStartIdentityResolved) {
+      currentProcessStartIdentity = lookupProcessStartIdentity(pid);
+      currentProcessStartIdentityResolved = true;
+    }
+    return currentProcessStartIdentity;
+  }
+  return lookupProcessStartIdentity(pid);
 }
 function guardedLockRemoval(lockPath, operation, owner) {
   const flock = flockPath();

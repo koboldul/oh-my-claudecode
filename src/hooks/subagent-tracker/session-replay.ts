@@ -10,6 +10,8 @@
 import { existsSync, appendFileSync, readFileSync, mkdirSync, readdirSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
 import { getOmcRoot } from '../../lib/worktree-paths.js';
+import { atomicWriteFileSync } from '../../lib/atomic-write.js';
+import { withStateFileMutationLock } from '../../lib/mode-state-io.js';
 
 // ============================================================================
 // Types
@@ -62,6 +64,14 @@ export interface ReplayEvent {
   context_injected?: boolean;
   /** Injected context size (bytes) */
   context_length?: number;
+  /** Durable idempotency key for owner-mediated appends. */
+  intent_id?: string;
+  /** Attempt telemetry is not successful execution state. */
+  attempt?: boolean;
+  /** Final aggregate batch disposition for an attempt. */
+  disposition?: 'accepted' | 'rejected';
+  /** Wall-clock timestamp captured by the hook snapshot. */
+  observed_at?: string;
 }
 
 export interface AgentBreakdown {
@@ -147,26 +157,131 @@ export function appendReplayEvent(
   directory: string,
   sessionId: string,
   event: Omit<ReplayEvent, 't'>
-): void {
+): ReplayAppendResult {
   try {
     const filePath = getReplayFilePath(directory, sessionId);
-
-    // Check file size limit
-    if (existsSync(filePath)) {
-      try {
-        const stats = statSync(filePath);
-        if (stats.size > MAX_REPLAY_SIZE_BYTES) return;
-      } catch { /* continue */ }
-    }
-
-    const replayEvent: ReplayEvent = {
-      t: getElapsedSeconds(sessionId),
-      ...event,
-    };
-
-    appendFileSync(filePath, JSON.stringify(replayEvent) + '\n', 'utf-8');
+    const locked = withStateFileMutationLock(filePath, () => {
+      if (existsSync(filePath)) {
+        try {
+          if (statSync(filePath).size > MAX_REPLAY_SIZE_BYTES) {
+            return { status: 'failed' as const };
+          }
+        } catch {
+          return { status: 'failed' as const };
+        }
+      }
+      const replayEvent: ReplayEvent = {
+        t: getElapsedSeconds(sessionId),
+        ...event,
+      };
+      appendFileSync(
+        filePath,
+        JSON.stringify(replayEvent) + '\n',
+        { encoding: 'utf-8', mode: 0o600 },
+      );
+      return { status: 'appended' as const };
+    });
+    return locked.acquired && locked.value
+      ? locked.value
+      : { status: 'failed' };
   } catch {
     // Never fail the hook on replay errors
+    return { status: 'failed' };
+  }
+}
+
+export interface ReplayAppendResult {
+  status: 'appended' | 'failed';
+}
+
+export interface ReplayAppendOnceResult {
+  status: 'appended' | 'duplicate' | 'reconciled' | 'failed';
+}
+
+/**
+ * Append one replay event under the replay-file owner lock. Replays with the
+ * same intent are deduplicated; a changed final disposition reconciles the
+ * existing line instead of appending contradictory telemetry.
+ */
+export function appendReplayEventOnce(
+  directory: string,
+  sessionId: string,
+  intentId: string,
+  event: Omit<ReplayEvent, 't' | 'intent_id'>,
+  observedAtMs = Date.now(),
+): ReplayAppendOnceResult {
+  if (!intentId) return { status: 'failed' };
+
+  try {
+    const filePath = getReplayFilePath(directory, sessionId);
+    const locked = withStateFileMutationLock(filePath, () => {
+      let lines: string[] = [];
+      if (existsSync(filePath)) {
+        try {
+          if (statSync(filePath).size > MAX_REPLAY_SIZE_BYTES) {
+            return { status: 'failed' as const };
+          }
+          lines = readFileSync(filePath, 'utf8')
+            .split('\n')
+            .filter(Boolean);
+        } catch {
+          return { status: 'failed' as const };
+        }
+      }
+
+      if (!sessionStartTimes.has(sessionId)) {
+        sessionStartTimes.set(sessionId, observedAtMs);
+      }
+      const start = sessionStartTimes.get(sessionId) ?? observedAtMs;
+      const replayEvent: ReplayEvent = {
+        t: Math.round(((observedAtMs - start) / 1000) * 10) / 10,
+        ...event,
+        intent_id: intentId,
+      };
+      const serialized = JSON.stringify(replayEvent);
+      const existingIndex = lines.findIndex((line) => {
+        try {
+          return (JSON.parse(line) as ReplayEvent).intent_id === intentId;
+        } catch {
+          return false;
+        }
+      });
+
+      if (existingIndex >= 0) {
+        let existingEvent: ReplayEvent;
+        try {
+          existingEvent = JSON.parse(lines[existingIndex]) as ReplayEvent;
+        } catch {
+          return { status: 'failed' as const };
+        }
+        const reconciledEvent: ReplayEvent = {
+          ...replayEvent,
+          t: existingEvent.t,
+        };
+        if (Object.prototype.hasOwnProperty.call(existingEvent, 'observed_at')) {
+          reconciledEvent.observed_at = existingEvent.observed_at;
+        } else {
+          delete reconciledEvent.observed_at;
+        }
+        const reconciled = JSON.stringify(reconciledEvent);
+        if (lines[existingIndex] === reconciled) {
+          return { status: 'duplicate' as const };
+        }
+        lines[existingIndex] = reconciled;
+        atomicWriteFileSync(filePath, `${lines.join('\n')}\n`);
+        return { status: 'reconciled' as const };
+      }
+
+      lines.push(serialized);
+      atomicWriteFileSync(filePath, `${lines.join('\n')}\n`);
+      return { status: 'appended' as const };
+    });
+
+    return locked.acquired && locked.value
+      ? locked.value
+      : { status: 'failed' };
+  } catch {
+    return { status: 'failed' };
   }
 }
 

@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   buildLegacyProcessorInput,
+  encodeLegacyCompatibleHookOutput,
   runHookPayload,
   type CanonicalHookEnvelope,
   type HookExecutionUnit,
@@ -183,6 +184,35 @@ describe('hook runtime entry legacy processor adapter', () => {
     });
   });
 
+  it('preserves Claude context_window data for post-tool processors', async () => {
+    const received: LegacyProcessorInput[] = [];
+    const contextWindow = {
+      used_percentage: 73,
+      context_window_size: 200_000,
+      current_usage: {
+        input_tokens: 140_000,
+        cache_creation_input_tokens: 6_000,
+      },
+    };
+
+    const result = await runHookPayload(
+      'post-tool-use',
+      {
+        ...loadFixture('claude', 'PostToolUse'),
+        context_window: contextWindow,
+      },
+      (unit, envelope) => {
+        received.push(buildLegacyProcessorInput(envelope, unit));
+        return { continue: true };
+      },
+    );
+
+    expect(result.reduction.decision).toBe('pass');
+    expect(received).toHaveLength(1);
+    expect(received[0].contextWindow).toEqual(contextWindow);
+    expect(received[0].eventPayload.contextWindow).toEqual(contextWindow);
+  });
+
   it.each(AGENT_ADAPTER_CASES)(
     'flattens canonical agent fields for non-tool $host/$fixture input',
     async ({ host, fixture, hookType, expected }) => {
@@ -227,4 +257,149 @@ describe('hook runtime entry legacy processor adapter', () => {
       expect(received[0]).not.toHaveProperty('toolInput');
     },
   );
+
+  it.each([
+    {
+      hookType: 'session-start',
+      fixture: 'sessionStart',
+      expected: {
+        hook_event_name: 'SessionStart',
+        source: 'new',
+        prompt: '<initial-prompt>',
+        initialPrompt: '<initial-prompt>',
+        initial_prompt: '<initial-prompt>',
+        promptAliases: ['<initial-prompt>'],
+      },
+    },
+    {
+      hookType: 'pre-compact',
+      fixture: 'preCompact',
+      expected: {
+        hook_event_name: 'PreCompact',
+        transcriptPath: '<transcript-path>',
+        transcript_path: '<transcript-path>',
+        trigger: 'auto',
+        customInstructions: '<custom-instructions>',
+        custom_instructions: '<custom-instructions>',
+      },
+    },
+    {
+      hookType: 'session-end',
+      fixture: 'sessionEnd',
+      expected: {
+        hook_event_name: 'SessionEnd',
+        reason: 'complete',
+        sessionEndReason: 'complete',
+      },
+    },
+  ] as const)(
+    'adapts Copilot lifecycle aliases for $fixture',
+    async ({ hookType, fixture, expected }) => {
+      const received: LegacyProcessorInput[] = [];
+
+      const result = await runHookPayload(
+        hookType,
+        loadFixture('copilot-1.0.72-1', fixture),
+        (unit, envelope) => {
+          received.push(buildLegacyProcessorInput(envelope, unit));
+          return { continue: true };
+        },
+      );
+
+      expect(result.reduction.decision).toBe('pass');
+      expect(received).toHaveLength(1);
+      expect(received[0]).toMatchObject({
+        host: 'copilot',
+        sessionId: '<session-id>',
+        session_id: '<session-id>',
+        directory: '<cwd>',
+        cwd: '<cwd>',
+        ...expected,
+      });
+    },
+  );
+
+  it.each([
+    {
+      payload: { userPrompt: 'use tdd now' },
+      aliases: ['use tdd now'],
+    },
+    {
+      payload: { message: { content: 'use tdd from message' } },
+      aliases: ['use tdd from message'],
+    },
+    {
+      payload: {
+        parts: [
+          { type: 'text', text: 'use tdd' },
+          { type: 'text', text: 'from parts' },
+        ],
+      },
+      aliases: ['use tdd from parts'],
+    },
+  ])('selects canonical prompt aliases without raw host parsing', async ({
+    payload,
+    aliases,
+  }) => {
+    const received: LegacyProcessorInput[] = [];
+    const result = await runHookPayload(
+      'user-prompt-submit',
+      {
+        sessionId: 'prompt-alias-session',
+        cwd: '<cwd>',
+        ...payload,
+      },
+      (unit, envelope) => {
+        received.push(buildLegacyProcessorInput(envelope, unit));
+        return { continue: true };
+      },
+    );
+
+    expect(result.reduction.decision).toBe('pass');
+    expect(received[0]).toMatchObject({
+      host: 'copilot',
+      prompt: aliases[0],
+      promptAliases: aliases,
+    });
+  });
+
+  it('preserves exact Claude output while encoding Copilot prompt context', async () => {
+    const legacyOutput = {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        additionalContext: '<activation>',
+      },
+    };
+
+    for (const [host, payload, expected] of [
+      [
+        'claude',
+        loadFixture('claude', 'UserPromptSubmit'),
+        legacyOutput,
+      ],
+      [
+        'copilot',
+        loadFixture('copilot-1.0.72-1', 'userPromptSubmitted'),
+        { additionalContext: '<activation>' },
+      ],
+    ] as const) {
+      let capturedOutput: unknown;
+      const result = await runHookPayload(
+        'user-prompt-submit',
+        payload,
+        () => {
+          capturedOutput = legacyOutput;
+          return legacyOutput;
+        },
+      );
+
+      expect(result.envelope.host).toBe(host);
+      expect(encodeLegacyCompatibleHookOutput(
+        result.envelope,
+        result.reduction,
+        capturedOutput,
+      )).toEqual(expected);
+    }
+  });
 });

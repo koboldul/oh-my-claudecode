@@ -10,6 +10,8 @@ import {
   type HookEvaluation,
   type HookEvaluationSource,
   type HookMutationIntent,
+  type HookMutationRetryIntent,
+  type HookMutationRetryHint,
   type HookReduction,
 } from './hook-protocol.js';
 import { canEncodeHookMutation } from './hook-output.js';
@@ -209,20 +211,45 @@ export function sanitizeHookEvaluation(
 
     let mutation: HookEvaluation['mutation'];
     if (hasOwn(value, 'mutation') && value.mutation !== undefined) {
+      const rawMutation = value.mutation;
       if (
-        !isRecord(value.mutation)
-        || !hasOwn(value.mutation, 'input')
-        || (value.mutation.requirement !== 'optional'
-          && value.mutation.requirement !== 'required')
+        !isRecord(rawMutation)
+        || !hasOwn(rawMutation, 'input')
+        || (rawMutation.requirement !== 'optional'
+          && rawMutation.requirement !== 'required')
       ) {
         return adapterDenyEvaluation(
           'mutation must contain input and a valid requirement',
           callId,
         );
       }
+      let retryHint: HookMutationRetryHint | undefined;
+      if (rawMutation.retryHint !== undefined) {
+        if (
+          !isRecord(rawMutation.retryHint)
+          || typeof rawMutation.retryHint.instruction !== 'string'
+          || rawMutation.retryHint.instruction.trim().length === 0
+          || (
+            rawMutation.retryHint.patch !== undefined
+            && !isPlainObject(rawMutation.retryHint.patch)
+          )
+        ) {
+          return adapterDenyEvaluation(
+            'mutation.retryHint must contain a non-empty instruction and optional plain-object patch',
+            callId,
+          );
+        }
+        retryHint = {
+          instruction: rawMutation.retryHint.instruction,
+          ...(rawMutation.retryHint.patch !== undefined
+            ? { patch: rawMutation.retryHint.patch }
+            : {}),
+        };
+      }
       mutation = {
-        input: value.mutation.input,
-        requirement: value.mutation.requirement,
+        input: rawMutation.input,
+        requirement: rawMutation.requirement,
+        ...(retryHint ? { retryHint } : {}),
       };
     }
 
@@ -385,6 +412,7 @@ function adapterReductionFailure(error: unknown): HookReduction {
     contexts: [],
     diagnostics: [],
     mutations: [],
+    mutationRetryHints: [],
     callDecisions: [callDecision],
     effects: [],
     stagedEffects: [],
@@ -497,6 +525,7 @@ function reduceHookEvaluationsInternal(
   let retry = false;
   const diagnostics: string[] = [];
   const mutations: HookMutationIntent[] = [];
+  const mutationRetryHints: HookMutationRetryIntent[] = [];
 
   if (safetyIssue) {
     decision = 'deny';
@@ -530,13 +559,15 @@ function reduceHookEvaluationsInternal(
   }
 
   let discardedOptionalMutation = false;
+  const mutationDecision = decision;
+  const requiredMutationReasons: string[] = [];
 
   for (const evaluation of normalizedEvaluations) {
     if (!evaluation.mutation) continue;
 
     const representationIssue = mutationRepresentationIssue(
       envelope,
-      decision,
+      mutationDecision,
       evaluation.callId,
       evaluation.mutation.input,
     );
@@ -545,6 +576,9 @@ function reduceHookEvaluationsInternal(
         callId: evaluation.callId,
         input: evaluation.mutation.input,
         requirement: evaluation.mutation.requirement,
+        ...(evaluation.mutation.retryHint
+          ? { retryHint: evaluation.mutation.retryHint }
+          : {}),
       });
       continue;
     }
@@ -553,19 +587,39 @@ function reduceHookEvaluationsInternal(
       ? ` for call "${evaluation.callId}"`
       : '';
     if (evaluation.mutation.requirement === 'required') {
-      decision = 'deny';
       retry = true;
-      const mutationReason = `Required input mutation${callLabel} cannot be represented by ${envelope.contract} because ${representationIssue}; retry the call separately with the required input changes.`;
-      reason = reason ? `${reason} ${mutationReason}` : mutationReason;
+      const retryInstruction = evaluation.mutation.retryHint?.instruction;
+      if (evaluation.mutation.retryHint) {
+        mutationRetryHints.push({
+          ...(evaluation.callId ? { callId: evaluation.callId } : {}),
+          ...evaluation.mutation.retryHint,
+        });
+      }
+      const mutationReason =
+        `Required input mutation${callLabel} cannot be represented by ${envelope.contract} because ${representationIssue}; `
+        + (
+          retryInstruction
+            ? `retry with this exact per-call patch: ${retryInstruction}.`
+            : 'retry the call separately with the required input changes.'
+        );
+      requiredMutationReasons.push(mutationReason);
       diagnostics.push(mutationReason);
-      mutations.length = 0;
-      break;
+      continue;
     }
 
     discardedOptionalMutation = true;
     diagnostics.push(
       `Optional input mutation${callLabel} was not applied because ${envelope.contract} cannot represent it: ${representationIssue}; the original input will be used.`,
     );
+  }
+
+  if (requiredMutationReasons.length > 0) {
+    decision = 'deny';
+    reason = [
+      reason,
+      ...requiredMutationReasons,
+    ].filter(Boolean).join(' ');
+    mutations.length = 0;
   }
 
   if (
@@ -598,6 +652,7 @@ function reduceHookEvaluationsInternal(
     context: contexts.length > 0 ? contexts.join('\n\n') : undefined,
     diagnostics: boundedDiagnostics,
     mutations,
+    mutationRetryHints,
     callDecisions,
     effects: stagedEffects,
     stagedEffects,
@@ -615,6 +670,7 @@ export function interpretLegacyOutput(
 
     const recognized = [
       'continue',
+      'suppressOutput',
       'hookSpecificOutput',
       'decision',
       'message',
@@ -631,6 +687,13 @@ export function interpretLegacyOutput(
       && typeof output.continue !== 'boolean'
     ) {
       return adapterDenyEvaluation('continue must be boolean');
+    }
+    if (
+      hasOwn(output, 'suppressOutput')
+      && output.suppressOutput !== undefined
+      && typeof output.suppressOutput !== 'boolean'
+    ) {
+      return adapterDenyEvaluation('suppressOutput must be boolean');
     }
     if (
       hasOwn(output, 'reason')
