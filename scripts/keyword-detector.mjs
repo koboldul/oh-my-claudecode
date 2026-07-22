@@ -32,6 +32,12 @@ import { atomicWriteFileSync, recoverEmergencyStateFile, withStateFileLockSync }
 import { readStdin } from './lib/stdin.mjs';
 import { resolveOmcStateRoot, resolveSessionStatePathsForHook } from './lib/state-root.mjs';
 import { parseWorkflowInvocation, selectWorkflowProfile, createWorkflowState, isValidWorkflowTrackingState, isWorkflowRuntimeSupported, resolveWorkflowStagePrompt, takeWorkflowTranscriptFailure } from './lib/workflow-profile-runtime.mjs';
+import {
+  describeHookRunFailure,
+  encodeLegacyCompatibleHookOutput,
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 
 // Resolve OMC package root: CLAUDE_PLUGIN_ROOT (plugin system) or derive from this script's location
 const _omcRoot = process.env.CLAUDE_PLUGIN_ROOT ||
@@ -183,23 +189,25 @@ const MODE_MESSAGE_KEYWORDS = new Map([
   ['security-review', SECURITY_REVIEW_MESSAGE],
 ]);
 
-// Extract prompt from various JSON structures
-function extractPrompt(input) {
-  try {
-    const data = JSON.parse(input);
-    if (data.prompt) return data.prompt;
-    if (data.message?.content) return data.message.content;
-    if (Array.isArray(data.parts)) {
-      return data.parts
-        .filter(p => p.type === 'text')
-        .map(p => p.text)
-        .join(' ');
-    }
-    return '';
-  } catch {
-    // Fail closed: don't risk false-positive keyword detection from malformed input
-    return '';
+// Extract prompt from the canonical legacy processor input.
+function extractPrompt(data) {
+  if (typeof data.prompt === 'string' && data.prompt) return data.prompt;
+  if (Array.isArray(data.promptAliases)) {
+    const alias = data.promptAliases.find(
+      (value) => typeof value === 'string' && value.length > 0,
+    );
+    if (alias) return alias;
   }
+  if (typeof data.message?.content === 'string') {
+    return data.message.content;
+  }
+  if (Array.isArray(data.parts)) {
+    return data.parts
+      .filter(p => p?.type === 'text' && typeof p.text === 'string')
+      .map(p => p.text)
+      .join(' ');
+  }
+  return '';
 }
 
 function isExplicitRalplanSlashInvocation(prompt) {
@@ -1491,53 +1499,24 @@ function createHookOutput(additionalContext) {
   };
 }
 
-// Main
-async function main() {
-  // Skip guard: check OMC_SKIP_HOOKS env var (see issue #838)
-  const _skipHooks = (process.env.OMC_SKIP_HOOKS || '').split(',').map(s => s.trim());
-  if (
-    process.env.DISABLE_OMC === '1' ||
-    process.env.DISABLE_OMC === 'true' ||
-    _skipHooks.includes('keyword-detector')
-  ) {
-    console.log(JSON.stringify({ continue: true }));
-    return;
-  }
-
-  // Team worker guard: prevent keyword detection inside team workers to avoid
-  // infinite spawning loops (worker detects "team" -> invokes team skill -> spawns more workers)
-  if (process.env.OMC_TEAM_WORKER) {
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-    return;
-  }
-
+async function processKeywordDetector(data) {
   try {
-    const input = await readStdin();
-    if (!input.trim()) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
-    }
-
-    let data = {};
-    try { data = JSON.parse(input); } catch {}
-    const directory = data.cwd || data.directory || process.cwd();
-    const sessionId = data.session_id || data.sessionId || '';
+    const directory = data.directory || process.cwd();
+    const sessionId = data.sessionId || '';
     const omcRoot = await resolveOmcStateRoot(directory);
 
-    const prompt = extractPrompt(input);
+    const prompt = extractPrompt(data);
     if (!prompt) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
+      return { continue: true, suppressOutput: true };
     }
 
     // Named profiles are an explicit command surface. Handle them before generic
     // autopilot keyword activation so only a complete, validated state is written.
     const workflowInvocation = parseWorkflowInvocation(prompt);
     if (workflowInvocation.kind === 'invalid-explicit-workflow-invocation') {
-      console.log(JSON.stringify(createHookOutput(
+      return createHookOutput(
         `[AUTOPILOT WORKFLOW ERROR] ${workflowInvocation.error} No autopilot state was activated.`
-      )));
-      return;
+      );
     }
     if (workflowInvocation.kind === 'valid') {
       try {
@@ -1545,41 +1524,37 @@ async function main() {
         const resumedPrompt = resumeWorkflowProfile(directory, sessionId, workflowInvocation.workflowName, omcRoot);
         if (resumedPrompt === false) throw new Error('workflow_descriptor_integrity_failed');
         if (resumedPrompt) {
-          console.log(JSON.stringify(createHookOutput(resumedPrompt)));
-          return;
+          return createHookOutput(resumedPrompt);
         }
         const workflow = selectWorkflowProfile(directory, workflowInvocation.workflowName);
-        const stagePrompt = activateWorkflowProfile(directory, sessionId, workflowInvocation.task, workflow, omcRoot, data.transcript_path || data.transcriptPath);
+        const stagePrompt = activateWorkflowProfile(directory, sessionId, workflowInvocation.task, workflow, omcRoot, data.transcriptPath);
         if (!stagePrompt) {
           throw new Error('Could not persist workflow state.');
         }
-        console.log(JSON.stringify(createHookOutput(stagePrompt)));
+        return createHookOutput(stagePrompt);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Workflow activation failed.';
-        console.log(JSON.stringify(createHookOutput(
+        return createHookOutput(
           `[AUTOPILOT WORKFLOW ERROR] ${message} No autopilot state was activated.`
-        )));
+        );
       }
-      return;
     }
 
     // `/ask <provider> ...` delegates the remainder of the prompt to an
     // advisor process. Magic keywords inside that delegated payload must not
     // activate modes in the current Claude Code session.
     if (isExplicitAskSlashInvocation(prompt)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
+      return { continue: true, suppressOutput: true };
     }
 
     if (isExplicitRalplanSlashInvocation(prompt)) {
       activateRalplanStartupState(directory, prompt, sessionId, omcRoot);
-      console.log(JSON.stringify(createHookOutput(
+      return createHookOutput(
         `[RALPLAN INIT]\n` +
         `Explicit /ralplan invoke detected during UserPromptSubmit.\n` +
         `ralplan state has been initialized immediately and marked awaiting confirmation so the stop hook will not block this startup path.\n\n` +
         createSkillInvocation('ralplan', prompt)
-      )));
-      return;
+      );
     }
 
     // Strip pasted system-echo blocks BEFORE any mode-keyword dispatch runs.
@@ -1761,12 +1736,10 @@ async function main() {
         });
 
         if (isTeamFollowup) {
-          console.log(JSON.stringify(createHookOutput(createSkillInvocation('team', prompt))));
-          return;
+          return createHookOutput(createSkillInvocation('team', prompt));
         }
         if (isRalphFollowup) {
-          console.log(JSON.stringify(createHookOutput(createSkillInvocation('ralph', prompt))));
-          return;
+          return createHookOutput(createSkillInvocation('ralph', prompt));
         }
 
         const isShortTeamRequest = followupPlanner.isShortTeamFollowupRequest?.(prompt) === true;
@@ -1775,8 +1748,7 @@ async function main() {
           // A compact continuation can echo the saved plan and a terse lane hint.
           // Unless the ralplan state is terminal and a launch hint is present,
           // keep ralplan read-only instead of falling through to generic ralph.
-          console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-          return;
+          return { continue: true, suppressOutput: true };
         }
       }
     }
@@ -1786,8 +1758,7 @@ async function main() {
     // prompts like "team" can launch the approved execution path even
     // though generic team keyword auto-detection is disabled.
     if (resolved.length === 0) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
+      return { continue: true, suppressOutput: true };
     }
 
     // Record detected keywords to flow trace
@@ -1796,11 +1767,9 @@ async function main() {
         try { tracer.recordKeywordDetected(directory, sessionId, match.name); } catch { /* silent */ }
       }
     }
-
     // Route cancellation without mutating state; the cancel workflow commits the primary mode first.
     if (resolved.length > 0 && resolved[0].name === 'cancel') {
-      console.log(JSON.stringify(createHookOutput(createSkillInvocation('cancel', prompt))));
-      return;
+      return createHookOutput(createSkillInvocation('cancel', prompt));
     }
 
     // Activate states for modes that need them (team removed — explicit-only via /team skill)
@@ -1808,8 +1777,7 @@ async function main() {
     for (const mode of stateModes) {
       const activationError = await activateState(directory, prompt, mode.name, sessionId);
       if (activationError === 'workflow_descriptor_integrity_failed') {
-        console.log(JSON.stringify(createHookOutput('workflow_descriptor_integrity_failed')));
-        return;
+        return createHookOutput('workflow_descriptor_integrity_failed');
       }
     }
 
@@ -1835,10 +1803,8 @@ async function main() {
         additionalContextParts.push(message);
       }
     }
-
     if (resolved.length === 0 && additionalContextParts.length > 0) {
-      console.log(JSON.stringify(createHookOutput(additionalContextParts.join(''))));
-      return;
+      return createHookOutput(additionalContextParts.join(''));
     }
 
     if (resolved.length > 0) {
@@ -1846,13 +1812,68 @@ async function main() {
     }
 
     if (additionalContextParts.length > 0) {
-      console.log(JSON.stringify(createHookOutput(additionalContextParts.join(''))));
-      return;
+      return createHookOutput(additionalContextParts.join(''));
     }
+    return { continue: true, suppressOutput: true };
   } catch (error) {
     // On any error, allow continuation
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    return { continue: true, suppressOutput: true };
   }
 }
 
-main();
+// Main
+async function main() {
+  // Skip guard: check OMC_SKIP_HOOKS env var (see issue #838)
+  const _skipHooks = (process.env.OMC_SKIP_HOOKS || '').split(',').map(s => s.trim());
+  if (
+    process.env.DISABLE_OMC === '1' ||
+    process.env.DISABLE_OMC === 'true' ||
+    _skipHooks.includes('keyword-detector')
+  ) {
+    console.log(JSON.stringify({ continue: true }));
+    return;
+  }
+
+  // Team worker guard: prevent keyword detection inside team workers to avoid
+  // infinite spawning loops (worker detects "team" -> invokes team skill -> spawns more workers)
+  if (process.env.OMC_TEAM_WORKER) {
+    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    return;
+  }
+
+  try {
+    const runtime = loadHookRuntime();
+    const input = await readStdin();
+    if (!input.trim()) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      'user-prompt-submit',
+      input,
+      async (unit, envelope) => {
+        legacyOutput = await processKeywordDetector(
+          runtime.buildLegacyProcessorInput(envelope, unit),
+        );
+        return legacyOutput;
+      },
+    );
+
+    const failure = describeHookRunFailure(runtime, result);
+    if (failure) throw new Error(failure);
+
+    console.log(JSON.stringify(
+      encodeLegacyCompatibleHookOutput(
+        runtime,
+        result,
+        legacyOutput,
+      ),
+    ));
+  } catch (error) {
+    surfaceOptionalHookFailure(error, { hookName: 'keyword-detector' });
+  }
+}
+
+void main();

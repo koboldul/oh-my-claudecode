@@ -1,12 +1,27 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import {
+  stageHookRuntime,
+  type StagedHookRuntime,
+} from './helpers/staged-hook-runtime.js';
 
-const SCRIPT_PATH = join(process.cwd(), 'scripts', 'skill-injector.mjs');
+const REPO_ROOT = process.cwd();
 const NODE = process.execPath;
 const tempDirs: string[] = [];
+let stagedRuntime: StagedHookRuntime;
+let scriptPath: string;
+
+beforeAll(() => {
+  stagedRuntime = stageHookRuntime(['skill-injector.mjs'], REPO_ROOT);
+  scriptPath = stagedRuntime.scriptPath('skill-injector.mjs');
+});
+
+afterAll(() => {
+  stagedRuntime.cleanup();
+});
 
 function makeTempDir(prefix: string) {
   const directory = mkdtempSync(join(tmpdir(), prefix));
@@ -16,7 +31,7 @@ function makeTempDir(prefix: string) {
 
 function runSkillInjector(env: NodeJS.ProcessEnv = {}, payload: Record<string, unknown> = {}) {
   const cwd = typeof payload.cwd === 'string' ? payload.cwd : makeTempDir('skill-injector-guard-');
-  const raw = execFileSync(NODE, [SCRIPT_PATH], {
+  const raw = execFileSync(NODE, [scriptPath], {
     cwd,
     encoding: 'utf-8',
     input: JSON.stringify({
@@ -130,13 +145,21 @@ Write concise release notes.`);
     const pluginRoot = makeTempDir('skill-injector-worker-plugin-');
     const scriptsDir = join(pluginRoot, 'scripts');
     const libDir = join(scriptsDir, 'lib');
-    mkdirSync(libDir, { recursive: true });
+    const runtimePath = join(pluginRoot, 'bridge', 'hook-runtime.cjs');
+    mkdirSync(join(pluginRoot, 'bridge'), { recursive: true });
     mkdirSync(join(pluginRoot, 'hooks'), { recursive: true });
-    for (const file of ['config-dir.mjs', 'stdin.mjs', 'atomic-write.mjs']) {
-      writeFileSync(join(libDir, file), readFileSync(join(process.cwd(), 'scripts', 'lib', file)));
-    }
+    cpSync(join(process.cwd(), 'scripts', 'lib'), libDir, { recursive: true });
     writeFileSync(join(scriptsDir, 'run.cjs'), readFileSync(join(process.cwd(), 'scripts', 'run.cjs')));
-    writeFileSync(join(scriptsDir, 'skill-injector.mjs'), readFileSync(SCRIPT_PATH));
+    writeFileSync(join(scriptsDir, 'skill-injector.mjs'), readFileSync(scriptPath));
+    execFileSync(
+      NODE,
+      [
+        join(process.cwd(), 'scripts', 'build-hook-runtime.mjs'),
+        '--outfile',
+        runtimePath,
+      ],
+      { cwd: process.cwd(), stdio: 'pipe' },
+    );
     writeFileSync(join(pluginRoot, 'hooks', 'hooks.json'), JSON.stringify({
       hooks: {
         UserPromptSubmit: [{ matcher: '', hooks: [{

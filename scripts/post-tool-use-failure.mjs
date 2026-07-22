@@ -9,6 +9,10 @@ import { join, sep, resolve, dirname } from 'path';
 import { readStdin } from './lib/stdin.mjs';
 import { atomicWriteFileSync, ensureDirSync } from './lib/atomic-write.mjs';
 import { resolveOmcStateRoot } from './lib/state-root.mjs';
+import {
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 
 // ============================================================================
 // Session ID resolution (mirrors src/lib/session-id.ts — inlined for .mjs)
@@ -17,7 +21,7 @@ import { resolveOmcStateRoot } from './lib/state-root.mjs';
 
 /**
  * Resolve the session id for hook context.
- * Payload session_id takes priority; falls back to OMC_SESSION_ID env var.
+ * Canonical payload sessionId takes priority; falls back to OMC_SESSION_ID env var.
  *
  * @param {object|null} hookPayload - Parsed stdin payload (may be null)
  * @returns {string|undefined}
@@ -26,9 +30,9 @@ function resolveHookSessionId(hookPayload) {
   const payloadId =
     hookPayload &&
     typeof hookPayload === 'object' &&
-    typeof hookPayload.session_id === 'string' &&
-    hookPayload.session_id.trim()
-      ? hookPayload.session_id.trim()
+    typeof hookPayload.sessionId === 'string' &&
+    hookPayload.sessionId.trim()
+      ? hookPayload.sessionId.trim()
       : undefined;
 
   const envId =
@@ -393,6 +397,114 @@ function shouldSuppressOptionalStartupMethodNotFound(toolName, error) {
   return /\bmethod not found\b/i.test(String(error || ''));
 }
 
+function describeCanonicalFailure(result) {
+  const failures = [];
+
+  for (const issue of result?.envelope?.issues ?? []) {
+    if (issue?.severity === 'safety' || issue?.batchSafety === true) {
+      failures.push(issue.message || issue.code || 'hook input normalization failed');
+    }
+  }
+
+  for (const evaluation of result?.evaluations ?? []) {
+    if (evaluation?.source === 'adapter' && evaluation?.decision === 'deny') {
+      failures.push(evaluation.reason || 'legacy processor adapter failed');
+    }
+  }
+
+  for (const decision of result?.reduction?.callDecisions ?? []) {
+    if (decision?.source === 'adapter' && decision?.decision === 'deny') {
+      failures.push(decision.reason || 'hook reduction failed');
+    }
+  }
+
+  if (result?.reduction?.decision && result.reduction.decision !== 'pass') {
+    failures.push(result.reduction.reason || `unexpected ${result.reduction.decision} reduction`);
+  }
+
+  return failures.length > 0 ? [...new Set(failures)].join('; ') : undefined;
+}
+
+async function processPostToolUseFailure(data) {
+  const toolName = data.toolName || '';
+  const toolInput = data.toolInput;
+  const error = data.toolError ?? '';
+  const isInterrupt = data.interrupted || false;
+  const directory = data.directory || process.cwd();
+
+  // Ignore user interrupts
+  if (isInterrupt) {
+    return { continue: true, suppressOutput: true };
+  }
+
+  // Skip if no tool name or error
+  if (!toolName || !error) {
+    return { continue: true, suppressOutput: true };
+  }
+
+  if (shouldSuppressOptionalStartupMethodNotFound(toolName, error)) {
+    return { continue: true, suppressOutput: true };
+  }
+
+  if (shouldSuppressFilesystemScanPermissionNoise(toolName, toolInput, error)) {
+    return { continue: true, suppressOutput: true };
+  }
+
+  // Resolve session id: payload wins over env var (hook context)
+  const rawSessionId = resolveHookSessionId(data);
+  const sessionId = validateSessionId(rawSessionId);
+
+  // Initialize .omc root directory
+  const omcRoot = await initOmcDir(directory);
+
+  // Resolve state paths (session-scoped or legacy)
+  const { stateDir, statePath } = resolveErrorStatePaths(omcRoot, sessionId);
+
+  // Ensure session state dir exists when session-scoped
+  if (sessionId) {
+    try { mkdirSync(stateDir, { recursive: true }); } catch {}
+  }
+
+  const lockPath = lockPathFor(statePath);
+
+  // Hoist retryCount so it is accessible for guidance generation after the lock
+  let retryCount = 1;
+
+  // Read-compute-write under lock to prevent concurrent retryCount corruption
+  withFileLockSync(lockPath, () => {
+    // Read existing state and calculate retry count
+    const existingState = readErrorState(statePath);
+    const currentTime = Date.now();
+    retryCount = calculateRetryCount(existingState, toolName, currentTime);
+
+    // Create input preview
+    const inputPreview = createInputPreview(toolInput);
+
+    // Write error state
+    writeErrorState(stateDir, toolName, inputPreview, error, retryCount, statePath);
+  });
+
+  // Inject continuation guidance so the model analyzes the error instead of stopping.
+  // Without this, PostToolUseFailure returns silently and the model may end its turn.
+  // The PostToolUse hook (post-tool-verifier.mjs) provides similar guidance for
+  // successful Bash calls with error patterns, but PostToolUseFailure is a separate
+  // event that needs its own guidance injection.
+  let guidance;
+  if (retryCount >= 5) {
+    guidance = `Tool "${toolName}" has failed ${retryCount} times. Stop retrying the same approach — try a different command, check dependencies, or ask the user for guidance.`;
+  } else {
+    guidance = `Tool "${toolName}" failed. Analyze the error, fix the issue, and continue working.`;
+  }
+
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: 'PostToolUseFailure',
+      additionalContext: guidance,
+    },
+  };
+}
+
 async function main() {
   // Skip guard: honor DISABLE_OMC and OMC_SKIP_HOOKS (see issues #838, #3253).
   // Token `post-tool-use-failure` is preferred; `post-tool-use` is accepted for
@@ -409,94 +521,33 @@ async function main() {
   }
 
   try {
+    const runtime = loadHookRuntime();
     const input = await readStdin();
-    const data = JSON.parse(input);
+    const result = await runtime.runHookJson(
+      'post-tool-use-failure',
+      input,
+      (unit, envelope) => processPostToolUseFailure(
+        runtime.buildLegacyProcessorInput(envelope, unit),
+      ),
+    );
 
-    // Official SDK fields (snake_case)
-    const toolName = data.tool_name || '';
-    const toolInput = data.tool_input;
-    const error = data.error || '';
-    const isInterrupt = data.is_interrupt || false;
-    const directory = data.cwd || data.directory || process.cwd();
-
-    // Ignore user interrupts
-    if (isInterrupt) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    const canonicalFailure = describeCanonicalFailure(result);
+    if (canonicalFailure) {
+      surfaceOptionalHookFailure(
+        new Error(canonicalFailure),
+        { hookName: 'post-tool-use-failure' },
+      );
       return;
     }
 
-    // Skip if no tool name or error
-    if (!toolName || !error) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
-    }
-
-    if (shouldSuppressOptionalStartupMethodNotFound(toolName, error)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
-    }
-
-    if (shouldSuppressFilesystemScanPermissionNoise(toolName, toolInput, error)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
-    }
-
-    // Resolve session id: payload wins over env var (hook context)
-    const rawSessionId = resolveHookSessionId(data);
-    const sessionId = validateSessionId(rawSessionId);
-
-    // Initialize .omc root directory
-    const omcRoot = await initOmcDir(directory);
-
-    // Resolve state paths (session-scoped or legacy)
-    const { stateDir, statePath } = resolveErrorStatePaths(omcRoot, sessionId);
-
-    // Ensure session state dir exists when session-scoped
-    if (sessionId) {
-      try { mkdirSync(stateDir, { recursive: true }); } catch {}
-    }
-
-    const lockPath = lockPathFor(statePath);
-
-    // Hoist retryCount so it is accessible for guidance generation after the lock
-    let retryCount = 1;
-
-    // Read-compute-write under lock to prevent concurrent retryCount corruption
-    withFileLockSync(lockPath, () => {
-      // Read existing state and calculate retry count
-      const existingState = readErrorState(statePath);
-      const currentTime = Date.now();
-      retryCount = calculateRetryCount(existingState, toolName, currentTime);
-
-      // Create input preview
-      const inputPreview = createInputPreview(toolInput);
-
-      // Write error state
-      writeErrorState(stateDir, toolName, inputPreview, error, retryCount, statePath);
-    });
-
-    // Inject continuation guidance so the model analyzes the error instead of stopping.
-    // Without this, PostToolUseFailure returns silently and the model may end its turn.
-    // The PostToolUse hook (post-tool-verifier.mjs) provides similar guidance for
-    // successful Bash calls with error patterns, but PostToolUseFailure is a separate
-    // event that needs its own guidance injection.
-    let guidance;
-    if (retryCount >= 5) {
-      guidance = `Tool "${toolName}" has failed ${retryCount} times. Stop retrying the same approach — try a different command, check dependencies, or ask the user for guidance.`;
-    } else {
-      guidance = `Tool "${toolName}" failed. Analyze the error, fix the issue, and continue working.`;
-    }
-
-    console.log(JSON.stringify({
-      continue: true,
-      hookSpecificOutput: {
-        hookEventName: 'PostToolUseFailure',
-        additionalContext: guidance,
-      },
-    }));
+    const encoded = runtime.encodeHookOutput(result.envelope, result.reduction);
+    const output =
+      result.envelope.host === 'claude' && Object.keys(encoded).length === 0
+        ? { continue: true, suppressOutput: true }
+        : encoded;
+    console.log(JSON.stringify(output));
   } catch (error) {
-    // Never block on hook errors
-    console.log(JSON.stringify({ continue: true }));
+    surfaceOptionalHookFailure(error, { hookName: 'post-tool-use-failure' });
   }
 }
 

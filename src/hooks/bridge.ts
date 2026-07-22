@@ -26,11 +26,15 @@ import {
 } from "fs";
 import { dirname, join } from "path";
 import { resolveToWorktreeRoot, getOmcRoot } from "../lib/worktree-paths.js";
-import { readModeState, writeModeState } from "../lib/mode-state-io.js";
+import {
+  confirmSkillModeStatesLocked,
+  readModeState,
+  writeModeState,
+} from "../lib/mode-state-io.js";
 import { SESSION_END_MODE_STATE_FILES } from "../lib/mode-names.js";
 import { formatOmcCliInvocation } from "../utils/omc-cli-rendering.js";
 import { createSwallowedErrorLogger } from "../lib/swallowed-error.js";
-import { dispatchNotificationInBackground } from "./background-notifications.js";
+import { dispatchDetachedNotificationInBackground } from "./background-notifications.js";
 import { readCanonicalTeamStateCandidate } from "./team-canonical-state.js";
 
 // Hot-path imports: needed on every/most hook invocations (keyword-detector, pre/post-tool-use)
@@ -77,11 +81,11 @@ import type { AutopilotState } from "./autopilot/types.js";
 import {
   writeSkillActiveState,
   isCanonicalWorkflowSkill,
+  isWorkflowSkillCompleted,
   upsertWorkflowSkillSlot,
   markWorkflowSkillCompleted,
   pruneExpiredWorkflowSkillTombstones,
-  readSkillActiveStateNormalized,
-  writeSkillActiveStateCopies,
+  mutateSkillActiveStateLocked,
   type ActiveSkillSlot,
 } from "./skill-state/index.js";
 import { parseExplicitWorkflowSlashInvocation } from "./keyword-detector/index.js";
@@ -159,13 +163,6 @@ const BACKGROUND_BASH_ID_PATTERN = /(?:background (?:bash )?(?:command|process|t
 const TASK_OUTPUT_ID_PATTERN = /<task_id>([^<]+)<\/task_id>/i;
 const TASK_OUTPUT_STATUS_PATTERN = /<status>([^<]+)<\/status>/i;
 const SAFE_SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/;
-const MODE_CONFIRMATION_SKILL_MAP: Record<string, string[]> = {
-  ralph: ["ralph", "ultrawork"],
-  ultrawork: ["ultrawork"],
-  autopilot: ["autopilot"],
-  ralplan: ["ralplan"],
-};
-
 const SESSION_START_CONTEXT_BUDGET = 6000;
 const SESSION_START_OMISSION_NOTICE = '[Additional SessionStart context omitted to preserve the 6000-character aggregate budget.]';
 const SESSION_STARTED_MARKER_FILE = "session-started.json";
@@ -620,9 +617,7 @@ function markModeAwaitingConfirmation(
 }
 
 function confirmSkillModeStates(directory: string, skillName: string, sessionId?: string): void {
-  for (const modeName of MODE_CONFIRMATION_SKILL_MAP[skillName] ?? []) {
-    updateModeAwaitingConfirmation(directory, modeName, sessionId, false);
-  }
+  confirmSkillModeStatesLocked(directory, skillName, sessionId);
 }
 
 function getSkillInvocationArgs(toolInput: unknown): string {
@@ -692,6 +687,7 @@ function deactivateRalplanState(directory: string, sessionId?: string): void {
   ]);
   const completedAt =
     typeof state.completed_at === "string"
+    && state.completed_at.trim().length > 0
       ? state.completed_at
       : new Date().toISOString();
 
@@ -1283,9 +1279,8 @@ function resolveWorkflowSlotModeStatePath(
 }
 
 /**
- * Seed (or refresh) a canonical workflow-slot entry in the dual-copy ledger
- * via the only sanctioned helper, `writeSkillActiveStateCopies()`. Returns
- * `true` when at least one copy was written, `false` on best-effort failure.
+ * Seed (or refresh) a canonical workflow-slot entry through the skill-state
+ * owner. Returns `false` on best-effort failure.
  */
 function seedWorkflowSlotForSkill(
   directory: string,
@@ -1298,9 +1293,6 @@ function seedWorkflowSlotForSkill(
   const normalized = skillName.toLowerCase().replace(/^oh-my-claudecode:/, "");
 
   try {
-    const current = readSkillActiveStateNormalized(directory, sessionId);
-    const pruned = pruneExpiredWorkflowSkillTombstones(current);
-
     // Resolve mode-state file pointers eagerly so downstream readers can
     // locate the mode payload without re-deriving the path.
     const rootStatePath = resolveStatePathSafe("skill-active", directory);
@@ -1325,8 +1317,17 @@ function seedWorkflowSlotForSkill(
       slotData.parent_skill = parentSkill;
     }
 
-    const next = upsertWorkflowSkillSlot(pruned, normalized, slotData);
-    return writeSkillActiveStateCopies(directory, next, sessionId);
+    const result = mutateSkillActiveStateLocked(
+      directory,
+      sessionId,
+      (current) =>
+        upsertWorkflowSkillSlot(
+          pruneExpiredWorkflowSkillTombstones(current),
+          normalized,
+          slotData,
+        ),
+    );
+    return result.status !== "failed";
   } catch {
     return false;
   }
@@ -1345,13 +1346,18 @@ function confirmWorkflowSlot(
   const normalized = skillName.toLowerCase().replace(/^oh-my-claudecode:/, "");
 
   try {
-    const current = readSkillActiveStateNormalized(directory, sessionId);
-    const slot = current.active_skills[normalized];
-    if (!slot || slot.completed_at) return false;
-    const next = upsertWorkflowSkillSlot(current, normalized, {
-      last_confirmed_at: new Date().toISOString(),
-    });
-    return writeSkillActiveStateCopies(directory, next, sessionId);
+    const result = mutateSkillActiveStateLocked(
+      directory,
+      sessionId,
+      (current) => {
+        const slot = current.active_skills[normalized];
+        if (!slot || isWorkflowSkillCompleted(slot)) return current;
+        return upsertWorkflowSkillSlot(current, normalized, {
+          last_confirmed_at: new Date().toISOString(),
+        });
+      },
+    );
+    return result.status === "written";
   } catch {
     return false;
   }
@@ -1370,10 +1376,15 @@ function tombstoneWorkflowSlot(
   if (!isCanonicalWorkflowSkill(skillName)) return false;
   const normalized = skillName.toLowerCase().replace(/^oh-my-claudecode:/, "");
   try {
-    const current = readSkillActiveStateNormalized(directory, sessionId);
-    if (!current.active_skills[normalized]) return false;
-    const next = markWorkflowSkillCompleted(current, normalized);
-    return writeSkillActiveStateCopies(directory, next, sessionId);
+    const result = mutateSkillActiveStateLocked(
+      directory,
+      sessionId,
+      (current) =>
+        current.active_skills[normalized]
+          ? markWorkflowSkillCompleted(current, normalized)
+          : current,
+    );
+    return result.status === "written";
   } catch {
     return false;
   }
@@ -1859,7 +1870,7 @@ async function processPersistentMode(input: HookInput): Promise<HookOutput> {
         }
         if (shouldSendIdleNotification(stateDir, sessionId, idleRepoState)) {
           recordIdleNotificationSent(stateDir, sessionId, idleRepoState);
-          dispatchNotificationInBackground("session-idle", {
+          dispatchDetachedNotificationInBackground("session-idle", {
             sessionId,
             projectPath: directory,
             profileName: process.env.OMC_NOTIFY_PROFILE,
@@ -1953,7 +1964,7 @@ async function processSessionStart(input: HookInput): Promise<HookOutput> {
 
   // Send session-start notification (non-blocking, swallows errors)
   if (sessionId) {
-    dispatchNotificationInBackground("session-start", {
+    dispatchDetachedNotificationInBackground("session-start", {
       sessionId,
       projectPath: directory,
       profileName: process.env.OMC_NOTIFY_PROFILE,
@@ -2285,7 +2296,7 @@ export function dispatchAskUserQuestionNotification(
       .filter(Boolean)
       .join("; ") || "User input requested";
 
-  dispatchNotificationInBackground("ask-user-question", {
+  dispatchDetachedNotificationInBackground("ask-user-question", {
     sessionId,
     projectPath: directory,
     question: questionText,
@@ -2583,7 +2594,7 @@ function processPreToolUse(input: HookInput): HookOutput {
     const agentName = agentType?.includes(":")
       ? agentType.split(":").pop()
       : agentType;
-    dispatchNotificationInBackground("agent-call", {
+    dispatchDetachedNotificationInBackground("agent-call", {
       sessionId: input.sessionId!,
       projectPath: directory,
       agentName,

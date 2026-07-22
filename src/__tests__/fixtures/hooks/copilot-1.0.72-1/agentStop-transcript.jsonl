@@ -1,0 +1,5 @@
+{"type":"session.start","data":{"version":1,"copilotVersion":"1.0.72-1","sessionId":"<session-id>","contextTier":null}}
+{"type":"assistant.message","data":{"messageId":"<tool-message-id>","model":"<model-id>","content":"","outputTokens":42,"toolRequests":[{"toolCallId":"<tool-call-id>"}]}}
+{"type":"tool.execution_complete","data":{"toolCallId":"<tool-call-id>","success":true}}
+{"type":"assistant.message","data":{"messageId":"<final-message-id>","model":"<model-id>","content":"PostgreSQL or SQLite?","outputTokens":17,"toolRequests":[]}}
+{"type":"hook.start","data":{"hookType":"agentStop","input":{"transcriptPath":"<transcript-path>","stopReason":"end_turn","sessionId":"<session-id>"}}}

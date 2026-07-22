@@ -17,6 +17,12 @@ import { getClaudeConfigDir } from './lib/config-dir.mjs';
 import { readStdin } from './lib/stdin.mjs';
 import { createRequire } from 'module';
 import { atomicWriteFileSync, ensureDirSync } from './lib/atomic-write.mjs';
+import {
+  describeHookRunFailure,
+  encodeLegacyCompatibleHookOutput,
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 
 const skipHooks = (process.env.OMC_SKIP_HOOKS || '').split(',').map(token => token.trim());
 const isDisabled = process.env.DISABLE_OMC === '1' ||
@@ -40,7 +46,7 @@ let MAX_LEARNED_SKILLS_CONTEXT_CHARS;
 
 /**
  * Resolve the session id for hook context.
- * Payload session_id takes priority; falls back to OMC_SESSION_ID env var.
+ * Canonical payload sessionId takes priority; falls back to OMC_SESSION_ID.
  *
  * @param {object|null} hookPayload - Parsed stdin payload (may be null)
  * @returns {string|undefined}
@@ -49,9 +55,9 @@ function resolveHookSessionId(hookPayload) {
   const payloadId =
     hookPayload &&
     typeof hookPayload === 'object' &&
-    typeof hookPayload.session_id === 'string' &&
-    hookPayload.session_id.trim()
-      ? hookPayload.session_id.trim()
+    typeof hookPayload.sessionId === 'string' &&
+    hookPayload.sessionId.trim()
+      ? hookPayload.sessionId.trim()
       : undefined;
 
   const envId =
@@ -563,32 +569,20 @@ function formatSkillsMessage(skills) {
   return `${header}${descriptors.join('')}${footer}`;
 }
 
-// Main
-async function main() {
-  try {
-    const input = await readStdin();
-    if (!input.trim()) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
-    }
-
-    let data = {};
-    try { data = JSON.parse(input); } catch { /* ignore parse errors */ }
-
+async function processSkillInjector(data) {
     const prompt = data.prompt || '';
-    const directory = data.cwd || process.cwd();
+    const directory = data.directory || process.cwd();
 
     // Resolve session id: payload wins over env var (hook context)
     const rawSessionId = resolveHookSessionId(data);
-    const sessionId = validateSessionId(rawSessionId) ?? (data.session_id || data.sessionId || 'unknown');
+    const sessionId = validateSessionId(rawSessionId) ?? 'unknown';
 
     // Resolve OMC root (walk up from data.cwd looking for workspace markers)
     const omcRoot = resolveOmcRootSync(directory);
 
     // Skip if no prompt
     if (!prompt) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
+      return { continue: true, suppressOutput: true };
     }
 
     const matchingSkills = findMatchingSkills(prompt, directory, sessionId, omcRoot);
@@ -604,19 +598,52 @@ async function main() {
     }
 
     if (matchingSkills.length > 0) {
-      console.log(JSON.stringify({
+      return {
         continue: true,
         hookSpecificOutput: {
           hookEventName: 'UserPromptSubmit',
           additionalContext: formatSkillsMessage(matchingSkills)
         }
-      }));
-    } else {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      };
     }
+
+    return { continue: true, suppressOutput: true };
+}
+
+// Main
+async function main() {
+  try {
+    const runtime = loadHookRuntime();
+    const input = await readStdin();
+    if (!input.trim()) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      'user-prompt-submit',
+      input,
+      async (unit, envelope) => {
+        legacyOutput = await processSkillInjector(
+          runtime.buildLegacyProcessorInput(envelope, unit),
+        );
+        return legacyOutput;
+      },
+    );
+
+    const failure = describeHookRunFailure(runtime, result);
+    if (failure) throw new Error(failure);
+
+    console.log(JSON.stringify(
+      encodeLegacyCompatibleHookOutput(
+        runtime,
+        result,
+        legacyOutput,
+      ),
+    ));
   } catch (error) {
-    // On any error, allow continuation
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    surfaceOptionalHookFailure(error, { hookName: 'skill-injector' });
   }
 }
 
@@ -638,5 +665,5 @@ if (isDisabled) {
   MAX_SKILLS_PER_SESSION = 5;
   MAX_LEARNED_SKILL_DESCRIPTOR_CHARS = 1000;
   MAX_LEARNED_SKILLS_CONTEXT_CHARS = 3000;
-  main();
+  void main();
 }

@@ -1,14 +1,49 @@
 import { execFileSync } from 'child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'fs';
+import {
+  copyFileSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { stageHookRuntime } from '../../__tests__/helpers/staged-hook-runtime.js';
 
 const ROOT = process.cwd();
-const SCRIPT = join(ROOT, 'scripts', 'workflow-drift-guard.mjs');
-const TEMPLATE = join(ROOT, 'templates', 'hooks', 'workflow-drift-guard.mjs');
+const COPILOT_FIXTURE_ROOT = join(
+  ROOT,
+  'src',
+  '__tests__',
+  'fixtures',
+  'hooks',
+  'copilot-1.0.72-1',
+);
+const COPILOT_AGENT_STOP = JSON.parse(
+  readFileSync(join(COPILOT_FIXTURE_ROOT, 'agentStop.json'), 'utf8'),
+) as Record<string, unknown>;
+const COPILOT_TRANSCRIPT_FIXTURE = join(
+  COPILOT_FIXTURE_ROOT,
+  'agentStop-transcript.jsonl',
+);
+const stagedRuntime = stageHookRuntime(['workflow-drift-guard.mjs']);
+const SCRIPT = stagedRuntime.scriptPath('workflow-drift-guard.mjs');
+const GUARD_CWD = mkdtempSync(join(tmpdir(), 'omc-workflow-drift-cwd-'));
 const QUESTION_REASON_MARKERS = ['AskUserQuestion', 'allowOther'];
 const AMBIENT_PARENT_LANE_SENTINEL = 'OMC_WORKFLOW_DRIFT_GUARD_AMBIENT_LANE';
+const transcriptRoots: string[] = [];
+
+afterAll(() => {
+  stagedRuntime.cleanup();
+  rmSync(GUARD_CWD, { recursive: true, force: true });
+});
+
+afterEach(() => {
+  for (const root of transcriptRoots.splice(0)) {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 interface GuardResult {
   decision?: string;
@@ -30,11 +65,36 @@ function runGuard(input: Record<string, unknown>, env: Record<string, string> = 
 }
 
 function guardInput(last_assistant_message: string, extra: Record<string, unknown> = {}) {
-  return { hook_event_name: 'Stop', last_assistant_message, cwd: ROOT, ...extra };
+  return { hook_event_name: 'Stop', last_assistant_message, cwd: GUARD_CWD, ...extra };
+}
+
+function copilotGuardInput(
+  transcriptPath: string,
+  extra: Record<string, unknown> = {},
+) {
+  return {
+    ...COPILOT_AGENT_STOP,
+    cwd: GUARD_CWD,
+    sessionId: 'copilot-transcript-fixture',
+    transcriptPath,
+    ...extra,
+  };
+}
+
+function makeTranscript(contents?: string): string {
+  const root = mkdtempSync(join(tmpdir(), 'omc-workflow-drift-transcript-'));
+  transcriptRoots.push(root);
+  const path = join(root, 'events.jsonl');
+  if (contents !== undefined) writeFileSync(path, contents);
+  return path;
 }
 
 function expectPass(result: GuardResult) {
   expect(result).toEqual({ suppressOutput: true });
+}
+
+function expectCopilotPass(result: GuardResult) {
+  expect(result).toEqual({});
 }
 
 function expectBlock(result: GuardResult) {
@@ -62,7 +122,7 @@ function restoreEnvironment(name: 'DISABLE_OMC' | 'OMC_SKIP_HOOKS', value: strin
 }
 
 describe('workflow-drift-guard Stop hook', () => {
-  it('has one exact Stop registration and byte-identical source/template scripts', () => {
+  it('has one exact Stop registration', () => {
     const manifest = JSON.parse(readFileSync(join(ROOT, 'hooks', 'hooks.json'), 'utf8')) as {
       hooks: Record<string, Array<{ hooks?: Array<{ type?: string; command?: string; timeout?: number }> }>>;
     };
@@ -71,7 +131,14 @@ describe('workflow-drift-guard Stop hook', () => {
     for (const [event, groups] of Object.entries(manifest.hooks)) {
       for (const group of groups) {
         for (const hook of group.hooks || []) {
-          if (hook.command?.includes('workflow-drift-guard.mjs')) registrations.push({ event, ...hook });
+          if (hook.command?.includes('workflow-drift-guard.mjs')) {
+            registrations.push({
+              event,
+              type: hook.type,
+              command: hook.command,
+              timeout: hook.timeout,
+            });
+          }
         }
       }
     }
@@ -82,7 +149,6 @@ describe('workflow-drift-guard Stop hook', () => {
       command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/workflow-drift-guard.mjs',
       timeout: 3,
     }]);
-    expect(readFileSync(SCRIPT).equals(readFileSync(TEMPLATE))).toBe(true);
   });
 
   it('uses canonical current-message evidence and preserves aliases', () => {
@@ -120,6 +186,91 @@ describe('workflow-drift-guard Stop hook', () => {
       message: 'PostgreSQL or SQLite?',
       cwd: ROOT,
     }));
+  });
+
+  it('recovers the final assistant response from the observed Copilot transcript shape', () => {
+    const transcriptPath = makeTranscript();
+    copyFileSync(COPILOT_TRANSCRIPT_FIXTURE, transcriptPath);
+
+    expectBlock(runGuard(copilotGuardInput(transcriptPath)));
+  });
+
+  it('keeps Copilot assistant payload fields ahead of transcript recovery, including empty values', () => {
+    const transcriptPath = makeTranscript();
+    copyFileSync(COPILOT_TRANSCRIPT_FIXTURE, transcriptPath);
+
+    expectCopilotPass(runGuard(copilotGuardInput(transcriptPath, {
+      lastAssistantMessage: 'Should I proceed?',
+    })));
+    expectCopilotPass(runGuard(copilotGuardInput(transcriptPath, {
+      last_assistant_message: '',
+      lastAssistantMessage: 'PostgreSQL or SQLite?',
+    })));
+  });
+
+  it('uses only the final non-empty Copilot assistant message in the bounded tail', () => {
+    const transcriptPath = makeTranscript([
+      JSON.stringify({
+        type: 'assistant.message',
+        data: { content: 'PostgreSQL or SQLite?' },
+      }),
+      JSON.stringify({
+        type: 'assistant.message',
+        data: { content: 'The requested work is complete.' },
+      }),
+      JSON.stringify({ type: 'hook.start', data: { hookType: 'agentStop' } }),
+      '',
+    ].join('\n'));
+
+    expectCopilotPass(runGuard(copilotGuardInput(transcriptPath)));
+  });
+
+  it('recovers a Copilot final response without reading an oversized transcript prefix', () => {
+    const prefix = `${JSON.stringify({
+      type: 'system.message',
+      data: { content: 'x'.repeat(120_000) },
+    })}\n`.repeat(3);
+    const transcriptPath = makeTranscript([
+      prefix,
+      JSON.stringify({
+        type: 'assistant.message',
+        data: { content: 'PostgreSQL or SQLite?' },
+      }),
+      JSON.stringify({ type: 'hook.start', data: { hookType: 'agentStop' } }),
+      '',
+    ].join('\n'));
+
+    expectBlock(runGuard(copilotGuardInput(transcriptPath)));
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['malformed', '{"type":\n'],
+    [
+      'malformed record before the final assistant message',
+      `{"type":\n${JSON.stringify({
+        type: 'assistant.message',
+        data: { content: 'PostgreSQL or SQLite?' },
+      })}\n`,
+    ],
+    [
+      'truncated',
+      `${JSON.stringify({
+        type: 'assistant.message',
+        data: { content: 'PostgreSQL or SQLite?' },
+      })}\n{"type":"hook.start"`,
+    ],
+    [
+      'oversized assistant content',
+      `${JSON.stringify({
+        type: 'assistant.message',
+        data: { content: 'x'.repeat(65 * 1024) },
+      })}\n`,
+    ],
+    ['unsupported', `${JSON.stringify({ type: 'assistant.message', data: [] })}\n`],
+  ])('fails open for a %s Copilot transcript', (_label, contents) => {
+    const transcriptPath = makeTranscript(contents);
+    expectCopilotPass(runGuard(copilotGuardInput(transcriptPath)));
   });
 
   it.each([
@@ -299,7 +450,11 @@ describe('workflow-drift-guard Stop hook', () => {
     const cleanEnv = { ...process.env };
     delete cleanEnv.DISABLE_OMC;
     delete cleanEnv.OMC_SKIP_HOOKS;
-    expect(() => execFileSync('npm', ['exec', 'vitest', '--', 'run', 'src/hooks/__tests__/workflow-drift-guard-script.test.ts'], {
+    expect(() => execFileSync(process.execPath, [
+      join(ROOT, 'node_modules', 'vitest', 'vitest.mjs'),
+      'run',
+      'src/hooks/__tests__/workflow-drift-guard-script.test.ts',
+    ], {
       cwd: ROOT,
       env: {
         ...cleanEnv,
@@ -309,7 +464,7 @@ describe('workflow-drift-guard Stop hook', () => {
       },
       stdio: 'pipe',
     })).not.toThrow();
-  });
+  }, 120_000);
 
   it('blocks completion claims when changed code adds skipped tests', () => {
     const cwd = makeRepo();

@@ -1,27 +1,56 @@
 #!/usr/bin/env node
 import { readStdin } from './lib/stdin.mjs';
+import {
+  describeHookRunFailure,
+  encodeLegacyCompatibleHookOutput,
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 
 async function main() {
-  const input = await readStdin(1000);
   try {
-    const data = JSON.parse(input);
+    const runtime = loadHookRuntime();
     const { onSessionStart } = await import('../dist/hooks/wiki/session-hooks.js');
-    const result = onSessionStart(data);
-    if (result.additionalContext) {
-      console.log(JSON.stringify({
-        continue: true,
-        hookSpecificOutput: {
-          hookEventName: 'SessionStart',
-          additionalContext: result.additionalContext,
-        },
-      }));
-    } else {
+    const input = await readStdin(1000);
+    if (!input.trim()) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
     }
+
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      'session-start',
+      input,
+      (unit, envelope) => {
+        const processorResult = onSessionStart(
+          runtime.buildLegacyProcessorInput(envelope, unit),
+        );
+        legacyOutput = processorResult.additionalContext
+          ? {
+              continue: true,
+              hookSpecificOutput: {
+                hookEventName: 'SessionStart',
+                additionalContext: processorResult.additionalContext,
+              },
+            }
+          : { continue: true, suppressOutput: true };
+        return legacyOutput;
+      },
+    );
+
+    const failure = describeHookRunFailure(runtime, result);
+    if (failure) throw new Error(failure);
+
+    console.log(JSON.stringify(
+      encodeLegacyCompatibleHookOutput(
+        runtime,
+        result,
+        legacyOutput,
+      ),
+    ));
   } catch (error) {
-    console.error('[wiki-session-start] Error:', error.message);
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    surfaceOptionalHookFailure(error, { hookName: 'wiki-session-start' });
   }
 }
 
-main();
+void main();

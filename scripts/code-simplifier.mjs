@@ -20,6 +20,10 @@ import {
 import { join } from 'path';
 import { homedir } from 'os';
 import { execFileSync } from 'child_process';
+import {
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 import { readStdin } from './lib/stdin.mjs';
 import { resolveOmcStateRoot } from './lib/state-root.mjs';
 import { BOUNDED_GIT_TIMEOUT_MS } from './lib/bounded-git-timeout.mjs';
@@ -79,118 +83,122 @@ function buildMessage(files) {
   );
 }
 
-async function main() {
-  try {
-    const input = await readStdin();
-    let data = {};
+async function processCodeSimplifierStop(data) {
+  const cwd = data.cwd || data.directory || process.cwd();
+  const stateDir = join(await resolveOmcStateRoot(cwd), 'state');
+  const config = readOmcConfig();
+
+  if (!isEnabled(config)) {
+    return { continue: true };
+  }
+
+  const markerPath = join(stateDir, MARKER_FILENAME);
+
+  // If already triggered this turn, clear marker and allow stop
+  if (existsSync(markerPath)) {
     try {
-      data = JSON.parse(input);
-    } catch {
-      process.stdout.write(JSON.stringify({ continue: true }) + '\n');
-      return;
-    }
-
-    const cwd = data.cwd || data.directory || process.cwd();
-    const stateDir = join(await resolveOmcStateRoot(cwd), 'state');
-    const config = readOmcConfig();
-
-    if (!isEnabled(config)) {
-      process.stdout.write(JSON.stringify({ continue: true }) + '\n');
-      return;
-    }
-
-    const markerPath = join(stateDir, MARKER_FILENAME);
-
-    // If already triggered this turn, clear marker and allow stop
-    if (existsSync(markerPath)) {
-      try {
-        unlinkSync(markerPath);
-      } catch {
-        // ignore
-      }
-      process.stdout.write(JSON.stringify({ continue: true }) + '\n');
-      return;
-    }
-
-    const extensions = config?.codeSimplifier?.extensions ?? DEFAULT_EXTENSIONS;
-    const maxFiles = config?.codeSimplifier?.maxFiles ?? DEFAULT_MAX_FILES;
-    const files = getModifiedFiles(cwd, extensions, maxFiles);
-
-    if (files.length === 0) {
-      process.stdout.write(JSON.stringify({ continue: true }) + '\n');
-      return;
-    }
-
-    // Write trigger marker to prevent re-triggering within this turn cycle
-    try {
-      if (!existsSync(stateDir)) {
-        mkdirSync(stateDir, { recursive: true });
-      }
-      writeFileSync(markerPath, new Date().toISOString(), 'utf-8');
-    } catch {
-      // best-effort — proceed even if marker write fails
-    }
-
-    process.stdout.write(
-      JSON.stringify({ continue: false, decision: 'block', reason: buildMessage(files) }) + '\n',
-    );
-  } catch (error) {
-    try {
-      process.stderr.write(`[code-simplifier] Error: ${error?.message || error}\n`);
+      unlinkSync(markerPath);
     } catch {
       // ignore
     }
-    try {
-      process.stdout.write(JSON.stringify({ continue: true }) + '\n');
-    } catch {
-      process.exit(0);
+    return { continue: true };
+  }
+
+  const extensions = config?.codeSimplifier?.extensions ?? DEFAULT_EXTENSIONS;
+  const maxFiles = config?.codeSimplifier?.maxFiles ?? DEFAULT_MAX_FILES;
+  const files = getModifiedFiles(cwd, extensions, maxFiles);
+
+  if (files.length === 0) {
+    return { continue: true };
+  }
+
+  // Write trigger marker to prevent re-triggering within this turn cycle
+  try {
+    if (!existsSync(stateDir)) {
+      mkdirSync(stateDir, { recursive: true });
     }
+    writeFileSync(markerPath, new Date().toISOString(), 'utf-8');
+  } catch {
+    // best-effort — proceed even if marker write fails
+  }
+
+  return {
+    continue: false,
+    decision: 'block',
+    reason: buildMessage(files),
+  };
+}
+
+function describeStopRunFailure(result) {
+  const failures = [];
+
+  for (const issue of result.envelope.issues) {
+    if (issue.severity === 'safety' || issue.batchSafety === true) {
+      failures.push(issue.message || issue.code || 'hook input normalization failed');
+    }
+  }
+  for (const evaluation of result.evaluations) {
+    if (evaluation.source === 'adapter' && evaluation.decision === 'deny') {
+      failures.push(evaluation.reason || 'legacy processor adapter failed');
+    }
+  }
+  for (const decision of result.reduction.callDecisions) {
+    if (decision.source === 'adapter' && decision.decision === 'deny') {
+      failures.push(decision.reason || 'hook reduction failed');
+    }
+  }
+  if (!['pass', 'deny'].includes(result.reduction.decision)) {
+    failures.push(
+      result.reduction.reason
+      || `unexpected ${result.reduction.decision} reduction`,
+    );
+  }
+
+  return failures.length > 0 ? [...new Set(failures)].join('; ') : undefined;
+}
+
+async function main() {
+  try {
+    const runtime = loadHookRuntime();
+    const input = await readStdin();
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      'stop',
+      input,
+      async (unit, envelope) => {
+        legacyOutput = await processCodeSimplifierStop(
+          runtime.buildLegacyProcessorInput(envelope, unit),
+        );
+        return legacyOutput;
+      },
+    );
+
+    const failure = describeStopRunFailure(result);
+    if (failure) throw new Error(failure);
+    if (!legacyOutput || typeof legacyOutput !== 'object') {
+      throw new Error('Code simplifier processor produced no legacy output.');
+    }
+
+    process.stdout.write(`${JSON.stringify(
+      runtime.encodeLegacyCompatibleHookOutput(
+        result.envelope,
+        result.reduction,
+        legacyOutput,
+      ),
+    )}\n`);
+  } catch (error) {
+    surfaceOptionalHookFailure(error, { hookName: 'code-simplifier' });
   }
 }
 
-process.on('uncaughtException', (error) => {
-  try {
-    process.stderr.write(`[code-simplifier] Uncaught: ${error?.message || error}\n`);
-  } catch {
-    // ignore
-  }
-  try {
-    process.stdout.write(JSON.stringify({ continue: true }) + '\n');
-  } catch {
-    // ignore
-  }
-  process.exit(0);
-});
-
-process.on('unhandledRejection', (error) => {
-  try {
-    process.stderr.write(`[code-simplifier] Unhandled: ${error?.message || error}\n`);
-  } catch {
-    // ignore
-  }
-  try {
-    process.stdout.write(JSON.stringify({ continue: true }) + '\n');
-  } catch {
-    // ignore
-  }
-  process.exit(0);
-});
-
-// Safety timeout: force exit after 10 seconds to prevent hook from hanging
 const safetyTimeout = setTimeout(() => {
-  try {
-    process.stderr.write('[code-simplifier] Safety timeout reached, forcing exit\n');
-  } catch {
-    // ignore
-  }
-  try {
-    process.stdout.write(JSON.stringify({ continue: true }) + '\n');
-  } catch {
-    // ignore
-  }
+  surfaceOptionalHookFailure(
+    new Error('Safety timeout reached after 10000ms.'),
+    { hookName: 'code-simplifier' },
+  );
   process.exit(0);
 }, 10000);
 
-main().finally(() => {
+void main().finally(() => {
   clearTimeout(safetyTimeout);
 });

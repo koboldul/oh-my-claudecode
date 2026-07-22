@@ -6,32 +6,60 @@
  */
 
 import { readStdin } from './lib/stdin.mjs';
+import {
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 
-// Debug logging helper - gated behind OMC_DEBUG env var
-const debugLog = (...args) => {
-  if (process.env.OMC_DEBUG) console.error('[omc:debug:project-memory]', ...args);
-};
+function describeCanonicalFailure(result) {
+  const failures = [];
 
-// Dynamic imports with graceful fallback (separate try-catch for partial availability)
-let learnFromToolOutput = null;
-let findProjectRoot = null;
-try {
-  learnFromToolOutput = (await import('../dist/hooks/project-memory/learner.js')).learnFromToolOutput;
-} catch (err) {
-  if (err?.code === 'ERR_MODULE_NOT_FOUND' && /dist\//.test(err?.message)) {
-    debugLog('dist/ learner module not found, skipping');
-  } else {
-    debugLog('Unexpected learner import error:', err?.code, err?.message);
+  for (const issue of result?.envelope?.issues ?? []) {
+    if (issue?.severity === 'safety' || issue?.batchSafety === true) {
+      failures.push(issue.message || issue.code || 'hook input normalization failed');
+    }
   }
+
+  for (const evaluation of result?.evaluations ?? []) {
+    if (evaluation?.source === 'adapter' && evaluation?.decision === 'deny') {
+      failures.push(evaluation.reason || 'legacy processor adapter failed');
+    }
+  }
+
+  for (const decision of result?.reduction?.callDecisions ?? []) {
+    if (decision?.source === 'adapter' && decision?.decision === 'deny') {
+      failures.push(decision.reason || 'hook reduction failed');
+    }
+  }
+
+  if (result?.reduction?.decision && result.reduction.decision !== 'pass') {
+    failures.push(result.reduction.reason || `unexpected ${result.reduction.decision} reduction`);
+  }
+
+  return failures.length > 0 ? [...new Set(failures)].join('; ') : undefined;
 }
-try {
-  findProjectRoot = (await import('../dist/hooks/rules-injector/finder.js')).findProjectRoot;
-} catch (err) {
-  if (err?.code === 'ERR_MODULE_NOT_FOUND' && /dist\//.test(err?.message)) {
-    debugLog('dist/ finder module not found, skipping');
-  } else {
-    debugLog('Unexpected finder import error:', err?.code, err?.message);
+
+async function processProjectMemoryPostTool(
+  data,
+  learnFromToolOutput,
+  findProjectRoot,
+) {
+  const directory = data.directory || process.cwd();
+  const projectRoot = findProjectRoot(directory);
+
+  if (projectRoot) {
+    await learnFromToolOutput(
+      data.toolName || '',
+      data.toolInput || {},
+      data.toolOutput ?? '',
+      projectRoot,
+    );
   }
+
+  return {
+    continue: true,
+    suppressOutput: true,
+  };
 }
 
 /**
@@ -39,40 +67,49 @@ try {
  */
 async function main() {
   try {
-    const input = await readStdin();
-    const data = JSON.parse(input);
+    const runtime = loadHookRuntime();
+    const [
+      { learnFromToolOutput },
+      { findProjectRoot },
+    ] = await Promise.all([
+      import('../dist/hooks/project-memory/learner.js'),
+      import('../dist/hooks/rules-injector/finder.js'),
+    ]);
+    if (typeof learnFromToolOutput !== 'function') {
+      throw new TypeError('Project memory learner export is unavailable.');
+    }
+    if (typeof findProjectRoot !== 'function') {
+      throw new TypeError('Project root finder export is unavailable.');
+    }
 
-    // Early exit if imports failed
-    if (!learnFromToolOutput || !findProjectRoot) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    const input = await readStdin();
+    const result = await runtime.runHookJson(
+      'post-tool-use',
+      input,
+      (unit, envelope) => processProjectMemoryPostTool(
+        runtime.buildLegacyProcessorInput(envelope, unit),
+        learnFromToolOutput,
+        findProjectRoot,
+      ),
+    );
+
+    const canonicalFailure = describeCanonicalFailure(result);
+    if (canonicalFailure) {
+      surfaceOptionalHookFailure(
+        new Error(canonicalFailure),
+        { hookName: 'project-memory-posttool' },
+      );
       return;
     }
 
-    // Extract directory and find project root
-    const directory = data.cwd || data.directory || process.cwd();
-    const projectRoot = findProjectRoot(directory);
-
-    if (projectRoot) {
-      // Learn from tool output
-      await learnFromToolOutput(
-        data.tool_name || data.toolName || '',
-        data.tool_input || data.toolInput || {},
-        data.tool_response || data.toolOutput || '',
-        projectRoot
-      );
-    }
-
-    // Return success
-    console.log(JSON.stringify({
-      continue: true,
-      suppressOutput: true
-    }));
+    const encoded = runtime.encodeHookOutput(result.envelope, result.reduction);
+    const output =
+      result.envelope.host === 'claude' && Object.keys(encoded).length === 0
+        ? { continue: true, suppressOutput: true }
+        : encoded;
+    console.log(JSON.stringify(output));
   } catch (error) {
-    // Always continue on error
-    console.log(JSON.stringify({
-      continue: true,
-      suppressOutput: true
-    }));
+    surfaceOptionalHookFailure(error, { hookName: 'project-memory-posttool' });
   }
 }
 

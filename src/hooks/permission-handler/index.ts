@@ -1004,6 +1004,11 @@ function canonicalShellRequest(
     && input.contract === 'claude-single'
     && nativeToolName === 'Bash'
     && input.shellDialect === 'posix';
+  const isCopilotBash =
+    input.host === 'copilot'
+    && input.contract === 'copilot-1.0.72-1'
+    && nativeToolName?.toLowerCase() === 'bash'
+    && input.shellDialect === 'posix';
   const isCopilotPowerShell =
     input.host === 'copilot'
     && input.contract === 'copilot-1.0.72-1'
@@ -1012,7 +1017,7 @@ function canonicalShellRequest(
 
   if (
     input.canonicalToolName !== 'Bash'
-    || (!isClaudeShell && !isCopilotPowerShell)
+    || (!isClaudeShell && !isCopilotBash && !isCopilotPowerShell)
     || typeof input.directory !== 'string'
     || input.directory.length === 0
     || !isRecord(input.toolInput)
@@ -1025,7 +1030,7 @@ function canonicalShellRequest(
   return {
     cwd: input.directory,
     command: input.toolInput.command,
-    shellDialect: isClaudeShell ? 'posix' : 'powershell',
+    shellDialect: isClaudeShell || isCopilotBash ? 'posix' : 'powershell',
   };
 }
 
@@ -1055,10 +1060,14 @@ function legacyShellRequest(
  * Process permission request and decide whether to auto-allow.
  */
 export function processPermissionRequest(input: PermissionProcessorInput): HookOutput {
+  const isCopilotRequest = 'host' in input && input.host === 'copilot';
   const shellRequest = 'host' in input
     ? canonicalShellRequest(input)
     : legacyShellRequest(input);
   if (!shellRequest) {
+    return { continue: true };
+  }
+  if (isCopilotRequest) {
     return { continue: true };
   }
 

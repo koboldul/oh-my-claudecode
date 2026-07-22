@@ -5,29 +5,59 @@
  * Ensures user directives and project context survive compaction
  */
 
-import { processPreCompact } from '../dist/hooks/project-memory/pre-compact.js';
 import { readStdin } from './lib/stdin.mjs';
+import {
+  describeHookRunFailure,
+  encodeLegacyCompatibleHookOutput,
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 
 /**
  * Main hook execution
  */
 async function main() {
   try {
+    const runtime = loadHookRuntime();
+    const { processPreCompact } = await import(
+      '../dist/hooks/project-memory/pre-compact.js'
+    );
     const input = await readStdin();
-    const data = JSON.parse(input);
+    if (!input.trim()) {
+      console.log(JSON.stringify({
+        continue: true,
+        suppressOutput: true,
+      }));
+      return;
+    }
 
-    // Process PreCompact
-    const result = await processPreCompact(data);
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      'pre-compact',
+      input,
+      async (unit, envelope) => {
+        legacyOutput = await processPreCompact(
+          runtime.buildLegacyProcessorInput(envelope, unit),
+        );
+        return legacyOutput;
+      },
+    );
 
-    // Return result
-    console.log(JSON.stringify(result));
+    const failure = describeHookRunFailure(runtime, result);
+    if (failure) throw new Error(failure);
+
+    console.log(JSON.stringify(
+      encodeLegacyCompatibleHookOutput(
+        runtime,
+        result,
+        legacyOutput,
+      ),
+    ));
   } catch (error) {
-    // Always continue on error
-    console.log(JSON.stringify({
-      continue: true,
-      suppressOutput: true,
-    }));
+    surfaceOptionalHookFailure(error, {
+      hookName: 'project-memory-precompact',
+    });
   }
 }
 
-main();
+void main();

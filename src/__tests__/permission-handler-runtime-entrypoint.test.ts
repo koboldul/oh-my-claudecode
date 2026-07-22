@@ -73,12 +73,16 @@ function claudePayload(
   };
 }
 
-function copilotPayload(cwd: string, command: unknown): HookPayload {
+function copilotPayload(
+  cwd: string,
+  command: unknown,
+  toolName: 'bash' | 'powershell' = 'powershell',
+): HookPayload {
   return {
     ...loadPermissionFixture('copilot-1.0.72-1'),
     sessionId: 'permission-runtime-session',
     cwd,
-    toolName: 'powershell',
+    toolName,
     toolInput: { command },
   };
 }
@@ -245,14 +249,43 @@ describe('scripts/permission-handler.mjs canonical runtime entrypoint', () => {
     }
   });
 
-  it('emits the exact Copilot permissionRequest allow contract for powershell', () => {
+  it('passes observed safe Copilot powershell requests to native permission handling', () => {
     const result = runPermissionHandler(
       productionScriptPath,
       copilotPayload(cwd, 'git status'),
       claudeConfigDir,
     );
 
-    expectExactOutput(result, { behavior: 'allow' });
+    expectExactOutput(result, {});
+  });
+
+  it('passes exact camelCase Copilot bash safe-command fixtures to native handling', () => {
+    for (const command of ['git status', SAFE_POSIX_HEREDOC_COMMAND]) {
+      expectExactOutput(
+        runPermissionHandler(
+          productionScriptPath,
+          copilotPayload(cwd, command, 'bash'),
+          claudeConfigDir,
+        ),
+        {},
+      );
+    }
+  });
+
+  it('keeps unsafe Copilot bash requests on the native prompt path', () => {
+    for (const command of [
+      'git status; rm -rf /',
+      UNSAFE_UNQUOTED_POSIX_HEREDOC_COMMAND,
+    ]) {
+      expectExactOutput(
+        runPermissionHandler(
+          productionScriptPath,
+          copilotPayload(cwd, command, 'bash'),
+          claudeConfigDir,
+        ),
+        {},
+      );
+    }
   });
 
   it('never applies POSIX heredoc auto-allow to Copilot powershell', () => {
@@ -299,7 +332,7 @@ describe('scripts/permission-handler.mjs canonical runtime entrypoint', () => {
     );
   });
 
-  it('uses a separate external executable allowlist for Copilot powershell', () => {
+  it('never converts Copilot powershell classifications into OMC allow', () => {
     for (const command of [
       'git status',
       'git diff --cached --stat',
@@ -309,18 +342,6 @@ describe('scripts/permission-handler.mjs canonical runtime entrypoint', () => {
       'npm.cmd run lint',
       'tsc.cmd --noEmit',
       'prettier --check .',
-    ]) {
-      expectExactOutput(
-        runPermissionHandler(
-          productionScriptPath,
-          copilotPayload(cwd, command),
-          claudeConfigDir,
-        ),
-        { behavior: 'allow' },
-      );
-    }
-
-    for (const command of [
       'ls',
       'ls Env:',
       'cat package.json',
@@ -385,7 +406,7 @@ describe('scripts/permission-handler.mjs canonical runtime entrypoint', () => {
     );
   });
 
-  it('does not auto-allow non-shell tools reached by the wildcard matcher', () => {
+  it('does not auto-allow non-shell tools when invoked directly', () => {
     expectExactOutput(
       runPermissionHandler(
         productionScriptPath,
@@ -424,7 +445,7 @@ describe('scripts/permission-handler.mjs canonical runtime entrypoint', () => {
     );
   });
 
-  it('keeps explicit native ask and deny decisions above OMC safe-command allow', () => {
+  it('keeps explicit Claude native ask and deny decisions above OMC safe-command allow', () => {
     const nativeAsk = {
       decision: 'ask',
       reason: 'Native confirmation required.',
@@ -445,44 +466,54 @@ describe('scripts/permission-handler.mjs canonical runtime entrypoint', () => {
     expectExactOutput(
       runPermissionHandler(
         productionScriptPath,
-        { ...copilotPayload(cwd, 'git status'), nativeDecision: nativeAsk },
-        claudeConfigDir,
-      ),
-      {},
-    );
-    expectExactOutput(
-      runPermissionHandler(
-        productionScriptPath,
         { ...claudePayload(cwd, 'git status'), nativeDecision: nativeDeny },
         claudeConfigDir,
       ),
       claudeDecision('deny', 'Native policy denied this command.'),
     );
-    expectExactOutput(
-      runPermissionHandler(
-        productionScriptPath,
-        { ...copilotPayload(cwd, 'git status'), nativeDecision: nativeDeny },
-        claudeConfigDir,
-      ),
-      {
-        behavior: 'deny',
-        message: 'Native policy denied this command.',
-      },
-    );
   });
 
-  it('matches the observed Copilot powershell permission request in the manifest', () => {
+  it('routes exact camelCase Copilot bash and powershell fixtures through the manifest', () => {
     const fixture = loadPermissionFixture('copilot-1.0.72-1');
+    const bashFixture = copilotPayload('<cwd>', '<command>', 'bash');
     const manifest = JSON.parse(
-      readFileSync(join(REPO_ROOT, 'hooks', 'hooks.json'), 'utf8'),
+      readFileSync(
+        join(REPO_ROOT, 'hooks', 'copilot-hooks.json'),
+        'utf8',
+      ),
     ) as {
+      version: number;
       hooks: {
-        PermissionRequest: Array<{ matcher: string }>;
+        permissionRequest: Array<{
+          matcher?: string;
+          command: string;
+        }>;
       };
     };
+    const entry = manifest.hooks.permissionRequest[0];
+    const matcher = new RegExp(`^(?:${entry.matcher})$`);
 
+    expect(manifest.version).toBe(1);
     expect(fixture.toolName).toBe('powershell');
-    expect(manifest.hooks.PermissionRequest[0].matcher).toBe('*');
+    expect(fixture).not.toHaveProperty('nativeDecision');
+    expect(fixture).not.toHaveProperty('hostDecision');
+    expect(bashFixture).toEqual({
+      hookName: 'permissionRequest',
+      sessionId: 'permission-runtime-session',
+      timestamp: 1700000000000,
+      cwd: '<cwd>',
+      permissionSuggestions: [],
+      toolName: 'bash',
+      toolInput: {
+        command: '<command>',
+      },
+    });
+    expect(entry.command).toContain('/scripts/permission-handler.mjs');
+    expect(entry.matcher).toBe('bash|powershell');
+    expect(matcher.test(fixture.toolName as string)).toBe(true);
+    expect(matcher.test(bashFixture.toolName as string)).toBe(true);
+    expect(matcher.test('Bash')).toBe(false);
+    expect(matcher.test('read')).toBe(false);
   });
 
   it.each(['missing', 'corrupt'] as const)(

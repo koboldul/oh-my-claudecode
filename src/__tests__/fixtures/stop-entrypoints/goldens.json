@@ -1,0 +1,37 @@
+{
+  "claude": {
+    "contextGuardPass": {
+      "continue": true,
+      "suppressOutput": true
+    },
+    "workflowDriftPass": {
+      "suppressOutput": true
+    },
+    "persistentModePass": {
+      "continue": true,
+      "suppressOutput": true
+    },
+    "codeSimplifierDisabled": {
+      "continue": true
+    },
+    "workflowDriftBlock": {
+      "decision": "block",
+      "reason": "[WORKFLOW DRIFT GUARD] The final response contains a supported local selection fork that should be asked with structured AskUserQuestion. Continue by calling AskUserQuestion with 2-4 options and keep allowOther enabled unless free-form input is unsafe."
+    },
+    "persistentRalphBlock": {
+      "decision": "block",
+      "reason": "[RALPH LOOP - ITERATION 2/50] Work is NOT done. Continue working.\nWhen FULLY complete (after Architect verification), run /oh-my-claudecode:cancel to cleanly exit ralph mode and clean up all state files. If cancel fails, retry with /oh-my-claudecode:cancel --force.\nTask: Fixture task"
+    }
+  },
+  "copilot": {
+    "pass": {},
+    "workflowDriftBlock": {
+      "decision": "block",
+      "reason": "[WORKFLOW DRIFT GUARD] The final response contains a supported local selection fork that should be asked with structured AskUserQuestion. Continue by calling AskUserQuestion with 2-4 options and keep allowOther enabled unless free-form input is unsafe."
+    },
+    "persistentRalphBlock": {
+      "decision": "block",
+      "reason": "[RALPH LOOP - ITERATION 2/50] Work is NOT done. Continue working.\nWhen FULLY complete (after Architect verification), run /oh-my-claudecode:cancel to cleanly exit ralph mode and clean up all state files. If cancel fails, retry with /oh-my-claudecode:cancel --force.\nTask: Fixture task"
+    }
+  }
+}

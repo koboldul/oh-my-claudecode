@@ -1,21 +1,47 @@
 #!/usr/bin/env node
-import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
 import { readStdin } from './lib/stdin.mjs';
+import {
+  describeHookRunFailure,
+  encodeLegacyCompatibleHookOutput,
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 
 async function main() {
-  // Read stdin (timeout-protected, see issue #240/#459)
-  const input = await readStdin();
-
   try {
-    const data = JSON.parse(input);
+    const runtime = loadHookRuntime();
     const { processPreCompact } = await import('../dist/hooks/pre-compact/index.js');
-    const result = await processPreCompact(data);
-    console.log(JSON.stringify(result));
+    const input = await readStdin();
+    if (!input.trim()) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      'pre-compact',
+      input,
+      async (unit, envelope) => {
+        legacyOutput = await processPreCompact(
+          runtime.buildLegacyProcessorInput(envelope, unit),
+        );
+        return legacyOutput;
+      },
+    );
+
+    const failure = describeHookRunFailure(runtime, result);
+    if (failure) throw new Error(failure);
+
+    console.log(JSON.stringify(
+      encodeLegacyCompatibleHookOutput(
+        runtime,
+        result,
+        legacyOutput,
+      ),
+    ));
   } catch (error) {
-    console.error('[pre-compact] Error:', error.message);
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    surfaceOptionalHookFailure(error, { hookName: 'pre-compact' });
   }
 }
 
-main();
+void main();

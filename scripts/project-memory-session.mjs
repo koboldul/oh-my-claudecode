@@ -7,6 +7,12 @@
 
 import { dirname, join } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import {
+  describeHookRunFailure,
+  encodeLegacyCompatibleHookOutput,
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -50,31 +56,52 @@ try {
  */
 async function main() {
   try {
+    const runtime = loadHookRuntime();
     const input = await readStdin();
-    let data = {};
-    try { data = JSON.parse(input); } catch {}
-
-    // Extract directory and session ID
-    const directory = data.cwd || data.directory || process.cwd();
-    const sessionId = data.session_id || data.sessionId || '';
-
-    // Register project memory context (skip if module unavailable)
-    if (registerProjectMemoryContext) {
-      await registerProjectMemoryContext(sessionId, directory);
+    if (!input.trim()) {
+      console.log(JSON.stringify({
+        continue: true,
+        suppressOutput: true,
+      }));
+      return;
     }
 
-    // Return success (context registered via contextCollector, not returned here)
-    console.log(JSON.stringify({
-      continue: true,
-      suppressOutput: true
-    }));
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      'session-start',
+      input,
+      async (unit, envelope) => {
+        const data = runtime.buildLegacyProcessorInput(envelope, unit);
+        const directory = data.directory || process.cwd();
+        const sessionId = data.sessionId || '';
+
+        if (registerProjectMemoryContext) {
+          await registerProjectMemoryContext(sessionId, directory);
+        }
+
+        legacyOutput = {
+          continue: true,
+          suppressOutput: true,
+        };
+        return legacyOutput;
+      },
+    );
+
+    const failure = describeHookRunFailure(runtime, result);
+    if (failure) throw new Error(failure);
+
+    console.log(JSON.stringify(
+      encodeLegacyCompatibleHookOutput(
+        runtime,
+        result,
+        legacyOutput,
+      ),
+    ));
   } catch (error) {
-    // Always continue on error
-    console.log(JSON.stringify({
-      continue: true,
-      suppressOutput: true
-    }));
+    surfaceOptionalHookFailure(error, {
+      hookName: 'project-memory-session',
+    });
   }
 }
 
-main();
+void main();

@@ -25,6 +25,10 @@ import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { getClaudeConfigDir } from './lib/config-dir.mjs';
 import { encodeProjectPath } from './lib/encode-project-path.mjs';
+import {
+  loadHookRuntime,
+  surfaceCriticalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 import { readStdin } from './lib/stdin.mjs';
 
 const THRESHOLD = parseInt(process.env.OMC_CONTEXT_GUARD_THRESHOLD || '75', 10);
@@ -32,6 +36,8 @@ const CRITICAL_THRESHOLD = 95;
 const MAX_BLOCKS = 2;
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/;
 const GIT_PROBE_TIMEOUT_MS = 1000;
+const COPILOT_CONTEXT_UNAVAILABLE_DIAGNOSTIC =
+  '[context-guard-stop] Copilot context blocking disabled: 1.0.72-1 agentStop/events do not provide a current Stop-time token count paired with the active model context limit; continuing without a synthetic estimate.';
 
 /**
  * Detect if stop was triggered by context-limit related reasons.
@@ -229,57 +235,117 @@ function buildStopRecoveryAdvice(contextPercent, blockCount) {
     `(.omc/state, .omc/notepad.md). (Block ${blockCount}/${MAX_BLOCKS})`;
 }
 
-async function main() {
+function reportCopilotContextUnavailable() {
   try {
-    const input = await readStdin();
-    const data = JSON.parse(input);
-
-    // CRITICAL: Never block context-limit stops (compaction deadlock)
-    if (isContextLimitStop(data)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
-    }
-
-    // Respect user abort
-    if (isUserAbort(data)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
-    }
-
-    const sessionId = data.session_id || data.sessionId || '';
-    const rawTranscriptPath = data.transcript_path || data.transcriptPath || '';
-    const transcriptPath = resolveTranscriptPath(rawTranscriptPath, data.cwd);
-    const pct = estimateContextPercent(transcriptPath);
-
-    if (pct >= CRITICAL_THRESHOLD) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
-    }
-
-    if (pct >= THRESHOLD) {
-      // Check retry guard
-      const blockCount = getBlockCount(sessionId);
-      if (blockCount >= MAX_BLOCKS) {
-        // Already blocked enough times — let it through
-        console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-        return;
-      }
-
-      incrementBlockCount(sessionId);
-
-      console.log(JSON.stringify({
-        continue: false,
-        decision: 'block',
-        reason: buildStopRecoveryAdvice(pct, blockCount + 1)
-      }));
-      return;
-    }
-
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    process.stderr.write(`${COPILOT_CONTEXT_UNAVAILABLE_DIAGNOSTIC}\n`);
   } catch {
-    // On any error, allow stop (never block on hook failure)
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    // Diagnostics must not turn this explicit fail-open path into a hook failure.
   }
 }
 
-main();
+function processContextGuardStop(data) {
+  // CRITICAL: Never block context-limit stops (compaction deadlock)
+  if (isContextLimitStop(data)) {
+    return { continue: true, suppressOutput: true };
+  }
+
+  // Respect user abort
+  if (isUserAbort(data)) {
+    return { continue: true, suppressOutput: true };
+  }
+
+  if (data.host === 'copilot') {
+    reportCopilotContextUnavailable();
+    return { continue: true, suppressOutput: true };
+  }
+
+  const sessionId = data.session_id || data.sessionId || '';
+  const rawTranscriptPath = data.transcript_path || data.transcriptPath || '';
+  const transcriptPath = resolveTranscriptPath(rawTranscriptPath, data.cwd);
+  const pct = estimateContextPercent(transcriptPath);
+
+  if (pct >= CRITICAL_THRESHOLD) {
+    return { continue: true, suppressOutput: true };
+  }
+
+  if (pct >= THRESHOLD) {
+    const blockCount = getBlockCount(sessionId);
+    if (blockCount >= MAX_BLOCKS) {
+      return { continue: true, suppressOutput: true };
+    }
+
+    incrementBlockCount(sessionId);
+
+    return {
+      continue: false,
+      decision: 'block',
+      reason: buildStopRecoveryAdvice(pct, blockCount + 1),
+    };
+  }
+
+  return { continue: true, suppressOutput: true };
+}
+
+function describeStopRunFailure(result) {
+  const failures = [];
+
+  for (const issue of result.envelope.issues) {
+    if (issue.severity === 'safety' || issue.batchSafety === true) {
+      failures.push(issue.message || issue.code || 'hook input normalization failed');
+    }
+  }
+  for (const evaluation of result.evaluations) {
+    if (evaluation.source === 'adapter' && evaluation.decision === 'deny') {
+      failures.push(evaluation.reason || 'legacy processor adapter failed');
+    }
+  }
+  for (const decision of result.reduction.callDecisions) {
+    if (decision.source === 'adapter' && decision.decision === 'deny') {
+      failures.push(decision.reason || 'hook reduction failed');
+    }
+  }
+  if (!['pass', 'deny'].includes(result.reduction.decision)) {
+    failures.push(
+      result.reduction.reason
+      || `unexpected ${result.reduction.decision} reduction`,
+    );
+  }
+
+  return failures.length > 0 ? [...new Set(failures)].join('; ') : undefined;
+}
+
+async function main() {
+  try {
+    const runtime = loadHookRuntime();
+    const input = await readStdin();
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      'stop',
+      input,
+      (unit, envelope) => {
+        legacyOutput = processContextGuardStop(
+          runtime.buildLegacyProcessorInput(envelope, unit),
+        );
+        return legacyOutput;
+      },
+    );
+
+    const failure = describeStopRunFailure(result);
+    if (failure) throw new Error(failure);
+    if (!legacyOutput || typeof legacyOutput !== 'object') {
+      throw new Error('Context guard processor produced no legacy output.');
+    }
+
+    process.stdout.write(`${JSON.stringify(
+      runtime.encodeLegacyCompatibleHookOutput(
+        result.envelope,
+        result.reduction,
+        legacyOutput,
+      ),
+    )}\n`);
+  } catch (error) {
+    surfaceCriticalHookFailure(error, { hookName: 'context-guard-stop' });
+  }
+}
+
+void main();

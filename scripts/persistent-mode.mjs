@@ -25,39 +25,21 @@ import { spawn } from "child_process";
 import { join, dirname, resolve, normalize, sep } from "path";
 import { homedir } from "os";
 import { fileURLToPath, pathToFileURL } from "url";
+import {
+  loadHookRuntime,
+  surfaceCriticalHookFailure,
+} from "./lib/hook-runtime-loader.mjs";
+import { readStdin } from "./lib/stdin.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const SAFE_CONTINUE = { continue: true, suppressOutput: true };
 const DEFAULT_SAFETY_TIMEOUT_MS = 8500;
-const SAFE_EXIT_FLUSH_TIMEOUT_MS = 100;
-
 
 function getSafetyTimeoutMs() {
   const parsed = Number.parseInt(process.env.OMC_PERSISTENT_MODE_TIMEOUT_MS || "", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SAFETY_TIMEOUT_MS;
-}
-
-function writeSafeContinue(onFlushed) {
-  let settled = false;
-  const finish = () => {
-    if (settled) return;
-    settled = true;
-    if (onFlushed) onFlushed();
-  };
-
-  try {
-    const ok = process.stdout.write(JSON.stringify(SAFE_CONTINUE) + "\n", finish);
-    if (!ok) {
-      process.stdout.once("drain", finish);
-    }
-    const timeout = setTimeout(finish, SAFE_EXIT_FLUSH_TIMEOUT_MS);
-    if (!onFlushed) timeout.unref?.();
-  } catch {
-    // If stdout is unavailable, exiting still prevents a wedged Stop hook.
-    finish();
-  }
 }
 
 function shouldSkipPersistentModeHook() {
@@ -74,34 +56,28 @@ function shouldSkipPersistentModeHook() {
   );
 }
 
-function forceSafeExit(message) {
-  try {
-    if (message) process.stderr.write(message + "\n");
-  } catch {
-    // Ignore stderr failures; the JSON decision is what matters.
-  }
-  writeSafeContinue(() => process.exit(0));
-}
-
-
 const safetyTimeout = setTimeout(() => {
-  forceSafeExit("[persistent-mode] Safety timeout reached, forcing exit");
+  surfaceCriticalHookFailure(
+    new Error(`Safety timeout reached after ${getSafetyTimeoutMs()}ms.`),
+    { hookName: "persistent-mode" },
+  );
+  process.exit(2);
 }, getSafetyTimeoutMs());
 
 process.on("uncaughtException", (error) => {
-  forceSafeExit(`[persistent-mode] Uncaught exception: ${error?.message || error}`);
+  surfaceCriticalHookFailure(error, { hookName: "persistent-mode" });
+  process.exit(2);
 });
 
 process.on("unhandledRejection", (error) => {
-  forceSafeExit(`[persistent-mode] Unhandled rejection: ${error?.message || error}`);
+  surfaceCriticalHookFailure(error, { hookName: "persistent-mode" });
+  process.exit(2);
 });
+
 const { advanceWorkflowOnStop, isValidWorkflowDescriptor, isValidWorkflowTrackingState, isWorkflowRuntimeSupported, refreshWorkflowBoundaryForCommit, resolveWorkflowStagePrompt, takeWorkflowTranscriptFailure } = await import(pathToFileURL(join(__dirname, "lib", "workflow-profile-runtime.mjs")).href);
 const { acquireStateFileLockSync, atomicWriteFileSync, releaseStateFileLockSync, withStateFileLockSync } = await import(pathToFileURL(join(__dirname, "lib", "atomic-write.mjs")).href);
 
 const { getClaudeConfigDir } = await import(pathToFileURL(join(__dirname, "lib", "config-dir.mjs")).href);
-const { readStdin } = await import(
-  pathToFileURL(join(__dirname, "lib", "stdin.mjs")).href
-);
 const { resolveOmcStateRoot } = await import(pathToFileURL(join(__dirname, "lib", "state-root.mjs")).href);
 
 function readJsonFile(path) {
@@ -463,23 +439,40 @@ function hasPendingScheduledWakeup(stateDir, sessionId) {
   });
 }
 
-function hasRunningSubagent(stateDir) {
-  // subagent-tracking.json is per-directory (not session-scoped), written by the
-  // wired SubagentStart/SubagentStop hooks. A "running" entry means a delegated
-  // agent is still working, so persistent modes must not inject a "stalled"
-  // reinforcement while we wait for it (mirrors the background-task gate).
-  const tracking = readJsonFile(join(stateDir, "subagent-tracking.json"));
-  const agents = Array.isArray(tracking?.agents) ? tracking.agents : [];
-  return agents.some((agent) => {
-    if (agent?.status !== "running") return false;
-    return isFreshTimestamp(agent.started_at, RUNNING_SUBAGENT_STALE_MS);
+function hasRunningSubagent(stateDir, sessionId) {
+  const safeSessionId = sanitizeSessionId(sessionId);
+  const candidates = [
+    ...(safeSessionId
+      ? [readJsonFile(join(
+          stateDir,
+          "sessions",
+          safeSessionId,
+          "subagent-tracking-state.json",
+        ))]
+      : []),
+    readJsonFile(join(stateDir, "subagent-tracking.json")),
+  ];
+
+  return candidates.some((tracking) => {
+    const agents = Array.isArray(tracking?.agents) ? tracking.agents : [];
+    return agents.some((agent) => {
+      if (agent?.status !== "running") return false;
+      if (
+        safeSessionId
+        && typeof agent.session_id === "string"
+        && agent.session_id !== safeSessionId
+      ) {
+        return false;
+      }
+      return isFreshTimestamp(agent.started_at, RUNNING_SUBAGENT_STALE_MS);
+    });
   });
 }
 
 function hasPendingOwnedAsyncWork(stateDir, sessionId) {
   return (
     hasPendingBackgroundTask(stateDir, sessionId) ||
-    hasRunningSubagent(stateDir) ||
+    hasRunningSubagent(stateDir, sessionId) ||
     hasPendingScheduledWakeup(stateDir, sessionId)
   );
 }
@@ -792,7 +785,18 @@ function isSessionCancelInProgress(stateDir, sessionId, currentAutopilotPath, ca
     if (!existsSync(signalPath)) return false;
     if (!currentAutopilotPath || !cancellationContext) return validateSignal(signalPath, null);
     const stateLock = acquireStateFileLockSync(currentAutopilotPath, 50, true);
-    if (!stateLock) return false;
+    if (!stateLock) {
+      const currentAutopilot = readJsonFile(currentAutopilotPath);
+      return isEnforceableAutopilotCancellationTarget(
+        currentAutopilot,
+        cancellationContext.directory,
+        cancellationContext.isGlobal,
+        cancellationContext.hasValidSessionId,
+        sessionId,
+      )
+        ? false
+        : validateSignal(signalPath, null);
+    }
     try {
       const currentAutopilot = readJsonFile(currentAutopilotPath);
       if (!isEnforceableAutopilotCancellationTarget(currentAutopilot, cancellationContext.directory, cancellationContext.isGlobal, cancellationContext.hasValidSessionId, sessionId)) return validateSignal(signalPath, null);
@@ -1186,29 +1190,19 @@ function isScheduledWakeupStop(data) {
   return reasons.some((reason) => stopPatterns.some((pattern) => reason.includes(pattern)));
 }
 
-async function main() {
-  try {
-    if (shouldSkipPersistentModeHook()) {
-      writeSafeContinue();
-      return;
-    }
+async function evaluatePersistentMode(data, console) {
+  if (shouldSkipPersistentModeHook()) {
+    console.log(JSON.stringify(SAFE_CONTINUE));
+    return;
+  }
 
-    const input = await readStdin();
-    let data = {};
-    try {
-      data = JSON.parse(input);
-    } catch {
-      writeSafeContinue();
-      return;
-    }
-
-    // Claude Code sets stop_hook_active when a Stop hook is already running.
-    // Never emit another decision:block in that re-entrant path: doing so trips
-    // Claude Code's safety override for repeatedly blocked Stop hooks.
-    if (data.stop_hook_active === true) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
-    }
+  // Claude Code sets stop_hook_active when a Stop hook is already running.
+  // Never emit another decision:block in that re-entrant path: doing so trips
+  // Claude Code's safety override for repeatedly blocked Stop hooks.
+  if (data.stop_hook_active === true || data.stopHookActive === true) {
+    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    return;
+  }
 
     const directory = data.cwd || data.directory || process.cwd();
     const sessionIdRaw = data.sessionId || data.session_id || data.sessionid || "";
@@ -1854,17 +1848,94 @@ async function main() {
       }
     }
     console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-  } catch (error) {
-    // On any error, allow stop rather than blocking forever
-    try {
-      process.stderr.write(`[persistent-mode] Error: ${error?.message || error}\n`);
-    } catch {
-      // Ignore stderr errors - we just need to return valid JSON
+}
+
+async function processPersistentModeStop(data) {
+  let legacyOutput;
+  await evaluatePersistentMode(data, {
+    log(serialized) {
+      if (typeof serialized !== "string") {
+        throw new TypeError("Persistent mode emitted a non-string decision.");
+      }
+      const output = JSON.parse(serialized);
+      if (!output || typeof output !== "object" || Array.isArray(output)) {
+        throw new TypeError("Persistent mode emitted an invalid decision.");
+      }
+      legacyOutput = output;
+    },
+  });
+
+  if (!legacyOutput) {
+    throw new Error("Persistent mode processor produced no legacy output.");
+  }
+  return legacyOutput;
+}
+
+function describeStopRunFailure(result) {
+  const failures = [];
+
+  for (const issue of result.envelope.issues) {
+    if (issue.severity === "safety" || issue.batchSafety === true) {
+      failures.push(issue.message || issue.code || "hook input normalization failed");
     }
-    writeSafeContinue();
+  }
+  for (const evaluation of result.evaluations) {
+    if (evaluation.source === "adapter" && evaluation.decision === "deny") {
+      failures.push(evaluation.reason || "legacy processor adapter failed");
+    }
+  }
+  for (const decision of result.reduction.callDecisions) {
+    if (decision.source === "adapter" && decision.decision === "deny") {
+      failures.push(decision.reason || "hook reduction failed");
+    }
+  }
+  if (!["pass", "deny"].includes(result.reduction.decision)) {
+    failures.push(
+      result.reduction.reason
+      || `unexpected ${result.reduction.decision} reduction`,
+    );
+  }
+
+  return failures.length > 0 ? [...new Set(failures)].join("; ") : undefined;
+}
+
+async function main() {
+  try {
+    const runtime = loadHookRuntime();
+    const input = await readStdin();
+    const skipPersistentMode = shouldSkipPersistentModeHook();
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      "stop",
+      input,
+      async (unit, envelope) => {
+        legacyOutput = skipPersistentMode
+          ? SAFE_CONTINUE
+          : await processPersistentModeStop(
+            runtime.buildLegacyProcessorInput(envelope, unit),
+          );
+        return legacyOutput;
+      },
+    );
+
+    const failure = describeStopRunFailure(result);
+    if (failure) throw new Error(failure);
+    if (!legacyOutput || typeof legacyOutput !== "object") {
+      throw new Error("Persistent mode processor produced no legacy output.");
+    }
+
+    process.stdout.write(`${JSON.stringify(
+      runtime.encodeLegacyCompatibleHookOutput(
+        result.envelope,
+        result.reduction,
+        legacyOutput,
+      ),
+    )}\n`);
+  } catch (error) {
+    surfaceCriticalHookFailure(error, { hookName: "persistent-mode" });
   }
 }
 
-main().finally(() => {
+void main().finally(() => {
   clearTimeout(safetyTimeout);
 });

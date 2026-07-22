@@ -11,6 +11,7 @@ import { execFileSync } from 'child_process';
 import { evaluateAgentHeavyPreflight } from '../../scripts/lib/pre-tool-enforcer-preflight.mjs';
 
 const SCRIPT_PATH = join(process.cwd(), 'scripts', 'pre-tool-enforcer.mjs');
+const ADVISORY_TEST_NOW_MS = Date.now();
 
 function runPreToolEnforcer(input: Record<string, unknown>): Record<string, unknown> {
   return runPreToolEnforcerWithEnv(input);
@@ -96,7 +97,10 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  function runWithThrottle(toolName: string, nowMs = '1000'): Record<string, unknown> {
+  function runWithThrottle(
+    toolName: string,
+    nowMs = String(ADVISORY_TEST_NOW_MS),
+  ): Record<string, unknown> {
     return runPreToolEnforcerWithEnv(
       {
         tool_name: toolName,
@@ -151,7 +155,7 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
     };
     const env = {
       OMC_PRE_TOOL_ADVISORY_COOLDOWN_MS: '5000',
-      OMC_PRE_TOOL_ADVISORY_NOW_MS: '1000',
+      OMC_PRE_TOOL_ADVISORY_NOW_MS: String(ADVISORY_TEST_NOW_MS),
     };
 
     const first = runPreToolEnforcerWithEnv(input, env);
@@ -166,9 +170,18 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
   });
 
   it('uses deterministic cooldown interval boundaries', () => {
-    const first = runWithThrottle('Bash', '1000');
-    const beforeCooldown = runWithThrottle('Bash', '5999');
-    const atCooldown = runWithThrottle('Bash', '6000');
+    const first = runWithThrottle(
+      'Bash',
+      String(ADVISORY_TEST_NOW_MS),
+    );
+    const beforeCooldown = runWithThrottle(
+      'Bash',
+      String(ADVISORY_TEST_NOW_MS + 4_999),
+    );
+    const atCooldown = runWithThrottle(
+      'Bash',
+      String(ADVISORY_TEST_NOW_MS + 5_000),
+    );
 
     expect((first.hookSpecificOutput as Record<string, unknown>).additionalContext).toContain(
       'Use parallel execution for independent tasks',
@@ -179,14 +192,15 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
     );
   });
 
-  it('does not let a future throttle timestamp suppress an advisory', () => {
-    runWithThrottle('Bash', '10000');
+  it('treats a future same-message timestamp as already emitted', () => {
+    runWithThrottle('Bash', String(ADVISORY_TEST_NOW_MS + 10_000));
 
-    const output = runWithThrottle('Bash', '1000');
-
-    expect((output.hookSpecificOutput as Record<string, unknown>).additionalContext).toContain(
-      'Use parallel execution for independent tasks',
+    const output = runWithThrottle(
+      'Bash',
+      String(ADVISORY_TEST_NOW_MS),
     );
+
+    expect(output).toEqual({ continue: true, suppressOutput: true });
   });
 
   it('keeps advisory throttle state capped after adding a new entry', () => {
@@ -203,14 +217,17 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
       Array.from({ length: 100 }, (_, index) => [
         `old-${index}`,
         {
-          last_emitted_at_ms: 10_000 - index,
+          last_emitted_at_ms: ADVISORY_TEST_NOW_MS - index,
           message: `old message ${index}`,
         },
       ]),
     );
     writeJson(throttlePath, { version: 1, entries });
 
-    runWithThrottle('Bash', '20000');
+    runWithThrottle(
+      'Bash',
+      String(ADVISORY_TEST_NOW_MS + 20_000),
+    );
 
     const state = JSON.parse(readFileSync(throttlePath, 'utf-8')) as {
       entries: Record<string, unknown>;
@@ -232,20 +249,24 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
       Array.from({ length: 100 }, (_, index) => [
         `future-${index}`,
         {
-          last_emitted_at_ms: 999_000 + index,
+          last_emitted_at_ms: ADVISORY_TEST_NOW_MS + 999_000 + index,
           message: `future message ${index}`,
         },
       ]),
     );
     writeJson(throttlePath, { version: 1, entries });
 
-    runWithThrottle('Bash', '20000');
+    runWithThrottle(
+      'Bash',
+      String(ADVISORY_TEST_NOW_MS + 20_000),
+    );
 
     const state = JSON.parse(readFileSync(throttlePath, 'utf-8')) as {
       entries: Record<string, { last_emitted_at_ms: number }>;
     };
     expect(Object.keys(state.entries)).toHaveLength(1);
-    expect(Object.values(state.entries)[0].last_emitted_at_ms).toBe(20_000);
+    expect(Object.values(state.entries)[0].last_emitted_at_ms)
+      .toBe(ADVISORY_TEST_NOW_MS + 20_000);
   });
 });
 
@@ -2429,7 +2450,7 @@ describe('pre-tool-enforcer agents.<name>.model injection (issue #3242)', () => 
     // window and is advisory-throttled.
     const throttleEnv = {
       OMC_PRE_TOOL_ADVISORY_COOLDOWN_MS: '5000',
-      OMC_PRE_TOOL_ADVISORY_NOW_MS: '1000',
+      OMC_PRE_TOOL_ADVISORY_NOW_MS: String(ADVISORY_TEST_NOW_MS),
     };
 
     const first = run(input, throttleEnv);
@@ -2459,20 +2480,29 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
   });
 
   function run(input: Record<string, unknown>, env: Record<string, string> = {}): Record<string, unknown> {
+    const toolName = String(input.tool_name || input.toolName || '');
+    const toolInput = input.toolInput || input.tool_input || {};
+    const sessionId = String(input.session_id || input.sessionId || '');
     return runPreToolEnforcerWithEnv(
-      { cwd: tempDir, ...input },
+      {
+        cwd: tempDir,
+        sessionId,
+        toolCalls: [{
+          id: `${sessionId || 'copilot'}-call`,
+          name: toolName.toLowerCase(),
+          args: JSON.stringify(toolInput),
+        }],
+      },
       {
         APPDATA: xdgConfigHome,
         XDG_CONFIG_HOME: xdgConfigHome,
-        OMC_HOST: 'copilot',
         ...env,
       },
     );
   }
 
   function updatedInput(output: Record<string, unknown>): Record<string, unknown> | undefined {
-    const hookOutput = output.hookSpecificOutput as Record<string, unknown> | undefined;
-    return hookOutput?.updatedInput as Record<string, unknown> | undefined;
+    return output.modifiedArgs as Record<string, unknown> | undefined;
   }
 
   it('defaults bundled OMC subagents to GPT-5.6 Sol with max reasoning', () => {
@@ -2503,14 +2533,12 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
       },
       session_id: 'copilot-agent-type',
     });
-    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
-
     expect(updatedInput(output)).toMatchObject({
       agent_type: 'oh-my-claudecode:explore',
       model: 'gpt-5.6-sol',
       reasoning_effort: 'max',
     });
-    expect(hookOutput.additionalContext).toContain(
+    expect(output.additionalContext).toContain(
       'Spawning agent: oh-my-claudecode:explore (gpt-5.6-sol) [BACKGROUND]',
     );
   });
@@ -2626,10 +2654,10 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
       },
       { OMC_COPILOT_REASONING_EFFORT: 'extreme' },
     );
-    const hookOutput = output.hookSpecificOutput as Record<string, unknown>;
-
     expect(updatedInput(output)?.reasoning_effort).toBe('max');
-    expect(hookOutput.additionalContext).toContain('Ignoring invalid reasoning effort "extreme"');
+    expect(output.additionalContext).toContain(
+      'Ignoring invalid reasoning effort "extreme"',
+    );
   });
 
   it('does not modify non-OMC agents or Claude-hosted calls', () => {

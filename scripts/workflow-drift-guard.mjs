@@ -10,11 +10,26 @@
  * fails open for ambiguous/free-form cases.
  */
 import { execFileSync } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+} from 'fs';
 import { extname, join } from 'path';
-const { readStdin } = await import(new URL('./lib/stdin.mjs', import.meta.url));
+import {
+  loadHookRuntime,
+  surfaceCriticalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
+import { readStdin } from './lib/stdin.mjs';
 
 const HOOK_NAME = 'workflow-drift-guard';
+const COPILOT_TRANSCRIPT_TAIL_BYTES = 256 * 1024;
+const COPILOT_TRANSCRIPT_RECORD_BYTES = 128 * 1024;
+const COPILOT_ASSISTANT_CONTENT_BYTES = 64 * 1024;
+const COPILOT_TRANSCRIPT_RECORD_LIMIT = 4096;
 const CODE_EXTENSIONS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts', '.py', '.sh', '.bash', '.zsh', '.go', '.rs', '.java', '.kt', '.kts', '.swift', '.rb', '.php', '.cs', '.c', '.cc', '.cpp', '.h', '.hpp']);
 const COMPLETION_CLAIM_RE = /\b(?:done|complete[sd]?|finished|implemented|fixed|resolved|all set|ready\s+(?:for\s+(?:review|merge|release|qa|testing)|to\s+(?:merge|ship|release|submit)))\b/i;
 const WORD_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
@@ -56,8 +71,99 @@ function skippedByEnv() {
   return (process.env.OMC_SKIP_HOOKS || '').split(',').map(s => s.trim()).includes(HOOK_NAME);
 }
 
-function safeJsonParse(text) {
-  try { return JSON.parse(text || '{}'); } catch { return {}; }
+function finalAssistantMessageFromCopilotTranscript(transcriptPath) {
+  if (typeof transcriptPath !== 'string' || transcriptPath.length === 0) return '';
+
+  let fd = -1;
+  try {
+    const stat = statSync(transcriptPath);
+    if (!stat.isFile() || stat.size <= 0 || !Number.isSafeInteger(stat.size)) return '';
+
+    const readStart = Math.max(0, stat.size - COPILOT_TRANSCRIPT_TAIL_BYTES - 1);
+    const readLength = stat.size - readStart;
+    if (readLength <= 0 || readLength > COPILOT_TRANSCRIPT_TAIL_BYTES + 1) return '';
+
+    const buffer = Buffer.allocUnsafe(readLength);
+    fd = openSync(transcriptPath, 'r');
+    let bytesRead = 0;
+    while (bytesRead < readLength) {
+      const count = readSync(
+        fd,
+        buffer,
+        bytesRead,
+        readLength - bytesRead,
+        readStart + bytesRead,
+      );
+      if (count === 0) return '';
+      bytesRead += count;
+    }
+
+    let tail = buffer;
+    if (readStart > 0) {
+      const firstRecordEnd = tail.indexOf(0x0a);
+      if (firstRecordEnd === -1) return '';
+      tail = tail.subarray(firstRecordEnd + 1);
+    }
+
+    const records = new TextDecoder('utf-8', { fatal: true })
+      .decode(tail)
+      .split('\n');
+    if (records.length > COPILOT_TRANSCRIPT_RECORD_LIMIT) return '';
+
+    const events = [];
+    for (const rawRecord of records) {
+      const record = rawRecord.endsWith('\r')
+        ? rawRecord.slice(0, -1)
+        : rawRecord;
+      if (!record.trim()) continue;
+      if (Buffer.byteLength(record, 'utf8') > COPILOT_TRANSCRIPT_RECORD_BYTES) {
+        return '';
+      }
+
+      let event;
+      try {
+        event = JSON.parse(record);
+      } catch {
+        return '';
+      }
+
+      if (typeof event !== 'object' || event === null || Array.isArray(event)) {
+        return '';
+      }
+      if (event.type === 'assistant.message') {
+        if (
+          typeof event.data !== 'object'
+          || event.data === null
+          || Array.isArray(event.data)
+          || typeof event.data.content !== 'string'
+        ) {
+          return '';
+        }
+        if (
+          Buffer.byteLength(event.data.content, 'utf8')
+          > COPILOT_ASSISTANT_CONTENT_BYTES
+        ) {
+          return '';
+        }
+      }
+      events.push(event);
+    }
+
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index];
+      if (event.type !== 'assistant.message') continue;
+      const content = event.data.content.trim();
+      if (content) return content;
+    }
+  } catch {
+    return '';
+  } finally {
+    if (fd !== -1) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+
+  return '';
 }
 
 function lastAssistantMessage(input) {
@@ -68,6 +174,11 @@ function lastAssistantMessage(input) {
   for (const key of ['lastAssistantMessage', 'message', 'output', 'response', 'text']) {
     const value = input?.[key];
     if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  if (input?.host === 'copilot') {
+    return finalAssistantMessageFromCopilotTranscript(
+      input.transcript_path || input.transcriptPath,
+    );
   }
   return '';
 }
@@ -894,23 +1005,19 @@ function makeBlock(reason) {
   return { decision: 'block', reason };
 }
 
-async function main() {
+function processWorkflowDriftGuard(input) {
   if (skippedByEnv()) {
-    console.log(JSON.stringify({ suppressOutput: true }));
-    return;
+    return { suppressOutput: true };
   }
-  const input = safeJsonParse(await readStdin());
   // Claude Code docs warn Stop hooks receive stop_hook_active while already
   // continuing from a Stop hook; fail open to avoid self-reinforcing loops.
   if (input.stop_hook_active === true || input.stopHookActive === true) {
-    console.log(JSON.stringify({ suppressOutput: true }));
-    return;
+    return { suppressOutput: true };
   }
 
   const message = lastAssistantMessage(input);
   if (shouldBlockStructuredDecision(message)) {
-    console.log(JSON.stringify(makeBlock('[WORKFLOW DRIFT GUARD] The final response contains a supported local selection fork that should be asked with structured AskUserQuestion. Continue by calling AskUserQuestion with 2-4 options and keep allowOther enabled unless free-form input is unsafe.')));
-    return;
+    return makeBlock('[WORKFLOW DRIFT GUARD] The final response contains a supported local selection fork that should be asked with structured AskUserQuestion. Continue by calling AskUserQuestion with 2-4 options and keep allowOther enabled unless free-form input is unsafe.');
   }
 
   const cwd = typeof input.cwd === 'string' ? input.cwd : (typeof input.directory === 'string' ? input.directory : process.cwd());
@@ -918,15 +1025,73 @@ async function main() {
     const blockers = findCompletionBlockers(cwd);
     if (blockers.length > 0) {
       const details = blockers.map(b => `${b.path}:${b.line} ${b.kind} — ${b.text}`).join('\n');
-      console.log(JSON.stringify(makeBlock(`[WORKFLOW DRIFT GUARD] Completion was claimed while changed code still contains TODO/stub/skipped-test blockers. Resolve them or explicitly report the blocker instead of claiming completion.\n${details}`)));
-      return;
+      return makeBlock(`[WORKFLOW DRIFT GUARD] Completion was claimed while changed code still contains TODO/stub/skipped-test blockers. Resolve them or explicitly report the blocker instead of claiming completion.\n${details}`);
     }
   }
 
-  console.log(JSON.stringify({ suppressOutput: true }));
+  return { suppressOutput: true };
 }
 
-main().catch((error) => {
-  console.error(`[workflow-drift-guard] ${error instanceof Error ? error.message : String(error)}`);
-  console.log(JSON.stringify({ suppressOutput: true }));
-});
+function describeStopRunFailure(result) {
+  const failures = [];
+
+  for (const issue of result.envelope.issues) {
+    if (issue.severity === 'safety' || issue.batchSafety === true) {
+      failures.push(issue.message || issue.code || 'hook input normalization failed');
+    }
+  }
+  for (const evaluation of result.evaluations) {
+    if (evaluation.source === 'adapter' && evaluation.decision === 'deny') {
+      failures.push(evaluation.reason || 'legacy processor adapter failed');
+    }
+  }
+  for (const decision of result.reduction.callDecisions) {
+    if (decision.source === 'adapter' && decision.decision === 'deny') {
+      failures.push(decision.reason || 'hook reduction failed');
+    }
+  }
+  if (!['pass', 'deny'].includes(result.reduction.decision)) {
+    failures.push(
+      result.reduction.reason
+      || `unexpected ${result.reduction.decision} reduction`,
+    );
+  }
+
+  return failures.length > 0 ? [...new Set(failures)].join('; ') : undefined;
+}
+
+async function main() {
+  try {
+    const runtime = loadHookRuntime();
+    const input = await readStdin();
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      'stop',
+      input,
+      (unit, envelope) => {
+        legacyOutput = processWorkflowDriftGuard(
+          runtime.buildLegacyProcessorInput(envelope, unit),
+        );
+        return legacyOutput;
+      },
+    );
+
+    const failure = describeStopRunFailure(result);
+    if (failure) throw new Error(failure);
+    if (!legacyOutput || typeof legacyOutput !== 'object') {
+      throw new Error('Workflow drift guard produced no legacy output.');
+    }
+
+    process.stdout.write(`${JSON.stringify(
+      runtime.encodeLegacyCompatibleHookOutput(
+        result.envelope,
+        result.reduction,
+        legacyOutput,
+      ),
+    )}\n`);
+  } catch (error) {
+    surfaceCriticalHookFailure(error, { hookName: 'workflow-drift-guard' });
+  }
+}
+
+void main();

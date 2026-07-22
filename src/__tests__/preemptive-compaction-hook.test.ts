@@ -4,8 +4,11 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 
 import { afterEach, describe, expect, it } from 'vitest';
+import { ensureHookRuntimeBundle } from './helpers/ensure-hook-runtime-bundle.js';
 
 const SCRIPT_PATH = join(process.cwd(), 'scripts', 'post-tool-verifier.mjs');
+
+ensureHookRuntimeBundle();
 const HOOKS_PATH = join(process.cwd(), 'hooks', 'hooks.json');
 
 const tempDirs: string[] = [];

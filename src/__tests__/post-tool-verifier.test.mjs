@@ -10,6 +10,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'os';
 import process from 'process';
 import { detectBashFailure, detectWriteFailure, isClaudeCodeWriteSuccess, isNonZeroExitWithOutput, summarizeAgentResult } from '../../scripts/post-tool-verifier.mjs';
+import { ensureHookRuntimeBundle } from './helpers/ensure-hook-runtime-bundle.js';
 
 const SCRIPT_PATH = join(process.cwd(), 'scripts', 'post-tool-verifier.mjs');
 const TEMPLATE_HOOK_PATH = join(process.cwd(), 'templates', 'hooks', 'post-tool-use.mjs');
@@ -33,6 +34,8 @@ const PYTEST_RED_RUN_OUTPUT = [
   'FAILED tests/test_example.py::test_red - assert 1 == 2',
   '============================== 1 failed in 0.12s ==============================',
 ].join('\n');
+
+ensureHookRuntimeBundle();
 
 function runPostToolVerifier(input, env = {}) {
   return runHookScript(SCRIPT_PATH, input, env);

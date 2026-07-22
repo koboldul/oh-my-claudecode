@@ -22,7 +22,7 @@ describe('HUD wrapper devPaths removal (binary-weaving-mountain)', () => {
   it('plugin-setup.mjs no longer contains an inline devPaths array', () => {
     const content = readFileSync(PLUGIN_SETUP_PATH, 'utf-8');
     expect(content).not.toMatch(/const devPaths\s*=\s*\[/);
-    expect(content).not.toContain('Workspace/oh-my-claudecode/dist/hud/index.js');
+    expect(content).not.toContain('Workspace/oh-my-claudecode/bridge/hud-runtime.mjs');
     expect(content).not.toContain('OMC_DEV');
   });
 
@@ -30,7 +30,7 @@ describe('HUD wrapper devPaths removal (binary-weaving-mountain)', () => {
     expect(existsSync(HUD_WRAPPER_TEMPLATE)).toBe(true);
     const content = readFileSync(HUD_WRAPPER_TEMPLATE, 'utf-8');
     expect(content).toContain('OMC_PLUGIN_ROOT');
-    expect(content).toContain('dist/hud/index.js');
+    expect(content).toContain('bridge/hud-runtime.mjs');
     expect(content).not.toContain('OMC_DEV');
     expect(content).not.toContain('Workspace/oh-my-claudecode');
     expect(content).not.toContain('projects/oh-my-claudecode');

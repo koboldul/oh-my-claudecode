@@ -1,19 +1,103 @@
 import { execFileSync } from 'node:child_process';
-import { resolve, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import {
+  copyFileSync,
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, resolve, join } from 'node:path';
+import * as esbuild from 'esbuild';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const NODE = process.execPath;
 const REPO_ROOT = resolve(join(__dirname, '..', '..'));
-const SCRIPT_PATH = join(REPO_ROOT, 'scripts', 'post-tool-rules-injector.mjs');
+let tempRoot: string;
+let pluginRoot: string;
+let workspace: string;
+let scriptPath: string;
+
+beforeAll(async () => {
+  tempRoot = mkdtempSync(join(tmpdir(), 'omc-rules-skip-entrypoint-'));
+  pluginRoot = join(tempRoot, 'plugin');
+  workspace = join(tempRoot, 'workspace');
+  scriptPath = join(pluginRoot, 'scripts', 'post-tool-rules-injector.mjs');
+
+  mkdirSync(join(pluginRoot, 'scripts'), { recursive: true });
+  cpSync(
+    join(REPO_ROOT, 'scripts', 'lib'),
+    join(pluginRoot, 'scripts', 'lib'),
+    { recursive: true },
+  );
+  copyFileSync(
+    join(REPO_ROOT, 'scripts', 'post-tool-rules-injector.mjs'),
+    scriptPath,
+  );
+  writeFileSync(
+    join(pluginRoot, 'package.json'),
+    JSON.stringify({ type: 'module' }),
+    'utf8',
+  );
+
+  execFileSync(
+    NODE,
+    [
+      join(REPO_ROOT, 'scripts', 'build-hook-runtime.mjs'),
+      '--outfile',
+      join(pluginRoot, 'bridge', 'hook-runtime.cjs'),
+    ],
+    {
+      cwd: REPO_ROOT,
+      stdio: 'pipe',
+      windowsHide: true,
+    },
+  );
+
+  const processorPath = join(
+    pluginRoot,
+    'dist',
+    'hooks',
+    'rules-injector',
+    'index.js',
+  );
+  mkdirSync(dirname(processorPath), { recursive: true });
+  await esbuild.build({
+    entryPoints: [
+      join(REPO_ROOT, 'src', 'hooks', 'rules-injector', 'index.ts'),
+    ],
+    bundle: true,
+    packages: 'bundle',
+    preserveSymlinks: true,
+    platform: 'node',
+    target: 'node20',
+    format: 'esm',
+    outfile: processorPath,
+  });
+
+  mkdirSync(workspace, { recursive: true });
+  writeFileSync(join(workspace, 'package.json'), '{}\n', 'utf8');
+  writeFileSync(join(workspace, 'README.md'), '# Test\n', 'utf8');
+});
+
+afterAll(() => {
+  rmSync(tempRoot, { recursive: true, force: true });
+});
 
 function runHook(input: Record<string, unknown>, extraEnv?: Record<string, string>) {
-  const raw = execFileSync(NODE, [SCRIPT_PATH], {
+  const testHome = join(tempRoot, 'home');
+  mkdirSync(testHome, { recursive: true });
+  const raw = execFileSync(NODE, [scriptPath], {
+    cwd: workspace,
     input: JSON.stringify(input),
     encoding: 'utf-8',
     env: {
       ...process.env,
-      CLAUDE_PLUGIN_ROOT: REPO_ROOT,
+      CLAUDE_PLUGIN_ROOT: pluginRoot,
+      HOME: testHome,
       NODE_ENV: 'test',
+      USERPROFILE: testHome,
       ...extraEnv,
     },
     timeout: 15000,

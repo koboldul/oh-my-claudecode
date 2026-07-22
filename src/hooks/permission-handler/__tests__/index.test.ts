@@ -13,7 +13,10 @@ import {
   isActiveModeRunning,
   processPermissionRequest,
 } from '../index.js';
-import type { PermissionRequestInput } from '../index.js';
+import type {
+  CanonicalPermissionRequestInput,
+  PermissionRequestInput,
+} from '../index.js';
 
 function initializeGitRepo(directory: string): void {
   execFileSync('git', ['init', '--quiet'], {
@@ -270,6 +273,39 @@ describe('permission-handler', () => {
         expect(isSafeAutoApprovedCommand(command, '/tmp', 'powershell')).toBe(false);
       });
     });
+  });
+
+  describe('canonical Copilot permission pass-through', () => {
+    function createCanonicalInput(
+      nativeToolName: string,
+      shellDialect: 'posix' | 'powershell',
+    ): CanonicalPermissionRequestInput {
+      return {
+        host: 'copilot',
+        contract: 'copilot-1.0.72-1',
+        hookType: 'permission-request',
+        directory: '/tmp',
+        toolName: nativeToolName,
+        nativeToolName,
+        canonicalToolName: 'Bash',
+        toolInput: { command: 'git status' },
+        shellDialect,
+      };
+    }
+
+    it.each([
+      ['bash', 'posix'],
+      ['powershell', 'powershell'],
+    ] as const)(
+      'passes native %s requests through without OMC allow',
+      (nativeToolName, shellDialect) => {
+        const result = processPermissionRequest(
+          createCanonicalInput(nativeToolName, shellDialect),
+        );
+
+        expect(result.hookSpecificOutput).toBeUndefined();
+      },
+    );
   });
 
   describe('repo-scoped inspection commands', () => {

@@ -18,6 +18,10 @@ import { encodeProjectPath } from './lib/encode-project-path.mjs';
 import { resolveOmcStateRoot } from './lib/state-root.mjs';
 import { readStdin } from './lib/stdin.mjs';
 import { BOUNDED_GIT_TIMEOUT_MS } from './lib/bounded-git-timeout.mjs';
+import {
+  loadHookRuntime,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 
 const AGENT_OUTPUT_ANALYSIS_LIMIT = parseInt(process.env.OMC_AGENT_OUTPUT_ANALYSIS_LIMIT || '12000', 10);
 const AGENT_OUTPUT_SUMMARY_LIMIT = parseInt(process.env.OMC_AGENT_OUTPUT_SUMMARY_LIMIT || '360', 10);
@@ -457,7 +461,7 @@ function readTranscriptUsage(transcriptPath) {
 }
 
 function readContextUsageFromHookInput(data) {
-  const contextWindow = data?.context_window;
+  const contextWindow = data?.contextWindow;
   if (!contextWindow || typeof contextWindow !== 'object') {
     return null;
   }
@@ -545,7 +549,7 @@ function maybeBuildPreemptiveCompactionMessage(toolName, data, directory) {
   }
 
   const percentFromTranscript = readTranscriptUsage(
-    resolveTranscriptPath(data.transcript_path || data.transcriptPath, directory),
+    resolveTranscriptPath(data.transcriptPath, directory),
   );
   const percentUsed =
     percentFromTranscript ?? readContextUsageFromHookInput(data);
@@ -558,7 +562,7 @@ function maybeBuildPreemptiveCompactionMessage(toolName, data, directory) {
 
   const severity = percentUsed >= criticalThreshold ? 'critical' : 'warning';
   const now = Date.now();
-  const sessionId = data.session_id || data.sessionId || 'unknown';
+  const sessionId = data.sessionId || 'unknown';
 
   if (shouldSuppressPreemptiveWarning(directory, sessionId, severity, now)) {
     return '';
@@ -1072,6 +1076,106 @@ function combineMessages(...messages) {
   return messages.filter(Boolean).join(' | ');
 }
 
+function describeCanonicalFailure(result) {
+  const failures = [];
+
+  for (const issue of result?.envelope?.issues ?? []) {
+    if (issue?.severity === 'safety' || issue?.batchSafety === true) {
+      failures.push(issue.message || issue.code || 'hook input normalization failed');
+    }
+  }
+
+  for (const evaluation of result?.evaluations ?? []) {
+    if (evaluation?.source === 'adapter' && evaluation?.decision === 'deny') {
+      failures.push(evaluation.reason || 'legacy processor adapter failed');
+    }
+  }
+
+  for (const decision of result?.reduction?.callDecisions ?? []) {
+    if (decision?.source === 'adapter' && decision?.decision === 'deny') {
+      failures.push(decision.reason || 'hook reduction failed');
+    }
+  }
+
+  if (result?.reduction?.decision && result.reduction.decision !== 'pass') {
+    failures.push(result.reduction.reason || `unexpected ${result.reduction.decision} reduction`);
+  }
+
+  return failures.length > 0 ? [...new Set(failures)].join('; ') : undefined;
+}
+
+function processPostToolUse(data) {
+  const toolName = data.toolName || '';
+  const rawResponse = data.toolOutput ?? '';
+  const structuredWriteSuccess =
+    (toolName === 'Write' || toolName === 'Edit') && hasStructuredWriteSuccess(rawResponse, toolName);
+  const structuredWriteFailure =
+    (toolName === 'Write' || toolName === 'Edit') && hasStructuredWriteFailure(rawResponse);
+  const toolOutput = typeof rawResponse === 'string' ? rawResponse : JSON.stringify(rawResponse);
+  const { clipped: clippedToolOutput, wasTruncated } = clipToolOutputForAnalysis(toolName, toolOutput);
+  const sessionId = data.sessionId || 'unknown';
+  const directory = data.directory || process.cwd();
+
+  // Update session statistics
+  const toolCount = updateStats(toolName, sessionId);
+
+  // Append Bash commands to ~/.bash_history for terminal recall
+  if ((toolName === 'Bash' || toolName === 'bash') && getBashHistoryConfig()) {
+    const toolInput = data.toolInput || {};
+    const command = typeof toolInput === 'string' ? toolInput : (toolInput.command || '');
+    appendToBashHistory(command);
+  }
+
+  // Process <remember> tags from Task agent output
+  if (
+    toolName === 'Task' ||
+    toolName === 'task' ||
+    toolName === 'TaskCreate' ||
+    toolName === 'TaskUpdate'
+  ) {
+    processRememberTags(clippedToolOutput, directory);
+  }
+
+  if (toolName === 'Skill' || toolName === 'skill') {
+    const toolInput = data.toolInput || {};
+    const skillName = getInvokedSkillName(toolInput);
+    const currentState = readSkillActiveState(directory, sessionId);
+    const completingSkill = (skillName ?? '')
+      .toLowerCase()
+      .replace(/^oh-my-claudecode:/, '');
+    if (!currentState || !currentState.active || currentState.skill_name === completingSkill) {
+      clearSkillActiveState(directory, sessionId);
+    }
+    if (isConsensusPlanningSkillInvocation(skillName, toolInput)) {
+      deactivateRalplanState(directory, sessionId);
+    }
+  }
+
+  // Generate contextual message
+  const message = combineMessages(
+    generateMessage(toolName, clippedToolOutput, sessionId, toolCount, directory, {
+      wasTruncated,
+      rawLength: toolOutput.length,
+      structuredWriteSuccess,
+      structuredWriteFailure,
+    }),
+    maybeBuildPreemptiveCompactionMessage(toolName, data, directory),
+  );
+
+  // Build response - use hookSpecificOutput.additionalContext for PostToolUse
+  const response = { continue: true };
+  if (message) {
+    response.hookSpecificOutput = {
+      hookEventName: 'PostToolUse',
+      additionalContext: message
+    };
+  } else {
+    response.suppressOutput = true;
+  }
+
+  return response;
+}
+
 async function main() {
   // Skip guard: check OMC_SKIP_HOOKS env var (see issue #838)
   const _skipHooks = (process.env.OMC_SKIP_HOOKS || '').split(',').map(s => s.trim());
@@ -1081,81 +1185,33 @@ async function main() {
   }
 
   try {
+    const runtime = loadHookRuntime();
     const input = await readStdin();
-    const data = JSON.parse(input);
-
-    const toolName = data.tool_name || data.toolName || '';
-    const rawResponse = data.tool_response || data.toolOutput || '';
-    const structuredWriteSuccess =
-      (toolName === 'Write' || toolName === 'Edit') && hasStructuredWriteSuccess(rawResponse, toolName);
-    const structuredWriteFailure =
-      (toolName === 'Write' || toolName === 'Edit') && hasStructuredWriteFailure(rawResponse);
-    const toolOutput = typeof rawResponse === 'string' ? rawResponse : JSON.stringify(rawResponse);
-    const { clipped: clippedToolOutput, wasTruncated } = clipToolOutputForAnalysis(toolName, toolOutput);
-    const sessionId = data.session_id || data.sessionId || 'unknown';
-    const directory = data.cwd || data.directory || process.cwd();
-
-    // Update session statistics
-    const toolCount = updateStats(toolName, sessionId);
-
-    // Append Bash commands to ~/.bash_history for terminal recall
-    if ((toolName === 'Bash' || toolName === 'bash') && getBashHistoryConfig()) {
-      const toolInput = data.tool_input || data.toolInput || {};
-      const command = typeof toolInput === 'string' ? toolInput : (toolInput.command || '');
-      appendToBashHistory(command);
-    }
-
-    // Process <remember> tags from Task agent output
-    if (
-      toolName === 'Task' ||
-      toolName === 'task' ||
-      toolName === 'TaskCreate' ||
-      toolName === 'TaskUpdate'
-    ) {
-      processRememberTags(clippedToolOutput, directory);
-    }
-
-    if (toolName === 'Skill' || toolName === 'skill') {
-      const toolInput = data.tool_input || data.toolInput || {};
-      const skillName = getInvokedSkillName(toolInput);
-      const currentState = readSkillActiveState(directory, sessionId);
-      const completingSkill = (skillName ?? '')
-        .toLowerCase()
-        .replace(/^oh-my-claudecode:/, '');
-      if (!currentState || !currentState.active || currentState.skill_name === completingSkill) {
-        clearSkillActiveState(directory, sessionId);
-      }
-      if (isConsensusPlanningSkillInvocation(skillName, toolInput)) {
-        deactivateRalplanState(directory, sessionId);
-      }
-    }
-
-    // Generate contextual message
-    const message = combineMessages(
-      generateMessage(toolName, clippedToolOutput, sessionId, toolCount, directory, {
-        wasTruncated,
-        rawLength: toolOutput.length,
-        structuredWriteSuccess,
-        structuredWriteFailure,
-      }),
-      maybeBuildPreemptiveCompactionMessage(toolName, data, directory),
+    const result = await runtime.runHookJson(
+      'post-tool-use',
+      input,
+      (unit, envelope) => processPostToolUse(
+        runtime.buildLegacyProcessorInput(envelope, unit),
+      ),
     );
 
-    // Build response - use hookSpecificOutput.additionalContext for PostToolUse
-    const response = { continue: true };
-    if (message) {
-      response.hookSpecificOutput = {
-        hookEventName: 'PostToolUse',
-        additionalContext: message
-      };
-    } else {
-      response.suppressOutput = true;
+    const canonicalFailure = describeCanonicalFailure(result);
+    if (canonicalFailure) {
+      surfaceOptionalHookFailure(
+        new Error(canonicalFailure),
+        { hookName: 'post-tool-verifier' },
+      );
+      return;
     }
 
-    console.log(JSON.stringify(response, null, 2));
+    const encoded = runtime.encodeHookOutput(result.envelope, result.reduction);
+    const output =
+      result.envelope.host === 'claude' && Object.keys(encoded).length === 0
+        ? { continue: true, suppressOutput: true }
+        : encoded;
+    console.log(JSON.stringify(output, null, 2));
   } catch (error) {
-    // On error, always continue
-    console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+    surfaceOptionalHookFailure(error, { hookName: 'post-tool-verifier' });
   }
 }
 

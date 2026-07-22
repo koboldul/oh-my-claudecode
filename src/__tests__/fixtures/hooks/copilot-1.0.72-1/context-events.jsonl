@@ -1,0 +1,4 @@
+{"type":"session.start","data":{"version":1,"copilotVersion":"1.0.72-1","sessionId":"<session-id>","contextTier":null}}
+{"type":"assistant.message","data":{"messageId":"<message-id>","model":"<model-id>","content":"Finished the requested work.","outputTokens":256,"toolRequests":[]}}
+{"type":"session.compaction_start","data":{"model":"<model-id>","systemTokens":10487,"conversationTokens":196177,"toolDefinitionsTokens":9797}}
+{"type":"session.compaction_complete","data":{"compactionTokensUsed":{"model":"<model-id>","inputTokens":213229,"outputTokens":2055,"cacheReadTokens":211328,"cacheWriteTokens":0}}}

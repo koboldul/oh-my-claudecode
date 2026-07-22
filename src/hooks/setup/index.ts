@@ -25,6 +25,7 @@ export interface SetupInput {
   permission_mode: string;
   hook_event_name: 'Setup';
   trigger: 'init' | 'maintenance';
+  host?: 'claude' | 'copilot';
 }
 
 export interface SetupResult {
@@ -59,6 +60,11 @@ const CONFIG_FILES = [
 ];
 
 const DEFAULT_STATE_MAX_AGE_DAYS = 7;
+
+function managesClaudeConfig(input: SetupInput): boolean {
+  const host = input.host ?? process.env.OMC_HOST?.trim().toLowerCase();
+  return host !== 'copilot';
+}
 
 // ============================================================================
 // Init Functions
@@ -288,13 +294,14 @@ export async function processSetupInit(input: SetupInput): Promise<HookOutput> {
     errors: [],
     env_vars_set: [],
   };
+  const manageClaudeConfig = managesClaudeConfig(input);
 
   // On Windows, patch hooks.json to use direct node invocation (no sh wrapper).
   // The sh->find-node.sh->node chain triggers Claude Code UI bug #17088 on
   // MSYS2/Git Bash, mislabeling every successful hook as an error (issue #899).
   // find-node.sh is only needed on Unix for nvm/fnm PATH discovery.
   const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
-  if (process.platform === 'win32') {
+  if (manageClaudeConfig && process.platform === 'win32') {
     if (pluginRoot) {
       patchHooksJsonForWindows(pluginRoot);
     }
@@ -302,7 +309,7 @@ export async function processSetupInit(input: SetupInput): Promise<HookOutput> {
 
   // Always heal the stdin.mjs symlink so upgrades don't break hooks
   // Best-effort: non-fatal, don't block init if this fails
-  if (pluginRoot) {
+  if (manageClaudeConfig && pluginRoot) {
     try {
       ensureStdinSymlink(pluginRoot);
     } catch {
@@ -318,7 +325,9 @@ export async function processSetupInit(input: SetupInput): Promise<HookOutput> {
     result.configs_validated = validateConfigFiles(input.cwd);
 
     // Set environment variables
-    result.env_vars_set = setEnvironmentVariables();
+    result.env_vars_set = manageClaudeConfig
+      ? setEnvironmentVariables()
+      : [];
   } catch (err) {
     result.errors.push(err instanceof Error ? err.message : String(err));
   }
