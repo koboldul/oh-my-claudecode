@@ -21,6 +21,13 @@ const HOOK_CONTRACTS = [
   { claude: 'SessionEnd', copilot: 'sessionEnd' },
 ] as const;
 
+/**
+ * Non-hook Copilot fixtures: these capture a stdin contract for a Copilot CLI
+ * command other than a hook event (e.g. the `statusLine` command), so they
+ * have no Claude-side counterpart and are excluded from `HOOK_CONTRACTS`.
+ */
+const NON_HOOK_COPILOT_FIXTURES = ['statusLine'] as const;
+
 type JsonObject = Record<string, unknown>;
 type FixtureStatus = 'observed' | 'provisional';
 
@@ -36,7 +43,12 @@ interface FixtureProvenance {
 interface CopilotProvenance {
   fixtures: Record<string, FixtureProvenance>;
   statusLine: {
-    status: 'phase-5-prerequisite';
+    status: 'observed';
+    source: string;
+    copilotVersion: string;
+    recordSha256: string;
+    recordLine: number;
+    recordByteLength: number;
     fixture: 'statusLine.json';
   };
 }
@@ -79,6 +91,17 @@ const EXACT_PLACEHOLDERS_BY_KEY: Readonly<Record<string, readonly string[]>> = {
   id: ['<tool-call-id-1>', '<tool-call-id-2>'],
   pattern: ['<glob-pattern>', '<search-pattern>'],
   glob: ['<glob-pattern>'],
+};
+
+/**
+ * Per-path placeholder overrides for fields whose exact JSON path narrows
+ * which placeholder is legitimate, independent of the shared by-key
+ * allowlist above. `$.model.id` is intentionally excluded from the global
+ * `id` allowlist so a bare tool-call `id` field can never silently pass
+ * validation using the `<model-id>` placeholder.
+ */
+const EXACT_PLACEHOLDERS_BY_PATH: Readonly<Record<string, readonly string[]>> = {
+  '$.model.id': ['<model-id>'],
 };
 
 const SENSITIVE_KEY_PATTERN =
@@ -158,7 +181,12 @@ describe('versioned hook contract fixtures', () => {
       .filter((file) => file.endsWith('.json'))
       .sort();
     const copilotFiles = readdirSync(COPILOT_FIXTURE_ROOT)
-      .filter((file) => file.endsWith('.json') && file !== '_provenance.json')
+      .filter(
+        (file) =>
+          file.endsWith('.json') &&
+          file !== '_provenance.json' &&
+          !(NON_HOOK_COPILOT_FIXTURES as readonly string[]).includes(file.replace(/\.json$/, '')),
+      )
       .sort();
 
     expect(claudeFiles).toEqual(HOOK_CONTRACTS.map(({ claude }) => `${claude}.json`).sort());
@@ -281,6 +309,11 @@ describe('versioned hook contract fixtures', () => {
       root: COPILOT_FIXTURE_ROOT,
       eventName: copilot,
     })),
+    ...NON_HOOK_COPILOT_FIXTURES.map((eventName) => ({
+      host: 'copilot-1.0.72-1',
+      root: COPILOT_FIXTURE_ROOT,
+      eventName,
+    })),
   ])(
     'uses exact placeholders for sensitive fields in $host/$eventName',
     ({ root, eventName }) => {
@@ -295,7 +328,7 @@ describe('versioned hook contract fixtures', () => {
         }
         if (!SENSITIVE_KEY_PATTERN.test(field.key)) continue;
 
-        const allowed = EXACT_PLACEHOLDERS_BY_KEY[field.key];
+        const allowed = EXACT_PLACEHOLDERS_BY_PATH[field.path] ?? EXACT_PLACEHOLDERS_BY_KEY[field.key];
         expect(allowed, `${field.path} lacks an explicit placeholder policy`).toBeDefined();
         expect(allowed, `${field.path} must use an exact deterministic placeholder`).toContain(
           field.value,
@@ -314,6 +347,11 @@ describe('versioned hook contract fixtures', () => {
       host: 'copilot-1.0.72-1',
       root: COPILOT_FIXTURE_ROOT,
       eventName: copilot,
+    })),
+    ...NON_HOOK_COPILOT_FIXTURES.map((eventName) => ({
+      host: 'copilot-1.0.72-1',
+      root: COPILOT_FIXTURE_ROOT,
+      eventName,
     })),
   ])(
     'rejects raw paths, IDs, prompts, and credential material in $host/$eventName',
@@ -352,18 +390,61 @@ describe('versioned hook contract fixtures', () => {
     );
   });
 
-  it('documents statusLine.json as a Phase 5 prerequisite instead of inventing fields', () => {
+  it('captures the observed Copilot 1.0.72-1 statusLine payload from an isolated capture', () => {
     const readme = readFileSync(join(COPILOT_FIXTURE_ROOT, 'README.md'), 'utf8');
     const provenance = loadCopilotProvenance();
 
-    expect(existsSync(join(COPILOT_FIXTURE_ROOT, 'statusLine.json'))).toBe(false);
+    expect(existsSync(join(COPILOT_FIXTURE_ROOT, 'statusLine.json'))).toBe(true);
+    expect(loadFixture(COPILOT_FIXTURE_ROOT, 'statusLine')).toEqual({
+      cwd: '<cwd>',
+      session_id: '<session-id>',
+      session_name: null,
+      transcript_path: '<transcript-path>',
+      model: { id: '<model-id>', display_name: '<model-name>' },
+      workspace: { current_dir: '<cwd>' },
+      username: null,
+      remote: { connected: false },
+      version: '1.0.72-1',
+      cost: {
+        total_api_duration_ms: 0,
+        total_lines_added: 0,
+        total_lines_removed: 0,
+        total_duration_ms: 1686,
+        total_premium_requests: 0,
+      },
+      context_window: {
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_cache_read_tokens: 0,
+        total_cache_write_tokens: 0,
+        total_reasoning_tokens: 0,
+        total_tokens: 0,
+        context_window_size: 1000000,
+        used_percentage: 0,
+        remaining_percentage: 100,
+        remaining_tokens: 1000000,
+        last_call_input_tokens: 0,
+        last_call_output_tokens: 0,
+        current_context_tokens: 0,
+        displayed_context_limit: 264000,
+        current_context_used_percentage: 0,
+      },
+      ai_used: { total_nano_aiu: 0, formatted: '0' },
+      allow_all_enabled: false,
+    });
+
     expect(provenance.statusLine).toEqual({
-      status: 'phase-5-prerequisite',
+      status: 'observed',
+      source: 'isolated-status-line-command',
+      copilotVersion: '1.0.72-1',
+      recordSha256: '26d19faef4768a7c3800cef8e6eb0007123a696ab76fe461150ac0c9ff21fce5',
+      recordLine: 3,
+      recordByteLength: 1231,
       fixture: 'statusLine.json',
     });
-    expect(readme).toContain('Phase 5 prerequisite');
+
     expect(readme).toContain('statusLine.json');
-    expect(readme).toContain('`observed`');
-    expect(readme).toContain('`provisional`');
+    expect(readme).toContain('isolated-status-line-command');
+    expect(readme).not.toContain('Phase 5 prerequisite');
   });
 });

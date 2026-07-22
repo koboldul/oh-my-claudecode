@@ -63,6 +63,20 @@
       "recordSha256": "887fc7f04bbf3061e436a4fcea5c685ad19bae3e10621b3d60d9c89a1ea37186",
       "recordLine": 154
     },
+    "agentStopTranscript": {
+      "status": "observed-shape-sanitized",
+      "source": "local-session-events",
+      "copilotVersion": "1.0.72-1",
+      "fixture": "agentStop-transcript.jsonl",
+      "requiredFields": ["type", "data.content"]
+    },
+    "contextEvents": {
+      "status": "observed-shape-sanitized",
+      "source": "local-session-events",
+      "copilotVersion": "1.0.72-1",
+      "fixture": "context-events.jsonl",
+      "observation": "conversationTokens is emitted on session.compaction_start; no paired active-model context-limit field was observed"
+    },
     "preCompact": {
       "status": "observed",
       "source": "local-session-events",
@@ -81,7 +95,12 @@
     }
   },
   "statusLine": {
-    "status": "phase-5-prerequisite",
+    "status": "observed",
+    "source": "isolated-status-line-command",
+    "copilotVersion": "1.0.72-1",
+    "recordSha256": "26d19faef4768a7c3800cef8e6eb0007123a696ab76fe461150ac0c9ff21fce5",
+    "recordLine": 3,
+    "recordByteLength": 1231,
     "fixture": "statusLine.json"
   }
 }

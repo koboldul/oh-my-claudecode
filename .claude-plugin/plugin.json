@@ -59,6 +59,7 @@
     "./skills/writer-memory/"
   ],
   "agents": "./agents/",
+  "hooks": "./hooks/hooks.json",
   "mcpServers": "./.mcp.json",
   "commands": "./commands/"
 }
