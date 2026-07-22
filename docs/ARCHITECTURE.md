@@ -333,14 +333,19 @@ Claude Code provides 11 lifecycle events. OMC registers hooks on these events:
 | `UserPromptSubmit` | User submits a prompt | Magic keyword detection, skill injection |
 | `SessionStart` | Session begins | Initial setup, project memory load |
 | `PreToolUse` | Before a tool is used | Permission validation, parallel execution hints |
-| `PermissionRequest` | Permission requested | Bash command permission handling |
+| `PermissionRequest` | Permission requested | Claude safe-command handling; Copilot native-policy pass-through |
 | `PostToolUse` | After a tool is used | Result validation, project memory update |
 | `PostToolUseFailure` | After a tool fails | Error recovery handling |
 | `SubagentStart` | Subagent starts | Agent tracking |
 | `SubagentStop` | Subagent stops | Agent tracking, output verification |
 | `PreCompact` | Before context compaction | Preserve critical information, save project memory |
 | `Stop` | Claude is about to stop | Persistent mode enforcement, code simplification |
-| `SessionEnd` | Session ends | Session data cleanup |
+| `SessionEnd` | Session ends | Bounded runner/admission, then deferred cleanup |
+
+The SessionEnd foreground contract is OMC runner/admission completion within
+500ms, measured monotonically inside `scripts/run.cjs` from its first
+executable statement. Host process launch, pre-script OS scheduling, and fresh
+Node startup are outside that guarantee.
 
 ### system-reminder Injection
 

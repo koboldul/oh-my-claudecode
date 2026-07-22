@@ -104,7 +104,12 @@ function packageManifest(gitHead?: string): Record<string, unknown> {
   };
 }
 
-function releaseTarball(gitHead = SHA, extraEntries: TarEntry[] = [], readme = '# fixture\n'): Buffer {
+function releaseTarball(
+  gitHead = SHA,
+  extraEntries: TarEntry[] = [],
+  readme = '# fixture\n',
+  omittedPaths: string[] = [],
+): Buffer {
   return makeTarball([
     { path: 'package/package.json', content: `${JSON.stringify(packageManifest(gitHead), null, 2)}\n` },
     {
@@ -137,13 +142,15 @@ function releaseTarball(gitHead = SHA, extraEntries: TarEntry[] = [], readme = '
     { path: 'package/bin/oh-my-claudecode.js', content: '#!/usr/bin/env node\n', mode: 0o755 },
     { path: 'package/bridge/cli.cjs', content: 'module.exports = {};\n' },
     { path: 'package/bridge/claude-md-coordinator.cjs', content: 'module.exports = {};\n' },
+    { path: 'package/bridge/copilot-hud-setup.mjs', content: 'export {};\n' },
     { path: 'package/bridge/hook-runtime.cjs', content: 'module.exports = {};\n' },
+    { path: 'package/bridge/hud-runtime.mjs', content: 'export {};\n' },
     { path: 'package/bridge/mcp-server.cjs', content: 'module.exports = {};\n' },
     { path: 'package/bridge/runtime-cli.cjs', content: 'module.exports = {};\n' },
     { path: 'package/bridge/team.js', content: 'export {};\n' },
     { path: 'package/README.md', content: readme },
     ...extraEntries,
-  ]);
+  ].filter(entry => !omittedPaths.includes(entry.path)));
 }
 
 function writeTarball(root: string, name: string, bytes: Buffer): string {
@@ -421,7 +428,9 @@ describe('release-boundary.mjs', () => {
       'package/bin/oh-my-claudecode.js',
       'package/bridge/claude-md-coordinator.cjs',
       'package/bridge/cli.cjs',
+      'package/bridge/copilot-hud-setup.mjs',
       'package/bridge/hook-runtime.cjs',
+      'package/bridge/hud-runtime.mjs',
       'package/bridge/mcp-server.cjs',
       'package/bridge/runtime-cli.cjs',
       'package/bridge/team.js',
@@ -441,7 +450,9 @@ describe('release-boundary.mjs', () => {
       { path: 'package/.mcp.json', content: JSON.stringify({ mcpServers: { omc: { command: 'node', args: ['${CLAUDE_PLUGIN_ROOT}/bridge/mcp-server.cjs'] } } }) },
       { path: 'package/bin/oh-my-claudecode.js', content: '#!/usr/bin/env node\n', mode: 0o755 },
       { path: 'package/bridge/cli.cjs', content: 'module.exports = {};\n' },
+      { path: 'package/bridge/copilot-hud-setup.mjs', content: 'export {};\n' },
       { path: 'package/bridge/hook-runtime.cjs', content: 'module.exports = {};\n' },
+      { path: 'package/bridge/hud-runtime.mjs', content: 'export {};\n' },
       { path: 'package/bridge/mcp-server.cjs', content: 'module.exports = {};\n' },
       { path: 'package/bridge/runtime-cli.cjs', content: 'module.exports = {};\n' },
       { path: 'package/bridge/team.js', content: 'export {};\n' },
@@ -456,11 +467,41 @@ describe('release-boundary.mjs', () => {
       { path: 'package/bin/oh-my-claudecode.js', content: '#!/usr/bin/env node\n', mode: 0o755 },
       { path: 'package/bridge/cli.cjs', content: 'module.exports = {};\n' },
       { path: 'package/bridge/claude-md-coordinator.cjs', content: 'module.exports = {};\n' },
+      { path: 'package/bridge/copilot-hud-setup.mjs', content: 'export {};\n' },
+      { path: 'package/bridge/hud-runtime.mjs', content: 'export {};\n' },
       { path: 'package/bridge/mcp-server.cjs', content: 'module.exports = {};\n' },
       { path: 'package/bridge/runtime-cli.cjs', content: 'module.exports = {};\n' },
       { path: 'package/bridge/team.js', content: 'export {};\n' },
     ]));
     expect(() => assertArchive(missingHookRuntimePath, { version: VERSION, gitHead: SHA })).toThrow('bridge/hook-runtime.cjs');
+    const missingHudRuntimePath = writeTarball(
+      root,
+      'missing-hud-runtime.tgz',
+      releaseTarball(
+        SHA,
+        [],
+        '# fixture\n',
+        ['package/bridge/hud-runtime.mjs'],
+      ),
+    );
+    expect(() => assertArchive(
+      missingHudRuntimePath,
+      { version: VERSION, gitHead: SHA },
+    )).toThrow('bridge/hud-runtime.mjs');
+    const missingCopilotSetupPath = writeTarball(
+      root,
+      'missing-copilot-hud-setup.tgz',
+      releaseTarball(
+        SHA,
+        [],
+        '# fixture\n',
+        ['package/bridge/copilot-hud-setup.mjs'],
+      ),
+    );
+    expect(() => assertArchive(
+      missingCopilotSetupPath,
+      { version: VERSION, gitHead: SHA },
+    )).toThrow('bridge/copilot-hud-setup.mjs');
     await expect(cliMain([
       'assert-evidence',
       '--tarball',

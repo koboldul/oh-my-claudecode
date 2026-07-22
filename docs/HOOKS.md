@@ -1,16 +1,18 @@
 # Hooks System
 
-> OMC's 21 hooks intercept Claude Code lifecycle events to enable magic keywords, context injection, and quality enforcement.
+> OMC's Claude manifest registers 21 hooks with PascalCase lifecycle keys; Copilot loads the common subset through a separate native camelCase manifest.
 
 ## What Are Hooks?
 
-Hooks are scripts that execute automatically in response to Claude Code lifecycle events. oh-my-claudecode extends Claude Code's default behavior with 21 hooks.
+Hooks are scripts that execute automatically in response to host lifecycle events. oh-my-claudecode extends Claude Code with 21 hooks and exposes the compatible common subset to GitHub Copilot CLI.
 
 When a user submits a prompt, a tool runs, or a session starts/ends, hooks fire automatically to inject additional context, activate modes, and manage state.
 
 ## How Hooks Work
 
-Hooks are defined in a `hooks.json` file. Each hook follows this structure:
+Claude Code loads `hooks/hooks.json` through `.claude-plugin/plugin.json`. It uses PascalCase event keys, matcher groups, and nested `hooks` arrays. GitHub Copilot CLI loads `hooks/copilot-hooks.json` through the root `plugin.json` using Copilot's supported `hooks` manifest field. The Copilot file uses `version: 1`, native camelCase event keys, and direct command entries. It preserves the common wrapper set but omits Claude-only setup groups and does not register alias copies.
+
+Claude hook entries follow this structure:
 
 ```json
 {
@@ -33,6 +35,27 @@ Hooks are defined in a `hooks.json` file. Each hook follows this structure:
 - **matcher**: Condition for running the hook (`*` matches all cases)
 - **command**: The Node.js script to execute
 - **timeout**: Maximum execution time in seconds
+
+Copilot native entries are direct:
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "permissionRequest": [
+      {
+        "type": "command",
+        "matcher": "bash|powershell",
+        "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/permission-handler.mjs\"",
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/permission-handler.mjs\"",
+        "timeout": 5
+      }
+    ]
+  }
+}
+```
+
+Native matchers are full-string regular expressions on the documented event field. Omit the matcher to receive every invocation; `*` is not a valid native “all” matcher. OMC therefore omits the `preToolUse` matcher and limits `permissionRequest` to the actual runtime tool names `bash|powershell`.
 
 Hook output is injected into Claude via `<system-reminder>` tags. Additional context is passed through `hookSpecificOutput.additionalContext`.
 
@@ -109,14 +132,14 @@ The 30s timeout is a per-command outer host fuse that includes launcher startup 
 
 Fires when a new session begins.
 
-| Script | Matcher | Role | Timeout |
-|--------|---------|------|---------|
-| `session-start.mjs` | `*` | Session initialization, state restoration | 5s |
-| `project-memory-session.mjs` | `*` | Loads project memory | 5s |
-| `setup-init.mjs` | `init` | Initial setup wizard | 30s |
-| `setup-maintenance.mjs` | `maintenance` | Maintenance tasks | 60s |
+| Script | Matcher | Host | Role | Timeout |
+|--------|---------|------|------|---------|
+| `session-start.mjs` | Claude `*`; Copilot omitted | Claude and Copilot | Session initialization, state restoration | 5s |
+| `project-memory-session.mjs` | Claude `*`; Copilot omitted | Claude and Copilot | Loads project memory | 5s |
+| `setup-init.mjs` | `init` | Claude only | Initial setup wizard | 30s |
+| `setup-maintenance.mjs` | `maintenance` | Claude only | Maintenance tasks | 60s |
 
-The `init` and `maintenance` matchers only run in special cases. For normal session starts, only the two `*` matcher scripts execute.
+The `init` and `maintenance` matchers remain explicit Claude behavior in `hooks/hooks.json`. They are absent from `hooks/copilot-hooks.json`, so Copilot `sessionStart` payloads, including source `new`, cannot invoke either setup script or receive a Setup hook output. Copilot's common `sessionStart` entries have no matcher.
 
 ### PreToolUse
 
@@ -130,13 +153,19 @@ Runs on all tool calls (`matcher: "*"`). Enforces agent permission restrictions 
 
 ### PermissionRequest
 
-Fires when a permission request arises during Bash tool execution.
+Fires when a shell tool reaches the host permission boundary.
 
-| Script | Matcher | Role | Timeout |
-|--------|---------|------|---------|
-| `permission-handler.mjs` | `Bash` | Handles Bash command permissions | 5s |
+| Host | Matcher | Behavior | Timeout |
+|------|---------|----------|---------|
+| Claude Code | `*` (processor accepts `Bash` / `proxy_Bash`) | May auto-allow commands that satisfy OMC's strict POSIX safe-command policy; explicit Claude ask/deny decisions still win | 5s |
+| Copilot CLI | `bash\|powershell` | Returns the native pass contract `{}` for normal requests so Copilot rules, session approvals, and the user prompt remain authoritative | 5s |
 
-Only processes permission requests for the Bash tool.
+Copilot CLI 1.0.72-1 emits `permissionRequest` before its native permission
+rules and the observed camelCase payload contains no trustworthy native
+decision. OMC therefore does not emit safe-command `allow` decisions for
+Copilot `bash` or `powershell`. Canonical malformed-envelope and explicit OMC
+safety failures may still deny; ordinary safe, unknown, chained, or destructive
+commands remain native decisions.
 
 ### PostToolUse
 
@@ -195,7 +224,7 @@ Fires when Claude finishes a response.
 
 | Script | Role | Timeout |
 |--------|------|---------|
-| `context-guard-stop.mjs` | Monitors context usage | 5s |
+| `context-guard-stop.mjs` | Monitors Claude context usage; diagnostic-only on Copilot | 5s |
 | `workflow-drift-guard.mjs` | Blocks narrow structured-question and fake-completion drift | 3s |
 | `persistent-mode.mjs` | Maintains active mode state (ralph, ultrawork, etc.) | 10s |
 | `code-simplifier.mjs` | Auto-simplifies modified files (opt-in) | 5s |
@@ -229,10 +258,15 @@ Detects magic keywords in user prompts and invokes the corresponding skill.
 
 See the [Magic Keywords](#magic-keywords) section for the full keyword list.
 
+#### context-guard-stop
+
+Warns before a Claude session approaches its context limit while preserving context-limit and user-cancel bypasses. The Claude path reads the existing bounded transcript-tail `context_window` and `input_tokens` fields.
+
+Copilot CLI 1.0.72-1 `agentStop` and `events.jsonl` do not expose a current Stop-time token count paired with the active model context limit. `conversationTokens` appears only on `session.compaction_start`, and the observed Stop payload has no matching denominator. OMC therefore does not synthesize a percentage or claim context-guard parity: Copilot receives a normal pass plus a visible diagnostic that context blocking is disabled.
 
 #### workflow-drift-guard
 
-Blocks only deterministic recurring workflow drift at the Claude Code `Stop` lifecycle point. The boundary follows the official Claude Code [hooks reference](https://code.claude.com/docs/en/hooks): Stop hooks receive `last_assistant_message`, may return `decision: "block"` with a `reason`, and must account for `stop_hook_active` to avoid self-reinforcing loops. Plugin/Hookify installs follow the official Claude Code [plugins reference](https://code.claude.com/docs/en/plugins-reference): plugin hooks can live in `hooks/hooks.json` at the plugin root and respond to the same lifecycle events as user hooks.
+Blocks only deterministic recurring workflow drift at the `Stop` lifecycle point. The Claude boundary follows the official Claude Code [hooks reference](https://code.claude.com/docs/en/hooks): Stop hooks receive `last_assistant_message`, may return `decision: "block"` with a `reason`, and must account for `stop_hook_active` to avoid self-reinforcing loops. Copilot CLI 1.0.72-1 `agentStop` omits assistant fields, so OMC recovers only the final non-empty `assistant.message.data.content` from a size-bounded, strictly parsed transcript tail. Missing, unreadable, malformed, oversized, or unsupported transcript records fail open. Plugin/Hookify installs follow the official Claude Code [plugins reference](https://code.claude.com/docs/en/plugins-reference): plugin hooks can live in `hooks/hooks.json` at the plugin root and respond to the same lifecycle events as user hooks.
 
 - **Event**: Stop
 - **Behavior**: Blocks only a supported, local selection fork in the final assistant message. The block reason directs Claude to use `AskUserQuestion` with 2–4 options and `allowOther` unless free-form input is unsafe.
@@ -240,7 +274,7 @@ Blocks only deterministic recurring workflow drift at the Claude Code `Stop` lif
 
 ##### Closed selection evidence
 
-The decision classifier is stateless and final-message-local. `last_assistant_message` takes precedence; only when it is absent does it use `lastAssistantMessage`, `message`, `output`, `response`, then `text`. It does not use transcript content, prior `AskUserQuestion` calls, firing history, counters, cooldowns, or session state. It masks recognized non-prose before extracting the final unmasked question and blocks only when exactly one of these three source-associated evidence forms independently establishes selection intent and at least two known-live alternatives:
+The decision classifier is stateless and final-message-local. `last_assistant_message` takes precedence, including an explicitly empty value; only when it is absent does it use `lastAssistantMessage`, `message`, `output`, `response`, then `text`. If every assistant field is absent on Copilot, it uses the bounded final-assistant transcript fallback described above. It does not use earlier transcript messages, prior `AskUserQuestion` calls, firing history, counters, cooldowns, or session state. It masks recognized non-prose before extracting the final unmasked question and blocks only when exactly one of these three source-associated evidence forms independently establishes selection intent and at least two known-live alternatives:
 
 1. **Direct binary question**: either a bare `<single name> or <single name>?` with exactly one top-level ASCII ` or ` delimiter, `Would you prefer <1–6-token named operand> or <1–6-token named operand>?`, `Do you prefer <1–6-token named operand> or <1–6-token named operand>?`, or `Should I <1–8-token action operand> or <1–8-token action operand>?`. Unsupported prefixes, polarity/auxiliary forms, duplicate alternatives, multiple delimiters, or `and`/`or` grouping are not inferred.
 2. **One exact adjacent setup plus one selection closer**: the final question must immediately follow exactly one supported setup sentence and use an exact closer: `Which [option|approach|path|one] should I [choose|use|take]?` or `Which should I [choose|use|take]?`. A named setup enumerates exactly two (`C and C`), three (`C, C, and C`), or four (`C, C, C, and C`) candidates. Its `ENUMERATION` core ends in exactly `are viable options`, `are viable`, `are options`, or `were considered`. The full setup is then exactly `<ENUMERATION>.`, `<ENUMERATION>; <C> is|was <status>[ and <C> is|was <status>].`, `<ENUMERATION>; only <C> remains.`, `<ENUMERATION>; the other module is unchanged.`, `<ENUMERATION>, or <paste|provide|enter> the exact <operand>.`, or `<ENUMERATION>, or describe <operand>.` Named liveness statuses are exactly `ruled out`, `eliminated`, `discarded`, `not viable`, `no longer an option`, `already chosen`, `already selected`, and `already resolved`. A named candidate is 1–4 exact `NAME_TOKEN`s (`[A-Za-z0-9][A-Za-z0-9._/+:-]*`) separated by one ASCII space, after at most one balanced outer emphasis pair is removed. The parser enumerates every full-string syntactic parse before normalization; zero or multiple parses pass. Only after one parse is established are normalized duplicate identities collapsed, and only compatible states may merge—conflicting duplicate states are unknown and pass.

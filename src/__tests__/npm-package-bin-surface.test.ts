@@ -1,7 +1,8 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
@@ -9,15 +10,18 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  COPILOT_NATIVE_HOOK_EVENTS,
   PLUGIN_JSON_PATH,
   listSourceControlledPackageFiles,
   readMcpServersFromPath,
   readPluginMcpServers,
+  referencesCopilotHooksManifest,
   referencesRootMcpConfig,
   referencesStandardHooksManifest,
   type McpServerConfig,
@@ -35,17 +39,46 @@ type PackageJson = {
   version?: string;
 };
 
+type CopilotCapabilityMatrix = {
+  skills: Array<{
+    id: string;
+    output: string;
+    supportFileModes?: Record<string, "100644" | "100755">;
+    supportFileChannels?: Record<
+      string,
+      {
+        gitMode: "100755";
+        npmTarMode: "0644-or-0755";
+        requiredInvocation: 'bash "$VALIDATE_SH"';
+        windowsRequirement: string;
+      }
+    >;
+  }>;
+  aliases: Array<{
+    id: string;
+    output: string;
+    targetSkill: string;
+  }>;
+  commands: Array<{ id: string; output: string }>;
+};
+
 type PackedPackage = {
   extractedPackageRoot: string;
   files: Set<string>;
   packageJson: PackageJson;
   pluginJson: PluginJson;
-  copilotPluginJson: PluginJson & { agents?: unknown };
+  copilotPluginJson: PluginJson & {
+    agents?: string;
+    commands?: string;
+    skills?: string[];
+  };
+  copilotCapabilityMatrix: CopilotCapabilityMatrix;
   mcpServers: Record<string, McpServerConfig>;
   startedWithoutGeneratedBundles: boolean;
 };
 
 type PluginShippingSurface = {
+  generatedRoots: string[];
   requiredPaths: string[];
 };
 
@@ -54,6 +87,9 @@ const SUPPORTED_CLI_ALIASES = ["oh-my-claudecode", "omc"] as const;
 const GENERATED_BRIDGE_FILES = new Set([
   "bridge/claude-md-coordinator.cjs",
   "bridge/cli.cjs",
+  "bridge/copilot-hud-setup.mjs",
+  "bridge/hook-runtime.cjs",
+  "bridge/hud-runtime.mjs",
   "bridge/mcp-server.cjs",
   "bridge/runtime-cli.cjs",
   "bridge/team-bridge.cjs",
@@ -68,6 +104,7 @@ let fixtureRootCache: string | null = null;
 let packDirCache: string | null = null;
 let packWorkspaceCache: string | null = null;
 let committedSnapshotCache: string | null = null;
+let candidateIndexCache: string | null = null;
 let tarballPathCache: string | null = null;
 
 function readPackageJson(): PackageJson {
@@ -78,17 +115,146 @@ function sha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
+function gitIndexMode(relativePath: string): string | null {
+  const output = execFileSync(
+    "git",
+    ["ls-files", "--stage", "--", relativePath],
+    {
+      cwd: PACKAGE_ROOT,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      env: candidateIndexCache
+        ? { ...process.env, GIT_INDEX_FILE: candidateIndexCache }
+        : process.env,
+    },
+  ).trim();
+  return output.match(/^(\d{6}) /)?.[1] ?? null;
+}
+
+function tarPermissions(
+  archivePath: string,
+  entryPath: string,
+  compressed: boolean,
+): string {
+  const output = execFileSync(
+    "tar",
+    [compressed ? "-tvzf" : "-tvf", archivePath, entryPath],
+    { encoding: "utf-8" },
+  ).trim();
+  return output.split(/\s+/)[0] ?? "";
+}
+
+function tarFileMode(permissions: string): number {
+  if (!/^-[r-][w-][x-][r-][w-][x-][r-][w-][x-]$/.test(permissions)) {
+    throw new Error(`Unsupported tar permission string: ${permissions}`);
+  }
+
+  return [...permissions.slice(1)].reduce((mode, value, index) => {
+    if (value === "-") return mode;
+    return mode | [0o400, 0o200, 0o100, 0o040, 0o020, 0o010, 0o004, 0o002, 0o001][index];
+  }, 0);
+}
+
+function isSupportedNpmTarMode(permissions: string): boolean {
+  return [0o644, 0o755].includes(tarFileMode(permissions));
+}
+
+function expectExecutablePermissions(permissions: string): void {
+  expect(permissions).toHaveLength(10);
+  expect(permissions[3]).toBe("x");
+  expect(permissions[6]).toBe("x");
+  expect(permissions[9]).toBe("x");
+}
+
+function gitArchivePermissions(relativePath: string): string {
+  const tree = execFileSync("git", ["write-tree"], {
+    cwd: PACKAGE_ROOT,
+    encoding: "utf-8",
+    env: candidateIndexCache
+      ? { ...process.env, GIT_INDEX_FILE: candidateIndexCache }
+      : process.env,
+  }).trim();
+  const archivePath = join(fixtureRootCache!, "copilot-prompt-modes.tar");
+  execFileSync(
+    "git",
+    [
+      "archive",
+      "--format=tar",
+      `--output=${archivePath}`,
+      tree,
+      "--",
+      relativePath,
+    ],
+    {
+      cwd: PACKAGE_ROOT,
+      stdio: "pipe",
+    },
+  );
+  return tarPermissions(archivePath, relativePath, false);
+}
+
+function validateWithExplicitBash(scriptPath: string): boolean {
+  chmodSync(scriptPath, 0o644);
+
+  if (process.platform === "win32") {
+    const match = scriptPath.match(/^([A-Za-z]):[\\/](.*)$/);
+    if (!match) return false;
+    const translatedPath = `/mnt/${match[1].toLowerCase()}/${match[2].replace(/\\/g, "/")}`;
+    const syntax = spawnSync(
+      "wsl.exe",
+      ["bash", "-n", translatedPath],
+      {
+        encoding: "utf-8",
+        windowsHide: true,
+      },
+    );
+    expect(syntax.stderr, syntax.error?.message).toBe("");
+    expect(syntax.status).toBe(0);
+    return true;
+  }
+
+  const syntax = spawnSync("bash", ["-n", scriptPath], {
+    encoding: "utf-8",
+  });
+  if (syntax.error && (syntax.error as NodeJS.ErrnoException).code === "ENOENT") {
+    return false;
+  }
+  expect(syntax.stderr, syntax.error?.message).toBe("");
+  expect(syntax.status).toBe(0);
+  return true;
+}
+
 function createIsolatedPackWorkspace(
   workspacePath: string,
   snapshotPath: string,
 ): void {
   mkdirSync(workspacePath, { recursive: true });
   mkdirSync(snapshotPath, { recursive: true });
+  const realIndexPath = resolve(
+    PACKAGE_ROOT,
+    execFileSync("git", ["rev-parse", "--git-path", "index"], {
+      cwd: PACKAGE_ROOT,
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim(),
+  );
+  candidateIndexCache = join(dirname(snapshotPath), "candidate.index");
+  cpSync(realIndexPath, candidateIndexCache);
+  const candidateEnv = {
+    ...process.env,
+    GIT_INDEX_FILE: candidateIndexCache,
+  };
+  execFileSync("git", ["add", "-A", "--", "."], {
+    cwd: PACKAGE_ROOT,
+    env: candidateEnv,
+    stdio: "pipe",
+  });
   execFileSync(
     "git",
     ["checkout-index", "--all", `--prefix=${snapshotPath}/`],
     {
       cwd: PACKAGE_ROOT,
+      env: candidateEnv,
       stdio: "pipe",
     },
   );
@@ -135,9 +301,19 @@ function getPackedPackage(): PackedPackage {
     );
     mkdirSync(packDirCache, { recursive: true });
 
+    const npmArgs = ["pack", "--pack-destination", packDirCache, "--silent"];
+    const npmCliPath =
+      process.env.npm_execpath ??
+      join(
+        dirname(process.execPath),
+        "node_modules",
+        "npm",
+        "bin",
+        "npm-cli.js",
+      );
     const stdout = execFileSync(
-      "npm",
-      ["pack", "--pack-destination", packDirCache, "--silent"],
+      process.platform === "win32" ? process.execPath : "npm",
+      process.platform === "win32" ? [npmCliPath, ...npmArgs] : npmArgs,
       {
         cwd: packWorkspaceCache,
         encoding: "utf-8",
@@ -181,8 +357,22 @@ function getPackedPackage(): PackedPackage {
         ),
       ) as PluginJson,
       copilotPluginJson: JSON.parse(
-        readFileSync(join(extractedPackageRoot, 'plugin.json'), 'utf-8'),
-      ) as PluginJson & { agents?: unknown },
+        readFileSync(join(extractedPackageRoot, "plugin.json"), "utf-8"),
+      ) as PluginJson & {
+        agents?: string;
+        commands?: string;
+        skills?: string[];
+      },
+      copilotCapabilityMatrix: JSON.parse(
+        readFileSync(
+          join(
+            extractedPackageRoot,
+            "prompt-assets",
+            "copilot-capability-matrix.json",
+          ),
+          "utf-8",
+        ),
+      ) as CopilotCapabilityMatrix,
       mcpServers: readMcpServersFromPath(
         join(extractedPackageRoot, ".mcp.json"),
       ),
@@ -199,7 +389,7 @@ afterAll(() => {
   if (fixtureRootCache) {
     rmSync(fixtureRootCache, { recursive: true, force: true });
   }
-});
+}, 60_000);
 
 // Build the single lifecycle tarball during file setup so individual assertions
 // retain the repository-wide 30-second test budget. Any setup failure still
@@ -226,6 +416,9 @@ describe("npm package bin surface regression", () => {
     expect(packedFiles.has("dist/hooks/skill-bridge.cjs")).toBe(true);
     expect(packedFiles.has("bridge/cli.cjs")).toBe(true);
     expect(packedFiles.has("bridge/claude-md-coordinator.cjs")).toBe(true);
+    expect(packedFiles.has("bridge/copilot-hud-setup.mjs")).toBe(true);
+    expect(packedFiles.has("bridge/hook-runtime.cjs")).toBe(true);
+    expect(packedFiles.has("bridge/hud-runtime.mjs")).toBe(true);
     expect(packedFiles.has("bridge/mcp-server.cjs")).toBe(true);
     expect(packedFiles.has("bridge/runtime-cli.cjs")).toBe(true);
     expect(packedFiles.has("bridge/team-bridge.cjs")).toBe(true);
@@ -235,22 +428,29 @@ describe("npm package bin surface regression", () => {
     expect(packedFiles.has("bridge/run-mcp-server.sh")).toBe(true);
   });
 
-  it("keeps the committed plugin runtime closure as a byte-identical npm package subset", () => {
-    const surface = collectPluginRuntimeClosure(
-      committedSnapshotCache!,
-    ) as PluginShippingSurface;
+  it("packs the built runtime closure and preserves source payload bytes", () => {
     const extractedPackageRoot = join(packDirCache!, "package");
+    const surface = collectPluginRuntimeClosure(
+      extractedPackageRoot,
+    ) as PluginShippingSurface;
 
     for (const relativePath of surface.requiredPaths) {
       expect(packedPackageFixture.files.has(relativePath), relativePath).toBe(
         true,
       );
+      if (
+        surface.generatedRoots.some((root) =>
+          relativePath === root || relativePath.startsWith(`${root}/`)
+        )
+      ) {
+        continue;
+      }
       expect(
         sha256(join(extractedPackageRoot, relativePath)),
         relativePath,
       ).toBe(sha256(join(committedSnapshotCache!, relativePath)));
     }
-  });
+  }, 60_000);
 
   it("rebuilds recovery CLI surfaces from source without committed bundles", () => {
     expect(packedPackageFixture.startedWithoutGeneratedBundles).toBe(true);
@@ -275,6 +475,106 @@ describe("npm package bin surface regression", () => {
     expect(resultHelp).toContain("request_id");
   });
 
+  it("packs dependency-closed Copilot HUD setup and runtime entrypoints", () => {
+    const packedRoot = packedPackageFixture.extractedPackageRoot;
+    expect(existsSync(join(packedRoot, "node_modules"))).toBe(false);
+    for (const relativePath of [
+      "bridge/copilot-hud-setup.mjs",
+      "bridge/hud-runtime.mjs",
+    ]) {
+      expect(readFileSync(join(packedRoot, relativePath), "utf8")).not.toMatch(
+        /(?:from\s+["']jsonc-parser["']|require\(["']jsonc-parser["']\))/,
+      );
+    }
+    const home = mkdtempSync(join(tmpdir(), "omc-packed-copilot-hud-"));
+
+    try {
+      const emptyNodeModules = join(home, "empty-node-modules");
+      const workspace = join(home, "workspace");
+      mkdirSync(emptyNodeModules);
+      mkdirSync(workspace);
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        COPILOT_HOME: home,
+        HOME: home,
+        NODE_PATH: emptyNodeModules,
+        OMC_HUD_DISABLE_NPM_FALLBACK: "1",
+      };
+      delete env.CLAUDE_CONFIG_DIR;
+      delete env.OMC_PLUGIN_ROOT;
+      delete env.CLAUDE_PLUGIN_ROOT;
+
+      const setupPath = join(
+        packedRoot,
+        "bridge",
+        "copilot-hud-setup.mjs",
+      );
+      const setup = spawnSync(
+        process.execPath,
+        [setupPath, "setup", "--json"],
+        { cwd: workspace, encoding: "utf8", env },
+      );
+      expect(setup.status, `${setup.stderr}\n${setup.stdout}`).toBe(0);
+      const result = JSON.parse(setup.stdout) as {
+        pluginRoot: string;
+        wrapperPath: string;
+      };
+      expect(result.pluginRoot).toBe(packedRoot);
+
+      const settingsPath = join(home, "settings.json");
+      const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+        omcHud?: Record<string, unknown>;
+      };
+      settings.omcHud = {
+        elements: {
+          rateLimits: false,
+          updateNotification: false,
+          sessionSummary: false,
+          missionBoard: false,
+        },
+      };
+      writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
+
+      const payload = JSON.parse(
+        readFileSync(
+          join(
+            PACKAGE_ROOT,
+            "src",
+            "__tests__",
+            "fixtures",
+            "hooks",
+            "copilot-1.0.72-1",
+            "statusLine.json",
+          ),
+          "utf8",
+        ),
+      ) as {
+        workspace: { current_dir: string };
+        transcript_path: string;
+      };
+      payload.workspace.current_dir = workspace;
+      payload.transcript_path = join(workspace, "missing.jsonl");
+      const render = spawnSync(
+        process.execPath,
+        [result.wrapperPath],
+        {
+          cwd: workspace,
+          encoding: "utf8",
+          env,
+          input: JSON.stringify(payload),
+          timeout: 15_000,
+        },
+      );
+      expect(render.status, render.stderr).toBe(0);
+      expect(render.stdout).toContain("<model-name>");
+      expect(render.stderr).not.toMatch(
+        /MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND/,
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it("packs the fixed worktree-paths dist with hidden Windows git subprocesses", () => {
     const source = readFileSync(
       join(PACKAGE_ROOT, "src", "lib", "worktree-paths.ts"),
@@ -293,9 +593,9 @@ describe("npm package bin surface regression", () => {
     expect(
       packedPackageFixture.files.has("dist/lib/worktree-paths.js"),
     ).toBe(true);
-    expect(source.match(/windowsHide/g)).toHaveLength(7);
+    expect(source.match(/windowsHide/g)).toHaveLength(6);
     expect(packedDist).not.toContain("execSync(");
-    expect(packedDist.match(/windowsHide: true/g)).toHaveLength(7);
+    expect(packedDist.match(/windowsHide: true/g)).toHaveLength(6);
   });
 
   it("packs the complete source-controlled plugin and hook payload", () => {
@@ -314,15 +614,57 @@ describe("npm package bin surface regression", () => {
 
     expect(packedPackageFixture.pluginJson).toEqual(sourcePluginJson);
     expect(packedPackageFixture.copilotPluginJson).toEqual(
-      JSON.parse(readFileSync(join(process.cwd(), 'plugin.json'), 'utf-8')),
+      JSON.parse(readFileSync(join(process.cwd(), "plugin.json"), "utf-8")),
     );
-    expect(packedPackageFixture.copilotPluginJson.agents).toBe('./agents-copilot/');
+    expect(packedPackageFixture.copilotPluginJson.agents).toBe(
+      "./agents-copilot/",
+    );
+    expect(packedPackageFixture.copilotPluginJson.commands).toBe(
+      "./commands-copilot/",
+    );
+    expect(
+      [...(packedPackageFixture.copilotPluginJson.skills ?? [])].sort(),
+    ).toEqual(
+      packedPackageFixture.copilotCapabilityMatrix.skills.map(
+        ({ id }) => `./skills-copilot/${id}/`,
+      ).sort(),
+    );
     expect(
       referencesStandardHooksManifest(packedPackageFixture.pluginJson.hooks),
-    ).toBe(false);
+    ).toBe(true);
+    expect(
+      referencesCopilotHooksManifest(
+        packedPackageFixture.copilotPluginJson.hooks,
+      ),
+    ).toBe(true);
     expect(
       referencesRootMcpConfig(packedPackageFixture.pluginJson.mcpServers),
     ).toBe(true);
+
+    const packedCopilotHooks = JSON.parse(
+      readFileSync(
+        join(
+          packedPackageFixture.extractedPackageRoot,
+          "hooks",
+          "copilot-hooks.json",
+        ),
+        "utf-8",
+      ),
+    ) as {
+      version?: number;
+      hooks?: Record<string, Array<Record<string, unknown>>>;
+    };
+    const sourceCopilotHooks = JSON.parse(
+      readFileSync(
+        join(process.cwd(), "hooks", "copilot-hooks.json"),
+        "utf-8",
+      ),
+    );
+    expect(packedCopilotHooks).toEqual(sourceCopilotHooks);
+    expect(packedCopilotHooks.version).toBe(1);
+    expect(Object.keys(packedCopilotHooks.hooks ?? {})).toEqual(
+      COPILOT_NATIVE_HOOK_EVENTS,
+    );
 
     expect(packedPackageFixture.mcpServers).toEqual(readPluginMcpServers());
     expect(Object.values(packedPackageFixture.mcpServers)).toEqual([
@@ -331,6 +673,83 @@ describe("npm package bin surface regression", () => {
         args: ["${CLAUDE_PLUGIN_ROOT}/bridge/mcp-server.cjs"],
       },
     ]);
+  });
+
+  it("packs every generated Copilot prompt and its capability inventory", () => {
+    const { copilotCapabilityMatrix, files } = packedPackageFixture;
+    const executableSupportPath =
+      "skills-copilot/self-improve/scripts/validate.sh";
+    const selfImprove = copilotCapabilityMatrix.skills.find(
+      ({ id }) => id === "self-improve",
+    );
+
+    expect(copilotCapabilityMatrix.skills).toHaveLength(41);
+    expect(copilotCapabilityMatrix.aliases).toHaveLength(4);
+    expect(copilotCapabilityMatrix.commands).toHaveLength(28);
+    expect(files.has("prompt-assets/copilot-capability-matrix.json")).toBe(
+      true,
+    );
+
+    for (const entry of [
+      ...copilotCapabilityMatrix.skills,
+      ...copilotCapabilityMatrix.aliases,
+      ...copilotCapabilityMatrix.commands,
+    ]) {
+      expect(files.has(entry.output), entry.output).toBe(true);
+    }
+
+    expect(selfImprove?.supportFileModes?.["scripts/validate.sh"]).toBe(
+      "100755",
+    );
+    expect(selfImprove?.supportFileChannels?.["scripts/validate.sh"]).toEqual({
+      gitMode: "100755",
+      npmTarMode: "0644-or-0755",
+      requiredInvocation: 'bash "$VALIDATE_SH"',
+      windowsRequirement: "Bash via Git Bash, WSL, or MSYS2",
+    });
+    expect(gitIndexMode(executableSupportPath)).toBe("100755");
+    expectExecutablePermissions(gitArchivePermissions(executableSupportPath));
+
+    const npmTarPermissions = tarPermissions(
+      tarballPathCache!,
+      `package/${executableSupportPath}`,
+      true,
+    );
+    expect(isSupportedNpmTarMode(npmTarPermissions)).toBe(true);
+
+    const extractedSupportPath = join(
+      packedPackageFixture.extractedPackageRoot,
+      executableSupportPath,
+    );
+    const extractedPrompt = readFileSync(
+      join(
+        packedPackageFixture.extractedPackageRoot,
+        "skills-copilot",
+        "self-improve",
+        "SKILL.md",
+      ),
+      "utf-8",
+    );
+    expect(extractedPrompt).toContain('bash "$VALIDATE_SH"');
+    expect(extractedPrompt).toContain(
+      'VALIDATE_SH="$(cd "{skill_dir}/scripts" && pwd -P)/validate.sh"',
+    );
+    expect(extractedPrompt).toContain(
+      "On Windows, use Git Bash, WSL, or MSYS2 Bash",
+    );
+    expect(extractedPrompt).not.toContain("./validate.sh");
+
+    const bashValidated = validateWithExplicitBash(extractedSupportPath);
+    if (!bashValidated) {
+      expect(extractedPrompt.replace(/\s+/g, " ")).toContain(
+        "If no Bash runtime is available, stop and report that requirement",
+      );
+    }
+  });
+
+  it("rejects npm tar mode 0775 for generated support scripts", () => {
+    expect(tarFileMode("-rwxrwxr-x")).toBe(0o775);
+    expect(isSupportedNpmTarMode("-rwxrwxr-x")).toBe(false);
   });
 
   it("executes the shared CLI bin wrapper", () => {

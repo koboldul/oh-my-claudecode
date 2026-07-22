@@ -3,12 +3,31 @@ import { dirname, join, normalize, relative, sep } from 'node:path';
 
 export const PACKAGE_ROOT = process.cwd();
 export const HOOKS_JSON_PATH = join(PACKAGE_ROOT, 'hooks', 'hooks.json');
+export const COPILOT_HOOKS_JSON_PATH = join(
+  PACKAGE_ROOT,
+  'hooks',
+  'copilot-hooks.json',
+);
 export const PLUGIN_JSON_PATH = join(
   PACKAGE_ROOT,
   '.claude-plugin',
   'plugin.json',
 );
+export const COPILOT_PLUGIN_JSON_PATH = join(PACKAGE_ROOT, 'plugin.json');
 export const MCP_JSON_PATH = join(PACKAGE_ROOT, '.mcp.json');
+export const COPILOT_NATIVE_HOOK_EVENTS = [
+  'userPromptSubmitted',
+  'sessionStart',
+  'preToolUse',
+  'permissionRequest',
+  'postToolUse',
+  'postToolUseFailure',
+  'subagentStart',
+  'subagentStop',
+  'preCompact',
+  'agentStop',
+  'sessionEnd',
+] as const;
 
 const SCRIPTS_ROOT = join(PACKAGE_ROOT, 'scripts');
 const LOCAL_IMPORT_RE =
@@ -67,6 +86,26 @@ export function referencesStandardHooksManifest(value: unknown): boolean {
 
   if (value && typeof value === 'object') {
     return Object.values(value).some(referencesStandardHooksManifest);
+  }
+
+  return false;
+}
+
+export function referencesCopilotHooksManifest(value: unknown): boolean {
+  if (typeof value === 'string') {
+    const normalized = value.replace(/\\/g, '/');
+    return (
+      normalized === './hooks/copilot-hooks.json'
+      || normalized === 'hooks/copilot-hooks.json'
+    );
+  }
+
+  if (Array.isArray(value)) {
+    return value.some(referencesCopilotHooksManifest);
+  }
+
+  if (value && typeof value === 'object') {
+    return Object.values(value).some(referencesCopilotHooksManifest);
   }
 
   return false;
@@ -188,6 +227,7 @@ export function listSourceControlledPackageFiles(): string[] {
     '.claude-plugin/plugin.json',
     '.mcp.json',
     'commands/omc-setup.md',
+    'hooks/copilot-hooks.json',
     'hooks/hooks.json',
     'plugin.json',
   ]);

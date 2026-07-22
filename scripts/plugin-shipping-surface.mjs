@@ -205,9 +205,50 @@ function pluginRootPaths(value, label) {
   return paths;
 }
 
+function collectHookManifestEntrypoints(
+  root,
+  paths,
+  pluginJson,
+  pluginManifestPath,
+) {
+  if (typeof pluginJson?.hooks !== 'string') return;
+
+  const hooksPath = normalizeRepoPath(
+    pluginJson.hooks,
+    `${pluginManifestPath} hooks`,
+  );
+  paths.add(hooksPath);
+  const hooksJson = readJson(root, hooksPath);
+  for (const entries of Object.values(hooksJson.hooks ?? {})) {
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      const hooks = Array.isArray(entry?.hooks) ? entry.hooks : [entry];
+      for (const hook of hooks) {
+        for (const [field, value] of Object.entries({
+          command: hook?.command,
+          bash: hook?.bash,
+          powershell: hook?.powershell,
+        })) {
+          for (const repoPath of pluginRootPaths(
+            value,
+            `${hooksPath} ${field}`,
+          )) {
+            paths.add(repoPath);
+          }
+        }
+      }
+    }
+  }
+}
+
 function collectManifestEntrypoints(root) {
   const paths = new Set(['.claude-plugin/plugin.json']);
   const pluginJson = readJson(root, '.claude-plugin/plugin.json');
+  const copilotPluginPath = 'plugin.json';
+  const copilotPluginJson = existsSync(join(root, copilotPluginPath))
+    ? readJson(root, copilotPluginPath)
+    : null;
+  if (copilotPluginJson) paths.add(copilotPluginPath);
   if (existsSync(join(root, '.claude-plugin', 'marketplace.json'))) paths.add('.claude-plugin/marketplace.json');
 
   if (typeof pluginJson.mcpServers === 'string') {
@@ -222,19 +263,18 @@ function collectManifestEntrypoints(root) {
     }
   }
 
-  if (existsSync(join(root, 'hooks', 'hooks.json'))) {
-    paths.add('hooks/hooks.json');
-    const hooksJson = readJson(root, 'hooks/hooks.json');
-    for (const groups of Object.values(hooksJson.hooks ?? {})) {
-      if (!Array.isArray(groups)) continue;
-      for (const group of groups) {
-        if (!Array.isArray(group?.hooks)) continue;
-        for (const hook of group.hooks) {
-          for (const repoPath of pluginRootPaths(hook?.command, 'hooks/hooks.json command')) paths.add(repoPath);
-        }
-      }
-    }
-  }
+  collectHookManifestEntrypoints(
+    root,
+    paths,
+    pluginJson,
+    '.claude-plugin/plugin.json',
+  );
+  collectHookManifestEntrypoints(
+    root,
+    paths,
+    copilotPluginJson,
+    copilotPluginPath,
+  );
 
   if (existsSync(join(root, 'scripts', 'setup-claude-md.sh'))) paths.add('scripts/setup-claude-md.sh');
   if (existsSync(join(root, 'scripts', 'lib', 'config-dir.sh'))) paths.add('scripts/lib/config-dir.sh');

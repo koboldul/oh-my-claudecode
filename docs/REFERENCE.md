@@ -53,7 +53,7 @@ The npm package exposes both `oh-my-claudecode` and `omc`; examples prefer `omc`
 
 ### GitHub Copilot CLI
 
-OMC is also packaged as a [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli) plugin. The root `plugin.json` routes Copilot to `agents-copilot/*.agent.md`, while `.claude-plugin/plugin.json` keeps Claude Code on `agents/*.md`. Both manifests expose the same `oh-my-claudecode:*` agent names, skills, `t` MCP server, commands, and hooks without sharing incompatible model metadata.
+OMC is also packaged as a [GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli) plugin. The root `plugin.json` routes Copilot to `agents-copilot/*.agent.md` and the native camelCase `hooks/copilot-hooks.json`, while `.claude-plugin/plugin.json` keeps Claude Code on `agents/*.md` and the PascalCase `hooks/hooks.json`. Both hosts expose the same `oh-my-claudecode:*` agent names, skills, `t` MCP server, commands, and common wrappers without sharing incompatible manifest schemas. Claude Code additionally registers the `SessionStart` `init` and `maintenance` setup matchers; Copilot does not.
 
 Manifest exposure and behavioral parity are separate claims. Copilot agent profiles declare **`gpt-5.6-sol` with `max` reasoning**, and direct custom-agent selection uses those profiles. Copilot CLI 1.0.72-1 delivers `PreToolUse` as a batched native `preToolUse` payload with `toolCalls[]`, so OMC must adapt per-call inputs and outputs before delegated Task/Agent defaulting through `updatedInput` can be claimed as equivalent to Claude Code.
 
@@ -83,11 +83,12 @@ A direct install also works today — `copilot plugin install Yeachan-Heo/oh-my-
 **After install**
 
 - Copilot clones the plugin to `~/.copilot/installed-plugins/omc/oh-my-claudecode`, selects the root `plugin.json`, rewrites the hooks' `$CLAUDE_PLUGIN_ROOT` to absolute paths (Copilot does not expand that variable at hook-run time), and enables the plugin. No `npm install` or build is needed — the repo ships generated Copilot profiles, prebuilt `dist/`, and bundled `bridge/*.cjs`.
+- The root manifest explicitly selects `hooks/copilot-hooks.json`. This `version: 1` native manifest uses each camelCase event key exactly once, flattens command entries, and omits Claude-only setup init/maintenance groups. The explicit declaration prevents convention-based discovery from registering a second manifest and double-firing events.
 - **Restart Copilot CLI** — plugins, hooks, and MCP servers are loaded at startup.
 - Verify installation with `copilot plugin list`, or run `/env` in a session to inspect loaded skills, agents, MCP servers, and hooks. These checks verify exposed surfaces, not equivalent runtime behavior. See [GitHub Copilot CLI compatibility](#github-copilot-cli-compatibility) for the verified host contract and current OMC adapter gaps.
 - Update the marketplace install later with `copilot plugin update oh-my-claudecode@omc`.
 
-Claude-Code-specific setup surfaces (`/omc-setup`, `~/.claude/CLAUDE.md`, and the current OMC HUD installer) target `~/.claude` and are not required to expose OMC under Copilot. Copilot CLI 1.0.72-1 supports a native custom `statusLine`, but OMC's Copilot HUD adapter and live gate are not yet documented as complete. `scripts/run.cjs` infers `CLAUDE_PLUGIN_ROOT` from the resolved hook path when Copilot does not export it, and sets `OMC_HOST=copilot` for hook children; `scripts/session-start.mjs` uses that signal to suppress Claude-only diagnostics under Copilot — it excludes `~/.claude/CLAUDE.md` from version-drift checks, skips the current OMC HUD/statusLine check, and never emits `/omc-setup` or "restart Claude Code" guidance. Update notices are host-specific too: for a marketplace install under Copilot they point at `copilot plugin update oh-my-claudecode@omc` followed by a Copilot CLI restart, never `/update` or `/plugin install`. No separate setup script is required for a Copilot-only install; plugin installation exposes the manifest surfaces, while behavioral parity remains partial.
+Claude-Code-specific setup surfaces (`/omc-setup`, `~/.claude/CLAUDE.md`, and the current OMC HUD installer) target `~/.claude` and are not required to expose OMC under Copilot. The Copilot hook manifest does not register `setup-init.mjs` or `setup-maintenance.mjs`, so a Copilot `sessionStart` with source `new` cannot run those Claude-owned setup paths. Copilot CLI 1.0.72-1 supports a native custom `statusLine`, but OMC's Copilot HUD adapter and live gate are not yet documented as complete. `scripts/run.cjs` infers `CLAUDE_PLUGIN_ROOT` from the resolved hook path when Copilot does not export it, and sets `OMC_HOST=copilot` for hook children; `scripts/session-start.mjs` uses that signal to suppress Claude-only diagnostics under Copilot — it excludes `~/.claude/CLAUDE.md` from version-drift checks, skips the current OMC HUD/statusLine check, and never emits `/omc-setup` or "restart Claude Code" guidance. Update notices are host-specific too: for a marketplace install under Copilot they point at `copilot plugin update oh-my-claudecode@omc` followed by a Copilot CLI restart, never `/update` or `/plugin install`. No separate setup script is required for a Copilot-only install; plugin installation exposes the manifest surfaces, while behavioral parity remains partial.
 
 ### Claude Code requirements
 
@@ -970,9 +971,9 @@ OMC registers 21 hook scripts across 11 Claude Code lifecycle events. For detail
 | Event                  | Scripts                                                                                                           | Timeout                                      |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
 | **UserPromptSubmit**   | `keyword-detector.mjs`, `skill-injector.mjs`                                                                      | 30s outer fuse per command; 8s, 12s trusted Worker limits |
-| **SessionStart**       | `session-start.mjs`, `project-memory-session.mjs`, `setup-init.mjs` (init), `setup-maintenance.mjs` (maintenance) | 5s, 5s, 30s, 60s |
+| **SessionStart**       | Common: `session-start.mjs`, `project-memory-session.mjs`; Claude only: `setup-init.mjs` (init), `setup-maintenance.mjs` (maintenance) | 5s, 5s, 30s, 60s |
 | **PreToolUse**         | `pre-tool-enforcer.mjs`                                                                                           | 3s               |
-| **PermissionRequest**  | `permission-handler.mjs` (Bash only)                                                                              | 5s               |
+| **PermissionRequest**  | `permission-handler.mjs` (Claude safe-command optimization; Copilot `bash|powershell` native-policy pass-through) | 5s               |
 | **PostToolUse**        | `post-tool-verifier.mjs`, `project-memory-posttool.mjs`                                                           | 3s, 3s           |
 | **PostToolUseFailure** | `post-tool-use-failure.mjs`                                                                                       | 3s               |
 | **SubagentStart**      | `subagent-tracker.mjs start`                                                                                      | 3s               |
@@ -983,33 +984,51 @@ OMC registers 21 hook scripts across 11 Claude Code lifecycle events. For detail
 
 For each UserPromptSubmit command, 30s is the outer host fuse, including any launcher delay before `run.cjs`. Only exact canonical targets in the trusted Worker branch receive the 8s keyword-detector or 12s skill-injector execution caps; generic, untrusted, and non-prompt child paths retain their existing timeout behavior. A command that never starts the runner can take the entire 30s per-command fuse, and host scheduling does not imply an aggregate latency.
 
+**SessionEnd latency boundary:** OMC runner/admission completion must be
+`<=500ms`, measured with a monotonic clock inside production `scripts/run.cjs`
+from its first executable statement through durable publication and the
+bounded authenticated resident-admission attempt. Host shell/process launch,
+OS scheduling before the script begins, and fresh Node startup are outside
+this guarantee; deferred cleanup is also outside the foreground boundary.
+
 The `workflow-drift-guard` blocks only supported source-associated local selection forks with a known minimum of two live alternatives—including exact binary questions and cardinality templates; explicit open input and every unsupported or ambiguous form fail open.
 
 > **Note**: autopilot, ralph, ultrawork, and ultraqa are **skills** (activated via keyword-detector), not hooks. The `persistent-mode.mjs` hook enforces their continuation by blocking the Stop event. A fresh unconfirmed ultragoal does not enforce matching `/goal`; confirmed runs remain fail-closed.
 
 ### GitHub Copilot CLI compatibility
 
-`hooks/hooks.json` is written in Claude Code's manifest format, but the same plugin is loadable by **GitHub Copilot CLI**. The host contract below was verified against Copilot CLI **1.0.72-1**:
+Claude Code explicitly loads `hooks/hooks.json`; GitHub Copilot CLI explicitly loads `hooks/copilot-hooks.json` through the root manifest's supported `hooks` field. The Copilot file projects the common wrapper set into Copilot's native `version: 1` schema: direct command entries, camelCase event keys, and camelCase payloads. It omits the Claude-only `SessionStart` `init` and `maintenance` groups and carries no PascalCase alias keys. The payload observations below were verified against Copilot CLI **1.0.72-1**:
 
-| Manifest entry | Native Copilot delivery | Verified host behavior |
-| -------------- | ----------------------- | ---------------------- |
-| PascalCase event names such as `UserPromptSubmit`, `Stop`, and `SessionStart` | Native camelCase events such as `userPromptSubmitted`, `agentStop`, and `sessionStart` | Copilot normalizes the manifest aliases to native camelCase event names and payloads. |
-| `PreToolUse` | `preToolUse` with `toolCalls[]` | Fires with a batch of tool calls, not Claude's single `tool_name` / `tool_input` payload. |
-| `SubagentStart` | `subagentStart` | Fires; it is not a missing event. |
+| Native manifest entry | Native Copilot delivery | Verified host behavior |
+| --------------------- | ----------------------- | ---------------------- |
+| `userPromptSubmitted`, `sessionStart`, and `sessionEnd` | Same camelCase event and payload fields | No alias translation or snake_case compatibility payload is requested. |
+| `preToolUse` with no matcher | Observed 1.0.72-1 `toolCalls[]` batch | Every call reaches the wrapper; OMC's canonical adapter reduces the observed batch without relying on Claude tool aliases. |
+| `permissionRequest` with `bash|powershell` | `toolName: "powershell"` in the observed Windows fixture; camelCase `bash` uses the same contract shape | Native regex matching uses actual runtime names; the hook runs before Copilot native permission rules and returns `{}` so native rules, session approvals, and the user prompt decide. |
+| `subagentStart` | `subagentStart` with camelCase agent fields | Fires and routes through the subagent tracker wrapper. |
+| `agentStop` | `agentStop` with `transcriptPath` but no assistant-response fields | OMC reads only a bounded `events.jsonl` tail for the final `assistant.message.data.content`; malformed or unsupported transcripts fail open. |
 | Custom status line | Native `statusLine` configuration | Supported by Copilot CLI. |
 
-These observations describe Copilot's exposed host behavior, not completed OMC parity. Current OMC hook scripts and HUD integration still need the corresponding payload adapters and live gates:
+These observations describe Copilot's exposed host behavior, not completed OMC parity.
+
+Permission matcher coverage is not permission-decision parity. The observed
+Copilot `permissionRequest` payload has no trustworthy `nativeDecision`, so OMC
+does not auto-allow safe commands on this host; Claude Code retains the strict
+safe-command optimization.
+
+Current OMC hook scripts and HUD integration still need the corresponding
+payload adapters and live gates:
 
 - `PreToolUse` handling must read and update individual entries in `toolCalls[]` before delegated model/reasoning defaults can be considered equivalent.
-- `SubagentStart` reaches the hook, but OMC must consume the native camelCase payload correctly before end-to-end subagent tracking is considered verified.
+- Native fixture routing covers `subagentStart`, `preCompact`, `sessionStart`, and `sessionEnd` wrapper selection without alias keys.
+- Copilot CLI 1.0.72-1 does not provide a Stop-time context-token numerator paired with an active-model context-limit denominator. `context-guard-stop` therefore passes with a visible diagnostic instead of synthesizing zero usage or claiming context-block parity.
 - Copilot supports native custom `statusLine`, but OMC HUD installation and rendering require Copilot-specific integration and live verification.
 - Loaded skills and hooks are discoverable surfaces. Persistence loops, HUD behavior, and every skill are **not** currently claimed to work identically to Claude Code.
 
-> **Do not add camelCase mirror events** (e.g. a `userPromptSubmitted` block alongside `UserPromptSubmit`). Copilot runs every entry for an event across all sources, so a duplicate key would **double-fire** the hook (double iteration increments, double continuation blocks).
+> **Do not add PascalCase compatibility aliases to the Copilot manifest or register both host manifests with Copilot.** Copilot runs every entry for an event across all sources, so alias copies would **double-fire** the hook (double iteration increments, double continuation blocks).
 
 #### Windows PowerShell hook variants
 
-Each hook entry carries `bash` and `powershell` command variants alongside the Claude-style `command`:
+Each native Copilot hook entry carries explicit `bash` and `powershell` commands alongside the cross-platform `command` fallback:
 
 ```jsonc
 {
@@ -1021,9 +1040,9 @@ Each hook entry carries `bash` and `powershell` command variants alongside the C
 }
 ```
 
-Why: Copilot's hook executor selects a shell per entry — on Windows it runs the `powershell` variant, elsewhere `bash` — and it substitutes only the **braced** `${CLAUDE_PLUGIN_ROOT}` placeholder with the absolute plugin root at load time. Claude Code keeps using `command`, where bash expands the bare `$CLAUDE_PLUGIN_ROOT` at runtime. The bare `command` form is unsafe under PowerShell (a bare `$CLAUDE_PLUGIN_ROOT` is an unset PowerShell variable, and `"$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs` splits into two arguments), which made Copilot fail-closed with `Denied by preToolUse hook … (hook errored)`. The variants use the braced, fully path-quoted form so the substituted absolute path stays a single argument under both PowerShell and bash, including plugin roots that contain spaces.
+Why: Copilot's hook executor selects a shell per entry — on Windows it runs the `powershell` variant, elsewhere `bash` — and it substitutes the **braced** `${CLAUDE_PLUGIN_ROOT}` placeholder with the absolute plugin root at load time. The explicit variants use the braced, fully path-quoted form so the substituted absolute path stays a single argument under both PowerShell and bash, including plugin roots that contain spaces.
 
-The compatibility contract is locked by dedicated tests: `src/__tests__/copilot-hook-compat.test.ts` checks event names, `src/__tests__/copilot-hook-shell-variants.test.ts` checks cross-platform commands, and `src/__tests__/copilot-agent-profiles.test.ts` checks manifest separation plus generated Sol/max profiles. Reference: [GitHub Copilot hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference).
+The compatibility contract is locked by dedicated tests: `src/__tests__/copilot-hook-compat.test.ts` resolves both real plugin declarations, checks the native common-hook projection, applies native regex routing to observed fixtures, and rejects alias duplicates; the shipped entrypoint suites execute the same representative fixtures through PreToolUse, PermissionRequest, postToolUse, agentStop, and prompt/session wrappers; and package tests compare the packed native manifest byte-for-structure with the source file. References: [GitHub Copilot plugin reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-plugin-reference) and [hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference).
 
 ### Code Simplifier Hook
 

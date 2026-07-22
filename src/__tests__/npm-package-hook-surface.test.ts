@@ -2,11 +2,15 @@ import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  COPILOT_HOOKS_JSON_PATH,
+  COPILOT_NATIVE_HOOK_EVENTS,
+  COPILOT_PLUGIN_JSON_PATH,
   MCP_JSON_PATH,
   PACKAGE_ROOT,
   PLUGIN_JSON_PATH,
   listSourceControlledPackageFiles,
   readPluginMcpServers,
+  referencesCopilotHooksManifest,
   referencesRootMcpConfig,
   referencesStandardHooksManifest,
   type PluginJson,
@@ -65,13 +69,35 @@ describe('npm package hook surface regression', () => {
 
   it('keeps the source-controlled plugin and MCP manifests wired to exact standard entrypoints', () => {
     expect(existsSync(PLUGIN_JSON_PATH)).toBe(true);
+    expect(existsSync(COPILOT_PLUGIN_JSON_PATH)).toBe(true);
+    expect(existsSync(COPILOT_HOOKS_JSON_PATH)).toBe(true);
     expect(existsSync(MCP_JSON_PATH)).toBe(true);
 
-    const pluginJson = JSON.parse(
+    const claudePluginJson = JSON.parse(
       readFileSync(PLUGIN_JSON_PATH, 'utf-8'),
     ) as PluginJson;
-    expect(referencesStandardHooksManifest(pluginJson.hooks)).toBe(false);
-    expect(referencesRootMcpConfig(pluginJson.mcpServers)).toBe(true);
+    const copilotPluginJson = JSON.parse(
+      readFileSync(COPILOT_PLUGIN_JSON_PATH, 'utf-8'),
+    ) as PluginJson;
+    const copilotHooksJson = JSON.parse(
+      readFileSync(COPILOT_HOOKS_JSON_PATH, 'utf-8'),
+    ) as {
+      version?: number;
+      hooks?: Record<string, Array<Record<string, unknown>>>;
+    };
+    expect(referencesStandardHooksManifest(claudePluginJson.hooks)).toBe(true);
+    expect(referencesCopilotHooksManifest(copilotPluginJson.hooks)).toBe(true);
+    expect(referencesRootMcpConfig(claudePluginJson.mcpServers)).toBe(true);
+    expect(referencesRootMcpConfig(copilotPluginJson.mcpServers)).toBe(true);
+    expect(copilotHooksJson.version).toBe(1);
+    expect(Object.keys(copilotHooksJson.hooks ?? {})).toEqual(
+      COPILOT_NATIVE_HOOK_EVENTS,
+    );
+    expect(
+      Object.values(copilotHooksJson.hooks ?? {})
+        .flat()
+        .some((entry) => Array.isArray(entry.hooks)),
+    ).toBe(false);
 
     expect(Object.values(readPluginMcpServers())).toEqual([
       {
