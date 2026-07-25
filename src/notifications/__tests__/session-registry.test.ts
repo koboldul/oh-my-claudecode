@@ -14,6 +14,7 @@ import {
 import { join } from "path";
 import { tmpdir } from "os";
 import { spawn } from "child_process";
+import { pathToFileURL } from "url";
 import {
   registerMessage,
   lookupByMessageId,
@@ -33,7 +34,7 @@ let LOCK_PATH: string;
 function registerMessageInChildProcess(mapping: SessionMapping): Promise<void> {
   return new Promise((resolve, reject) => {
     const script = `
-import { registerMessage } from ${JSON.stringify(SESSION_REGISTRY_MODULE_PATH)};
+import { registerMessage } from ${JSON.stringify(pathToFileURL(SESSION_REGISTRY_MODULE_PATH).href)};
 const mapping = JSON.parse(process.env.TEST_MAPPING_JSON ?? "{}");
 registerMessage(mapping);
 `;
@@ -74,7 +75,7 @@ describe("session-registry", () => {
 
   afterEach(() => {
     delete process.env["OMC_TEST_REGISTRY_DIR"];
-    rmSync(testDir, { recursive: true, force: true });
+    rmSync(testDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 
   describe("registerMessage", () => {
