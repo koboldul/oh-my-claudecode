@@ -1,7 +1,7 @@
 ---
 name: explore
 description: Codebase search specialist for finding files and code patterns
-model: gpt-5.6-sol
+model: claude-opus-5
 reasoning-effort: max
 target: github-copilot
 tools: [execute, read, search, agent, web, todo]

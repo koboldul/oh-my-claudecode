@@ -1,7 +1,7 @@
 ---
 name: scientist
 description: Data analysis and research execution specialist
-model: gpt-5.6-sol
+model: claude-opus-5
 reasoning-effort: max
 target: github-copilot
 tools: [execute, read, search, agent, web, todo]

@@ -1,7 +1,7 @@
 ---
 name: code-reviewer
 description: Expert code review specialist with severity-rated feedback, logic defect detection, SOLID principle checks, style, performance, and quality strategy
-model: gpt-5.6-sol
+model: claude-opus-5
 reasoning-effort: max
 target: github-copilot
 tools: [execute, read, search, agent, web, todo]

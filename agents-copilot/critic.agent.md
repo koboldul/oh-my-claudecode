@@ -1,7 +1,7 @@
 ---
 name: critic
 description: Work plan and code review expert — thorough, structured, multi-perspective
-model: gpt-5.6-sol
+model: claude-opus-5
 reasoning-effort: max
 target: github-copilot
 tools: [execute, read, search, agent, web, todo]

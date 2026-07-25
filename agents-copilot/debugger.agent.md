@@ -1,7 +1,7 @@
 ---
 name: debugger
 description: Root-cause analysis, regression isolation, stack trace analysis, build/compilation error resolution
-model: gpt-5.6-sol
+model: claude-opus-5
 reasoning-effort: max
 target: github-copilot
 level: 3

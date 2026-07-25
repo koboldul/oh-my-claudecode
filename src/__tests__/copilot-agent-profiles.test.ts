@@ -47,7 +47,7 @@ describe('Copilot-specific agent profiles', () => {
       const generated = readFileSync(join(COPILOT_DIR, outputFile), 'utf8');
 
       expect(generated).toBe(beforeGeneration[outputFile]);
-      expect(generated).toMatch(/^model: gpt-5\.6-sol$/m);
+      expect(generated).toMatch(/^model: claude-opus-5$/m);
       expect(generated).toMatch(/^reasoning-effort: max$/m);
       expect(generated).toMatch(/^target: github-copilot$/m);
       expect(generated).not.toMatch(/^model: (?:haiku|sonnet|opus|fable)$/m);

@@ -1,7 +1,7 @@
 ---
 name: executor
 description: Focused task executor for implementation work
-model: gpt-5.6-sol
+model: claude-opus-5
 reasoning-effort: max
 target: github-copilot
 level: 2

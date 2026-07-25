@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SOURCE_DIR = join(ROOT, 'agents');
 const OUTPUT_DIR = join(ROOT, 'agents-copilot');
-const COPILOT_MODEL = 'gpt-5.6-sol';
+const COPILOT_MODEL = 'claude-opus-5';
 const COPILOT_REASONING_EFFORT = 'max';
 
 function rewriteDescription(frontmatter) {
