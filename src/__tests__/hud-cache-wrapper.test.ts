@@ -13,7 +13,8 @@ function makeOld(path: string): void {
   utimesSync(path, old, old);
 }
 
-describe('HUD cache wrapper stale render cleanup', () => {
+// Drives a POSIX shell script through `sh`, which is unavailable on Windows.
+describe.skipIf(process.platform === 'win32')('HUD cache wrapper stale render cleanup', () => {
   it('removes stale render locks and zero-byte temp files without deleting diagnostics', () => {
     const tempRoot = mkdtempSync(join(tmpdir(), 'omc-hud-cache-wrapper-'));
     const cacheDir = join(tempRoot, 'cache');
