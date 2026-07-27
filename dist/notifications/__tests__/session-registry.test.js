@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, rmSync, unlinkSync, statSync, readFileSync, wr
 import { join } from "path";
 import { tmpdir } from "os";
 import { spawn } from "child_process";
+import { pathToFileURL } from "url";
 import { registerMessage, lookupByMessageId, removeSession, removeMessagesByPane, pruneStale, loadAllMappings, } from "../session-registry.js";
 const SESSION_REGISTRY_MODULE_PATH = join(process.cwd(), "src", "notifications", "session-registry.ts");
 let testDir;
@@ -11,7 +12,7 @@ let LOCK_PATH;
 function registerMessageInChildProcess(mapping) {
     return new Promise((resolve, reject) => {
         const script = `
-import { registerMessage } from ${JSON.stringify(SESSION_REGISTRY_MODULE_PATH)};
+import { registerMessage } from ${JSON.stringify(pathToFileURL(SESSION_REGISTRY_MODULE_PATH).href)};
 const mapping = JSON.parse(process.env.TEST_MAPPING_JSON ?? "{}");
 registerMessage(mapping);
 `;
@@ -48,7 +49,7 @@ describe("session-registry", () => {
     });
     afterEach(() => {
         delete process.env["OMC_TEST_REGISTRY_DIR"];
-        rmSync(testDir, { recursive: true, force: true });
+        rmSync(testDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     });
     describe("registerMessage", () => {
         it("appends to JSONL file", () => {

@@ -102,5 +102,34 @@
     "recordLine": 3,
     "recordByteLength": 1231,
     "fixture": "statusLine.json"
+  },
+  "qualifiedVersions": {
+    "method": "envelope-keypath-diff",
+    "baseline": "1.0.72-1",
+    "source": "local-session-events",
+    "description": "Every hook.start.data.input record in sampled local Copilot session logs was reduced to a typed key-path set and diffed against the baseline version. Tool-specific toolInput/toolResult payloads are collapsed because they vary by which tool ran, not by CLI version. A version qualifies only when all 11 baseline hook events were observed and no envelope field was added or removed.",
+    "sampledSessionsPerVersion": 14,
+    "baselineHookEvents": [
+      "sessionStart",
+      "userPromptSubmitted",
+      "preToolUse",
+      "permissionRequest",
+      "postToolUse",
+      "postToolUseFailure",
+      "subagentStart",
+      "subagentStop",
+      "agentStop",
+      "preCompact",
+      "sessionEnd"
+    ],
+    "qualified": ["1.0.72", "1.0.72-1", "1.0.73", "1.0.74", "1.0.74-0", "1.0.74-2", "1.0.75"],
+    "notQualified": {
+      "1.0.69-2": "agentStop omits stop_hook_active",
+      "1.0.71-0": "preCompact not observed in sample",
+      "1.0.71-1": "preCompact not observed in sample",
+      "1.0.71-3": "preCompact not observed in sample",
+      "1.0.72-0": "preCompact not observed in sample",
+      "1.0.74-3": "subagentStart, subagentStop, preCompact not observed in sample; observed events were identical"
+    }
   }
 }

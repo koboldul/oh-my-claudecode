@@ -17,7 +17,9 @@ function stageWrapper() {
     return { dir, hudDir, cacheDir, wrapperPath, hudPath };
 }
 const stdinPayload = JSON.stringify({ session_id: 'session-123', cwd: '/tmp', transcript_path: '/tmp/session.jsonl', model: { id: 'claude' } });
-describe('HUD cached statusLine launcher', () => {
+// The launcher under test is a POSIX shell script driven through `sh` with a
+// colon-separated PATH and 0o755 permissions; none of that exists on Windows.
+describe.skipIf(process.platform === 'win32')('HUD cached statusLine launcher', () => {
     it('cached hot path returns the previous render without invoking Node when refresh is locked', () => {
         const staged = stageWrapper();
         try {

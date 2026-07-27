@@ -9,9 +9,11 @@ vi.mock('../cli-detection.js', () => ({
 }));
 
 import {
+  QUALIFIED_COPILOT_CLI_VERSIONS,
   VERIFIED_COPILOT_CLI_VERSION,
   assessCopilotCliVersion,
   detectCopilotCliCompatibility,
+  isQualifiedCopilotCliVersion,
   parseCopilotCliVersion,
 } from '../copilot-cli-compatibility.js';
 
@@ -43,6 +45,39 @@ describe('Copilot CLI compatibility contract', () => {
       status: 'unsupported',
       guidance: expect.stringContaining('Upgrade GitHub Copilot CLI'),
     });
+  });
+
+  it.each([...QUALIFIED_COPILOT_CLI_VERSIONS])(
+    'treats qualified version %s as verified against the baseline contract',
+    (version) => {
+      expect(assessCopilotCliVersion(version)).toMatchObject({
+        status: 'verified',
+        verifiedVersion: VERIFIED_COPILOT_CLI_VERSION,
+        detectedVersion: version,
+      });
+      expect(isQualifiedCopilotCliVersion(version)).toBe(true);
+    },
+  );
+
+  it('reports 1.0.75 as verified through qualification rather than exact match', () => {
+    mocks.detectCli.mockReturnValue({
+      available: true,
+      runnable: true,
+      version: 'GitHub Copilot CLI 1.0.75.',
+      path: 'C:\\Tools\\copilot.exe',
+    });
+
+    expect(detectCopilotCliCompatibility()).toMatchObject({
+      status: 'verified',
+      detectedVersion: '1.0.75',
+      message: expect.stringContaining('qualified against'),
+    });
+  });
+
+  it('keeps unqualified versions out of the verified set', () => {
+    for (const version of ['1.0.69-2', '1.0.71-0', '1.0.74-3', '1.0.76']) {
+      expect(isQualifiedCopilotCliVersion(version)).toBe(false);
+    }
   });
 
   it.each(['1.0.72-2', '1.0.73-0'])(

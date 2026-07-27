@@ -169,9 +169,10 @@ copilot --version
 - If plugin dir missing: CRITICAL - install with Copilot's `/plugin` command: `/plugin marketplace add https://github.com/Yeachan-Heo/oh-my-claudecode` then `/plugin install oh-my-claudecode`.
 - If `enabled` (config.json) or the settings.json flag is `false`: WARN - plugin installed but disabled; re-enable it via Copilot's `/plugin` command.
 - If plugin version is behind the latest npm version: WARN - outdated; update via Copilot's `/plugin` command, then restart Copilot CLI.
-- If `copilot --version` reports **1.0.72-1**: OK - this is the verified Copilot host contract.
-- If it reports an earlier version: CRITICAL - unsupported; upgrade GitHub Copilot CLI to at least 1.0.72-1 using the same package manager used to install it, then rerun `copilot --version`.
-- If it reports a later version: WARN - compatibility is unverified, not failed. Continue diagnostics, but note that contract fixtures and live qualification have not yet passed for that version.
+- If `copilot --version` reports **1.0.72-1**: OK - this is the verified Copilot host contract snapshot.
+- If it reports **1.0.72**, **1.0.73**, **1.0.74**, **1.0.74-0**, **1.0.74-2**, or **1.0.75**: OK - qualified against the 1.0.72-1 contract; the hook envelope was diffed against the baseline and is unchanged.
+- If it reports any other earlier version: CRITICAL - unsupported; upgrade GitHub Copilot CLI to at least 1.0.72-1 using the same package manager used to install it, then rerun `copilot --version`.
+- If it reports any other later version: WARN - compatibility is unverified, not failed. Continue diagnostics, but note that contract fixtures and live qualification have not yet passed for that version.
 - When the OMC terminal CLI is available, `omc doctor copilot` performs this compatibility check and `omc doctor copilot --json` emits the structured result.
 
 ### C2: Confirm skills, agents, MCP server, and hooks loaded
@@ -257,7 +258,7 @@ Report rows for the host(s) detected in Step 0. Rows marked _(Claude only)_ / _(
 | Legacy Commands (~/.claude/commands/) _(Claude only)_ | OK/WARN | ... |
 | Legacy Skills (~/.claude/skills/) _(Claude only)_ | OK/WARN | ... |
 | Copilot Plugin (installed + enabled) _(Copilot only)_ | OK/WARN/CRITICAL | C1 |
-| Copilot CLI Contract Version _(Copilot only)_ | OK/WARN/CRITICAL | 1.0.72-1 verified; earlier unsupported; later unverified |
+| Copilot CLI Contract Version _(Copilot only)_ | OK/WARN/CRITICAL | 1.0.72-1 verified; 1.0.72/1.0.73/1.0.74/1.0.74-0/1.0.74-2/1.0.75 qualified; other earlier unsupported; other later unverified |
 | Copilot Skills/Agents/MCP/Hooks (`/env`) _(Copilot only)_ | OK/WARN | C2 |
 | Copilot Native HUD _(Copilot only)_ | OK/WARN/CRITICAL | C4 |
 

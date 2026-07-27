@@ -102743,6 +102743,19 @@ function detectCli(binary) {
 // src/team/copilot-cli-compatibility.ts
 init_auto_update();
 var VERIFIED_COPILOT_CLI_VERSION = "1.0.72-1";
+var QUALIFIED_COPILOT_CLI_VERSIONS = [
+  "1.0.72",
+  "1.0.72-1",
+  "1.0.73",
+  "1.0.74",
+  "1.0.74-0",
+  "1.0.74-2",
+  "1.0.75"
+];
+var QUALIFIED_COPILOT_CLI_VERSION_SET = new Set(QUALIFIED_COPILOT_CLI_VERSIONS);
+function isQualifiedCopilotCliVersion(version3) {
+  return QUALIFIED_COPILOT_CLI_VERSION_SET.has(version3);
+}
 var COPILOT_CLI_VERSION_PATTERN = /\b(\d+\.\d+\.\d+(?:-\d+)?)\b/;
 function parseCopilotCliVersion(versionOutput) {
   return versionOutput.match(COPILOT_CLI_VERSION_PATTERN)?.[1];
@@ -102762,6 +102775,14 @@ function assessCopilotCliVersion(detectedVersion) {
       verifiedVersion: VERIFIED_COPILOT_CLI_VERSION,
       detectedVersion,
       message: `GitHub Copilot CLI ${detectedVersion} matches the verified OMC host contract.`
+    };
+  }
+  if (isQualifiedCopilotCliVersion(detectedVersion)) {
+    return {
+      status: "verified",
+      verifiedVersion: VERIFIED_COPILOT_CLI_VERSION,
+      detectedVersion,
+      message: `GitHub Copilot CLI ${detectedVersion} was qualified against the verified OMC host contract ${VERIFIED_COPILOT_CLI_VERSION}; its hook envelope is unchanged.`
     };
   }
   if (comparison < 0) {

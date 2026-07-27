@@ -1252,9 +1252,13 @@ function renderCopilotDoctorBody() {
        directory only as the final diagnostic fallback. Confirm package version
        and enabled state.
     2. Run \`copilot --version\`.
-       - \`1.0.72-1\` is the verified baseline.
-       - Earlier versions are unsupported.
-       - Later versions are unverified until contract and live qualification pass.
+       - \`1.0.72-1\` is the verified baseline contract snapshot.
+       - \`1.0.72\`, \`1.0.73\`, \`1.0.74\`, \`1.0.74-0\`, \`1.0.74-2\`, and \`1.0.75\`
+         are qualified: their hook envelope was diffed against the baseline
+         and is unchanged.
+       - Other earlier versions are unsupported.
+       - Other later versions are unverified until contract and live
+         qualification pass.
     3. Ask the user to inspect \`/env\` and confirm:
        - generated \`skills-copilot\` skills
        - generated \`commands-copilot\` commands

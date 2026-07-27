@@ -3,6 +3,34 @@ import { detectCli } from './cli-detection.js';
 
 export const VERIFIED_COPILOT_CLI_VERSION = '1.0.72-1';
 
+/**
+ * Copilot CLI versions whose hook envelope was qualified against the
+ * `1.0.72-1` contract snapshot in
+ * `src/__tests__/fixtures/hooks/copilot-1.0.72-1/`.
+ *
+ * Qualification method: every `hook.start.data.input` record in local Copilot
+ * session logs was reduced to a typed key-path set and diffed against the
+ * baseline version. Tool-specific `toolInput`/`toolResult` payloads are
+ * collapsed because they vary by which tool ran, not by CLI version. A version
+ * qualifies only when all baseline hook events were observed and no envelope
+ * field was added or removed. See `_provenance.json` -> `qualifiedVersions`.
+ */
+export const QUALIFIED_COPILOT_CLI_VERSIONS: readonly string[] = [
+  '1.0.72',
+  '1.0.72-1',
+  '1.0.73',
+  '1.0.74',
+  '1.0.74-0',
+  '1.0.74-2',
+  '1.0.75',
+];
+
+const QUALIFIED_COPILOT_CLI_VERSION_SET = new Set(QUALIFIED_COPILOT_CLI_VERSIONS);
+
+export function isQualifiedCopilotCliVersion(version: string): boolean {
+  return QUALIFIED_COPILOT_CLI_VERSION_SET.has(version);
+}
+
 export type CopilotCliCompatibilityStatus =
   | 'verified'
   | 'unsupported'
@@ -46,6 +74,15 @@ export function assessCopilotCliVersion(
       verifiedVersion: VERIFIED_COPILOT_CLI_VERSION,
       detectedVersion,
       message: `GitHub Copilot CLI ${detectedVersion} matches the verified OMC host contract.`,
+    };
+  }
+
+  if (isQualifiedCopilotCliVersion(detectedVersion)) {
+    return {
+      status: 'verified',
+      verifiedVersion: VERIFIED_COPILOT_CLI_VERSION,
+      detectedVersion,
+      message: `GitHub Copilot CLI ${detectedVersion} was qualified against the verified OMC host contract ${VERIFIED_COPILOT_CLI_VERSION}; its hook envelope is unchanged.`,
     };
   }
 

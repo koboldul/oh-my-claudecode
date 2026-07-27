@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync, existsSync } from 'fs';
-import { join, dirname, sep } from 'path';
+import { join, dirname, sep, resolve } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { getClaudeConfigDir } from '../utils/config-dir.js';
 import { getPluginCacheBase } from '../utils/paths.js';
@@ -18,6 +18,9 @@ import { getPluginCacheBase } from '../utils/paths.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const packageRoot = join(__dirname, '..', '..');
+// On Windows a rooted POSIX path resolves against the current drive, which is
+// not necessarily C:. Derive it so the suite passes from any checkout drive.
+const windowsDrivePrefix = resolve(sep).slice(0, 2);
 describe('HUD Windows Compatibility', () => {
     describe('File Naming', () => {
         it('session-start.mjs should reference omc-hud.mjs', () => {
@@ -64,13 +67,13 @@ describe('HUD Windows Compatibility', () => {
         it('pathToFileURL should correctly convert Unix paths', () => {
             const unixPath = '/home/user/test.js';
             expect(pathToFileURL(unixPath).href).toBe(process.platform === 'win32'
-                ? 'file:///C:/home/user/test.js'
+                ? `file:///${windowsDrivePrefix}/home/user/test.js`
                 : 'file:///home/user/test.js');
         });
         it('pathToFileURL should encode spaces in paths', () => {
             const spacePath = '/path/with spaces/file.js';
             expect(pathToFileURL(spacePath).href).toBe(process.platform === 'win32'
-                ? 'file:///C:/path/with%20spaces/file.js'
+                ? `file:///${windowsDrivePrefix}/path/with%20spaces/file.js`
                 : 'file:///path/with%20spaces/file.js');
         });
     });
