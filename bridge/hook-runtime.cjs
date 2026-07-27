@@ -801,7 +801,10 @@ function identityForPath(lockPath) {
   }
 }
 function identitiesEqual(left, right) {
-  return !!left && left.dev === right.dev && left.ino === right.ino;
+  if (!left) return false;
+  if (left.ino !== right.ino) return false;
+  if (left.dev === 0 || right.dev === 0) return left.ino !== 0;
+  return left.dev === right.dev;
 }
 function parseObservedLock(raw) {
   try {

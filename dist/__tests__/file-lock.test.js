@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { closeSync, mkdirSync, rmSync, existsSync, readFileSync, unlinkSync, writeFileSync, utimesSync } from 'fs';
+import { closeSync, mkdirSync, readdirSync, rmSync, existsSync, readFileSync, unlinkSync, writeFileSync, utimesSync } from 'fs';
 import { spawn, spawnSync } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -49,6 +49,37 @@ describe('file-lock', () => {
     describe('lockPathFor', () => {
         it('should append .lock to the file path', () => {
             expect(lockPathFor('/path/to/file.json')).toBe('/path/to/file.json.lock');
+        });
+    });
+    describe('lock file residue', () => {
+        // Regression: identityForFd used fstat while identityForPath used lstat.
+        // Windows reports dev=0 for path-based stat, so every ownership check
+        // failed, acquisition threw, and each attempt orphaned a publication temp.
+        it('acquires repeatedly without orphaning publication temp files', () => {
+            const lockPath = join(testDir, 'residue.lock');
+            for (let attempt = 0; attempt < 5; attempt++) {
+                const handle = acquireFileLockSync(lockPath);
+                expect(handle).not.toBeNull();
+                releaseFileLockSync(handle);
+            }
+            expect(readdirSync(testDir)).toEqual([]);
+        });
+        it('reaps a stale guard left by a dead owner instead of throwing', () => {
+            const lockPath = join(testDir, 'stale-guard.lock');
+            const guardPath = `${lockPath}.reclaim.guard`;
+            writeFileSync(guardPath, JSON.stringify({
+                version: 2,
+                pid: 999999999,
+                processStartIdentity: '1',
+                nonce: '99999999-9999-4999-8999-999999999999',
+                timestamp: Date.now() - 60_000,
+            }));
+            const oldTime = new Date(Date.now() - 60_000);
+            utimesSync(guardPath, oldTime, oldTime);
+            const handle = acquireFileLockSync(lockPath, { staleLockMs: 1000 });
+            expect(handle).not.toBeNull();
+            expect(existsSync(guardPath)).toBe(false);
+            releaseFileLockSync(handle);
         });
     });
     describe('acquireFileLockSync / releaseFileLockSync', () => {

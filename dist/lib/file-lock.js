@@ -40,7 +40,15 @@ function identityForPath(lockPath) {
     }
 }
 function identitiesEqual(left, right) {
-    return !!left && left.dev === right.dev && left.ino === right.ino;
+    if (!left)
+        return false;
+    if (left.ino !== right.ino)
+        return false;
+    // Windows reports a volume serial for fstat but 0 for path-based stat, so a
+    // zero device on either side carries no information and only ino can decide.
+    if (left.dev === 0 || right.dev === 0)
+        return left.ino !== 0;
+    return left.dev === right.dev;
 }
 function parseObservedLock(raw) {
     try {
