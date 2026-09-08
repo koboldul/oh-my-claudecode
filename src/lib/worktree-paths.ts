@@ -59,6 +59,10 @@ const worktreeCacheMap = new Map<string, string>();
 const toplevelCacheMap = new Map<string, string>();
 /** LRU cache for outermost superproject root lookups, including negative results. */
 const superprojectCacheMap = new Map<string, string | null>();
+/** Stable process-cwd classification for long-lived plugin MCP servers. */
+let processCwdValidationCache: { cwd: string; gitRoot: string | null; pluginRuntime: boolean } | null = null;
+/** First project root accepted by a non-git plugin MCP server. */
+let pinnedPluginProjectRoot: string | null = null;
 
 /**
  * LRU cache for workspace marker lookups.
@@ -503,6 +507,7 @@ export function getProjectIdentifier(worktreeRoot?: string): string {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      timeout: 5000,
     }).trim();
     source = remoteUrl || root;
   } catch {
@@ -749,6 +754,8 @@ export function clearWorktreeCache(): void {
   toplevelCacheMap.clear();
   superprojectCacheMap.clear();
   workspaceCacheMap.clear();
+  processCwdValidationCache = null;
+  pinnedPluginProjectRoot = null;
 }
 
 // ============================================================================
@@ -1219,6 +1226,85 @@ export function resolveTranscriptPath(transcriptPath: string | undefined, cwd?: 
 }
 
 /**
+ * Detect whether a directory is an installed oh-my-claudecode plugin runtime
+ * root (the directory Copilot launches `bridge/mcp-server.cjs` from).
+ *
+ * Requires the OMC plugin manifest *and* the bridge entrypoint, plus one
+ * corroborating host signal:
+ *   - `CLAUDE_PLUGIN_ROOT` pointing at this same directory, or
+ *   - a Copilot host marker (`COPILOT_CLI`, `COPILOT_AGENT_SESSION_ID`,
+ *     `OMC_HOST=copilot`) for installed Copilot sessions.
+ *
+ * A `CLAUDE_PLUGIN_ROOT` that points somewhere else is disqualifying: the
+ * directory is then not the active runtime root.
+ */
+function isOmcPluginRuntimeRoot(directory: string): boolean {
+  if (!existsSync(join(directory, 'bridge', 'mcp-server.cjs'))) {
+    return false;
+  }
+
+  const manifestPath = join(directory, 'plugin.json');
+  if (!existsSync(manifestPath)) {
+    return false;
+  }
+
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { name?: unknown };
+    if (manifest?.name !== 'oh-my-claudecode') {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
+  const pluginRootEnv = process.env.CLAUDE_PLUGIN_ROOT?.trim();
+  if (pluginRootEnv) {
+    return canonicalizeForCompare(resolve(pluginRootEnv)) === canonicalizeForCompare(directory);
+  }
+
+  return (
+    Boolean(process.env.COPILOT_CLI) ||
+    Boolean(process.env.COPILOT_AGENT_SESSION_ID) ||
+    process.env.OMC_HOST === 'copilot'
+  );
+}
+
+/** Best-effort canonical form for path identity comparisons. */
+function canonicalizeForCompare(path: string): string {
+  const canonical = canonicalizeExistingPath(path);
+  return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+}
+
+function canonicalizeExistingPath(path: string): string {
+  let canonical = resolve(path);
+  try {
+    canonical = realpathSync(canonical);
+  } catch {
+    // Keep the resolved path when the filesystem cannot canonicalize it.
+  }
+  return canonical;
+}
+
+function getProcessCwdValidationContext(): {
+  cwd: string;
+  gitRoot: string | null;
+  pluginRuntime: boolean;
+} {
+  const cwd = resolve(process.cwd());
+  if (processCwdValidationCache?.cwd === cwd) {
+    return processCwdValidationCache;
+  }
+
+  const gitRoot = getGitTopLevel(cwd);
+  processCwdValidationCache = {
+    cwd,
+    gitRoot,
+    pluginRuntime: !gitRoot && isOmcPluginRuntimeRoot(cwd),
+  };
+  return processCwdValidationCache;
+}
+
+/**
  * Validate that a workingDirectory is within the trusted git top-level.
  * The trusted root is derived from process.cwd(), NOT from user input.
  *
@@ -1231,7 +1317,12 @@ export function resolveTranscriptPath(transcriptPath: string | undefined, cwd?: 
  * @throws Error if workingDirectory is outside trusted root
  */
 export function validateWorkingDirectory(workingDirectory?: string): string {
-  const trustedRoot = getGitTopLevel(process.cwd()) || process.cwd();
+  const {
+    cwd,
+    gitRoot: cwdGitRoot,
+    pluginRuntime,
+  } = getProcessCwdValidationContext();
+  const trustedRoot = cwdGitRoot || cwd;
 
   if (!workingDirectory) {
     return trustedRoot;
@@ -1239,6 +1330,37 @@ export function validateWorkingDirectory(workingDirectory?: string): string {
 
   // Resolve to absolute
   const resolved = resolve(workingDirectory);
+
+  // Installed-plugin escape hatch: Copilot starts the MCP server with
+  // `node ${CLAUDE_PLUGIN_ROOT}/bridge/mcp-server.cjs`, so process.cwd() is the
+  // plugin installation directory — a non-git folder that holds no project
+  // state. Trusting it would silently write every project's state under the
+  // installation. Only when cwd is a *verified* OMC runtime root AND not a git
+  // repo do we honor an explicit workingDirectory that is itself a git worktree.
+  const providedRoot = getGitTopLevel(resolved);
+  if (pluginRuntime && providedRoot) {
+    const providedRootReal = canonicalizeExistingPath(providedRoot);
+    if (
+      pinnedPluginProjectRoot &&
+      canonicalizeForCompare(providedRootReal) !== canonicalizeForCompare(pinnedPluginProjectRoot)
+    ) {
+      console.error('[worktree] plugin MCP server is already pinned to a different project root', {
+        workingDirectory: resolved,
+        requestedRoot: providedRootReal,
+        pinnedRoot: pinnedPluginProjectRoot,
+      });
+      return pinnedPluginProjectRoot;
+    }
+
+    if (!pinnedPluginProjectRoot) {
+      pinnedPluginProjectRoot = providedRootReal;
+      console.error('[worktree] plugin MCP server pinned to project root', {
+        workingDirectory: resolved,
+        projectRoot: pinnedPluginProjectRoot,
+      });
+    }
+    return pinnedPluginProjectRoot;
+  }
 
   let trustedRootReal: string;
   try {
@@ -1248,8 +1370,6 @@ export function validateWorkingDirectory(workingDirectory?: string): string {
   }
 
   // Try to resolve the provided directory to its literal git top-level.
-  const providedRoot = getGitTopLevel(resolved);
-
   if (providedRoot) {
     // Git resolution succeeded — require exact worktree identity.
     let providedRootReal: string;

@@ -69,6 +69,8 @@ var MAX_WORKTREE_CACHE_SIZE = 8;
 var worktreeCacheMap = /* @__PURE__ */ new Map();
 var toplevelCacheMap = /* @__PURE__ */ new Map();
 var superprojectCacheMap = /* @__PURE__ */ new Map();
+var processCwdValidationCache = null;
+var pinnedPluginProjectRoot = null;
 var workspaceCacheMap = /* @__PURE__ */ new Map();
 function findWorkspaceRoot(startDir) {
   if (process.env.OMC_DISABLE_MULTIREPO === "1") return null;
@@ -264,7 +266,8 @@ function getProjectIdentifier(worktreeRoot) {
       cwd: root,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true
+      windowsHide: true,
+      timeout: 5e3
     }).trim();
     source = remoteUrl || root;
   } catch {
@@ -490,19 +493,90 @@ function resolveTranscriptPath(transcriptPath, cwd) {
   }
   return transcriptPath;
 }
+function isOmcPluginRuntimeRoot(directory) {
+  if (!existsSync(join2(directory, "bridge", "mcp-server.cjs"))) {
+    return false;
+  }
+  const manifestPath = join2(directory, "plugin.json");
+  if (!existsSync(manifestPath)) {
+    return false;
+  }
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    if (manifest?.name !== "oh-my-claudecode") {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  const pluginRootEnv = process.env.CLAUDE_PLUGIN_ROOT?.trim();
+  if (pluginRootEnv) {
+    return canonicalizeForCompare(resolve(pluginRootEnv)) === canonicalizeForCompare(directory);
+  }
+  return Boolean(process.env.COPILOT_CLI) || Boolean(process.env.COPILOT_AGENT_SESSION_ID) || process.env.OMC_HOST === "copilot";
+}
+function canonicalizeForCompare(path3) {
+  const canonical = canonicalizeExistingPath(path3);
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+function canonicalizeExistingPath(path3) {
+  let canonical = resolve(path3);
+  try {
+    canonical = realpathSync(canonical);
+  } catch {
+  }
+  return canonical;
+}
+function getProcessCwdValidationContext() {
+  const cwd = resolve(process.cwd());
+  if (processCwdValidationCache?.cwd === cwd) {
+    return processCwdValidationCache;
+  }
+  const gitRoot = getGitTopLevel(cwd);
+  processCwdValidationCache = {
+    cwd,
+    gitRoot,
+    pluginRuntime: !gitRoot && isOmcPluginRuntimeRoot(cwd)
+  };
+  return processCwdValidationCache;
+}
 function validateWorkingDirectory(workingDirectory) {
-  const trustedRoot = getGitTopLevel(process.cwd()) || process.cwd();
+  const {
+    cwd,
+    gitRoot: cwdGitRoot,
+    pluginRuntime
+  } = getProcessCwdValidationContext();
+  const trustedRoot = cwdGitRoot || cwd;
   if (!workingDirectory) {
     return trustedRoot;
   }
   const resolved = resolve(workingDirectory);
+  const providedRoot = getGitTopLevel(resolved);
+  if (pluginRuntime && providedRoot) {
+    const providedRootReal = canonicalizeExistingPath(providedRoot);
+    if (pinnedPluginProjectRoot && canonicalizeForCompare(providedRootReal) !== canonicalizeForCompare(pinnedPluginProjectRoot)) {
+      console.error("[worktree] plugin MCP server is already pinned to a different project root", {
+        workingDirectory: resolved,
+        requestedRoot: providedRootReal,
+        pinnedRoot: pinnedPluginProjectRoot
+      });
+      return pinnedPluginProjectRoot;
+    }
+    if (!pinnedPluginProjectRoot) {
+      pinnedPluginProjectRoot = providedRootReal;
+      console.error("[worktree] plugin MCP server pinned to project root", {
+        workingDirectory: resolved,
+        projectRoot: pinnedPluginProjectRoot
+      });
+    }
+    return pinnedPluginProjectRoot;
+  }
   let trustedRootReal;
   try {
     trustedRootReal = realpathSync(trustedRoot);
   } catch {
     trustedRootReal = trustedRoot;
   }
-  const providedRoot = getGitTopLevel(resolved);
   if (providedRoot) {
     let providedRootReal;
     try {

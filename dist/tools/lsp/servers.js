@@ -8,6 +8,8 @@ import { spawnSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { dirname, extname, isAbsolute, join, parse, resolve } from 'path';
 const TYPESCRIPT_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'];
+/** Hard upper bound for the PATH lookup performed by {@link commandExists}. */
+const COMMAND_EXISTS_TIMEOUT_MS = 3000;
 const TYPESCRIPT_CLASSIC_SERVER = {
     name: 'TypeScript Language Server',
     command: 'typescript-language-server',
@@ -216,13 +218,24 @@ export const LSP_SERVERS = {
     }
 };
 /**
- * Check if a command exists in PATH
+ * Check if a command exists in PATH.
+ *
+ * The lookup is bounded: a wedged `where`/`which` (network drives, broken PATH
+ * entries) would otherwise block the single-threaded MCP event loop forever.
+ * Any error or kill signal is reported as "not available".
  */
 export function commandExists(command) {
     if (isAbsolute(command))
         return existsSync(command);
     const checkCommand = process.platform === 'win32' ? 'where' : 'which';
-    const result = spawnSync(checkCommand, [command], { stdio: 'ignore' });
+    const result = spawnSync(checkCommand, [command], {
+        stdio: 'ignore',
+        timeout: COMMAND_EXISTS_TIMEOUT_MS,
+        killSignal: 'SIGKILL',
+        windowsHide: true
+    });
+    if (result.error || result.signal)
+        return false;
     return result.status === 0;
 }
 /**

@@ -48,7 +48,7 @@ export async function runDirectoryDiagnostics(
 
   // Run diagnostics based on strategy
   if (useStrategy === 'tsc' && hasTsconfig) {
-    return formatTscResult(runTscDiagnostics(directory));
+    return formatTscResult(await runTscDiagnostics(directory));
   } else {
     return formatLspResult(await runLspAggregatedDiagnostics(directory));
   }

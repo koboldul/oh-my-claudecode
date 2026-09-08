@@ -298,6 +298,129 @@ describe('worktree-paths', () => {
       rmSync(nestedRepoDir, { recursive: true, force: true });
     });
 
+    describe('installed plugin runtime root (Copilot MCP launch)', () => {
+      let pluginRoot: string;
+      let projectDir: string;
+      let originalCwd: string;
+      const savedEnv: Record<string, string | undefined> = {};
+
+      beforeEach(() => {
+        pluginRoot = mkdtempSync(join(tmpdir(), 'omc-plugin-runtime-'));
+        projectDir = mkdtempSync(join(tmpdir(), 'omc-copilot-project-'));
+        originalCwd = process.cwd();
+
+        for (const key of ['CLAUDE_PLUGIN_ROOT', 'COPILOT_CLI', 'COPILOT_AGENT_SESSION_ID', 'OMC_HOST']) {
+          savedEnv[key] = process.env[key];
+          delete process.env[key];
+        }
+
+        // Fake installed plugin root: manifest + bridge entrypoint, no git.
+        mkdirSync(join(pluginRoot, 'bridge'), { recursive: true });
+        writeFileSync(join(pluginRoot, 'bridge', 'mcp-server.cjs'), '// bridge entrypoint');
+        writeFileSync(join(pluginRoot, 'plugin.json'), JSON.stringify({ name: 'oh-my-claudecode' }));
+
+        execSync('git init', { cwd: projectDir, stdio: 'pipe' });
+        clearWorktreeCache();
+      });
+
+      afterEach(() => {
+        process.chdir(originalCwd);
+        clearWorktreeCache();
+        for (const [key, value] of Object.entries(savedEnv)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        rmSync(pluginRoot, { recursive: true, force: true });
+        rmSync(projectDir, { recursive: true, force: true });
+      });
+
+      it('returns the explicit project git root when cwd is a verified non-git plugin root', () => {
+        process.env.COPILOT_CLI = '1';
+        process.chdir(pluginRoot);
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const result = validateWorkingDirectory(projectDir);
+
+        expect(canonicalTestPath(result)).toBe(canonicalTestPath(projectDir));
+        expect(canonicalTestPath(result)).not.toBe(canonicalTestPath(pluginRoot));
+        expect(errorSpy).toHaveBeenCalledWith(
+          '[worktree] plugin MCP server pinned to project root',
+          expect.objectContaining({ projectRoot: expect.any(String) }),
+        );
+        errorSpy.mockRestore();
+      });
+
+      it('accepts CLAUDE_PLUGIN_ROOT pointing at cwd as corroboration', () => {
+        process.env.CLAUDE_PLUGIN_ROOT = pluginRoot;
+        process.chdir(pluginRoot);
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        const result = validateWorkingDirectory(projectDir);
+
+        expect(canonicalTestPath(result)).toBe(canonicalTestPath(projectDir));
+        errorSpy.mockRestore();
+      });
+
+      it('keeps a plugin MCP server pinned to the first accepted project root', () => {
+        process.env.COPILOT_CLI = '1';
+        process.chdir(pluginRoot);
+        const otherProjectDir = mkdtempSync(join(tmpdir(), 'omc-copilot-project-other-'));
+        execSync('git init', { cwd: otherProjectDir, stdio: 'pipe' });
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+        try {
+          const firstResult = validateWorkingDirectory(projectDir);
+          const secondResult = validateWorkingDirectory(otherProjectDir);
+
+          expect(canonicalTestPath(firstResult)).toBe(canonicalTestPath(projectDir));
+          expect(canonicalTestPath(secondResult)).toBe(canonicalTestPath(projectDir));
+          expect(errorSpy).toHaveBeenCalledWith(
+            '[worktree] plugin MCP server is already pinned to a different project root',
+            expect.objectContaining({
+              requestedRoot: expect.any(String),
+              pinnedRoot: expect.any(String),
+            }),
+          );
+        } finally {
+          errorSpy.mockRestore();
+          rmSync(otherProjectDir, { recursive: true, force: true });
+        }
+      });
+
+      it('rejects when no plugin or host signal corroborates the runtime root', () => {
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        process.chdir(pluginRoot);
+
+        const result = validateWorkingDirectory(projectDir);
+
+        expect(canonicalTestPath(result)).not.toBe(canonicalTestPath(projectDir));
+        expect(canonicalTestPath(result)).toBe(canonicalTestPath(process.cwd()));
+        expect(errorSpy).toHaveBeenCalledWith(
+          '[worktree] workingDirectory resolved to different git worktree root, using trusted root',
+          expect.any(Object)
+        );
+        errorSpy.mockRestore();
+      });
+
+      it('rejects when cwd is an arbitrary non-git directory without the plugin manifest', () => {
+        process.env.COPILOT_CLI = '1';
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        const plainDir = mkdtempSync(join(tmpdir(), 'omc-plain-nongit-'));
+        try {
+          process.chdir(plainDir);
+
+          const result = validateWorkingDirectory(projectDir);
+
+          expect(canonicalTestPath(result)).not.toBe(canonicalTestPath(projectDir));
+          expect(canonicalTestPath(result)).toBe(canonicalTestPath(process.cwd()));
+        } finally {
+          errorSpy.mockRestore();
+          process.chdir(originalCwd);
+          rmSync(plainDir, { recursive: true, force: true });
+        }
+      });
+    });
+
     it('uses the submodule git top-level as the trusted validation boundary', () => {
       const parentDir = mkdtempSync(join(tmpdir(), 'worktree-paths-validator-parent-'));
       const subDir = mkdtempSync(join(tmpdir(), 'worktree-paths-validator-child-'));

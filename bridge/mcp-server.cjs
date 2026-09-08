@@ -19080,11 +19080,58 @@ var DEVCONTAINER_CONFIG_FILE_LABELS = [
   "devcontainer.config_file",
   "vsch.config.file"
 ];
+var DOCKER_PROBE_TIMEOUT_MS = 3e3;
+var DEVCONTAINER_CACHE_TTL_MS = 5e3;
+var DEVCONTAINER_CACHE_MAX_ENTRIES = 16;
+var devContainerContextCache = /* @__PURE__ */ new Map();
 function resolveDevContainerContext(workspaceRoot) {
   const hostWorkspaceRoot = (0, import_path4.resolve)(workspaceRoot);
+  const overrideContainerId = process.env.OMC_LSP_CONTAINER_ID?.trim();
+  const cacheKey = `${canonicalWorkspaceCacheKey(hostWorkspaceRoot)}\0${overrideContainerId ?? ""}`;
+  const cached2 = readCachedContext(cacheKey);
+  if (cached2) {
+    return cached2.context;
+  }
+  const context = computeDevContainerContext(hostWorkspaceRoot, overrideContainerId);
+  writeCachedContext(cacheKey, context);
+  return context;
+}
+function canonicalWorkspaceCacheKey(workspaceRoot) {
+  let canonical = workspaceRoot;
+  try {
+    canonical = (0, import_fs5.realpathSync)(workspaceRoot);
+  } catch {
+  }
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+function readCachedContext(cacheKey) {
+  const entry = devContainerContextCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+  if (entry.expiresAt <= Date.now()) {
+    devContainerContextCache.delete(cacheKey);
+    return null;
+  }
+  devContainerContextCache.delete(cacheKey);
+  devContainerContextCache.set(cacheKey, entry);
+  return entry;
+}
+function writeCachedContext(cacheKey, context) {
+  if (devContainerContextCache.size >= DEVCONTAINER_CACHE_MAX_ENTRIES) {
+    const oldest = devContainerContextCache.keys().next().value;
+    if (oldest !== void 0) {
+      devContainerContextCache.delete(oldest);
+    }
+  }
+  devContainerContextCache.set(cacheKey, {
+    expiresAt: Date.now() + DEVCONTAINER_CACHE_TTL_MS,
+    context
+  });
+}
+function computeDevContainerContext(hostWorkspaceRoot, overrideContainerId) {
   const configFilePath = resolveDevContainerConfigPath(hostWorkspaceRoot);
   const config2 = readDevContainerConfig(configFilePath);
-  const overrideContainerId = process.env.OMC_LSP_CONTAINER_ID?.trim();
   if (overrideContainerId) {
     return buildContextFromContainer(overrideContainerId, hostWorkspaceRoot, configFilePath, config2);
   }
@@ -19093,11 +19140,7 @@ function resolveDevContainerContext(workspaceRoot) {
     return null;
   }
   let bestMatch = null;
-  for (const containerId of containerIds) {
-    const inspect = inspectContainer(containerId);
-    if (!inspect) {
-      continue;
-    }
+  for (const inspect of inspectContainers(containerIds)) {
     const score = scoreContainerMatch(inspect, hostWorkspaceRoot, configFilePath);
     if (score <= 0) {
       continue;
@@ -19151,7 +19194,16 @@ function containerUriToHostUri(uri, context) {
   if (!context || !uri.startsWith("file://")) {
     return uri;
   }
-  return (0, import_url2.pathToFileURL)(containerPathToHostPath((0, import_url2.fileURLToPath)(uri), context)).href;
+  try {
+    const parsed = new URL(uri);
+    if (parsed.protocol !== "file:" || parsed.hostname || /%2f|%5c/i.test(parsed.pathname)) {
+      return uri;
+    }
+    const containerPath = decodeURIComponent(parsed.pathname);
+    return (0, import_url2.pathToFileURL)(containerPathToHostPath(containerPath, context)).href;
+  } catch {
+    return uri;
+  }
 }
 function resolveDevContainerConfigPath(workspaceRoot) {
   let dir = workspaceRoot;
@@ -19214,28 +19266,32 @@ function listRunningContainerIds() {
   if (!result || result.status !== 0) {
     return [];
   }
-  const stdout = typeof result.stdout === "string" ? result.stdout : result.stdout.toString("utf8");
-  return stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return readDockerStdout(result).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
-function inspectContainer(containerId) {
-  const result = runDocker(["inspect", containerId]);
+function inspectContainers(containerIds) {
+  if (containerIds.length === 0) {
+    return [];
+  }
+  const result = runDocker(["inspect", ...containerIds]);
   if (!result || result.status !== 0) {
-    return null;
+    return [];
   }
   try {
-    const stdout = typeof result.stdout === "string" ? result.stdout : result.stdout.toString("utf8");
-    const parsed = JSON.parse(stdout);
-    const inspect = parsed[0];
-    if (!inspect?.Id || inspect.State?.Running === false) {
-      return null;
-    }
-    return inspect;
+    const parsed = JSON.parse(readDockerStdout(result));
+    return parsed.filter((inspect) => Boolean(inspect?.Id) && inspect.State?.Running !== false);
   } catch {
-    return null;
+    return [];
   }
 }
+function readDockerStdout(result) {
+  const { stdout } = result;
+  if (typeof stdout === "string") {
+    return stdout;
+  }
+  return stdout ? stdout.toString("utf8") : "";
+}
 function buildContextFromContainer(containerId, hostWorkspaceRoot, configFilePath, config2) {
-  const inspect = inspectContainer(containerId);
+  const inspect = inspectContainers([containerId])[0];
   if (!inspect) {
     return null;
   }
@@ -19317,9 +19373,12 @@ function containerPathToFileUri(filePath) {
 function runDocker(args) {
   const result = (0, import_child_process4.spawnSync)("docker", args, {
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"]
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: DOCKER_PROBE_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    windowsHide: true
   });
-  if (result.error) {
+  if (result.error || result.signal) {
     return null;
   }
   return result;
@@ -19330,6 +19389,7 @@ var import_child_process5 = require("child_process");
 var import_fs6 = require("fs");
 var import_path6 = require("path");
 var TYPESCRIPT_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"];
+var COMMAND_EXISTS_TIMEOUT_MS = 3e3;
 var TYPESCRIPT_CLASSIC_SERVER = {
   name: "TypeScript Language Server",
   command: "typescript-language-server",
@@ -19536,7 +19596,13 @@ var LSP_SERVERS = {
 function commandExists(command) {
   if ((0, import_path6.isAbsolute)(command)) return (0, import_fs6.existsSync)(command);
   const checkCommand = process.platform === "win32" ? "where" : "which";
-  const result = (0, import_child_process5.spawnSync)(checkCommand, [command], { stdio: "ignore" });
+  const result = (0, import_child_process5.spawnSync)(checkCommand, [command], {
+    stdio: "ignore",
+    timeout: COMMAND_EXISTS_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    windowsHide: true
+  });
+  if (result.error || result.signal) return false;
   return result.status === 0;
 }
 function getServerForFile(filePath, workspaceRoot) {
@@ -20602,7 +20668,11 @@ var import_path10 = require("path");
 var import_child_process7 = require("child_process");
 var import_fs8 = require("fs");
 var import_path8 = require("path");
-function runTscDiagnostics(directory) {
+var TSC_TIMEOUT_MS = 12e4;
+var TSC_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
+var TSC_TIMEOUT_CODE = "OMC-TSC-TIMEOUT";
+var TSC_EXECUTION_ERROR_CODE = "OMC-TSC-EXEC";
+async function runTscDiagnostics(directory) {
   const tsconfigPath = (0, import_path8.join)(directory, "tsconfig.json");
   if (!(0, import_fs8.existsSync)(tsconfigPath)) {
     return {
@@ -20612,24 +20682,84 @@ function runTscDiagnostics(directory) {
       warningCount: 0
     };
   }
-  try {
-    (0, import_child_process7.execFileSync)("tsc", ["--noEmit", "--pretty", "false"], {
-      cwd: directory,
-      encoding: "utf-8",
-      stdio: "pipe"
-    });
-    return {
-      success: true,
-      diagnostics: [],
-      errorCount: 0,
-      warningCount: 0
-    };
-  } catch (error2) {
-    const output = error2.stdout || error2.stderr || "";
-    return parseTscOutput(output);
+  const outcome = await execTsc(directory);
+  const output = combineOutput(outcome.stdout, outcome.stderr);
+  if (isTimedOut(outcome.error)) {
+    return timeoutResult(directory);
   }
+  const parsed = parseTscOutput(output, directory);
+  if (!outcome.error || parsed.diagnostics.length > 0) {
+    return outcome.error ? { ...parsed, success: false } : parsed;
+  }
+  return executionFailureResult(directory, outcome.error, output);
 }
-function parseTscOutput(output) {
+function execTsc(directory) {
+  return new Promise((settle) => {
+    (0, import_child_process7.execFile)(
+      "tsc",
+      ["--noEmit", "--pretty", "false"],
+      {
+        cwd: directory,
+        encoding: "utf-8",
+        timeout: TSC_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+        maxBuffer: TSC_MAX_BUFFER_BYTES,
+        windowsHide: true
+      },
+      (error2, stdout, stderr) => {
+        settle({
+          error: error2,
+          stdout,
+          stderr
+        });
+      }
+    );
+  });
+}
+function combineOutput(...values) {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].join("\n");
+}
+function isTimedOut(error2) {
+  return Boolean(
+    error2 && error2.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" && error2.killed === true
+  );
+}
+function timeoutResult(directory) {
+  return {
+    success: false,
+    diagnostics: [
+      {
+        file: (0, import_path8.join)(directory, "tsconfig.json"),
+        line: 1,
+        column: 1,
+        severity: "error",
+        code: TSC_TIMEOUT_CODE,
+        message: `TypeScript check timed out after ${TSC_TIMEOUT_MS}ms and was terminated. Re-run 'tsc --noEmit' manually or check a smaller directory.`
+      }
+    ],
+    errorCount: 1,
+    warningCount: 0
+  };
+}
+function executionFailureResult(directory, error2, output) {
+  const detail = output.split(/\r?\n/, 1)[0]?.trim() || error2.message;
+  return {
+    success: false,
+    diagnostics: [
+      {
+        file: (0, import_path8.join)(directory, "tsconfig.json"),
+        line: 1,
+        column: 1,
+        severity: "error",
+        code: TSC_EXECUTION_ERROR_CODE,
+        message: `TypeScript check could not complete: ${detail}`
+      }
+    ],
+    errorCount: 1,
+    warningCount: 0
+  };
+}
+function parseTscOutput(output, directory) {
   const diagnostics = [];
   const regex = /^(.+)\((\d+),(\d+)\):\s+(error|warning)\s+(TS\d+):\s+(.+)$/gm;
   let match;
@@ -20641,6 +20771,17 @@ function parseTscOutput(output) {
       severity: match[4],
       code: match[5],
       message: match[6]
+    });
+  }
+  const globalRegex = /^(error|warning)\s+(TS\d+):\s+(.+)$/gm;
+  while ((match = globalRegex.exec(output)) !== null) {
+    diagnostics.push({
+      file: (0, import_path8.join)(directory, "tsconfig.json"),
+      line: 1,
+      column: 1,
+      severity: match[1],
+      code: match[2],
+      message: match[3]
     });
   }
   const errorCount = diagnostics.filter((d) => d.severity === "error").length;
@@ -20749,7 +20890,7 @@ async function runDirectoryDiagnostics(directory, strategy = "auto") {
     useStrategy = strategy;
   }
   if (useStrategy === "tsc" && hasTsconfig) {
-    return formatTscResult(runTscDiagnostics(directory));
+    return formatTscResult(await runTscDiagnostics(directory));
   } else {
     return formatLspResult(await runLspAggregatedDiagnostics(directory));
   }
@@ -21255,6 +21396,8 @@ var MAX_WORKTREE_CACHE_SIZE = 8;
 var worktreeCacheMap = /* @__PURE__ */ new Map();
 var toplevelCacheMap = /* @__PURE__ */ new Map();
 var superprojectCacheMap = /* @__PURE__ */ new Map();
+var processCwdValidationCache = null;
+var pinnedPluginProjectRoot = null;
 var workspaceCacheMap = /* @__PURE__ */ new Map();
 function findWorkspaceRoot(startDir) {
   if (process.env.OMC_DISABLE_MULTIREPO === "1") return null;
@@ -21450,7 +21593,8 @@ function getProjectIdentifier(worktreeRoot) {
       cwd: root,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true
+      windowsHide: true,
+      timeout: 5e3
     }).trim();
     source = remoteUrl || root;
   } catch {
@@ -21597,19 +21741,90 @@ function resolveToWorktreeRoot(directory) {
   }
   return resolveRoot(processDirectory) || processDirectory;
 }
+function isOmcPluginRuntimeRoot(directory) {
+  if (!(0, import_fs11.existsSync)((0, import_path11.join)(directory, "bridge", "mcp-server.cjs"))) {
+    return false;
+  }
+  const manifestPath = (0, import_path11.join)(directory, "plugin.json");
+  if (!(0, import_fs11.existsSync)(manifestPath)) {
+    return false;
+  }
+  try {
+    const manifest = JSON.parse((0, import_fs11.readFileSync)(manifestPath, "utf-8"));
+    if (manifest?.name !== "oh-my-claudecode") {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+  const pluginRootEnv = process.env.CLAUDE_PLUGIN_ROOT?.trim();
+  if (pluginRootEnv) {
+    return canonicalizeForCompare((0, import_path11.resolve)(pluginRootEnv)) === canonicalizeForCompare(directory);
+  }
+  return Boolean(process.env.COPILOT_CLI) || Boolean(process.env.COPILOT_AGENT_SESSION_ID) || process.env.OMC_HOST === "copilot";
+}
+function canonicalizeForCompare(path13) {
+  const canonical = canonicalizeExistingPath(path13);
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+function canonicalizeExistingPath(path13) {
+  let canonical = (0, import_path11.resolve)(path13);
+  try {
+    canonical = (0, import_fs11.realpathSync)(canonical);
+  } catch {
+  }
+  return canonical;
+}
+function getProcessCwdValidationContext() {
+  const cwd = (0, import_path11.resolve)(process.cwd());
+  if (processCwdValidationCache?.cwd === cwd) {
+    return processCwdValidationCache;
+  }
+  const gitRoot = getGitTopLevel(cwd);
+  processCwdValidationCache = {
+    cwd,
+    gitRoot,
+    pluginRuntime: !gitRoot && isOmcPluginRuntimeRoot(cwd)
+  };
+  return processCwdValidationCache;
+}
 function validateWorkingDirectory(workingDirectory) {
-  const trustedRoot = getGitTopLevel(process.cwd()) || process.cwd();
+  const {
+    cwd,
+    gitRoot: cwdGitRoot,
+    pluginRuntime
+  } = getProcessCwdValidationContext();
+  const trustedRoot = cwdGitRoot || cwd;
   if (!workingDirectory) {
     return trustedRoot;
   }
   const resolved = (0, import_path11.resolve)(workingDirectory);
+  const providedRoot = getGitTopLevel(resolved);
+  if (pluginRuntime && providedRoot) {
+    const providedRootReal = canonicalizeExistingPath(providedRoot);
+    if (pinnedPluginProjectRoot && canonicalizeForCompare(providedRootReal) !== canonicalizeForCompare(pinnedPluginProjectRoot)) {
+      console.error("[worktree] plugin MCP server is already pinned to a different project root", {
+        workingDirectory: resolved,
+        requestedRoot: providedRootReal,
+        pinnedRoot: pinnedPluginProjectRoot
+      });
+      return pinnedPluginProjectRoot;
+    }
+    if (!pinnedPluginProjectRoot) {
+      pinnedPluginProjectRoot = providedRootReal;
+      console.error("[worktree] plugin MCP server pinned to project root", {
+        workingDirectory: resolved,
+        projectRoot: pinnedPluginProjectRoot
+      });
+    }
+    return pinnedPluginProjectRoot;
+  }
   let trustedRootReal;
   try {
     trustedRootReal = (0, import_fs11.realpathSync)(trustedRoot);
   } catch {
     trustedRootReal = trustedRoot;
   }
-  const providedRoot = getGitTopLevel(resolved);
   if (providedRoot) {
     let providedRootReal;
     try {
@@ -30362,7 +30577,8 @@ function getMainRepoRoot(projectRoot) {
       cwd: projectRoot,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true
+      windowsHide: true,
+      timeout: 5e3
     }).trim();
     const absoluteCommonDir = (0, import_path38.resolve)(projectRoot, gitCommonDir);
     const mainRepoRoot = (0, import_path38.dirname)(absoluteCommonDir);

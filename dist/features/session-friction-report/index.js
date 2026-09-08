@@ -39,6 +39,7 @@ function getMainRepoRoot(projectRoot) {
             encoding: 'utf-8',
             stdio: ['pipe', 'pipe', 'pipe'],
             windowsHide: true,
+            timeout: 5000,
         }).trim();
         const mainRepoRoot = dirname(resolve(projectRoot, gitCommonDir));
         return mainRepoRoot === projectRoot ? null : mainRepoRoot;

@@ -19,7 +19,11 @@ export declare function getTypeScriptServerForWorkspace(workspaceRoot: string): 
  */
 export declare const LSP_SERVERS: Record<string, LspServerConfig>;
 /**
- * Check if a command exists in PATH
+ * Check if a command exists in PATH.
+ *
+ * The lookup is bounded: a wedged `where`/`which` (network drives, broken PATH
+ * entries) would otherwise block the single-threaded MCP event loop forever.
+ * Any error or kill signal is reported as "not available".
  */
 export declare function commandExists(command: string): boolean;
 /**

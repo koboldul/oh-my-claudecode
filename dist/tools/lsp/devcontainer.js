@@ -1,5 +1,5 @@
 import { spawnSync } from 'child_process';
-import { existsSync, readFileSync, readdirSync } from 'fs';
+import { existsSync, readFileSync, readdirSync, realpathSync } from 'fs';
 import { resolve, join, relative, sep, dirname, parse, basename } from 'path';
 import { posix } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
@@ -15,11 +15,86 @@ const DEVCONTAINER_CONFIG_FILE_LABELS = [
     'devcontainer.config_file',
     'vsch.config.file'
 ];
+/**
+ * Hard upper bound for every `docker` probe.
+ *
+ * The MCP server is single-threaded: an unbounded `spawnSync('docker', ...)`
+ * against a hung Docker Desktop blocks the event loop forever and makes every
+ * later tool call time out. Three seconds is well above a healthy `docker ps`
+ * and far below the host's request deadline.
+ */
+const DOCKER_PROBE_TIMEOUT_MS = 3000;
+/**
+ * TTL for the resolved devcontainer context cache.
+ *
+ * `resolveDevContainerContext()` runs once per LSP client lookup (twice per
+ * operation via getClientForFile/runWithClientLease), so a short TTL collapses
+ * the duplicate probe without permanently hiding a container that was started
+ * moments ago.
+ */
+const DEVCONTAINER_CACHE_TTL_MS = 5000;
+/** Bound on the context cache so long-lived servers cannot grow it unboundedly. */
+const DEVCONTAINER_CACHE_MAX_ENTRIES = 16;
+/** LRU + TTL cache keyed by canonical workspace root and container override. */
+const devContainerContextCache = new Map();
 export function resolveDevContainerContext(workspaceRoot) {
     const hostWorkspaceRoot = resolve(workspaceRoot);
+    const overrideContainerId = process.env.OMC_LSP_CONTAINER_ID?.trim();
+    const cacheKey = `${canonicalWorkspaceCacheKey(hostWorkspaceRoot)}\u0000${overrideContainerId ?? ''}`;
+    const cached = readCachedContext(cacheKey);
+    if (cached) {
+        return cached.context;
+    }
+    const context = computeDevContainerContext(hostWorkspaceRoot, overrideContainerId);
+    writeCachedContext(cacheKey, context);
+    return context;
+}
+/**
+ * Clear the devcontainer context cache (useful for testing).
+ * @internal
+ */
+export function clearDevContainerContextCache() {
+    devContainerContextCache.clear();
+}
+function canonicalWorkspaceCacheKey(workspaceRoot) {
+    let canonical = workspaceRoot;
+    try {
+        canonical = realpathSync(workspaceRoot);
+    }
+    catch {
+        // Keep the resolved path when the filesystem cannot canonicalize it.
+    }
+    return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+}
+function readCachedContext(cacheKey) {
+    const entry = devContainerContextCache.get(cacheKey);
+    if (!entry) {
+        return null;
+    }
+    if (entry.expiresAt <= Date.now()) {
+        devContainerContextCache.delete(cacheKey);
+        return null;
+    }
+    // LRU: refresh recency without extending the TTL.
+    devContainerContextCache.delete(cacheKey);
+    devContainerContextCache.set(cacheKey, entry);
+    return entry;
+}
+function writeCachedContext(cacheKey, context) {
+    if (devContainerContextCache.size >= DEVCONTAINER_CACHE_MAX_ENTRIES) {
+        const oldest = devContainerContextCache.keys().next().value;
+        if (oldest !== undefined) {
+            devContainerContextCache.delete(oldest);
+        }
+    }
+    devContainerContextCache.set(cacheKey, {
+        expiresAt: Date.now() + DEVCONTAINER_CACHE_TTL_MS,
+        context
+    });
+}
+function computeDevContainerContext(hostWorkspaceRoot, overrideContainerId) {
     const configFilePath = resolveDevContainerConfigPath(hostWorkspaceRoot);
     const config = readDevContainerConfig(configFilePath);
-    const overrideContainerId = process.env.OMC_LSP_CONTAINER_ID?.trim();
     if (overrideContainerId) {
         return buildContextFromContainer(overrideContainerId, hostWorkspaceRoot, configFilePath, config);
     }
@@ -28,11 +103,7 @@ export function resolveDevContainerContext(workspaceRoot) {
         return null;
     }
     let bestMatch = null;
-    for (const containerId of containerIds) {
-        const inspect = inspectContainer(containerId);
-        if (!inspect) {
-            continue;
-        }
+    for (const inspect of inspectContainers(containerIds)) {
         const score = scoreContainerMatch(inspect, hostWorkspaceRoot, configFilePath);
         if (score <= 0) {
             continue;
@@ -86,7 +157,17 @@ export function containerUriToHostUri(uri, context) {
     if (!context || !uri.startsWith('file://')) {
         return uri;
     }
-    return pathToFileURL(containerPathToHostPath(fileURLToPath(uri), context)).href;
+    try {
+        const parsed = new URL(uri);
+        if (parsed.protocol !== 'file:' || parsed.hostname || /%2f|%5c/i.test(parsed.pathname)) {
+            return uri;
+        }
+        const containerPath = decodeURIComponent(parsed.pathname);
+        return pathToFileURL(containerPathToHostPath(containerPath, context)).href;
+    }
+    catch {
+        return uri;
+    }
 }
 function resolveDevContainerConfigPath(workspaceRoot) {
     let dir = workspaceRoot;
@@ -154,32 +235,37 @@ function listRunningContainerIds() {
     if (!result || result.status !== 0) {
         return [];
     }
-    const stdout = typeof result.stdout === 'string' ? result.stdout : result.stdout.toString('utf8');
-    return stdout
+    return readDockerStdout(result)
         .split(/\r?\n/)
         .map(line => line.trim())
         .filter(Boolean);
 }
-function inspectContainer(containerId) {
-    const result = runDocker(['inspect', containerId]);
+function inspectContainers(containerIds) {
+    if (containerIds.length === 0) {
+        return [];
+    }
+    const result = runDocker(['inspect', ...containerIds]);
     if (!result || result.status !== 0) {
-        return null;
+        return [];
     }
     try {
-        const stdout = typeof result.stdout === 'string' ? result.stdout : result.stdout.toString('utf8');
-        const parsed = JSON.parse(stdout);
-        const inspect = parsed[0];
-        if (!inspect?.Id || inspect.State?.Running === false) {
-            return null;
-        }
-        return inspect;
+        const parsed = JSON.parse(readDockerStdout(result));
+        return parsed.filter(inspect => Boolean(inspect?.Id) && inspect.State?.Running !== false);
     }
     catch {
-        return null;
+        return [];
     }
 }
+function readDockerStdout(result) {
+    const { stdout } = result;
+    if (typeof stdout === 'string') {
+        return stdout;
+    }
+    // A killed probe can leave stdout null; treat it as empty output.
+    return stdout ? stdout.toString('utf8') : '';
+}
 function buildContextFromContainer(containerId, hostWorkspaceRoot, configFilePath, config) {
-    const inspect = inspectContainer(containerId);
+    const inspect = inspectContainers([containerId])[0];
     if (!inspect) {
         return null;
     }
@@ -266,9 +352,14 @@ function containerPathToFileUri(filePath) {
 function runDocker(args) {
     const result = spawnSync('docker', args, {
         encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'ignore']
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: DOCKER_PROBE_TIMEOUT_MS,
+        killSignal: 'SIGKILL',
+        windowsHide: true
     });
-    if (result.error) {
+    // A hung/absent Docker daemon must degrade to "no devcontainer", never throw
+    // and never block. `signal` is set when the timeout killed the probe.
+    if (result.error || result.signal) {
         return null;
     }
     return result;
