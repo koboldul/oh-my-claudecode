@@ -447,13 +447,15 @@ describe('doctor-conflicts: CLAUDE.md companion file detection (issue #1101)', (
         mkdirSync(TEST_PROJECT_CLAUDE_DIR, { recursive: true });
         process.env.CLAUDE_CONFIG_DIR = TEST_CLAUDE_DIR;
         process.env.CLAUDE_MCP_CONFIG_PATH = join(TEST_CLAUDE_DIR, '..', '.claude.json');
+        process.env.OMC_MCP_REGISTRY_PATH = join(TEST_PROJECT_DIR, '.omc-home', 'mcp-registry.json');
+        process.env.CODEX_HOME = join(TEST_PROJECT_DIR, '.codex');
         cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(TEST_PROJECT_DIR);
     });
     afterEach(() => {
         cwdSpy?.mockRestore();
         delete process.env.CLAUDE_CONFIG_DIR;
         delete process.env.CLAUDE_MCP_CONFIG_PATH;
-        delete process.env.OMC_HOME;
+        delete process.env.OMC_MCP_REGISTRY_PATH;
         delete process.env.CODEX_HOME;
         for (const dir of [TEST_CLAUDE_DIR, TEST_PROJECT_DIR]) {
             if (dir && existsSync(dir)) {
@@ -534,7 +536,10 @@ describe('doctor-conflicts: CLAUDE.md companion file detection (issue #1101)', (
         const status = checkClaudeMdStatus();
         expect(status.companionFile).toBe(missingPath);
         expect(status.files).toHaveLength(1);
-        expect(runConflictCheck().hasConflicts).toBe(false);
+        const report = runConflictCheck();
+        expect(report.mcpRegistrySync.registryPath).toBe(join(TEST_PROJECT_DIR, '.omc-home', 'mcp-registry.json'));
+        expect(report.mcpRegistrySync.codexConfigPath).toBe(join(TEST_PROJECT_DIR, '.codex', 'config.toml'));
+        expect(report.hasConflicts).toBe(false);
     });
     it.each(corpus.variants)('classifies exact legacy %s in main and CRLF companion files without claiming guide ownership', async (variant) => {
         const mainPath = join(TEST_CLAUDE_DIR, 'CLAUDE.md');
@@ -824,6 +829,13 @@ describe('doctor-conflicts: config known fields (issue #1499)', () => {
         }, null, 2));
         expect(checkConfigIssues().unknownFields).toEqual(['totallyMadeUpKey', 'anotherUnknown']);
         expect(runConflictCheck().hasConflicts).toBe(true);
+    });
+    it('flags the retired defaultExecutionMode key as unknown (5.0.0 removed its last writer/reader)', () => {
+        writeFileSync(join(TEST_CLAUDE_DIR, '.omc-config.json'), JSON.stringify({
+            silentAutoUpdate: false,
+            defaultExecutionMode: 'ultrawork',
+        }, null, 2));
+        expect(checkConfigIssues().unknownFields).toEqual(['defaultExecutionMode']);
     });
 });
 describe('doctor-conflicts: workspace marker check (Wave F.2)', () => {

@@ -226,6 +226,29 @@ export {
   writeWorkerOverlay,
 } from './worker-bootstrap.js';
 
+export type {
+  WorkerLaunchAttempt,
+  WorkerLaunchBootstrapSpec,
+  WorkerLaunchAcceptance,
+  WorkerLaunchBootstrapResult,
+  WorkerLaunchContext,
+  ProviderSpawnInvocation,
+} from './worker-launch-ack.js';
+export {
+  prepareWorkerLaunchAttempt,
+  loadWorkerLaunchAttempt,
+  loadCurrentWorkerLaunchAttempt,
+  buildWorkerLaunchBootstrapSpec,
+  revokeWorkerLaunchAttempt,
+  awaitWorkerLaunchAcknowledgement,
+  isWorkerLaunchAttemptAccepted,
+  runWorkerLaunchBootstrap,
+  isWorkerLaunchProviderStarted,
+  isWorkerLaunchAttemptCurrent,
+  withWorkerLaunchAttemptFence,
+  buildProviderSpawnInvocation,
+} from './worker-launch-ack.js';
+
 // tmux-comm
 export {
   sendTmuxTrigger,

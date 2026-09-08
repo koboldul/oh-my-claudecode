@@ -1,16 +1,10 @@
-import { afterAll, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { execFileSync } from 'child_process';
-import { ULTRAWORK_MESSAGE } from '../installer/hooks.js';
-import { getUltraworkMessage } from '../hooks/keyword-detector/ultrawork/index.js';
-import { stageHookRuntime } from './helpers/staged-hook-runtime.js';
-const stagedRuntime = stageHookRuntime(['persistent-mode.mjs']);
-afterAll(() => {
-    stagedRuntime.cleanup();
-});
 describe('issue #2652 runtime wiring and output contract', () => {
+    const persistentModePath = join(process.cwd(), 'scripts', 'persistent-mode.mjs');
     it('ships the Stop hook through persistent-mode.mjs', () => {
         const hooksJsonPath = join(process.cwd(), 'hooks', 'hooks.json');
         const hooks = JSON.parse(readFileSync(hooksJsonPath, 'utf-8'));
@@ -18,7 +12,6 @@ describe('issue #2652 runtime wiring and output contract', () => {
             .flatMap((entry) => entry.hooks ?? [])
             .map((hook) => hook.command ?? '');
         expect(stopCommands.some((command) => command.includes('/scripts/persistent-mode.mjs'))).toBe(true);
-        const persistentModePath = join(process.cwd(), 'scripts', 'persistent-mode.mjs');
         const persistentModeSource = readFileSync(persistentModePath, 'utf-8');
         expect(persistentModeSource).toContain('session-idle');
         expect(persistentModeSource).toContain('dispatchIdleNotificationInBackground');
@@ -36,7 +29,7 @@ describe('issue #2652 runtime wiring and output contract', () => {
             writeFileSync(join(pluginRoot, 'dist', 'notifications', 'index.js'), `export async function notify(event, payload) {\n` +
                 `  await import('node:fs').then(({ writeFileSync }) => writeFileSync(process.env.IDLE_MARKER_PATH, JSON.stringify({ event, payload })));\n` +
                 `}\n`);
-            execFileSync(process.execPath, [stagedRuntime.scriptPath('persistent-mode.mjs')], {
+            execFileSync(process.execPath, [persistentModePath], {
                 input: JSON.stringify({ cwd: projectRoot, session_id: 'session-idle-test' }),
                 encoding: 'utf-8',
                 env: {
@@ -63,13 +56,6 @@ describe('issue #2652 runtime wiring and output contract', () => {
         finally {
             rmSync(tempRoot, { recursive: true, force: true });
         }
-    });
-    it('ultrawork mode instructs spawned agents to keep outputs concise', () => {
-        expect(ULTRAWORK_MESSAGE).toBe(getUltraworkMessage());
-        expect(ULTRAWORK_MESSAGE).toContain('CONCISE OUTPUTS');
-        expect(ULTRAWORK_MESSAGE).toContain('under 100 words');
-        expect(ULTRAWORK_MESSAGE).toContain('files touched');
-        expect(ULTRAWORK_MESSAGE).toContain('verification status');
     });
 });
 //# sourceMappingURL=issue-2652-runtime-wiring-and-output-contract.test.js.map

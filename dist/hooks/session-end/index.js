@@ -3,8 +3,9 @@ import * as path from 'path';
 import * as readline from 'readline';
 import { resolveToWorktreeRoot, getOmcRoot, validateSessionId, isValidTranscriptPath, resolveSessionStatePath } from '../../lib/worktree-paths.js';
 import { SESSION_END_MODE_STATE_FILES, SESSION_METRICS_MODE_FILES } from '../../lib/mode-names.js';
-import { clearModeStateFile, readModeState } from '../../lib/mode-state-io.js';
+import { canClearStateForSession, clearModeStateFile, clearStateFileLockedIf, readModeStateWithMeta, } from '../../lib/mode-state-io.js';
 import { completeForegroundCleanup, completeForegroundCleanupAndSealCore, prepareCoreManifest, readSessionEndJob, sealWikiManifest, } from './cleanup-manifest.js';
+import { getSessionEndStalePrdWarning } from '../ralph/stale-prd.js';
 const SESSION_STARTED_MARKER_FILE = 'session-started.json';
 const DEFAULT_SESSION_END_CLEANUP_BUDGET_MS = 2_000;
 const MAX_SESSION_END_CLEANUP_BUDGET_MS = 10_000;
@@ -285,14 +286,13 @@ export function cleanupTransientState(directory, endingSessionId) {
             // Patterns that are safe to delete across every session dir:
             // these are short-lived markers/breakers that do not represent
             // live per-session state an active concurrent session is reading.
-            const crossSessionSafePatterns = [
-                /^cancel-signal/,
-                /stop-breaker/,
-            ];
+            const crossSessionSafePatterns = [];
             // Patterns that must only be deleted from the session that is
             // actually ending — deleting them from a still-running session
             // would reintroduce cross-session interference.
             const endingSessionOnlyPatterns = [
+                /^cancel-signal/,
+                /stop-breaker/,
                 // HUD's stdin cache is session-scoped (see `src/hud/stdin.ts`)
                 // and consumed by `omc hud --watch` for the owning session.
                 /^hud-stdin-cache\.json$/,
@@ -416,17 +416,23 @@ export function cleanupModeStates(directory, sessionId) {
     if (!fs.existsSync(stateDir)) {
         return { filesRemoved, modesCleaned };
     }
-    for (const { file, mode } of SESSION_END_MODE_STATE_FILES) {
+    // Retired workflows are absent from active mode registries, but their state
+    // files remain eligible for bounded upgrade cleanup at session end.
+    const cleanupStateFiles = [
+        ...SESSION_END_MODE_STATE_FILES,
+        { file: 'ultrawork-state.json', mode: 'ultrawork' },
+    ];
+    for (const { file, mode } of cleanupStateFiles) {
         const localPath = path.join(stateDir, file);
         const sessionPath = sessionId ? resolveSessionStatePath(mode, sessionId, directory) : undefined;
         const hasSessionState = Boolean(sessionPath && fs.existsSync(sessionPath));
         try {
             // For JSON files, check if active before removing
             if (file.endsWith('.json')) {
-                const sessionState = sessionId && hasSessionState
-                    ? readModeState(mode, directory, sessionId)
+                const sessionState = sessionId
+                    ? readModeStateWithMeta(mode, directory, sessionId)
                     : null;
-                let shouldCleanup = sessionState?.active === true;
+                let shouldCleanup = sessionState?.active === true && (!sessionId || canClearStateForSession(sessionState, sessionId));
                 if (!shouldCleanup && fs.existsSync(localPath)) {
                     const content = fs.readFileSync(localPath, 'utf-8');
                     const state = JSON.parse(content);
@@ -436,8 +442,7 @@ export function cleanupModeStates(directory, sessionId) {
                         // If sessionId is provided, only clean matching states
                         // If state has no session_id, it's legacy - clean it
                         // If state.session_id matches our sessionId, clean it
-                        const stateSessionId = state.session_id;
-                        if (!sessionId || !stateSessionId || stateSessionId === sessionId) {
+                        if (!sessionId || canClearStateForSession(state, sessionId)) {
                             shouldCleanup = true;
                         }
                     }
@@ -499,7 +504,7 @@ export function cleanupMissionState(directory, sessionId) {
             // If sessionId provided, only remove missions for this session
             if (sessionId) {
                 const missionId = typeof mission.id === 'string' ? mission.id : '';
-                return !missionId.includes(sessionId);
+                return !(missionId === `session:${sessionId}` || missionId.startsWith(`session:${sessionId}:`) || missionId.endsWith(`-${sessionId}`));
             }
             // No sessionId: remove all session-sourced missions
             return false;
@@ -525,7 +530,7 @@ function cleanupSessionStartedMarker(directory, sessionId) {
     try {
         const markerPath = path.join(getOmcRoot(directory), 'state', 'sessions', sessionId, SESSION_STARTED_MARKER_FILE);
         if (fs.existsSync(markerPath)) {
-            fs.unlinkSync(markerPath);
+            clearStateFileLockedIf(markerPath, current => canClearStateForSession(current, sessionId));
         }
     }
     catch {
@@ -539,8 +544,10 @@ function extractTeamNameFromState(state) {
 }
 async function findSessionOwnedTeams(directory, sessionId) {
     const teamNames = new Set();
-    const teamState = readModeState('team', directory, sessionId);
-    const stateTeamName = extractTeamNameFromState(teamState);
+    const teamState = readModeStateWithMeta('team', directory, sessionId);
+    const stateTeamName = canClearStateForSession(teamState, sessionId)
+        ? extractTeamNameFromState(teamState)
+        : null;
     if (stateTeamName) {
         teamNames.add(stateTeamName);
     }
@@ -584,7 +591,7 @@ export async function cleanupSessionOwnedTeams(directory, sessionId, initialTeam
     if (teamNames.length === 0) {
         return { attempted, cleaned, failed };
     }
-    const { teamReadConfig, teamCleanup } = await import('../../team/team-ops.js');
+    const { teamReadConfig } = await import('../../team/team-ops.js');
     const { shutdownTeamV2 } = await import('../../team/runtime-v2.js');
     const { shutdownTeam } = await import('../../team/runtime.js');
     await Promise.all(teamNames.map(async (teamName) => {
@@ -592,16 +599,15 @@ export async function cleanupSessionOwnedTeams(directory, sessionId, initialTeam
         try {
             const config = await teamReadConfig(teamName, directory);
             if (!config || typeof config !== 'object') {
-                await teamCleanup(teamName, directory);
-                cleaned.push(teamName);
+                failed.push({ teamName, error: 'team-shutdown-preserved:config_missing_cleanup_evidence' });
                 return;
             }
-            if (Array.isArray(config.workers)) {
-                await shutdownTeamV2(teamName, directory, { force: true, timeoutMs: 0 });
-                cleaned.push(teamName);
-                return;
-            }
-            if (Array.isArray(config.agentTypes)) {
+            // Classify raw provenance: agentTypes => legacy V1, even if workers:[] was injected.
+            const hasAgentTypes = Array.isArray(config.agentTypes);
+            const workers = config.workers;
+            // V2 when workers array present and not legacy agentTypes provenance.
+            const hasV2Workers = !hasAgentTypes && Array.isArray(workers);
+            if (hasAgentTypes) {
                 const legacyConfig = config;
                 const sessionName = typeof legacyConfig.tmuxSession === 'string' && legacyConfig.tmuxSession.trim() !== ''
                     ? legacyConfig.tmuxSession.trim()
@@ -609,12 +615,25 @@ export async function cleanupSessionOwnedTeams(directory, sessionId, initialTeam
                 const leaderPaneId = typeof legacyConfig.leaderPaneId === 'string' && legacyConfig.leaderPaneId.trim() !== ''
                     ? legacyConfig.leaderPaneId.trim()
                     : undefined;
-                await shutdownTeam(teamName, sessionName, directory, 0, undefined, leaderPaneId, legacyConfig.tmuxOwnsWindow === true);
-                cleaned.push(teamName);
+                if (await shutdownTeam(teamName, sessionName, directory, 0, undefined, leaderPaneId, legacyConfig.tmuxOwnsWindow === true)) {
+                    cleaned.push(teamName);
+                }
+                else {
+                    failed.push({ teamName, error: 'team-shutdown-failed:legacy_cleanup_unverified' });
+                }
                 return;
             }
-            await teamCleanup(teamName, directory);
-            cleaned.push(teamName);
+            if (hasV2Workers) {
+                const shutdown = await shutdownTeamV2(teamName, directory, { force: true, timeoutMs: 0 });
+                if (shutdown.outcome === 'cleaned') {
+                    cleaned.push(teamName);
+                }
+                else {
+                    failed.push({ teamName, error: `team-shutdown-${shutdown.outcome}:${shutdown.reason}` });
+                }
+                return;
+            }
+            failed.push({ teamName, error: 'team-shutdown-preserved:config_cleanup_unsupported' });
         }
         catch (error) {
             failed.push({
@@ -740,14 +759,10 @@ export async function runForegroundSessionEndCleanup(directory, sessionId, persi
 }
 /** Foreground path: only durable local state and worker launch; deferred adapters are worker-owned. */
 function buildDurableSessionEndPayload(directory, input, metrics) {
-    const stateDir = path.join(getOmcRoot(directory), 'state');
-    const teamSessionPath = resolveSessionStatePath('team', input.session_id, directory);
-    const hasTeamState = fs.existsSync(path.join(stateDir, 'team-state.json'))
-        || fs.existsSync(teamSessionPath);
-    const teamState = hasTeamState
-        ? readModeState('team', directory, input.session_id)
-        : null;
-    const teamName = extractTeamNameFromState(teamState);
+    const teamState = readModeStateWithMeta('team', directory, input.session_id);
+    const teamName = teamState && canClearStateForSession(teamState, input.session_id)
+        ? extractTeamNameFromState(teamState)
+        : undefined;
     // Keep only routing identifiers and booleans: credentials remain in the inherited worker environment.
     return {
         transcriptPath: input.transcript_path,
@@ -773,6 +788,13 @@ export async function admitSessionEnd(input, event) {
             admitted: true,
             deduplicated: matches,
         };
+    }
+    // Stale-unfinished-PRD warning (#3669): surface the divergence at session end
+    // BEFORE mode-state cleanup removes the ralph state (the abnormal-exit
+    // signal). Never blocks session end.
+    const stalePrdWarning = getSessionEndStalePrdWarning(directory, input.session_id);
+    if (stalePrdWarning) {
+        console.warn(stalePrdWarning);
     }
     const metrics = recordSessionMetrics(directory, input);
     const payload = buildDurableSessionEndPayload(directory, input, metrics);

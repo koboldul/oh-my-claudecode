@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { getOmcRoot } from '../lib/worktree-paths.js';
+import { teamStateRoot } from './state-paths.js';
 import { TEAM_NAME_SAFE_PATTERN, WORKER_NAME_SAFE_PATTERN, TASK_ID_SAFE_PATTERN, TEAM_TASK_STATUSES, TEAM_EVENT_TYPES, TEAM_TASK_APPROVAL_STATUSES, } from './contracts.js';
 import { teamSendMessage as sendDirectMessage, teamBroadcast as broadcastMessage, teamListMailbox as listMailboxMessages, teamMarkMessageDelivered as markMessageDelivered, teamMarkMessageNotified as markMessageNotified, teamCreateTask, teamReadTask, teamListTasks, teamUpdateTask, teamClaimTask, teamTransitionTaskStatus, teamReleaseTaskClaim, teamReadConfig, teamReadManifest, teamReadWorkerStatus, teamReadWorkerHeartbeat, teamUpdateWorkerHeartbeat, teamWriteWorkerInbox, teamWriteWorkerIdentity, teamAppendEvent, teamGetSummary, teamCleanup, teamWriteShutdownRequest, teamReadShutdownAck, teamReadMonitorSnapshot, teamWriteMonitorSnapshot, teamReadTaskApproval, teamWriteTaskApproval, teamPublishTaskRecoveryCheckpoint, teamReadCanonicalMailboxMessageStrict, } from './team-ops.js';
 import { queueBroadcastMailboxMessage, queueDirectMailboxMessage, runMailboxNotificationAttempt, } from './mcp-comm.js';
@@ -30,6 +31,7 @@ const RECOVERY_ERROR_CODES = new Set([
     'recovery_checkpoint_ambiguous', 'recovery_checkpoint_stale', 'task_requeue_failed',
     'launch_metadata_incomplete', 'launch_descriptor_unresolvable', 'spawn_failed',
     'startup_ack_timeout', 'worker_activation_failed', 'auto_merge_unavailable',
+    'worker_cleanup_incomplete',
     'stale_state_revision', 'config_commit_failed',
 ]);
 export const LEGACY_TEAM_MCP_TOOLS = [
@@ -210,11 +212,25 @@ export function resolveTeamApiCliCommand(env = process.env) {
         return 'omx team api';
     return 'omc team api';
 }
-function isRuntimeV2Config(config) {
-    return !!config && typeof config === 'object' && Array.isArray(config.workers);
-}
+/**
+ * Classify team configs BEFORE relying on canonicalized shape.
+ * V1 (legacy) configs are identified by the durable `agentTypes` field.
+ * An empty `workers: []` array must NOT be treated as V2 provenance — that is
+ * often injected by canonicalizeTeamConfigWorkers on raw V1 configs.
+ */
 function isLegacyRuntimeConfig(config) {
-    return !!config && typeof config === 'object' && Array.isArray(config.agentTypes);
+    return !!config && typeof config === 'object'
+        && Array.isArray(config.agentTypes);
+}
+function isRuntimeV2Config(config) {
+    if (!config || typeof config !== 'object')
+        return false;
+    // Legacy agentTypes provenance wins over any workers array (including []).
+    // teamReadConfig preserves agentTypes for on-disk V1 configs so they never
+    // reach this branch after empty-workers canonicalization.
+    if (isLegacyRuntimeConfig(config))
+        return false;
+    return Array.isArray(config.workers);
 }
 function assertNoNativeWorktreeCleanupEvidence(teamName, cwd) {
     const safety = inspectTeamWorktreeCleanupSafety(teamName, cwd);
@@ -246,10 +262,7 @@ async function executeTeamCleanupViaRuntime(teamName, cwd) {
         await teamCleanup(teamName, cwd);
         return;
     }
-    if (isRuntimeV2Config(config)) {
-        await shutdownTeamV2(teamName, cwd);
-        return;
-    }
+    // Legacy first: agentTypes provenance must not be shadowed by empty workers[].
     if (isLegacyRuntimeConfig(config)) {
         const legacyConfig = config;
         const sessionName = typeof legacyConfig.tmuxSession === 'string' && legacyConfig.tmuxSession.trim() !== ''
@@ -258,7 +271,15 @@ async function executeTeamCleanupViaRuntime(teamName, cwd) {
         const leaderPaneId = typeof legacyConfig.leaderPaneId === 'string' && legacyConfig.leaderPaneId.trim() !== ''
             ? legacyConfig.leaderPaneId.trim()
             : undefined;
-        await shutdownTeam(teamName, sessionName, cwd, 30_000, undefined, leaderPaneId, legacyConfig.tmuxOwnsWindow === true);
+        const cleaned = await shutdownTeam(teamName, sessionName, cwd, 30_000, undefined, leaderPaneId, legacyConfig.tmuxOwnsWindow === true);
+        if (!cleaned)
+            throw new Error(`team_shutdown_failed:legacy_cleanup_unverified`);
+        return;
+    }
+    if (isRuntimeV2Config(config)) {
+        const shutdown = await shutdownTeamV2(teamName, cwd);
+        if (shutdown.outcome !== 'cleaned')
+            throw new Error(`team_shutdown_${shutdown.outcome}:${shutdown.reason}`);
         return;
     }
     assertNoNativeWorktreeCleanupEvidence(teamName, cwd);
@@ -371,8 +392,10 @@ export function buildLegacyTeamDeprecationHint(legacyName, originalArgs, env = p
     return `Use CLI interop: ${teamApiCli} ${operation} --input '${payload}' --json`;
 }
 const WORKTREE_TRIGGER_STATE_ROOT = '$OMC_TEAM_STATE_ROOT';
-function resolveInstructionStateRoot(worktreePath) {
-    return worktreePath ? WORKTREE_TRIGGER_STATE_ROOT : undefined;
+function resolveInstructionStateRoot(_worktreePath, cwd, teamName) {
+    if (process.platform === 'win32' && cwd && teamName)
+        return teamStateRoot(cwd, teamName);
+    return WORKTREE_TRIGGER_STATE_ROOT;
 }
 function hasExactText(value) {
     return typeof value === 'string' && value.length > 0 && value === value.trim();
@@ -430,7 +453,7 @@ function findWorkerDispatchTarget(teamName, toWorker, cwd) {
         return {
             paneId: recipient?.pane_id,
             workerIndex: recipient?.index,
-            instructionStateRoot: resolveInstructionStateRoot(recipient?.worktree_path),
+            instructionStateRoot: resolveInstructionStateRoot(recipient?.worktree_path, cwd, teamName),
         };
     });
 }
@@ -630,7 +653,7 @@ export async function executeTeamApiOperation(operation, args, fallbackCwd) {
                     workerName: worker.name,
                     workerIndex: worker.index,
                     paneId: worker.pane_id,
-                    instructionStateRoot: resolveInstructionStateRoot(worker.worktree_path),
+                    instructionStateRoot: resolveInstructionStateRoot(worker.worktree_path, cwd, teamName),
                 }));
                 const notificationOutcomes = await queueBroadcastMailboxMessage({
                     teamName,

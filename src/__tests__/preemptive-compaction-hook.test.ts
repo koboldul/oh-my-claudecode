@@ -1,5 +1,5 @@
 import { execFileSync } from 'child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -15,6 +15,7 @@ const tempDirs: string[] = [];
 
 function makeTempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'omc-preemptive-hook-'));
+  execFileSync('git', ['init', '--quiet', dir], { stdio: 'ignore' });
   tempDirs.push(dir);
   return dir;
 }
@@ -58,6 +59,24 @@ function writeTranscriptWithoutContextWindow(
     'utf-8',
   );
   return transcriptPath;
+}
+function writeHudCache(dir: string, sessionId: string, usedPercentage: number): string {
+  const cacheDir = join(dir, '.omc', 'state', 'sessions', sessionId);
+  mkdirSync(cacheDir, { recursive: true });
+  const cachePath = join(cacheDir, 'hud-stdin-cache.json');
+  writeFileSync(cachePath, JSON.stringify({
+    cwd: dir,
+    context_window: {
+      used_percentage: usedPercentage,
+      context_window_size: 1000,
+      current_usage: {
+        input_tokens: 10,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    },
+  }), 'utf-8');
+  return cachePath;
 }
 
 function runPostToolVerifier(
@@ -172,7 +191,7 @@ describe('post-tool-verifier preemptive compaction warnings', () => {
     );
 
     expect(first.hookSpecificOutput).toBeDefined();
-    expect(second).toEqual({ continue: true, suppressOutput: true });
+    expect(second).toEqual({ continue: true });
   });
 
   it('does not let one session suppress another session in the same repo', () => {
@@ -324,6 +343,38 @@ describe('post-tool-verifier preemptive compaction warnings', () => {
       },
     });
   });
+
+  it('warns from HUD cache when transcript and hook payload omit context_window', () => {
+    const dir = makeTempDir();
+    const sessionId = `preemptive-hud-cache-${Date.now()}`;
+    const transcriptPath = writeTranscriptWithoutContextWindow(dir, 10);
+    writeHudCache(dir, sessionId, 72);
+
+    const result = runPostToolVerifier(
+      {
+        cwd: dir,
+        transcript_path: transcriptPath,
+        tool_name: 'Read',
+        session_id: sessionId,
+        tool_response: 'read output',
+      },
+      {
+        CLAUDE_PLUGIN_ROOT: process.cwd(),
+        OMC_QUIET: '2',
+        OMC_PREEMPTIVE_COMPACTION_WARNING_PERCENT: '70',
+        OMC_PREEMPTIVE_COMPACTION_CRITICAL_PERCENT: '90',
+      },
+    );
+
+    expect(result).toEqual({
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: 'PostToolUse',
+        additionalContext:
+          '[OMC WARNING] Context at 72% (warning threshold: 70%). Plan a /compact soon to preserve room for the next large tool output.',
+      },
+    });
+  });
 });
 
 describe('post-tool-verifier Write/Edit response envelopes', () => {
@@ -349,7 +400,7 @@ describe('post-tool-verifier Write/Edit response envelopes', () => {
       { OMC_QUIET: '2' },
     );
 
-    expect(result).toEqual({ continue: true, suppressOutput: true });
+    expect(result).toEqual({ continue: true });
   });
 
   it('trusts Edit success markers extracted from object response message before JSON stringify analysis', () => {
@@ -366,7 +417,7 @@ describe('post-tool-verifier Write/Edit response envelopes', () => {
       { OMC_QUIET: '2' },
     );
 
-    expect(result).toEqual({ continue: true, suppressOutput: true });
+    expect(result).toEqual({ continue: true });
   });
 
   it('keeps real plain string Write failures failing', () => {

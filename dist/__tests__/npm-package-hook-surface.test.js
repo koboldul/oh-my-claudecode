@@ -5,7 +5,9 @@ import { COPILOT_HOOKS_JSON_PATH, COPILOT_NATIVE_HOOK_EVENTS, COPILOT_PLUGIN_JSO
 describe('npm package hook surface regression', () => {
     it('builds generated hook runtimes for packaging without mutating ordinary test entrypoints', () => {
         const packageJson = JSON.parse(readFileSync(join(PACKAGE_ROOT, 'package.json'), 'utf-8'));
-        expect(packageJson.scripts?.build).toMatch(/npm run compose-docs && npm run build:claude-md-coordinator/);
+        expect(packageJson.scripts?.build).toMatch(/npm run compose-docs && npm run generate:prompt-projections && npm run build:claude-md-coordinator/);
+        expect(packageJson.scripts?.build?.indexOf('npm run compose-docs')).toBeLessThan(packageJson.scripts?.build?.indexOf('npm run generate:prompt-projections') ?? -1);
+        expect(packageJson.scripts?.build?.indexOf('npm run generate:prompt-projections')).toBeLessThan(packageJson.scripts?.build?.indexOf('npm run build:claude-md-coordinator') ?? -1);
         expect(packageJson.scripts?.build).toContain('npm run build:hook-runtime');
         expect(packageJson.scripts?.['build:hook-runtime']).toBe('node scripts/build-hook-runtime.mjs');
         expect(existsSync(join(PACKAGE_ROOT, 'scripts', 'build-hook-runtime.mjs'))).toBe(true);

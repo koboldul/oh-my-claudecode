@@ -43,7 +43,7 @@ The `swarm` compatibility alias was removed in #1131.
 /team 2:antigravity "redesign the UI components"
 # With GitHub Copilot CLI workers
 /team 2:copilot "implement and review the requested change"
-# Mixed: Codex for backend analysis, Gemini/Antigravity for frontend (use /ccg instead for this)
+# Mixed: Codex for backend analysis, Gemini/Antigravity for frontend (delegate per-task with /oh-my-claudecode:ask)
 ```
 
 **External routing rule:** `N:copilot` MUST invoke `omc team N:copilot "<task>"` (or the
@@ -96,7 +96,7 @@ User: "/team 3:executor fix all TypeScript errors"
 
 ## Goal Workflow Relationship
 
-Team is the OMC authority for parallel, staged execution. Use the deterministic conflict policies `refuse`, `adopt_existing`, and `artifact_only` rather than non-deterministic warning handling. If a task mentions Claude Code `/goal`, Ralph, UltraQA, or artifact-only Ultragoal, keep Team as the primary loop authority unless the leader explicitly hands off. Use `/goal` only as a documented native Claude Code handoff target or as visible evidence from the lead session; do not claim the `/goal` evaluator independently runs commands, reads files, or replaces `team-verify` / `team-fix`. Artifact-only Ultragoal references should be treated as durable goal ledger/checkpoint/evidence artifacts, not as worker execution by themselves.
+Team is the OMC authority for parallel, staged execution. Use the deterministic conflict policies `refuse`, `adopt_existing`, and `artifact_only` rather than non-deterministic warning handling. If a task mentions Claude Code `/goal`, Ralph, or artifact-only Ultragoal, keep Team as the primary loop authority unless the leader explicitly hands off. Use `/goal` only as a documented native Claude Code handoff target or as visible evidence from the lead session; do not claim the `/goal` evaluator independently runs commands, reads files, or replaces `team-verify` / `team-fix`. Artifact-only Ultragoal references should be treated as durable goal ledger/checkpoint/evidence artifacts, not as worker execution by themselves.
 
 ## Staged Pipeline (Canonical Team Runtime)
 
@@ -475,7 +475,7 @@ Do NOT mark the task as completed. Leave it in_progress so the lead can reassign
 == RULES ==
 - NEVER spawn sub-agents or use the Task tool
 - NEVER run tmux pane/session orchestration commands (for example `tmux split-window`, `tmux new-session`)
-- NEVER run team spawning/orchestration skills or commands (for example `$team`, `$ultrawork`, `$autopilot`, `$ralph`, `omc team ...`, `omx team ...`)
+- NEVER run team spawning/orchestration skills or commands (for example `$team`, `$autopilot`, `$ralph`, `omc team ...`, `omx team ...`)
 - ALWAYS use absolute file paths
 - ALWAYS report progress to "team-lead" through the active team/conversation surface
 - Use direct team/conversation messages with type "message" only -- never "broadcast"
@@ -895,7 +895,11 @@ Optional settings live in `.claude/omc.jsonc` (project) or `~/.config/claude-omc
 - **ops.monitorIntervalMs** - How often to review TodoWrite or the active task-list surface (default: 30s)
 - **ops.shutdownTimeoutMs** - How long to wait for shutdown responses (default: 15s)
 
-> **Note:** Team members do not have a hardcoded model default. Each teammate is a separate Claude Code session that inherits the user's configured model. Since teammates can spawn their own subagents, the session model acts as the orchestration layer while subagents can use any model tier.
+> **Note:** Native Claude Code teammates do not have a hardcoded model default; each teammate inherits the lead session's configured model unless overridden per role. OMC's legacy CLI workers are separate processes: their provider and model come from OMC's team routing, not native teammate inheritance.
+>
+> **Nesting (Claude Code 2.1.217+):** Claude teammates are full, independent Claude Code sessions in the session's implicit team (see Phase 5). Do not assume a teammate can or cannot spawn nested subagents: Claude Code 2.1.217–2.1.218 defaulted `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` to 1, while 2.1.219+ defaults to 3, and the current setting controls subagent layers below the main conversation. Plan each teammate as the unit that does the work unless nested delegation is deliberate and supported by the active runtime. OMC CLI workers (`claude`, `codex`, `gemini`, `grok`, `cursor`, and `antigravity` via `ops.defaultAgentType`) are separate processes, not Claude Code subagents, and are unaffected by Claude's subagent depth setting.
+>
+> **Concurrency:** The current OMC team CLI caps worker fan-out at 20 (`MAX_WORKER_COUNT`); although `ops.maxAgents` exists in the config schema, the current launcher does not consult it. Claude Code's `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` also defaults to 20, but that limit applies to Agent-spawned subagents; Claude Code documents agent-team teammates as following their own limits. Do not treat the two values as a shared cap or assume a full-size OMC team leaves exactly zero headroom for ordinary subagents; size OMC teams conservatively when the lead also needs Agent-spawned work.
 
 ## Per-Role Provider & Model Routing
 
@@ -948,7 +952,7 @@ User-friendly aliases normalize via `normalizeDelegationRole()` — e.g. `review
 
 `orchestrator` is pinned to `claude`; only `model` is user-configurable. Any other key on `orchestrator` is rejected by the validator.
 
-`cursor` launches `cursor-agent` as an interactive executor/refactor worker. Do not route reviewer/verdict roles (`critic`, `code-reviewer`, `security-reviewer`, `test-engineer`) to Cursor unless its CLI gains a compatible verdict-output mode; the runtime intentionally skips the structured verdict contract for Cursor panes.
+`cursor` launches `cursor-agent` as an interactive worker. Reviewer/verdict roles (`critic`, `code-reviewer`, `security-reviewer`, `test-engineer`) are supported and receive the same structured verdict-output contract as other non-Claude providers. The leader owns the terminal task transition after consuming the verdict; final approval remains a lead-session responsibility.
 
 ### Env override
 
@@ -960,7 +964,7 @@ Precedence: `OMC_TEAM_ROLE_OVERRIDES` > `.claude/omc.jsonc` (project) > `~/.conf
 
 ### Fallback when a CLI is missing
 
-If the CLI for a configured provider is absent from `PATH` at spawn time, `buildLaunchArgs()` throws, the team lead emits a visible team/conversation warning, and the runtime falls back to a deterministic Claude assignment pre-computed by `buildResolvedRoutingSnapshot` (same tier + same agent, `provider: "claude"`). Fallback is loud by design — silent fallback is a test failure. Probe provider availability with `omc doctor --team-routing`.
+If the CLI for a configured provider is absent from `PATH` at spawn time, `buildLaunchArgs()` throws, the team lead emits a visible team/conversation warning, and the runtime falls back to a deterministic Claude assignment pre-computed by `buildResolvedRoutingSnapshot` (same tier + same agent, `provider: "claude"`) only when the Claude CLI is resolvable. If the Claude CLI is unavailable, no runnable fallback exists: orchestration/startup is unavailable and the warning stays loud rather than claiming a fallback. Probe provider availability with `omc doctor --team-routing`.
 
 ### Stickiness — resolved once, reused everywhere
 

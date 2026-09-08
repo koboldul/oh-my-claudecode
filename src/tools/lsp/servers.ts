@@ -245,6 +245,21 @@ export const LSP_SERVERS: Record<string, LspServerConfig> = {
   }
 };
 
+const BASEDPYRIGHT_SERVER: LspServerConfig = {
+  name: 'Python Language Server (basedpyright)',
+  command: 'basedpyright-langserver',
+  args: ['--stdio'],
+  extensions: ['.py', '.pyw'],
+  installHint: 'uv tool install basedpyright'
+};
+
+/** Resolve the supported Python language server. Only exact basedpyright opts in. */
+export function resolvePythonServer(): LspServerConfig {
+  return process.env.OMC_PYTHON_LSP === 'basedpyright'
+    ? BASEDPYRIGHT_SERVER
+    : LSP_SERVERS.python;
+}
+
 /**
  * Check if a command exists in PATH.
  *
@@ -277,9 +292,9 @@ export function getServerForFile(filePath: string, workspaceRoot?: string): LspS
     return getTypeScriptServerForWorkspace(workspaceRoot);
   }
 
-  for (const [_, config] of Object.entries(LSP_SERVERS)) {
+  for (const [key, config] of Object.entries(LSP_SERVERS)) {
     if (config.extensions.includes(ext)) {
-      return config;
+      return key === 'python' ? resolvePythonServer() : config;
     }
   }
 
@@ -290,10 +305,13 @@ export function getServerForFile(filePath: string, workspaceRoot?: string): LspS
  * Get all available servers (installed and not installed)
  */
 export function getAllServers(): Array<LspServerConfig & { installed: boolean }> {
-  return Object.values(LSP_SERVERS).map(config => ({
-    ...config,
-    installed: commandExists(config.command)
-  }));
+  return Object.values(LSP_SERVERS).map(config => {
+    const selectedConfig = config === LSP_SERVERS.python ? resolvePythonServer() : config;
+    return {
+      ...selectedConfig,
+      installed: commandExists(selectedConfig.command)
+    };
+  });
 }
 
 /**
@@ -351,7 +369,7 @@ export function getServerForLanguage(language: string): LspServerConfig | null {
 
   const serverKey = langMap[language.toLowerCase()];
   if (serverKey && LSP_SERVERS[serverKey]) {
-    return LSP_SERVERS[serverKey];
+    return serverKey === 'python' ? resolvePythonServer() : LSP_SERVERS[serverKey];
   }
 
   return null;

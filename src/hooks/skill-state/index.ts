@@ -40,13 +40,19 @@ import {
   unlinkSync,
 } from 'fs';
 import { dirname, join, normalize, resolve } from 'path';
+import { atomicWriteJsonSync } from '../../lib/atomic-write.js';
+import {
+  canClearStateForSession,
+  clearStateFileLockedIf,
+  readModeStateWithMeta,
+  withStateFileMutationLock,
+  writeModeState,
+} from '../../lib/mode-state-io.js';
 import {
   resolveStatePath,
   resolveSessionStatePath,
   resolveToWorktreeRoot,
 } from '../../lib/worktree-paths.js';
-import { atomicWriteJsonSync } from '../../lib/atomic-write.js';
-import { withStateFileMutationLock } from '../../lib/mode-state-io.js';
 import { readTrackingState, getStaleAgents } from '../subagent-tracker/index.js';
 
 // ---------------------------------------------------------------------------
@@ -68,8 +74,6 @@ export const CANONICAL_WORKFLOW_SKILLS = [
   'autopilot',
   'ralph',
   'team',
-  'ultrawork',
-  'ultraqa',
   'deep-interview',
   'ralplan',
   'self-improve',
@@ -104,7 +108,7 @@ const PROTECTION_CONFIGS: Record<SkillProtectionLevel, SkillStateConfig> = {
 /**
  * Maps each skill name to its support-skill protection level.
  *
- * Workflow skills (autopilot, ralph, ultrawork, team, ultraqa, ralplan,
+ * Workflow skills (autopilot, ralph, team, ralplan,
  * deep-interview, self-improve) have dedicated mode state and workflow slots,
  * so their support-skill protection is 'none'. They flow through the
  * `active_skills` branch instead.
@@ -114,10 +118,8 @@ const SKILL_PROTECTION: Record<string, SkillProtectionLevel> = {
   autopilot: 'none',
   autoresearch: 'none',
   ralph: 'none',
-  ultrawork: 'none',
   team: 'none',
   'omc-teams': 'none',
-  ultraqa: 'none',
   ralplan: 'none',
   'self-improve': 'none',
   cancel: 'none',
@@ -153,17 +155,19 @@ const SKILL_PROTECTION: Record<string, SkillProtectionLevel> = {
   'writer-memory': 'medium',
   'ralph-init': 'medium',
   release: 'medium',
-  ccg: 'medium',
 
   // === Heavy protection (long-running, 10 reinforcements) ===
   deepinit: 'heavy',
 };
+
+const RETIRED_SKILL_NAMES = new Set(['ultrawork', 'ccg']);
 
 export function getSkillProtection(skillName: string, rawSkillName?: string): SkillProtectionLevel {
   if (rawSkillName != null && !rawSkillName.toLowerCase().startsWith('oh-my-claudecode:')) {
     return 'none';
   }
   const normalized = skillName.toLowerCase().replace(/^oh-my-claudecode:/, '');
+  if (RETIRED_SKILL_NAMES.has(normalized)) return 'none';
   return SKILL_PROTECTION[normalized] ?? 'none';
 }
 
@@ -698,9 +702,14 @@ export function pruneExpiredWorkflowSkillTombstones(
 export function resolveAuthoritativeWorkflowSkill(
   state: SkillActiveStateV2,
 ): ActiveSkillSlot | null {
-  const live = Object.values(state.active_skills).filter(
-    (slot) => !isWorkflowSkillCompleted(slot),
-  );
+  const live = Object.entries(state.active_skills)
+    .filter(([name, slot]) =>
+      isCanonicalWorkflowSkill(name) &&
+      typeof slot.skill_name === 'string' &&
+      isCanonicalWorkflowSkill(slot.skill_name) &&
+      !isWorkflowSkillCompleted(slot),
+    )
+    .map(([, slot]) => slot);
   if (live.length === 0) return null;
 
   const isLiveAncestor = (name: string | null | undefined): boolean => {
@@ -730,6 +739,7 @@ export function isWorkflowSkillLive(
   skillName: string,
 ): boolean {
   const normalized = skillName.toLowerCase().replace(/^oh-my-claudecode:/, '');
+  if (!isCanonicalWorkflowSkill(normalized)) return false;
   const slot = state.active_skills[normalized];
   return !!slot && !isWorkflowSkillCompleted(slot);
 }
@@ -2053,6 +2063,26 @@ export function checkSkillActiveState(
     return { shouldBlock: false, message: '' };
   }
 
+  // Retired skills may leave support-state records behind, but those records
+  // are cleanup-only and must never re-arm stop enforcement.
+  const normalizedSupportSkill = typeof state.skill_name === 'string'
+    ? state.skill_name.toLowerCase().replace(/^oh-my-claudecode:/, '')
+    : '';
+  if (RETIRED_SKILL_NAMES.has(normalizedSupportSkill)) {
+    return { shouldBlock: false, message: '', skillName: state.skill_name };
+  }
+
+  // Staleness check
+  if (isSkillStateStale(state)) {
+    clearSkillActiveState(directory, sessionId);
+    return { shouldBlock: false, message: '' };
+  }
+
+  // Reinforcement limit check
+  if (state.reinforcement_count >= state.max_reinforcements) {
+    clearSkillActiveState(directory, sessionId);
+    return { shouldBlock: false, message: '' };
+  }
   // Orchestrators are allowed to go idle while delegated work is still active.
   const trackingState = readTrackingState(directory);
   const staleIds = new Set(getStaleAgents(trackingState).map((a) => a.agent_id));

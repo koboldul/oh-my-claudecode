@@ -12,7 +12,7 @@ import {
 } from '../config/models.js';
 import { isExternalLLMDisabled } from '../lib/security-config.js';
 import type { WorkerLaunchDescriptor } from './types.js';
-import type { CopilotReasoningEffort } from '../shared/types.js';
+import type { CopilotReasoningEffort, ExternalModelsDefaults } from '../shared/types.js';
 
 export type CliAgentType = 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity' | 'copilot';
 
@@ -339,15 +339,23 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     agentType: 'cursor',
     binary: 'cursor-agent',
     installInstructions: 'Install Cursor Agent CLI: see https://docs.cursor.com/cli',
-    // cursor-agent runs as an interactive REPL — no exit-on-complete prompt mode.
-    // Keep supportsPromptMode false so the verdict-file contract path
-    // (CONTRACT_ROLES + shouldInjectContract) skips this provider; cursor
-    // workers participate as executors only.
+    // Team workers must be persistent interactive panes, so the one-shot
+    // `-p/--print` path is deliberately unused here (same stance as codex).
     supportsPromptMode: false,
-    buildLaunchArgs(_model?: string, extraFlags: string[] = []): string[] {
-      // Minimal flags — cursor-agent owns its own session/auth state.
-      // The model is selected interactively inside cursor-agent itself.
-      return [...extraFlags];
+    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+      // `--force` suppresses per-command approval prompts and `--trust` accepts
+      // the workspace, which together are cursor-agent's equivalent of the
+      // approval bypass every other provider already passes. Without them a
+      // worker pane opened on a directory cursor has not seen before stops at
+      // "Workspace Trust Required" and exits; team worktrees are freshly
+      // created per worker, so they always hit that path. `omc ask cursor`
+      // already launches with `--force --trust` for the same reason.
+      const args = ['--force', '--trust'];
+      const extra = extraFlags.filter(flag => !['--force', '-f', '--yolo', '--trust'].includes(flag));
+      // `--model <id>` is a documented global option; ids come from
+      // `cursor-agent --list-models` (e.g. cursor-grok-4.6-high, composer-2.5).
+      if (model) args.push('--model', model);
+      return [...args, ...extra];
     },
     parseOutput(rawOutput: string): string {
       return rawOutput.trim();
@@ -463,12 +471,19 @@ export function validateWorkerLaunchDescriptor(value: unknown): WorkerLaunchDesc
     throw new Error('Invalid worker launch descriptor');
   }
   getContract(descriptor.provider as CliAgentType);
+  const args = descriptor.provider === 'cursor'
+    ? [
+        '--force',
+        '--trust',
+        ...descriptor.args.filter(flag => !['--force', '-f', '--yolo', '--trust'].includes(flag)),
+      ]
+    : [...descriptor.args];
   return {
     schema_version: 1,
     provider: descriptor.provider as CliAgentType,
     model: descriptor.model,
     binary: descriptor.binary,
-    args: [...descriptor.args],
+    args,
   };
 }
 
@@ -601,27 +616,97 @@ export function resolveClaudeWorkerModel(
   }
 
   // Direct model env vars — highest priority
-  const directModel = env.ANTHROPIC_MODEL || env.CLAUDE_MODEL || '';
+  const directModel = [env.ANTHROPIC_MODEL, env.CLAUDE_MODEL]
+    .map(value => value?.trim())
+    .find(Boolean) ?? '';
   if (directModel) {
     return directModel;
   }
 
   // Fallback: Bedrock tier-specific env vars (default to sonnet tier)
-  const bedrockModel =
-    env.CLAUDE_CODE_BEDROCK_SONNET_MODEL ||
-    env.ANTHROPIC_DEFAULT_SONNET_MODEL ||
-    '';
+  const bedrockModel = [env.CLAUDE_CODE_BEDROCK_SONNET_MODEL, env.ANTHROPIC_DEFAULT_SONNET_MODEL]
+    .map(value => value?.trim())
+    .find(Boolean) ?? '';
   if (bedrockModel) {
     return bedrockModel;
   }
 
   // OMC tier env vars
-  const omcModel = env.OMC_MODEL_MEDIUM || '';
+  const omcModel = env.OMC_MODEL_MEDIUM?.trim() ?? '';
   if (omcModel) {
     return omcModel;
   }
 
   return undefined;
+}
+
+/**
+ * Resolve the default model for any team worker provider from the process
+ * environment. Explicit routing/configured models are applied by callers
+ * before this fallback; this helper only owns provider-specific env precedence.
+ */
+export function resolveDefaultWorkerModel(
+  agentType: CliAgentType,
+  env: NodeJS.ProcessEnv = process.env,
+  defaults?: ExternalModelsDefaults,
+): string | undefined {
+  if (agentType === 'claude') return resolveClaudeWorkerModel(env);
+  const providerConfigKeys: Record<Exclude<CliAgentType, 'claude'>, keyof ExternalModelsDefaults> = {
+    codex: 'codexModel',
+    gemini: 'geminiModel',
+    antigravity: 'antigravityModel',
+    grok: 'grokModel',
+    cursor: 'cursorModel',
+    copilot: 'copilotModel',
+  };
+  const configuredValue = defaults?.[providerConfigKeys[agentType]];
+  const configured = typeof configuredValue === 'string' ? configuredValue.trim() : undefined;
+  if (configured) return configured;
+
+  const providerName = agentType.toUpperCase();
+  const envKeys = [
+    `OMC_EXTERNAL_MODELS_DEFAULT_${providerName}_MODEL`,
+    `OMC_${providerName}_DEFAULT_MODEL`,
+  ];
+  for (const key of envKeys) {
+    const value = env[key]?.trim();
+    if (value) return value;
+  }
+  if (agentType === 'copilot') return resolveCopilotModel();
+  return undefined;
+}
+
+/** Keep persisted provider defaults to trimmed, non-sensitive model names. */
+export function normalizeExternalModelsDefaults(defaults?: ExternalModelsDefaults): ExternalModelsDefaults | undefined {
+  if (!defaults || typeof defaults !== 'object') return undefined;
+  const normalized: ExternalModelsDefaults = {};
+  for (const key of ['codexModel', 'geminiModel', 'grokModel', 'antigravityModel', 'cursorModel', 'copilotModel'] as const) {
+    const value = defaults[key];
+    if (typeof value === 'string' && value.trim()) normalized[key] = value.trim();
+  }
+  if (defaults.provider === 'codex' || defaults.provider === 'gemini' || defaults.provider === 'antigravity' || defaults.provider === 'copilot') {
+    normalized.provider = defaults.provider;
+  }
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
+
+/** Capture the effective provider defaults at team creation for env-removal parity. */
+export function resolveExternalModelsDefaults(
+  defaults?: ExternalModelsDefaults,
+  env: NodeJS.ProcessEnv = process.env,
+): ExternalModelsDefaults {
+  const normalized = normalizeExternalModelsDefaults(defaults) ?? {};
+  for (const [provider, key] of [
+    ['CODEX', 'codexModel'], ['GEMINI', 'geminiModel'], ['GROK', 'grokModel'],
+    ['CURSOR', 'cursorModel'], ['ANTIGRAVITY', 'antigravityModel'],
+  ] as const) {
+    if (normalized[key]) continue;
+    const value = [env[`OMC_EXTERNAL_MODELS_DEFAULT_${provider}_MODEL`], env[`OMC_${provider}_DEFAULT_MODEL`]]
+      .map(candidate => candidate?.trim())
+      .find(Boolean);
+    if (value) normalized[key] = value;
+  }
+  return normalized;
 }
 
 /**

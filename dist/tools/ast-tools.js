@@ -10,7 +10,7 @@ import { z } from "zod";
 import { readFileSync, readdirSync, statSync, writeFileSync } from "fs";
 import { join, extname, resolve, normalize, relative, isAbsolute } from "path";
 import { createRequire } from "module";
-import { getGitTopLevel } from "../lib/worktree-paths.js";
+import { probeGitTopLevel } from "../lib/worktree-paths.js";
 import { isToolPathRestricted } from "../lib/security-config.js";
 // Dynamic import for @ast-grep/napi
 // Graceful degradation: if the module is not available (e.g., in bundled/plugin context),
@@ -22,7 +22,10 @@ import { isToolPathRestricted } from "../lib/security-config.js";
 // via NODE_PATH set in the bundle's startup banner.
 let sgModule = null;
 let sgLoadFailed = false;
-let sgLoadError = '';
+let sgLoadError = "";
+const AST_GREP_INSTALL_COMMAND = "npm install -g @ast-grep/napi@0.31";
+const AST_GREP_RECOVERY_GUIDANCE = `Install the supported runtime with: ${AST_GREP_INSTALL_COMMAND}\n` +
+    "Then restart Claude Code (or the MCP server) so @ast-grep/napi is reloaded.";
 async function getSgModule() {
     if (sgLoadFailed) {
         return null;
@@ -30,7 +33,7 @@ async function getSgModule() {
     if (!sgModule) {
         try {
             // Use createRequire for CJS-style resolution (respects NODE_PATH)
-            const require = createRequire(import.meta.url || __filename || process.cwd() + '/');
+            const require = createRequire(import.meta.url || __filename || process.cwd() + "/");
             sgModule = require("@ast-grep/napi");
         }
         catch {
@@ -62,7 +65,12 @@ export function validateToolPath(inputPath) {
     }
     // Use the literal git toplevel (not the superproject-climbing getWorktreeRoot)
     // so a tool inside a submodule stays confined to that submodule (#3349 / PR #3350).
-    const projectRoot = getGitTopLevel() || process.cwd();
+    const projectProbe = probeGitTopLevel(process.cwd());
+    if (projectProbe.status !== 'ok') {
+        throw new Error(`Path restricted: unable to verify the project root because the Git probe failed. ` +
+            `Disable via security.restrictToolPaths in .claude/omc.jsonc or unset OMC_SECURITY.`);
+    }
+    const projectRoot = projectProbe.root;
     const normalizedRoot = normalize(projectRoot);
     const normalizedPath = normalize(resolved);
     const rel = relative(normalizedRoot, normalizedPath);
@@ -98,7 +106,7 @@ function toLangEnum(sg, language) {
     };
     const lang = langMap[language];
     if (!lang) {
-        throw new Error(`Unsupported language: ${language}`);
+        throw new Error(`Unsupported language: ${language}. The loaded @ast-grep/napi runtime does not provide this language.\n${AST_GREP_RECOVERY_GUIDANCE}`);
     }
     return lang;
 }
@@ -285,7 +293,7 @@ Note: Patterns must be valid AST nodes for the language.`,
                     content: [
                         {
                             type: "text",
-                            text: `@ast-grep/napi is not available. Install it with: npm install -g @ast-grep/napi\nError: ${sgLoadError}`,
+                            text: `@ast-grep/napi is not available.\n${AST_GREP_RECOVERY_GUIDANCE}\nError: ${sgLoadError}`,
                         },
                     ],
                 };
@@ -301,6 +309,7 @@ Note: Patterns must be valid AST nodes for the language.`,
                     ],
                 };
             }
+            const lang = toLangEnum(sg, language);
             const results = [];
             let totalMatches = 0;
             for (const filePath of files) {
@@ -308,7 +317,7 @@ Note: Patterns must be valid AST nodes for the language.`,
                     break;
                 try {
                     const content = readFileSync(filePath, "utf-8");
-                    const root = sg.parse(toLangEnum(sg, language), content).root();
+                    const root = sg.parse(lang, content).root();
                     const matches = root.findAll(pattern);
                     for (const match of matches) {
                         if (totalMatches >= maxResults)
@@ -398,7 +407,7 @@ IMPORTANT: dryRun=true (default) only previews changes. Set dryRun=false to appl
                     content: [
                         {
                             type: "text",
-                            text: `@ast-grep/napi is not available. Install it with: npm install -g @ast-grep/napi\nError: ${sgLoadError}`,
+                            text: `@ast-grep/napi is not available.\n${AST_GREP_RECOVERY_GUIDANCE}\nError: ${sgLoadError}`,
                         },
                     ],
                 };
@@ -414,12 +423,13 @@ IMPORTANT: dryRun=true (default) only previews changes. Set dryRun=false to appl
                     ],
                 };
             }
+            const lang = toLangEnum(sg, language);
             const changes = [];
             let totalReplacements = 0;
             for (const filePath of files) {
                 try {
                     const content = readFileSync(filePath, "utf-8");
-                    const root = sg.parse(toLangEnum(sg, language), content).root();
+                    const root = sg.parse(lang, content).root();
                     const matches = root.findAll(pattern);
                     if (matches.length === 0)
                         continue;
@@ -445,7 +455,7 @@ IMPORTANT: dryRun=true (default) only previews changes. Set dryRun=false to appl
                                 if (captured) {
                                     // Escape $ in captured text to prevent JS replacement patterns
                                     // ($&, $', $`, $$) from being interpreted by replaceAll
-                                    const safeText = captured.text().replace(/\$/g, '$$$$');
+                                    const safeText = captured.text().replace(/\$/g, "$$$$");
                                     finalReplacement = finalReplacement.replaceAll(metaVar, safeText);
                                 }
                             }

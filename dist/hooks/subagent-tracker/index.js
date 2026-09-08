@@ -19,6 +19,7 @@ import { resolveSessionId } from '../../lib/session-id.js';
 import { withFileLockSync, lockPathFor } from '../../lib/file-lock.js';
 import { recordAgentReconciliation, recordAgentStart, recordAgentStop, } from './session-replay.js';
 import { recordMissionAgentStart, recordMissionAgentStop } from '../../hud/mission-board.js';
+import { collectWorktreeDirtyEvidence, isAbnormalTermination, } from './worktree-evidence.js';
 export const COST_LIMIT_USD = 1.0;
 export const DEADLOCK_CHECK_THRESHOLD = 3;
 // ============================================================================
@@ -337,6 +338,37 @@ export function executeFlush(directory, pendingState, sessionId) {
     catch {
         return false;
     }
+}
+/**
+ * Durable merge-and-write for a caller that ALREADY holds the state lock.
+ *
+ * R1 (#3663): the state lock is a non-reentrant O_CREAT|O_EXCL advisory lock
+ * (src/lib/file-lock.ts) and isLockStale() sees the CURRENT process as alive, so
+ * a nested acquisition can never succeed. Routing through writeTrackingState +
+ * flushPendingWrites from inside a lock scope therefore busy-spins for the whole
+ * LOCK_OPTS.timeoutMs (500ms of wasted hook budget, and Atomics.wait throws on
+ * the main thread so the wait is a spin) and then degrades to an UNLOCKED,
+ * NON-MERGE-AWARE writeTrackingStateImmediate fallback that overwrites whatever
+ * a concurrent writer landed on disk.
+ *
+ * This helper does the same disk re-read + merge + atomic write as executeFlush
+ * without re-entering the lock, so an in-lock caller gets a durable, merged
+ * write at zero lock-contention cost.
+ *
+ * Any debounced pending write for the same path is consumed: `state` is derived
+ * from readTrackingState(), which already serves the pending snapshot, so
+ * dropping it cannot lose data and stops a later debounce from resurrecting a
+ * pre-mutation snapshot.
+ */
+function writeTrackingStateLocked(directory, state, sessionId) {
+    const writePath = resolveWritePath(directory, sessionId);
+    const pending = pendingWrites.get(writePath);
+    if (pending) {
+        clearTimeout(pending.timeout);
+        pendingWrites.delete(writePath);
+    }
+    const merged = mergeTrackerStates(readDiskState(directory, sessionId), state);
+    writeTrackingStateImmediate(directory, merged, sessionId);
 }
 /**
  * Write tracking state with debouncing to reduce I/O.
@@ -839,6 +871,12 @@ export function processSubagentStart(input) {
             const startedAt = timestampIso(normalized.event_timestamp);
             const taskDescription = (normalized.prompt
                 ?? normalized.agent_description)?.substring(0, 200);
+            const rawInput = input;
+            const agentName = rawInput?.name?.trim() || undefined;
+            const agentDescription = rawInput?.description?.trim() || undefined;
+            const existingAgent = state.agents.find((agent) => agent.agent_id === rawInput?.agent_id);
+            const isDuplicateRunningStart = existingAgent?.status === "running";
+            let trackedAgent;
             const duplicateOutput = (duplicateAgent) => {
                 const runningCount = state.agents.filter((agent) => agent.status === "running").length;
                 return {
@@ -940,7 +978,6 @@ export function processSubagentStart(input) {
                 && normalized.agent_name) {
                 existingIndex = findPendingReorderedStopByName(state, normalized.agent_name, normalized.event_timestamp, normalized.agent_id);
             }
-            let trackedAgent;
             let reordered = false;
             let previousAgentId;
             if (existingIndex !== -1) {
@@ -971,6 +1008,11 @@ export function processSubagentStart(input) {
                 existingAgent.parent_mode = parentMode;
                 existingAgent.task_description = taskDescription;
                 existingAgent.model = normalized.model;
+                if (agentName)
+                    existingAgent.name = agentName;
+                if (agentDescription)
+                    existingAgent.description = agentDescription;
+                existingAgent.worktree_evidence = undefined;
                 existingAgent.synthetic = undefined;
                 existingAgent.telemetry_status = undefined;
                 existingAgent.telemetry_note = REORDERED_LIFECYCLE_TELEMETRY_NOTE;
@@ -1016,6 +1058,8 @@ export function processSubagentStart(input) {
                     task_description: taskDescription,
                     status: "running",
                     model: normalized.model,
+                    name: agentName,
+                    description: agentDescription,
                 };
                 state.agents.push(agentInfo);
                 state.total_spawned++;
@@ -1031,9 +1075,13 @@ export function processSubagentStart(input) {
                     recorded_at: startedAt,
                 }
                 : undefined);
-            // Lifecycle counters must be committed while the lock is held. Debounced
-            // whole-state snapshots can merge disjoint agents but cannot add counters.
             writeTrackingStateImmediate(normalized.cwd, state, sessionId);
+            if (!isDuplicateRunningStart) {
+                try {
+                    recordAgentStart(normalized.cwd, sessionId ?? '', trackedAgent.agent_id, trackedAgent.agent_type, normalized.prompt ?? '', parentMode, normalized.model, agentDescription, agentName);
+                }
+                catch { /* best-effort */ }
+            }
             const staleAgents = getStaleAgents(state);
             const runningCount = state.agents.filter((agent) => agent.status === "running").length;
             return {
@@ -1193,10 +1241,26 @@ export function processSubagentStop(input) {
     const writePath = resolveWritePath(normalized.cwd, sessionId);
     ensureParentDir(writePath);
     const lockPath = lockPathFor(writePath);
+    // Issue #3663: collect dirty-worktree evidence OUTSIDE the session-state
+    // lock. The collector is bounded by EVIDENCE_DEADLINE_MS (4s) — comfortably
+    // below the 5s SubagentStop hook budget with the 500ms run.cjs cushion — so
+    // the durable state write below can never be starved (B5). Holding the lock
+    // that long would also drop concurrent stop hooks (LOCK_OPTS.timeoutMs is
+    // 500ms). READ-ONLY, fail-closed, fail-open: a budget timeout degrades to a
+    // non-dirty evidence kind, never a thrown hook, and never commits/resets/
+    // removes anything.
+    let abnormalEvidence;
+    if (isAbnormalTermination(input)) {
+        try {
+            abnormalEvidence = collectWorktreeDirtyEvidence(normalized.cwd);
+        }
+        catch { /* evidence is best-effort; never break the stop hook */ }
+    }
     try {
         const processed = withLifecycleLock(lockPath, () => {
             const state = readTrackingState(normalized.cwd, sessionId);
-            const succeeded = normalized.success !== false;
+            const abnormal = isAbnormalTermination(input);
+            const succeeded = !abnormal;
             const nowIso = timestampIso(normalized.event_timestamp);
             const priorReceipt = findDeliveryReceipt(state, "stop", normalized.delivery_receipt);
             if (priorReceipt) {
@@ -1338,6 +1402,9 @@ export function processSubagentStop(input) {
                 }
             }
             const stoppedAgent = agentIndex !== -1 ? state.agents[agentIndex] : undefined;
+            if (stoppedAgent && abnormalEvidence) {
+                stoppedAgent.worktree_evidence = abnormalEvidence;
+            }
             recordDeliveryReceipt(state, stoppedAgent && normalized.delivery_receipt
                 ? {
                     action: "stop",
@@ -1379,13 +1446,27 @@ export function processSubagentStop(input) {
         if (processed.record) {
             const { stoppedAgent, succeeded, nowIso } = processed.record;
             try {
-                recordAgentStop(normalized.cwd, normalized.session_id, stoppedAgent.agent_id, stoppedAgent.agent_type, succeeded, stoppedAgent.duration_ms, stoppedAgent.synthetic
+                const baseStopMetadata = stoppedAgent.synthetic
                     ? {
                         synthetic: true,
                         telemetry_status: stoppedAgent.telemetry_status,
                         reason: stoppedAgent.telemetry_note,
                     }
-                    : undefined);
+                    : undefined;
+                const evidence = stoppedAgent.worktree_evidence;
+                const stopMetadata = evidence && evidence.kind === "dirty"
+                    ? {
+                        ...(baseStopMetadata ?? {}),
+                        dirty_worktree: {
+                            tracked: evidence.trackedCount,
+                            untracked: evidence.untrackedCount,
+                            ignored: evidence.ignoredCount,
+                            worktree_root: evidence.worktreeRoot ?? "",
+                            truncated: evidence.truncated,
+                        },
+                    }
+                    : baseStopMetadata;
+                recordAgentStop(normalized.cwd, normalized.session_id, stoppedAgent.agent_id, stoppedAgent.agent_type, succeeded, stoppedAgent.duration_ms, stopMetadata);
             }
             catch { /* best-effort */ }
             if (!stoppedAgent.synthetic) {
@@ -1554,9 +1635,13 @@ export function getAgentDashboard(directory, sessionId) {
         const shortType = agent.agent_type.replace("oh-my-claudecode:", "");
         const toolCount = agent.tool_usage?.length || 0;
         const lastTool = agent.tool_usage?.[agent.tool_usage.length - 1]?.tool_name || "-";
-        const desc = agent.task_description
-            ? ` "${agent.task_description.substring(0, 60)}"`
-            : "";
+        // Prefer the Agent-tool description (with short id for disambiguation,
+        // #3665) over the prompt-derived task description when available.
+        const desc = agent.description
+            ? ` "${agent.description.substring(0, 60)} (${agent.agent_id.substring(0, 7)})"`
+            : agent.task_description
+                ? ` "${agent.task_description.substring(0, 60)}"`
+                : "";
         lines.push(`  [${agent.agent_id.substring(0, 7)}] ${shortType} (${elapsed}s) tools:${toolCount} last:${lastTool}${desc}`);
     }
     const stale = getStaleAgents(state);

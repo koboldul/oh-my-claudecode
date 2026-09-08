@@ -46,7 +46,7 @@ Or from Claude Code slash commands:
 /omc-teams ${agentSpec} "<implementation task from ${planPath}>"
 \`\`\`
 
-Requested worker types: ${requested}. Cursor workers are executor-style only; keep reviewer, critic, security-review, validation verdict, and final-approval work away from Cursor. Prompt-mode external providers, including Copilot, may serve reviewer roles when team role routing selects them; they must follow the structured verdict-file contract. Keep final approval with the lead orchestrator.${cursorGuidance}`;
+Requested worker types: ${requested}. CLI workers may receive their assigned team roles, including reviewer-style roles. Prompt-mode external providers, including Copilot, may serve reviewer roles when team role routing selects them. The roles \`critic\`, \`code-reviewer\`, \`security-reviewer\`, and \`test-engineer\` use the structured verdict-output contract, with the team leader owning the terminal task transition. Final approval remains a lead-session responsibility.${cursorGuidance}`;
 }
 export const executionAdapter = {
     id: "execution",
@@ -93,7 +93,7 @@ Every teammate response must stay concise: return ONLY a short execution summary
 
 ### Agent Selection
 
-${useCliTeamRuntime ? `Use the requested CLI worker spec for executor-style implementation tasks only. Keep task prompts framed as implementation/build/test-fix work; do not ask Cursor/CLI workers to act as reviewers, critics, security reviewers, or final verdict agents.` : `Match agent types to task complexity:
+${useCliTeamRuntime ? `Use the requested CLI worker spec for assigned implementation or reviewer tasks. For \`critic\`, \`code-reviewer\`, \`security-reviewer\`, and \`test-engineer\` work, require the structured verdict output and let the leader perform the terminal transition; do not assign final approval to a worker.` : `Match agent types to task complexity:
 - Simple tasks (single file, config): \`executor\` with \`model="haiku"\`
 - Standard implementation: \`executor\` with \`model="sonnet"\`
 - Complex work (architecture, refactoring): \`executor\` with \`model="opus"\`

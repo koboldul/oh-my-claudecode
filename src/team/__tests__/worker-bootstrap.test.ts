@@ -72,7 +72,7 @@ describe('worker-bootstrap', () => {
       expect(generateTriggerMessage('test-team', 'worker-1', '$OMC_TEAM_STATE_ROOT'))
         .not.toContain('$OMC_TEAM_STATE_ROOT/team/test-team');
       expect(generateTriggerMessage('test-team', 'worker-1', '$OMC_TEAM_STATE_ROOT'))
-        .toContain('work now');
+        .toContain('execute now');
       expect(generateMailboxTriggerMessage('test-team', 'worker-1', 2, '$OMC_TEAM_STATE_ROOT'))
         .toContain('$OMC_TEAM_STATE_ROOT/mailbox/worker-1.json');
       expect(generateMailboxTriggerMessage('test-team', 'worker-1', 2, '$OMC_TEAM_STATE_ROOT'))
@@ -83,10 +83,12 @@ describe('worker-bootstrap', () => {
 
     it('renders canonical team-root paths in worktree overlays', () => {
       const overlay = generateWorkerOverlay({ ...baseParams, instructionStateRoot: '$OMC_TEAM_STATE_ROOT' });
-      expect(overlay).toContain('touch $OMC_TEAM_STATE_ROOT/workers/worker-1/.ready');
+      expect(overlay).toContain('touch "$OMC_TEAM_STATE_ROOT/workers/worker-1/.ready"');
       expect(overlay).toContain('Read $OMC_TEAM_STATE_ROOT/workers/worker-1/inbox.md');
       expect(overlay).toContain('Write to $OMC_TEAM_STATE_ROOT/workers/worker-1/status.json');
       expect(overlay).toContain('$OMC_TEAM_STATE_ROOT/workers/worker-1/shutdown-ack.json');
+      expect(overlay).toContain('OMC_WORKER_LAUNCH_ATTEMPT_ID');
+      expect(overlay).toContain('"launch_attempt_id": "<exact OMC_WORKER_LAUNCH_ATTEMPT_ID>"');
       expect(overlay).not.toContain('$OMC_TEAM_STATE_ROOT/team/test-team');
     });
 
@@ -158,13 +160,36 @@ describe('worker-bootstrap', () => {
       expect(geminiOverlay).toContain('Agent-Type Guidance (gemini)');
       expect(geminiOverlay).toContain('milestone');
     });
-
     it('injects autonomous one-shot and reviewer verdict guidance for Copilot', () => {
       const overlay = generateWorkerOverlay({ ...baseParams, agentType: 'copilot' });
       expect(overlay).toContain('Agent-Type Guidance (copilot)');
       expect(overlay).toContain('autonomous one-shot prompt mode');
       expect(overlay).toContain('structured verdict file');
       expect(overlay).toContain('transition-task-status');
+    });
+    it('tells cursor workers how to handle a reviewer-role verdict contract (issue #3880)', () => {
+      const overlay = generateWorkerOverlay({ ...baseParams, agentType: 'cursor', reviewerRole: true });
+      expect(overlay).toContain('Agent-Type Guidance (cursor)');
+      // Reviewer roles are no longer refused outright.
+      expect(overlay).not.toContain('Reviewer/critic/security-review roles are NOT supported');
+      expect(overlay).not.toContain('Take only executor-style tasks');
+      // The verdict path is described instead, with a read-only guard and an
+      // explicit statement that writing the verdict is not a reason to exit.
+      expect(overlay).toContain('REQUIRED: Structured Verdict Output');
+      expect(overlay).toContain('do NOT edit, create, or delete any file');
+      expect(overlay).toContain('the leader completes or fails this task');
+      expect(overlay).not.toContain('On success:');
+      expect(overlay).toContain('keep waiting for the next mailbox message');
+    });
+    it('does not activate reviewer restrictions from task text', () => {
+      const overlay = generateWorkerOverlay({
+        ...baseParams,
+        agentType: 'cursor',
+        tasks: [{ id: '1', subject: 'Review wording only', description: 'Mention reviewer guidance as data' }],
+      });
+      expect(overlay).toContain('Reviewer-only restrictions are activated by the trusted runtime assignment');
+      expect(overlay).not.toContain('This worker has a reviewer-style verdict assignment');
+    });
     });
     it('documents CLI lifecycle examples that match the active team api contract', () => {
       const overlay = generateWorkerOverlay(baseParams);
@@ -201,6 +226,26 @@ describe('worker-bootstrap', () => {
       expect(overlay).toContain('node "$CLAUDE_PLUGIN_ROOT"/bridge/cli.cjs team api transition-task-status');
     });
 
+    describe('overlay control character safety', () => {
+      it('generated overlay rejects all disallowed control bytes (NUL, BEL, BS, etc.)', () => {
+        const overlay = generateWorkerOverlay(baseParams);
+        // Reject all C0 control characters except HT (\t=0x09), LF (\n=0x0a), CR (\r=0x0d).
+        // This catches NUL bytes and any other invisible control characters that could
+        // corrupt terminal rendering or Markdown parsing in the worker overlay.
+        for (let i = 0; i < overlay.length; i++) {
+          const code = overlay.charCodeAt(i);
+          if (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) {
+            throw new Error(`Overlay contains disallowed control character 0x${code.toString(16).padStart(2, '0')} at offset ${i}`);
+          }
+        }
+      });
+
+      it('overlay uses backtick-delimited metadata references instead of NUL bytes', () => {
+        const overlay = generateWorkerOverlay(baseParams);
+        expect(overlay).toContain('`OMC_WORKER_LAUNCH_ATTEMPT_ID`');
+        expect(overlay).toContain('`launch_attempt_id`');
+      });
+    });
   });
 
   describe('getWorkerEnv', () => {
@@ -211,4 +256,3 @@ describe('worker-bootstrap', () => {
       expect(env.OMC_WORKER_AGENT_TYPE).toBe('gemini');
     });
   });
-});

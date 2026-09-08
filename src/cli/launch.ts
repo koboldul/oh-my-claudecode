@@ -9,14 +9,19 @@ import {
   copyFileSync,
   existsSync,
   lstatSync,
+  linkSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'fs';
 import { homedir } from 'os';
-import { basename, dirname, join } from 'path';
+import { basename, dirname, isAbsolute, join, resolve } from 'path';
+import { atomicWriteJsonSync } from '../lib/atomic-write.js';
+import { lockPathFor, withFileLockSync } from '../lib/file-lock.js';
 import { resolvePluginDirArg } from '../lib/plugin-dir.js';
 import { stripRetiredTeamMcpServers } from '../installer/mcp-registry.js';
 import { getClaudeConfigDir } from '../utils/config-dir.js';
@@ -96,6 +101,10 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function readJsonObject(path: string): Record<string, unknown> | null {
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf-8')) as unknown;
@@ -105,16 +114,392 @@ function readJsonObject(path: string): Record<string, unknown> | null {
   }
 }
 
-function refreshRuntimeClaudeJsonMcpServers(baseConfigDir: string, runtimeClaudeJsonPath: string): void {
-  const sourceClaudeJsonPath = join(dirname(baseConfigDir), '.claude.json');
-  const sourceClaudeJson = readJsonObject(sourceClaudeJsonPath);
-  if (!sourceClaudeJson || !isJsonObject(sourceClaudeJson.mcpServers)) {
+interface OAuthCredentialCandidate {
+  nested: boolean;
+  expiresAt: number;
+  fields: Record<string, unknown>;
+}
+
+interface CredentialFileInspection {
+  exists: boolean;
+  regularFile: boolean;
+  readable: boolean;
+  valid: boolean;
+  parsed: Record<string, unknown> | null;
+  candidate: OAuthCredentialCandidate | null;
+}
+
+const OAUTH_CREDENTIAL_FIELDS = [
+  'accessToken',
+  'refreshToken',
+  'expiresAt',
+  'scopes',
+  'subscriptionType',
+  'rateLimitTier',
+  'organizationUuid',
+  'accountUuid',
+  'emailAddress',
+  'email',
+  'hasExtraUsageEnabled',
+] as const;
+
+function extractOAuthCandidate(parsed: Record<string, unknown>): OAuthCredentialCandidate | null {
+  const inspect = (record: Record<string, unknown>, nested: boolean): OAuthCredentialCandidate | null => {
+    const accessToken = record.accessToken;
+    const expiresAt = record.expiresAt;
+    if (typeof accessToken !== 'string' || accessToken.trim().length === 0) return null;
+    if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) return null;
+
+    const fields: Record<string, unknown> = {};
+    for (const key of OAUTH_CREDENTIAL_FIELDS) {
+      if (hasOwn(record, key)) fields[key] = record[key];
+    }
+    return { nested, expiresAt, fields };
+  };
+
+  if (isJsonObject(parsed.claudeAiOauth)) {
+    const nestedCandidate = inspect(parsed.claudeAiOauth, true);
+    if (nestedCandidate) return nestedCandidate;
+  }
+  return inspect(parsed, false);
+}
+
+function hasLinkableCredentials(inspection: CredentialFileInspection): boolean {
+  if (inspection.candidate) return true;
+  if (!inspection.parsed) return false;
+  const source = isJsonObject(inspection.parsed.claudeAiOauth)
+    ? inspection.parsed.claudeAiOauth
+    : inspection.parsed;
+  return typeof source.accessToken === 'string' && source.accessToken.trim().length > 0;
+}
+
+function inspectCredentialFile(path: string): CredentialFileInspection {
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error
+      ? (error as { code?: unknown }).code
+      : undefined;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+      return { exists: true, regularFile: false, readable: false, valid: false, parsed: null, candidate: null };
+    }
+    return { exists: false, regularFile: false, readable: false, valid: false, parsed: null, candidate: null };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf-8')) as unknown;
+  } catch {
+    return {
+      exists: true,
+      regularFile: stat.isFile(),
+      readable: false,
+      valid: false,
+      parsed: null,
+      candidate: null,
+    };
+  }
+
+  if (!isJsonObject(parsed)) {
+    return {
+      exists: true,
+      regularFile: stat.isFile(),
+      readable: true,
+      valid: false,
+      parsed: null,
+      candidate: null,
+    };
+  }
+
+  return {
+    exists: true,
+    regularFile: stat.isFile(),
+    readable: true,
+    valid: true,
+    parsed,
+    candidate: extractOAuthCandidate(parsed),
+  };
+}
+
+function credentialExpiry(parsed: Record<string, unknown>): number | null {
+  const source = isJsonObject(parsed.claudeAiOauth) ? parsed.claudeAiOauth : parsed;
+  const expiresAt = source.expiresAt;
+  return typeof expiresAt === 'number' && Number.isFinite(expiresAt) ? expiresAt : null;
+}
+
+function resolveCredentialWritePath(path: string): string {
+  let current = resolve(path);
+  const visited = new Set<string>();
+
+  while (true) {
+    if (visited.has(current)) {
+      throw new Error('Claude credential symlink chain contains a cycle');
+    }
+    visited.add(current);
+
+    let stat: ReturnType<typeof lstatSync>;
+    try {
+      stat = lstatSync(current);
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error
+        ? (error as { code?: unknown }).code
+        : undefined;
+      if (code === 'ENOENT' || code === 'ENOTDIR') return current;
+      throw error;
+    }
+
+    if (!stat.isSymbolicLink()) return current;
+    const target = readlinkSync(current);
+    current = isAbsolute(target) ? resolve(target) : resolve(dirname(current), target);
+  }
+}
+
+/** True only when source and runtime can be proven to be the same account. */
+function accountsProvenSame(
+  sourceClaudeJson: Record<string, unknown> | null,
+  runtimeClaudeJson: Record<string, unknown> | null,
+): boolean {
+  const sourceAccount = isJsonObject(sourceClaudeJson?.oauthAccount) ? sourceClaudeJson.oauthAccount : null;
+  const runtimeAccount = isJsonObject(runtimeClaudeJson?.oauthAccount) ? runtimeClaudeJson.oauthAccount : null;
+  if (!sourceAccount || !runtimeAccount) return false;
+
+  const sourceUuid = typeof sourceAccount.accountUuid === 'string' ? sourceAccount.accountUuid.trim() : '';
+  const runtimeUuid = typeof runtimeAccount.accountUuid === 'string' ? runtimeAccount.accountUuid.trim() : '';
+  if (sourceUuid && runtimeUuid) return sourceUuid === runtimeUuid;
+
+  let compared = false;
+  for (const key of ['emailAddress', 'email'] as const) {
+    const sourceValue = sourceAccount[key];
+    const runtimeValue = runtimeAccount[key];
+    const sourceEmail = typeof sourceValue === 'string' ? sourceValue.trim() : '';
+    const runtimeEmail = typeof runtimeValue === 'string' ? runtimeValue.trim() : '';
+    if (!sourceEmail || !runtimeEmail) continue;
+    compared = true;
+    if (sourceEmail.toLowerCase() !== runtimeEmail.toLowerCase()) return false;
+  }
+  return compared;
+}
+
+function credentialIdentitiesConflict(
+  baseCandidate: OAuthCredentialCandidate | null,
+  runtimeCandidate: OAuthCredentialCandidate,
+): boolean {
+  if (!baseCandidate) return false;
+
+  const baseUuid = typeof baseCandidate.fields.accountUuid === 'string'
+    ? baseCandidate.fields.accountUuid.trim()
+    : '';
+  const runtimeUuid = typeof runtimeCandidate.fields.accountUuid === 'string'
+    ? runtimeCandidate.fields.accountUuid.trim()
+    : '';
+  if (baseUuid || runtimeUuid) {
+    return !baseUuid || !runtimeUuid || baseUuid !== runtimeUuid;
+  }
+
+  for (const key of ['emailAddress', 'email'] as const) {
+    const baseValue = baseCandidate.fields[key];
+    const runtimeValue = runtimeCandidate.fields[key];
+    const baseEmail = typeof baseValue === 'string' ? baseValue.trim() : '';
+    const runtimeEmail = typeof runtimeValue === 'string' ? runtimeValue.trim() : '';
+    if (!baseEmail && !runtimeEmail) continue;
+    if (!baseEmail || !runtimeEmail) return true;
+    if (baseEmail.toLowerCase() !== runtimeEmail.toLowerCase()) return true;
+  }
+
+  return false;
+}
+
+function compareOnboardingVersion(left: unknown, right: unknown): number | null {
+  const toParts = (value: unknown): number[] | null => {
+    if (typeof value === 'number') return Number.isFinite(value) ? [value] : null;
+    if (typeof value !== 'string' || value.trim().length === 0) return null;
+    const parts = value.trim().split(/[.+-]/).map((part) => {
+      if (part.length === 0 || !/^\d+$/.test(part)) return Number.NaN;
+      return Number(part);
+    });
+    if (parts.some((part) => !Number.isFinite(part))) return null;
+    return parts;
+  };
+
+  const leftParts = toParts(left);
+  const rightParts = toParts(right);
+  if (!leftParts || !rightParts) return null;
+  const length = Math.max(leftParts.length, rightParts.length);
+  for (let index = 0; index < length; index += 1) {
+    const a = leftParts[index] ?? 0;
+    const b = rightParts[index] ?? 0;
+    if (a > b) return 1;
+    if (a < b) return -1;
+  }
+  return 0;
+}
+
+function refreshRuntimeClaudeJson(
+  baseConfigDir: string,
+  runtimeClaudeJsonPath: string,
+  sourceClaudeJson = readJsonObject(join(dirname(baseConfigDir), '.claude.json')),
+): void {
+  if (!sourceClaudeJson) return;
+
+  const runtimeClaudeJson = readJsonObject(runtimeClaudeJsonPath) ?? {};
+  let changed = false;
+
+  if (sourceClaudeJson.hasCompletedOnboarding === true && runtimeClaudeJson.hasCompletedOnboarding !== true) {
+    runtimeClaudeJson.hasCompletedOnboarding = true;
+    changed = true;
+  }
+
+  const sourceVersion = sourceClaudeJson.lastOnboardingVersion;
+  if (typeof sourceVersion === 'string' || typeof sourceVersion === 'number') {
+    const runtimeHasVersion = hasOwn(runtimeClaudeJson, 'lastOnboardingVersion');
+    const compared = compareOnboardingVersion(sourceVersion, runtimeClaudeJson.lastOnboardingVersion);
+    if (!runtimeHasVersion || (compared !== null && compared > 0)) {
+      runtimeClaudeJson.lastOnboardingVersion = sourceVersion;
+      changed = true;
+    }
+  }
+
+  if (hasOwn(sourceClaudeJson, 'oauthAccount')) {
+    const sourceAccount = sourceClaudeJson.oauthAccount;
+    if (sourceAccount === null || sourceAccount === undefined) {
+      if (hasOwn(runtimeClaudeJson, 'oauthAccount')) {
+        delete runtimeClaudeJson.oauthAccount;
+        changed = true;
+      }
+    } else if (!hasOwn(runtimeClaudeJson, 'oauthAccount')) {
+      runtimeClaudeJson.oauthAccount = sourceAccount;
+      changed = true;
+    } else if (!accountsProvenSame(sourceClaudeJson, runtimeClaudeJson)) {
+      // Prefer source account metadata when identities cannot be proven equal.
+      runtimeClaudeJson.oauthAccount = sourceAccount;
+      changed = true;
+    }
+  }
+
+
+  if (isJsonObject(sourceClaudeJson.mcpServers)) {
+    runtimeClaudeJson.mcpServers = sourceClaudeJson.mcpServers;
+    changed = true;
+  }
+
+  if (changed) {
+    writeFileSync(runtimeClaudeJsonPath, JSON.stringify(runtimeClaudeJson, null, 2));
+  }
+}
+
+function ensureMirroredCredentials(
+  sourcePath: string,
+  targetPath: string,
+  hasEligibleSourceCredentials: boolean,
+): void {
+  if (!existsSync(sourcePath)) return;
+
+  const removeExistingTarget = (): void => {
+    try {
+      lstatSync(targetPath);
+      rmSync(targetPath, { recursive: true, force: true });
+    } catch {
+      // A missing target is expected in a fresh staged directory.
+    }
+  };
+
+  removeExistingTarget();
+  try {
+    symlinkSync(sourcePath, targetPath, 'file');
+    return;
+  } catch {
+    removeExistingTarget();
+  }
+
+  try {
+    linkSync(sourcePath, targetPath);
+    return;
+  } catch {
+    removeExistingTarget();
+    if (hasEligibleSourceCredentials) {
+      throw new Error('Unable to mirror Claude credentials without copying credential content');
+    }
+  }
+}
+
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function reconcileRuntimeCredentials(
+  baseConfigDir: string,
+  runtimeCredentialsPath: string,
+  sourceClaudeJson: Record<string, unknown> | null,
+  preservedRuntimeClaudeJson: Record<string, unknown> | null,
+): void {
+  const runtimeInspection = inspectCredentialFile(runtimeCredentialsPath);
+  const runtimeCandidate = runtimeInspection.candidate;
+  if (!runtimeCandidate) return;
+
+  const baseCredentialsPath = join(baseConfigDir, '.credentials.json');
+  const baseInspection = inspectCredentialFile(baseCredentialsPath);
+  if (!baseInspection.exists) return;
+
+  if (!baseInspection.readable || !baseInspection.valid || !baseInspection.parsed) {
+    if (runtimeInspection.regularFile) {
+      throw new Error('Unable to read or parse base Claude credentials');
+    }
     return;
   }
 
-  const runtimeClaudeJson = readJsonObject(runtimeClaudeJsonPath) ?? {};
-  runtimeClaudeJson.mcpServers = sourceClaudeJson.mcpServers;
-  writeFileSync(runtimeClaudeJsonPath, JSON.stringify(runtimeClaudeJson, null, 2));
+  const baseExpiresAt = credentialExpiry(baseInspection.parsed);
+  if (baseExpiresAt === null || runtimeCandidate.expiresAt <= baseExpiresAt) return;
+  // Fail closed unless both sides prove the same account identity.
+  if (!accountsProvenSame(sourceClaudeJson, preservedRuntimeClaudeJson)) return;
+  // Credential fields may veto promotion but cannot establish account identity.
+  if (credentialIdentitiesConflict(baseInspection.candidate, runtimeCandidate)) return;
+
+  const mergedBaseCredentials = { ...baseInspection.parsed };
+  if (hasOwn(baseInspection.parsed, 'claudeAiOauth') || runtimeCandidate.nested) {
+    const existingNested = isJsonObject(baseInspection.parsed.claudeAiOauth)
+      ? baseInspection.parsed.claudeAiOauth
+      : {};
+    mergedBaseCredentials.claudeAiOauth = { ...existingNested, ...runtimeCandidate.fields };
+  } else {
+    Object.assign(mergedBaseCredentials, runtimeCandidate.fields);
+  }
+
+  atomicWriteJsonSync(resolveCredentialWritePath(baseCredentialsPath), mergedBaseCredentials);
+}
+
+function swapRuntimeConfigDir(runtimeConfigDir: string, nextConfigDir: string): void {
+  const previousConfigDir = `${runtimeConfigDir}.prev`;
+  let movedPrevious = false;
+  try {
+    rmSync(previousConfigDir, { recursive: true, force: true });
+    if (pathExists(runtimeConfigDir)) {
+      renameSync(runtimeConfigDir, previousConfigDir);
+      movedPrevious = true;
+    }
+    renameSync(nextConfigDir, runtimeConfigDir);
+  } catch (error) {
+    try {
+      if (movedPrevious && !pathExists(runtimeConfigDir) && pathExists(previousConfigDir)) {
+        renameSync(previousConfigDir, runtimeConfigDir);
+      }
+    } catch {
+      // Keep the original swap error; the previous directory remains available for recovery.
+    }
+    rmSync(nextConfigDir, { recursive: true, force: true });
+    throw error;
+  }
+
+  try {
+    rmSync(previousConfigDir, { recursive: true, force: true });
+  } catch {
+    // Best effort cleanup; the new runtime directory is already active.
+  }
 }
 
 export function prepareOmcLaunchConfigDir(baseConfigDir = getClaudeConfigDir()): string {
@@ -124,64 +509,93 @@ export function prepareOmcLaunchConfigDir(baseConfigDir = getClaudeConfigDir()):
   }
 
   const runtimeConfigDir = join(baseConfigDir, OMC_RUNTIME_DIRNAME);
+  const nextConfigDir = `${runtimeConfigDir}.next`;
   const runtimeClaudeJsonPath = join(runtimeConfigDir, '.claude.json');
-  const preservedClaudeJson = existsSync(runtimeClaudeJsonPath)
-    ? readFileSync(runtimeClaudeJsonPath)
-    : null;
+  const runtimeCredentialsPath = join(runtimeConfigDir, '.credentials.json');
+  const sourceClaudeJsonPath = join(dirname(baseConfigDir), '.claude.json');
+  const lifecycleLockPath = lockPathFor(join(baseConfigDir, '.omc-launch.prepare.lock'));
 
-  rmSync(runtimeConfigDir, { recursive: true, force: true });
-  mkdirSync(runtimeConfigDir, { recursive: true });
-  if (preservedClaudeJson) {
-    writeFileSync(runtimeClaudeJsonPath, preservedClaudeJson);
-  }
-  refreshRuntimeClaudeJsonMcpServers(baseConfigDir, runtimeClaudeJsonPath);
-  copyFileSync(companionPath, join(runtimeConfigDir, 'CLAUDE.md'));
+  return withFileLockSync(lifecycleLockPath, () => {
+    const preservedClaudeJson = pathExists(runtimeClaudeJsonPath)
+      ? readFileSync(runtimeClaudeJsonPath)
+      : null;
+    const preservedRuntimeClaudeJson = readJsonObject(runtimeClaudeJsonPath);
+    const sourceClaudeJson = readJsonObject(sourceClaudeJsonPath);
 
-  for (const entry of [
-    'agents',
-    'commands',
-    'hooks',
-    'hud',
-    'plugins',
-    'projects',
-    'rules',
-    'skills',
-    'themes',
-    OMC_CONFIG_FILE_REL,
-    '.omc-version.json',
-    '.omc-silent-update.json',
-    'keybindings.json',
-    'settings.json',
-    'settings.local.json',
-    '.credentials.json',
-  ]) {
-    ensureMirroredPath(
-      join(baseConfigDir, entry),
-      join(runtimeConfigDir, basename(entry)),
-      { allowCopyFallback: entry !== '.credentials.json' },
+    reconcileRuntimeCredentials(
+      baseConfigDir,
+      runtimeCredentialsPath,
+      sourceClaudeJson,
+      preservedRuntimeClaudeJson,
     );
-  }
 
-  const runtimeSettingsPath = join(runtimeConfigDir, 'settings.json');
-  if (existsSync(runtimeSettingsPath)) {
+    rmSync(nextConfigDir, { recursive: true, force: true });
     try {
-      const rawSettings = JSON.parse(readFileSync(runtimeSettingsPath, 'utf-8')) as Record<string, unknown>;
-      const repaired = stripRetiredTeamMcpServers(rawSettings);
-      if (repaired.changed) {
-        writeFileSync(runtimeSettingsPath, JSON.stringify(repaired.settings, null, 2));
+      mkdirSync(nextConfigDir, { recursive: true });
+      const nextClaudeJsonPath = join(nextConfigDir, '.claude.json');
+      if (preservedClaudeJson) {
+        writeFileSync(nextClaudeJsonPath, preservedClaudeJson);
       }
-    } catch {
-      // Best-effort compatibility repair; launch must continue even if a legacy
-      // settings file cannot be parsed or rewritten.
+      refreshRuntimeClaudeJson(baseConfigDir, nextClaudeJsonPath, sourceClaudeJson);
+      copyFileSync(companionPath, join(nextConfigDir, 'CLAUDE.md'));
+
+      for (const entry of [
+        'agents',
+        'commands',
+        'hooks',
+        'hud',
+        'plugins',
+        'projects',
+        'rules',
+        'skills',
+        'themes',
+        OMC_CONFIG_FILE_REL,
+        '.omc-version.json',
+        '.omc-silent-update.json',
+        'keybindings.json',
+        'settings.json',
+        'settings.local.json',
+      ]) {
+        ensureMirroredPath(
+          join(baseConfigDir, entry),
+          join(nextConfigDir, basename(entry)),
+        );
+      }
+
+      const baseCredentialsPath = join(baseConfigDir, '.credentials.json');
+      const baseCredentialInspection = inspectCredentialFile(baseCredentialsPath);
+      ensureMirroredCredentials(
+        baseCredentialsPath,
+        join(nextConfigDir, '.credentials.json'),
+        hasLinkableCredentials(baseCredentialInspection),
+      );
+
+      const runtimeSettingsPath = join(nextConfigDir, 'settings.json');
+      if (existsSync(runtimeSettingsPath)) {
+        try {
+          const rawSettings = JSON.parse(readFileSync(runtimeSettingsPath, 'utf-8')) as Record<string, unknown>;
+          const repaired = stripRetiredTeamMcpServers(rawSettings);
+          if (repaired.changed) {
+            writeFileSync(runtimeSettingsPath, JSON.stringify(repaired.settings, null, 2));
+          }
+        } catch {
+          // Best-effort compatibility repair; launch must continue even if a legacy
+          // settings file cannot be parsed or rewritten.
+        }
+      }
+
+      writeFileSync(
+        join(nextConfigDir, '.omc-launch-profile.json'),
+        JSON.stringify({ sourceConfigDir: baseConfigDir, sourceClaudeMd: companionPath }, null, 2),
+      );
+    } catch (error) {
+      rmSync(nextConfigDir, { recursive: true, force: true });
+      throw error;
     }
-  }
 
-  writeFileSync(
-    join(runtimeConfigDir, '.omc-launch-profile.json'),
-    JSON.stringify({ sourceConfigDir: baseConfigDir, sourceClaudeMd: companionPath }, null, 2),
-  );
-
-  return runtimeConfigDir;
+    swapRuntimeConfigDir(runtimeConfigDir, nextConfigDir);
+    return runtimeConfigDir;
+  }, { timeoutMs: 5000, retryDelayMs: 50 });
 }
 
 function isDefaultClaudeConfigDirPath(configDir: string): boolean {

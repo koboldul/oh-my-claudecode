@@ -2,7 +2,7 @@
  * Autopilot Cancellation
  *
  * Handles cancellation of autopilot, cleaning up all related state
- * including any active Ralph or UltraQA modes.
+ * including any active Ralph mode.
  */
 
 import {
@@ -12,8 +12,7 @@ import {
   updateAutopilotStateIfCurrent,
   updateAutopilotStateIfExact,
 } from './state.js';
-import { clearRalphState, clearLinkedUltraworkState, readRalphState } from '../ralph/index.js';
-import { clearUltraQAState, readUltraQAState } from '../ultraqa/index.js';
+import { clearRalphState, readRalphState } from '../ralph/index.js';
 import type { AutopilotState } from './types.js';
 import { namedWorkflowRuntimeSupported, validateNamedWorkflowState, validateNamedWorkflowStateStructure } from './named-workflow-resume-validator.js';
 import { clearModeStateFile, readModeState } from '../../lib/mode-state-io.js';
@@ -118,24 +117,15 @@ export function cancelAutopilot(directory: string, sessionId?: string): CancelRe
 
   const ralphState = sessionId ? readRalphState(directory, sessionId) : readRalphState(directory);
   if (ralphState?.active) {
-    let mayClearRalph = true;
-    if (ralphState.linked_ultrawork) {
-      const cleared = sessionId ? clearLinkedUltraworkState(directory, sessionId) : clearLinkedUltraworkState(directory);
-      if (cleared) cleanedUp.push('ultrawork');
-      else { failedCleanup.push('ultrawork'); mayClearRalph = false; }
-    }
-    if (mayClearRalph) {
-      const cleared = sessionId ? clearRalphState(directory, sessionId) : clearRalphState(directory);
-      if (cleared) cleanedUp.push('ralph');
-      else failedCleanup.push('ralph');
-    } else {
-      failedCleanup.push('ralph');
-    }
+    const cleared = sessionId ? clearRalphState(directory, sessionId) : clearRalphState(directory);
+    if (cleared) cleanedUp.push('ralph');
+    else failedCleanup.push('ralph');
   }
 
-  const ultraqaState = sessionId ? readUltraQAState(directory, sessionId) : readUltraQAState(directory);
-  if (ultraqaState?.active) {
-    const cleared = sessionId ? clearUltraQAState(directory, sessionId) : clearUltraQAState(directory);
+  // Bounded cleanup of pre-existing retired ultraqa state (5.0.0 removal).
+  const ultraqaState = readModeState('ultraqa', directory, sessionId);
+  if (ultraqaState?.active === true) {
+    const cleared = clearModeStateFile('ultraqa', directory, sessionId);
     if (cleared) cleanedUp.push('ultraqa');
     else failedCleanup.push('ultraqa');
   }
@@ -186,22 +176,14 @@ export function clearAutopilot(directory: string, sessionId?: string): CancelRes
   }
   const ralphState = sessionId ? readRalphState(directory, sessionId) : readRalphState(directory);
   if (ralphState) {
-    let mayClearRalph = true;
-    if (ralphState.linked_ultrawork) {
-      const cleared = sessionId ? clearLinkedUltraworkState(directory, sessionId) : clearLinkedUltraworkState(directory);
-      if (!cleared) { failedCleanup.push('ultrawork'); mayClearRalph = false; }
-    }
-    if (mayClearRalph) {
-      const cleared = sessionId ? clearRalphState(directory, sessionId) : clearRalphState(directory);
-      if (!cleared) failedCleanup.push('ralph');
-    } else {
-      failedCleanup.push('ralph');
-    }
+    const cleared = sessionId ? clearRalphState(directory, sessionId) : clearRalphState(directory);
+    if (!cleared) failedCleanup.push('ralph');
   }
 
-  const ultraqaState = sessionId ? readUltraQAState(directory, sessionId) : readUltraQAState(directory);
+  // Bounded cleanup of pre-existing retired ultraqa state (5.0.0 removal).
+  const ultraqaState = readModeState('ultraqa', directory, sessionId);
   if (ultraqaState) {
-    const cleared = sessionId ? clearUltraQAState(directory, sessionId) : clearUltraQAState(directory);
+    const cleared = clearModeStateFile('ultraqa', directory, sessionId);
     if (!cleared) failedCleanup.push('ultraqa');
   }
 

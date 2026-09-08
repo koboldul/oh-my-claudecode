@@ -11,8 +11,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { mkdirSync, rmSync, existsSync, readFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync } from 'fs';
 import { readFile } from 'fs/promises';
+import { getOmcRoot } from '../../lib/worktree-paths.js';
 
 type ExecFileCallback = (error: Error | null, stdout: string, stderr: string) => void;
 
@@ -33,7 +34,6 @@ import { killWorkerPanes, killTeamSession } from '../../team/tmux-session.js';
 
 let killedPanes: string[] = [];
 let killedSessions: string[] = [];
-
 beforeEach(async () => {
   killedPanes = [];
   killedSessions = [];
@@ -48,6 +48,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.clearAllMocks();
+  vi.unstubAllEnvs();
 });
 
 // ─── killWorkerPanes ─────────────────────────────────────────────────────────
@@ -83,8 +84,14 @@ describe('killWorkerPanes', () => {
   });
 
   it('writes shutdown sentinel before force-killing', async () => {
-    const cwd = join(tmpdir(), `omc-cleanup-test-${process.pid}`);
-    const stateDir = join(cwd, '.omc', 'state', 'team', 'myteam');
+    const cwd = mkdtempSync(join(tmpdir(), 'omc-cleanup-test-'));
+    const previousHome = process.env.HOME;
+    const previousUserProfile = process.env.USERPROFILE;
+    const previousStateDir = process.env.OMC_STATE_DIR;
+    process.env.HOME = cwd;
+    process.env.USERPROFILE = cwd;
+    process.env.OMC_STATE_DIR = cwd;
+    const stateDir = join(getOmcRoot(cwd), 'state', 'team', 'myteam');
     mkdirSync(stateDir, { recursive: true });
 
     try {
@@ -100,6 +107,12 @@ describe('killWorkerPanes', () => {
       expect(content).toHaveProperty('requestedAt');
       expect(typeof content.requestedAt).toBe('number');
     } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = previousUserProfile;
+      if (previousStateDir === undefined) delete process.env.OMC_STATE_DIR;
+      else process.env.OMC_STATE_DIR = previousStateDir;
       rmSync(cwd, { recursive: true, force: true });
     }
   });
@@ -125,16 +138,15 @@ describe('killTeamSession', () => {
     expect(killedSessions).toHaveLength(0);
   });
 
-  it('kills worker panes in split-pane mode', async () => {
+  it('preserves worker panes when split-pane membership cannot be proven', async () => {
     await killTeamSession('mysession:1', ['%2', '%3'], '%1');
-    expect(killedPanes).toContain('%2');
-    expect(killedPanes).toContain('%3');
+    expect(killedPanes).toEqual([]);
   });
 
-  it('skips leaderPaneId in split-pane mode', async () => {
+  it('still skips the leader when split-pane membership is unavailable', async () => {
     await killTeamSession('mysession:1', ['%1', '%2'], '%1');
     expect(killedPanes).not.toContain('%1');
-    expect(killedPanes).toContain('%2');
+    expect(killedPanes).toEqual([]);
   });
 
   it('is a no-op in split-pane mode when paneIds is empty', async () => {
@@ -150,6 +162,7 @@ describe('killTeamSession', () => {
   });
 
   it('calls kill-session for session-mode sessions (no ":" in name)', async () => {
+    vi.stubEnv('TMUX', '');
     await killTeamSession('omc-team-myteam-worker1');
     expect(killedSessions).toContain('omc-team-myteam-worker1');
   });

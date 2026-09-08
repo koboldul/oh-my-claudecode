@@ -471,7 +471,13 @@ describe('permission-handler', () => {
     describe('isActiveModeRunning', () => {
         const testDir = '/tmp/omc-permission-test';
         const stateDir = path.join(testDir, '.omc', 'state');
+        let previousHome;
+        let previousUserProfile;
         beforeEach(() => {
+            previousHome = process.env.HOME;
+            previousUserProfile = process.env.USERPROFILE;
+            process.env.HOME = testDir;
+            process.env.USERPROFILE = testDir;
             // Clean up any existing test directory
             if (fs.existsSync(testDir)) {
                 fs.rmSync(testDir, { recursive: true, force: true });
@@ -481,6 +487,14 @@ describe('permission-handler', () => {
             if (fs.existsSync(testDir)) {
                 fs.rmSync(testDir, { recursive: true, force: true });
             }
+            if (previousHome === undefined)
+                delete process.env.HOME;
+            else
+                process.env.HOME = previousHome;
+            if (previousUserProfile === undefined)
+                delete process.env.USERPROFILE;
+            else
+                process.env.USERPROFILE = previousUserProfile;
         });
         it('should return false when no state directory exists', () => {
             expect(isActiveModeRunning(testDir)).toBe(false);
@@ -533,7 +547,13 @@ describe('permission-handler', () => {
     describe('processPermissionRequest', () => {
         const testDir = '/tmp/omc-permission-test';
         const stateDir = path.join(testDir, '.omc', 'state');
+        let previousHome;
+        let previousUserProfile;
         beforeEach(() => {
+            previousHome = process.env.HOME;
+            previousUserProfile = process.env.USERPROFILE;
+            process.env.HOME = testDir;
+            process.env.USERPROFILE = testDir;
             clearWorktreeCache();
             if (fs.existsSync(testDir)) {
                 fs.rmSync(testDir, { recursive: true, force: true });
@@ -544,6 +564,14 @@ describe('permission-handler', () => {
                 fs.rmSync(testDir, { recursive: true, force: true });
             }
             clearWorktreeCache();
+            if (previousHome === undefined)
+                delete process.env.HOME;
+            else
+                process.env.HOME = previousHome;
+            if (previousUserProfile === undefined)
+                delete process.env.USERPROFILE;
+            else
+                process.env.USERPROFILE = previousUserProfile;
         });
         const createInput = (command) => ({
             session_id: 'test-session',

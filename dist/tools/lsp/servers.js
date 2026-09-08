@@ -217,6 +217,19 @@ export const LSP_SERVERS = {
         installHint: 'Download from https://github.com/chipsalliance/verible/releases'
     }
 };
+const BASEDPYRIGHT_SERVER = {
+    name: 'Python Language Server (basedpyright)',
+    command: 'basedpyright-langserver',
+    args: ['--stdio'],
+    extensions: ['.py', '.pyw'],
+    installHint: 'uv tool install basedpyright'
+};
+/** Resolve the supported Python language server. Only exact basedpyright opts in. */
+export function resolvePythonServer() {
+    return process.env.OMC_PYTHON_LSP === 'basedpyright'
+        ? BASEDPYRIGHT_SERVER
+        : LSP_SERVERS.python;
+}
 /**
  * Check if a command exists in PATH.
  *
@@ -248,9 +261,9 @@ export function getServerForFile(filePath, workspaceRoot) {
     if (TYPESCRIPT_EXTENSIONS.includes(ext) && workspaceRoot) {
         return getTypeScriptServerForWorkspace(workspaceRoot);
     }
-    for (const [_, config] of Object.entries(LSP_SERVERS)) {
+    for (const [key, config] of Object.entries(LSP_SERVERS)) {
         if (config.extensions.includes(ext)) {
-            return config;
+            return key === 'python' ? resolvePythonServer() : config;
         }
     }
     return null;
@@ -259,10 +272,13 @@ export function getServerForFile(filePath, workspaceRoot) {
  * Get all available servers (installed and not installed)
  */
 export function getAllServers() {
-    return Object.values(LSP_SERVERS).map(config => ({
-        ...config,
-        installed: commandExists(config.command)
-    }));
+    return Object.values(LSP_SERVERS).map(config => {
+        const selectedConfig = config === LSP_SERVERS.python ? resolvePythonServer() : config;
+        return {
+            ...selectedConfig,
+            installed: commandExists(selectedConfig.command)
+        };
+    });
 }
 /**
  * Get the appropriate server for a language
@@ -318,7 +334,7 @@ export function getServerForLanguage(language) {
     };
     const serverKey = langMap[language.toLowerCase()];
     if (serverKey && LSP_SERVERS[serverKey]) {
-        return LSP_SERVERS[serverKey];
+        return serverKey === 'python' ? resolvePythonServer() : LSP_SERVERS[serverKey];
     }
     return null;
 }

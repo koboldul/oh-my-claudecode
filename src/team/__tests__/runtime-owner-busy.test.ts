@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -21,14 +21,38 @@ const launchMetadata = { worker_cli: 'claude' as const,
     binary: '/usr/bin/claude', args: ['--dangerously-skip-permissions'] } };
 
 let cwd: string;
+let previousHome: string | undefined;
+let previousUserProfile: string | undefined;
+let previousOmcStateDir: string | undefined;
+
+beforeEach(() => {
+  previousHome = process.env.HOME;
+  previousUserProfile = process.env.USERPROFILE;
+  previousOmcStateDir = process.env.OMC_STATE_DIR;
+});
+
+function mkdtempFixture(prefix: string): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  process.env.HOME = root;
+  process.env.USERPROFILE = root;
+  delete process.env.OMC_STATE_DIR;
+  return root;
+}
+
 afterEach(() => {
   vi.clearAllMocks();
   if (cwd) rmSync(cwd, { recursive: true, force: true });
+  if (previousHome === undefined) delete process.env.HOME;
+  else process.env.HOME = previousHome;
+  if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = previousUserProfile;
+  if (previousOmcStateDir === undefined) delete process.env.OMC_STATE_DIR;
+  else process.env.OMC_STATE_DIR = previousOmcStateDir;
 });
 
 describe('runtime owner team mutation contention', () => {
   it('returns team_mutation_busy without publishing a terminal final for the waiting recovery', async () => {
-    cwd = mkdtempSync(join(tmpdir(), 'runtime-owner-busy-'));
+    cwd = mkdtempFixture('runtime-owner-busy-');
     const teamName = 'busy-team';
     const configPath = absPath(cwd, TeamPaths.config(teamName));
     mkdirSync(join(configPath, '..'), { recursive: true });
@@ -56,7 +80,7 @@ describe('runtime owner team mutation contention', () => {
   });
 
   it('keeps recovery transient while a durable scale-down reservation is active', async () => {
-    cwd = mkdtempSync(join(tmpdir(), 'runtime-owner-scale-down-busy-'));
+    cwd = mkdtempFixture('runtime-owner-scale-down-busy-');
     const teamName = 'scale-down-busy-team';
     const configPath = absPath(cwd, TeamPaths.config(teamName));
     mkdirSync(join(configPath, '..'), { recursive: true });
@@ -81,7 +105,7 @@ describe('runtime owner team mutation contention', () => {
   });
 
   it('terminally rejects a persisted attempt secret with a mismatched durable identity tuple', async () => {
-    cwd = mkdtempSync(join(tmpdir(), 'runtime-owner-attempt-secret-'));
+    cwd = mkdtempFixture('runtime-owner-attempt-secret-');
     const teamName = 'attempt-team';
     const configPath = absPath(cwd, TeamPaths.config(teamName));
     mkdirSync(join(configPath, '..'), { recursive: true });
@@ -107,7 +131,7 @@ describe('runtime owner team mutation contention', () => {
 
 
   it('rejects PID-reuse takeover when the active recovery belongs to a different attempt', async () => {
-    cwd = mkdtempSync(join(tmpdir(), 'runtime-owner-pid-reuse-'));
+    cwd = mkdtempFixture('runtime-owner-pid-reuse-');
     const teamName = 'pid-reuse-team';
     const configPath = absPath(cwd, TeamPaths.config(teamName));
     mkdirSync(join(configPath, '..'), { recursive: true });
@@ -132,7 +156,7 @@ describe('runtime owner team mutation contention', () => {
     });
   });
   it('retains a committed pane on unknown liveness without spawning a duplicate replacement', async () => {
-    cwd = mkdtempSync(join(tmpdir(), 'runtime-owner-unknown-committed-pane-'));
+    cwd = mkdtempFixture('runtime-owner-unknown-committed-pane-');
     const teamName = 'committed-team';
     const configPath = absPath(cwd, TeamPaths.config(teamName));
     mkdirSync(join(configPath, '..'), { recursive: true });
@@ -165,7 +189,7 @@ describe('runtime owner team mutation contention', () => {
   });
 
   it.each(['alive', 'unknown', 'missing'] as const)('rechecks %s original-pane liveness after election before replay effects', async liveness => {
-    cwd = mkdtempSync(join(tmpdir(), `runtime-owner-precommit-${liveness}-`));
+    cwd = mkdtempFixture(`runtime-owner-precommit-${liveness}-`);
     const teamName = `precommit-${liveness}-team`;
     const requestId = `request-${liveness}`;
     const recoveryId = `recovery-${liveness}`;
@@ -223,7 +247,7 @@ describe('runtime owner team mutation contention', () => {
     ['launch_metadata_incomplete', undefined],
     ['launch_descriptor_unresolvable', { schema_version: 1, provider: 'claude', model: null, binary: 'claude', args: [] }],
   ] as const)('rejects %s before recovery pane effects', async (expectedError, launchDescriptor) => {
-    cwd = mkdtempSync(join(tmpdir(), 'runtime-owner-launch-metadata-'));
+    cwd = mkdtempFixture('runtime-owner-launch-metadata-');
     const teamName = `launch-${expectedError}`;
     const configPath = absPath(cwd, TeamPaths.config(teamName));
     mkdirSync(join(configPath, '..'), { recursive: true });
@@ -241,5 +265,91 @@ describe('runtime owner team mutation contention', () => {
       .resolves.toMatchObject({ outcome: 'failed', error: expectedError });
     expect(tmuxMocks.tmuxExecAsync.mock.calls.some(([args]) => args[0] === 'split-window')).toBe(false);
   });
+
+
+  it('allows recovery past a committed scale-up fence without team_mutation_busy', async () => {
+    cwd = mkdtempFixture('runtime-owner-committed-scale-up-');
+    const teamName = 'committed-scale-up-team';
+    const configPath = absPath(cwd, TeamPaths.config(teamName));
+    mkdirSync(join(configPath, '..'), { recursive: true });
+    const now = new Date().toISOString();
+    writeFileSync(configPath, JSON.stringify({
+      name: teamName, worker_count: 1,
+      workers: [{ name: 'worker-1', index: 1, ...launchMetadata, pane_id: '%1', replacement_generation: 1 }],
+      agent_type: 'claude', created_at: now, tmux_session: `${teamName}:0`, lifecycle_state: 'active', state_revision: 3,
+      // Durable post-commit fence after release write failure — reconcilable, non-blocking.
+      active_scale_up: {
+        operation_id: 'scale-up-committed-1', phase: 'committed', pid: 999999,
+        process_started_at: 'linux:1', state_revision: 3, created_at: now, updated_at: now,
+      },
+    }));
+    reserveRecoveryRequest(cwd, 'committed-scale-up-request', { operation: 'recover-worker',
+      workspaceHash: createHash('sha256').update(cwd).digest('hex'), teamName, workerName: 'worker-1' }, 'committed-scale-up-recovery');
+
+    const result = await executeRecoverDeadWorkerV2Owner({
+      teamName, cwd, workerName: 'worker-1', requestId: 'committed-scale-up-request',
+    });
+    expect(result.recoveryId).toBe('committed-scale-up-recovery');
+    // Recovery is allowed to proceed past the fence (may fail later for other reasons).
+    if (result.outcome === 'failed') {
+      expect(result.error).not.toBe('team_mutation_busy');
+    } else {
+      expect(['recovered', 'already_running']).toContain(result.outcome);
+    }
+  });
+
+  it.each(['reserved', 'effects', 'failed'] as const)(
+    'keeps recovery blocked while scale-up fence phase is %s',
+    async (phase) => {
+      cwd = mkdtempFixture(`runtime-owner-scale-up-${phase}-`);
+      const teamName = `scale-up-${phase}-team`;
+      const configPath = absPath(cwd, TeamPaths.config(teamName));
+      mkdirSync(join(configPath, '..'), { recursive: true });
+      const now = new Date().toISOString();
+      writeFileSync(configPath, JSON.stringify({
+        name: teamName, worker_count: 1,
+        workers: [{ name: 'worker-1', index: 1, ...launchMetadata, pane_id: '%1', replacement_generation: 1 }],
+        agent_type: 'claude', created_at: now, tmux_session: `${teamName}:0`, lifecycle_state: 'active', state_revision: 3,
+        active_scale_up: {
+          operation_id: `scale-up-${phase}-1`, phase, pid: 999999,
+          process_started_at: 'linux:1', state_revision: 3, created_at: now, updated_at: now,
+          ...(phase === 'failed' ? { failure_reason: 'test' } : {}),
+        },
+      }));
+      const requestId = `scale-up-${phase}-request`;
+      const recoveryId = `scale-up-${phase}-recovery`;
+      reserveRecoveryRequest(cwd, requestId, { operation: 'recover-worker',
+        workspaceHash: createHash('sha256').update(cwd).digest('hex'), teamName, workerName: 'worker-1' }, recoveryId);
+
+      await expect(executeRecoverDeadWorkerV2Owner({ teamName, cwd, workerName: 'worker-1', requestId }))
+        .resolves.toMatchObject({ outcome: 'failed', error: 'team_mutation_busy', recoveryId });
+      expect(readRecoveryOutcome(cwd, requestId)).toBeNull();
+    },
+  );
+
+  it('does not treat non-committed phase labels as committed even if other fields look durable', async () => {
+    cwd = mkdtempFixture('runtime-owner-stale-scale-up-label-');
+    const teamName = 'stale-scale-up-label-team';
+    const configPath = absPath(cwd, TeamPaths.config(teamName));
+    mkdirSync(join(configPath, '..'), { recursive: true });
+    const now = new Date().toISOString();
+    writeFileSync(configPath, JSON.stringify({
+      name: teamName, worker_count: 1,
+      workers: [{ name: 'worker-1', index: 1, ...launchMetadata, pane_id: '%1', replacement_generation: 1 }],
+      agent_type: 'claude', created_at: now, tmux_session: `${teamName}:0`, lifecycle_state: 'active', state_revision: 3,
+      // Foreign/stale-looking fence without the atomic committed phase proof.
+      active_scale_up: {
+        operation_id: 'foreign-op', phase: 'effects', pid: 1,
+        process_started_at: 'linux:foreign', state_revision: 3, created_at: now, updated_at: now,
+      },
+    }));
+    reserveRecoveryRequest(cwd, 'stale-label-request', { operation: 'recover-worker',
+      workspaceHash: createHash('sha256').update(cwd).digest('hex'), teamName, workerName: 'worker-1' }, 'stale-label-recovery');
+
+    await expect(executeRecoverDeadWorkerV2Owner({
+      teamName, cwd, workerName: 'worker-1', requestId: 'stale-label-request',
+    })).resolves.toMatchObject({ outcome: 'failed', error: 'team_mutation_busy', recoveryId: 'stale-label-recovery' });
+  });
+
 
 });

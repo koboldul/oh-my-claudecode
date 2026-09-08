@@ -15,6 +15,8 @@ import { validateTeamName } from './team-name.js';
 import { getOmcRoot } from '../lib/worktree-paths.js';
 import { tmuxExec, tmuxExecAsync, tmuxShell, tmuxCmdAsync } from '../cli/tmux-utils.js';
 import { configureTmuxClipboardForSession, configureTmuxClipboardForSessionAsync } from '../cli/tmux-clipboard.js';
+import { paneLineLooksLikeIdlePrompt } from './pane-readiness.js';
+import { awaitWorkerLaunchAcknowledgement, awaitWorkerLaunchProviderStarted, cleanupWorkerLaunchTransport, isWorkerLaunchAttemptAccepted, isWorkerLaunchAttemptCurrent, materializeWorkerLaunchTransport, prepareWorkerLaunchAttempt, retireAndCleanupCurrentWorkerLaunchAttempt, revokeWorkerLaunchAttempt, } from './worker-launch-ack.js';
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const execFileAsync = promisify(execFile);
 const TMUX_SESSION_PREFIX = 'omc-team';
@@ -33,33 +35,36 @@ export function isUnixLikeOnWindows() {
     return process.platform === 'win32' &&
         !!(process.env.MSYSTEM || process.env.MINGW_PREFIX);
 }
-export async function applyMainVerticalLayout(teamTarget) {
-    try {
-        await tmuxExecAsync(['select-layout', '-t', teamTarget, 'main-vertical']);
-    }
-    catch {
-        // Layout may not apply if only 1 pane; ignore.
-    }
+export async function applyMainVerticalLayout(teamTarget, options = {}) {
     try {
         const widthResult = await tmuxCmdAsync([
             'display-message', '-p', '-t', teamTarget, '#{window_width}',
         ]);
         const width = parseInt(widthResult.stdout.trim(), 10);
-        if (Number.isFinite(width) && width >= 40) {
-            const half = String(Math.floor(width / 2));
-            await tmuxExecAsync(['set-window-option', '-t', teamTarget, 'main-pane-width', half]);
-            await tmuxExecAsync(['select-layout', '-t', teamTarget, 'main-vertical']);
+        if (!Number.isFinite(width) || width < 40) {
+            throw new Error(`team_layout_window_width_invalid:${widthResult.stdout.trim() || 'empty'}`);
         }
+        const half = String(Math.floor(width / 2));
+        await tmuxExecAsync(['set-window-option', '-t', teamTarget, 'main-pane-width', half]);
     }
-    catch {
-        /* ignore layout sizing errors */
+    catch (error) {
+        if (options.required)
+            throw error;
+        return;
+    }
+    try {
+        await tmuxExecAsync(['select-layout', '-t', teamTarget, 'main-vertical']);
+    }
+    catch (error) {
+        if (options.required)
+            throw error;
     }
 }
 function isCmuxContext() {
     return detectTeamMultiplexerContext() === 'cmux';
 }
 function isCmuxSurfaceTarget(value) {
-    return isCmuxContext() && typeof value === 'string' && value.trim().length > 0 && !value.trim().startsWith('%');
+    return typeof value === 'string' && value.trim().length > 0 && !value.trim().startsWith('%');
 }
 async function cmuxExecAsync(args) {
     const result = await execFileAsync('cmux', args, { encoding: 'utf-8' });
@@ -432,19 +437,16 @@ export function buildWorkerLaunchSpec(shellPath) {
 function commandFingerprint(value) {
     return createHash('sha256').update(value).digest('hex').slice(0, 12);
 }
-function redactWorkerStartCommandForLog(command) {
-    return command
-        // POSIX env assignments in the generated launch command.
-        .replace(/\b([A-Za-z_][A-Za-z0-9_]*)='[^']*'/g, "$1='<redacted>'")
-        // Windows cmd env assignments.
-        .replace(/set "([A-Za-z_][A-Za-z0-9_]*)=[^"]*"/g, 'set "$1=<redacted>"')
-        // PowerShell env assignments.
-        .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)='[^']*'/g, "$env:$1='<redacted>'")
-        // Sensitive CLI flags that may appear in launchArgs.
-        .replace(/(--?[A-Za-z0-9_-]*(?:api[-_]?key|token|secret|password|credential|auth)[A-Za-z0-9_-]*)(?:=|\s+)(?:'[^']*'|"[^"]*"|\S+)/gi, '$1=<redacted>');
-}
-function workerStartCommandPreview(command, maxLength = 180) {
-    const redacted = redactWorkerStartCommandForLog(command).replace(/\s+/g, ' ').trim();
+export function redactBoundedDiagnostic(error, maxLength = 240) {
+    const raw = error instanceof Error ? error.message : String(error);
+    const redacted = raw
+        .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 <redacted>')
+        .replace(/("--?[A-Za-z0-9_-]*(?:api[-_]?key|token|secret|password|credential|auth)[A-Za-z0-9_-]*"\s*,\s*)"[^"]*"/gi, '$1"<redacted>"')
+        .replace(/("[A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIALS?)"\s*:\s*)"[^"]*"/gi, '$1"<redacted>"')
+        .replace(/(--?[A-Za-z0-9_-]*(?:api[-_]?key|token|secret|password|credential|auth)[A-Za-z0-9_-]*)(?:=|\s+)(?:'[^']*'|"[^"]*"|\S+)/gi, '$1=<redacted>')
+        .replace(/\b[A-Za-z_][A-Za-z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIALS?)=[^\s;]+/gi, '<redacted>')
+        .replace(/\s+/g, ' ')
+        .trim();
     return redacted.length > maxLength ? `${redacted.slice(0, maxLength)}…` : redacted;
 }
 function logWorkerSpawnDiagnostic(message) {
@@ -496,7 +498,8 @@ async function waitForShellReady(paneId, opts = {}) {
         }
         await sleep(pollIntervalMs);
     }
-    logWorkerSpawnDiagnostic(`worker shell readiness timed out pane=${paneId} timeoutMs=${timeoutMs} lastStatus=${JSON.stringify(lastStatus)}`);
+    logWorkerSpawnDiagnostic(`worker shell readiness timed out pane=${safePaneDiagnosticToken(paneId)} timeoutMs=${timeoutMs} ` +
+        `lastStatus=${JSON.stringify(redactBoundedDiagnostic(lastStatus, 128))}`);
     return false;
 }
 async function verifyWorkerStartCommandDelivered(paneId, startCmd) {
@@ -568,6 +571,10 @@ function workerPaneShellCommand() {
 function escapeForCmdSet(value) {
     return value.replace(/(["%])/g, '$1$1');
 }
+function assertSafeCmdValue(value) {
+    if (/[\r\n\0]/.test(value))
+        throw new Error('Invalid Windows command value: contains CR, LF, or NUL');
+}
 function shellNameFromPath(shellPath) {
     const shellName = basename(shellPath.replace(/\\/g, '/'));
     return shellName.replace(/\.(exe|cmd|bat)$/i, '');
@@ -612,83 +619,71 @@ function getLaunchWords(config) {
 export function buildWorkerStartCommand(config) {
     const shell = getDefaultShell();
     const launchSpec = buildWorkerLaunchSpec(process.env.SHELL);
-    const launchWords = getLaunchWords(config);
+    const providerLaunchWords = getLaunchWords(config);
+    const launchWords = config.launchAttempt
+        ? [process.execPath, config.launchAttempt.runtimeCliPath, '--worker-launch']
+        : providerLaunchWords;
+    const envVars = config.launchAttempt
+        ? {
+            ...config.envVars,
+            // Supervised launches carry the attempt-owned bootstrap descriptor by
+            // path (never inline): secrets stay out of the process list and tmux
+            // scrollback, and the delivered command stays small. The runtime CLI
+            // validates and consumes the descriptor before running the provider.
+            OMC_WORKER_LAUNCH_SPEC_FILE: config.launchAttempt.bootstrapDescriptorPath,
+        }
+        : config.envVars;
     const shouldSourceRc = process.env.OMC_TEAM_NO_RC !== '1';
     if (process.platform === 'win32' && !isUnixLikeOnWindows()) {
-        const envPrefix = Object.entries(config.envVars)
-            .map(([k, v]) => {
-            assertSafeEnvKey(k);
-            return `set "${k}=${escapeForCmdSet(v)}"`;
+        const windowsEnvVars = { ...envVars };
+        if (windowsEnvVars.OMC_WORKER_LAUNCH_SPEC) {
+            windowsEnvVars.OMC_WORKER_LAUNCH_SPEC_B64 = Buffer.from(windowsEnvVars.OMC_WORKER_LAUNCH_SPEC, 'utf8').toString('base64');
+            delete windowsEnvVars.OMC_WORKER_LAUNCH_SPEC;
+        }
+        if (windowsEnvVars.OMC_RECOVERY_GATE_SPEC) {
+            windowsEnvVars.OMC_RECOVERY_GATE_SPEC_B64 = Buffer.from(windowsEnvVars.OMC_RECOVERY_GATE_SPEC, 'utf8').toString('base64');
+            delete windowsEnvVars.OMC_RECOVERY_GATE_SPEC;
+        }
+        const envPrefix = Object.entries(windowsEnvVars)
+            .map(([key, value]) => {
+            assertSafeEnvKey(key);
+            assertSafeCmdValue(value);
+            return `set "${key}=${escapeForCmdSet(value)}"`;
         })
             .join(' && ');
-        const launch = config.launchBinary
-            ? launchWords.map((part) => `"${escapeForCmdSet(part)}"`).join(' ')
-            : launchWords[0];
+        const launch = launchWords.map(part => {
+            assertSafeCmdValue(part);
+            return `"${escapeForCmdSet(part)}"`;
+        }).join(' ');
         const cmdBody = envPrefix ? `${envPrefix} && ${launch}` : launch;
-        return `${shell} /d /s /c "${cmdBody}"`;
+        return `${shell} /d /s /c "${cmdBody}" & exit /b`;
     }
-    if (config.launchBinary) {
-        const envAssignments = Object.entries(config.envVars).map(([key, value]) => {
-            assertSafeEnvKey(key);
-            return `${key}=${shellEscape(value)}`;
-        });
-        const shellName = shellNameFromPath(shell) || 'bash';
-        const isFish = shellName === 'fish';
-        const execArgsCommand = isFish ? 'exec $argv' : 'exec "$@"';
-        // Use rcFile from launchSpec when shell matches; fall back to legacy derivation otherwise
-        let rcFile = (launchSpec.shell === shell ? launchSpec.rcFile : null) ?? '';
-        if (!rcFile && process.env.HOME) {
-            rcFile = isFish
-                ? `${process.env.HOME}/.config/fish/config.fish`
-                : `${process.env.HOME}/.${shellName}rc`;
-        }
-        let script;
-        if (isFish) {
-            // Fish uses different syntax for conditionals and sourcing
-            script = shouldSourceRc && rcFile
-                ? `test -f ${shellEscape(rcFile)}; and source ${shellEscape(rcFile)}; ${execArgsCommand}`
-                : execArgsCommand;
-        }
-        else {
-            script = shouldSourceRc && rcFile
-                ? `[ -f ${shellEscape(rcFile)} ] && . ${shellEscape(rcFile)}; ${execArgsCommand}`
-                : execArgsCommand;
-        }
-        // Fish doesn't support combined -lc; use separate -l -c flags
-        const shellFlags = isFish ? ['-l', '-c'] : ['-lc'];
-        // envAssignments are already shell-escaped (KEY='value'), so they must
-        // NOT go through shellEscape again — that would wrap them in a second
-        // layer of quotes, causing `env` to receive literal quote characters
-        // in the values (e.g. ANTHROPIC_MODEL="'us.anthropic...'" instead of
-        // ANTHROPIC_MODEL="us.anthropic..."). Issue #1415.
-        return [
-            shellEscape('env'),
-            ...envAssignments,
-            ...[shell, ...shellFlags, script, '--', ...launchWords].map(shellEscape),
-        ].join(' ');
-    }
-    const envString = Object.entries(config.envVars)
-        .map(([k, v]) => {
-        assertSafeEnvKey(k);
-        return `${k}=${shellEscape(v)}`;
-    })
-        .join(' ');
+    const envAssignments = Object.entries(envVars).map(([key, value]) => {
+        assertSafeEnvKey(key);
+        return `${key}=${shellEscape(value)}`;
+    });
     const shellName = shellNameFromPath(shell) || 'bash';
     const isFish = shellName === 'fish';
-    // Use rcFile from launchSpec when shell matches; fall back to legacy derivation otherwise
+    const execArgsCommand = isFish ? 'exec $argv' : 'exec "$@"';
     let rcFile = (launchSpec.shell === shell ? launchSpec.rcFile : null) ?? '';
     if (!rcFile && process.env.HOME) {
         rcFile = isFish
             ? `${process.env.HOME}/.config/fish/config.fish`
             : `${process.env.HOME}/.${shellName}rc`;
     }
-    let sourceCmd = '';
-    if (shouldSourceRc && rcFile) {
-        sourceCmd = isFish
-            ? `test -f "${rcFile}"; and source "${rcFile}"; `
-            : `[ -f "${rcFile}" ] && source "${rcFile}"; `;
-    }
-    return `env ${envString} ${shell} -c "${sourceCmd}exec ${launchWords[0]}"`;
+    const script = isFish
+        ? (shouldSourceRc && rcFile
+            ? `test -f ${shellEscape(rcFile)}; and source ${shellEscape(rcFile)}; ${execArgsCommand}`
+            : execArgsCommand)
+        : (shouldSourceRc && rcFile
+            ? `[ -f ${shellEscape(rcFile)} ] && . ${shellEscape(rcFile)}; ${execArgsCommand}`
+            : execArgsCommand);
+    const shellFlags = isFish ? ['-l', '-c'] : ['-lc'];
+    return [
+        shellEscape('env'),
+        ...envAssignments,
+        ...[shell, ...shellFlags, script, '--', ...launchWords].map(shellEscape),
+    ].join(' ');
 }
 /** Validate tmux is available. Throws with install instructions if not. */
 export function validateTmux(hasTmuxContext = false) {
@@ -800,8 +795,82 @@ export function spawnBridgeInSession(tmuxSession, bridgeScriptPath, configFilePa
         .join(' ');
     tmuxExec(['send-keys', '-t', tmuxSession, cmd, 'Enter'], { stripTmux: true, stdio: 'pipe', timeout: 5000 });
 }
-export async function splitTeamWorkerPaneWithEvidence(splitTarget, direction, cwd) {
-    const provider = isCmuxContext() ? 'cmux' : 'tmux';
+function paneIdentityIsProviderNative(provider, paneId) {
+    if (provider === 'tmux')
+        return /^%\d+$/.test(paneId);
+    return paneId.length <= 256 && !paneId.startsWith('%') && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(paneId);
+}
+export function proveWorkerPaneOwnership(evidence, constraints) {
+    if (!evidence.commandSucceeded)
+        return { ok: false, reason: 'split_failed' };
+    if (!evidence.paneId)
+        return { ok: false, reason: 'pane_id_missing' };
+    if (!paneIdentityIsProviderNative(evidence.provider, evidence.paneId))
+        return { ok: false, reason: 'pane_id_malformed' };
+    if (evidence.paneId === constraints.leaderPaneId)
+        return { ok: false, reason: 'leader_alias' };
+    if (constraints.requireNewFromSplitTarget !== false && evidence.paneId === evidence.splitTarget) {
+        return { ok: false, reason: 'split_target_alias' };
+    }
+    if (constraints.reservedPaneIds.includes(evidence.paneId))
+        return { ok: false, reason: 'reserved_worker_alias' };
+    return {
+        ok: true,
+        ownership: {
+            provider: evidence.provider,
+            providerTarget: constraints.providerTarget,
+            paneId: evidence.paneId,
+            splitTarget: evidence.splitTarget,
+            leaderPaneId: constraints.leaderPaneId,
+            reservedPaneIds: [...constraints.reservedPaneIds],
+            source: 'split',
+        },
+    };
+}
+export async function adoptWorkerPaneOwnership(input) {
+    const proved = proveWorkerPaneOwnership({
+        commandSucceeded: true,
+        provider: input.provider,
+        splitTarget: '',
+        direction: 'right',
+        rawOutput: '',
+        stderr: '',
+        paneId: input.paneId,
+    }, {
+        providerTarget: input.providerTarget,
+        leaderPaneId: input.leaderPaneId,
+        reservedPaneIds: input.reservedPaneIds,
+        requireNewFromSplitTarget: false,
+    });
+    if (!proved.ok)
+        return proved;
+    const membership = await verifyTeamTargetOwnership({
+        provider: input.provider,
+        providerTarget: input.providerTarget,
+        recipient: 'worker',
+        recipientRole: 'worker',
+        paneId: input.paneId,
+    }, input.dependencies);
+    if (membership.kind === 'foreign')
+        return { ok: false, reason: 'pane_foreign' };
+    if (membership.kind !== 'owned')
+        return { ok: false, reason: 'pane_membership_unavailable' };
+    return {
+        ok: true,
+        ownership: { ...proved.ownership, source: 'adopted' },
+    };
+}
+export async function workerPaneBelongsToProviderTarget(input) {
+    const membership = await verifyTeamTargetOwnership({
+        provider: input.provider,
+        providerTarget: input.providerTarget,
+        recipient: 'worker',
+        recipientRole: 'worker',
+        paneId: input.paneId,
+    }, input.dependencies);
+    return membership.kind === 'owned';
+}
+export async function splitTeamWorkerPaneWithEvidence(splitTarget, direction, cwd, provider = isCmuxContext() ? 'cmux' : 'tmux') {
     try {
         if (provider === 'cmux') {
             const splitResult = await cmuxSplitSurface(splitTarget, direction, cwd);
@@ -989,67 +1058,171 @@ export async function createTeamSession(teamName, workerCount, cwd, options = {}
  */
 export async function spawnWorkerInPane(sessionName, paneId, config) {
     validateTeamName(config.teamName);
-    const startCmd = buildWorkerStartCommand(config);
-    const fingerprint = commandFingerprint(startCmd);
-    const preview = workerStartCommandPreview(startCmd);
-    logWorkerSpawnDiagnostic(`worker start delivery begin session=${sessionName} pane=${paneId} ` +
-        `worker=${config.workerName} cmdSha=${fingerprint} cmdPreview=${JSON.stringify(preview)}`);
-    if (isCmuxSurfaceTarget(paneId)) {
-        try {
+    if (config.launchAttempt && config.launchAttempt.pane_id !== paneId) {
+        throw new Error('worker_launch_attempt_pane_mismatch');
+    }
+    let startCmd = '';
+    let fingerprint = config.launchAttempt?.attempt_id.slice(0, 12) ?? 'unbuilt';
+    let materializedTransport;
+    const nativeAttemptTransport = process.platform === 'win32'
+        && !isUnixLikeOnWindows()
+        && Boolean(config.launchAttempt)
+        && !isCmuxSurfaceTarget(paneId);
+    const supervisedLaunch = Boolean(config.launchAttempt);
+    const requireAcknowledgement = async () => {
+        if (!config.launchAttempt)
+            return;
+        const accepted = await awaitWorkerLaunchAcknowledgement(config.launchAttempt);
+        if (!accepted.ok) {
+            throw new Error(`worker_start_ack_${accepted.reason}:${config.workerName}:${paneId}:${config.launchAttempt.attempt_id.slice(0, 12)}`);
+        }
+        if (!await awaitWorkerLaunchProviderStarted(config.launchAttempt)) {
+            throw new Error(`worker_start_provider_failed:${config.workerName}:${paneId}:${config.launchAttempt.attempt_id.slice(0, 12)}`);
+        }
+    };
+    try {
+        if (supervisedLaunch && config.launchAttempt) {
+            // Every supervised launch (Windows native, cmux surface, or POSIX tmux)
+            // materializes the attempt-owned transport: owner + bootstrap descriptor
+            // + wrapper. Native Windows then delivers the wrapper command; POSIX and
+            // cmux deliver the runtime CLI invocation pointing at the descriptor.
+            materializedTransport = await materializeWorkerLaunchTransport({
+                attempt: config.launchAttempt,
+                providerArgv: getLaunchWords(config),
+                cwd: config.cwd,
+                providerEnv: config.envVars,
+                releaseAfterSpawn: Boolean(config.envVars.OMC_RECOVERY_GATE_SPEC),
+                windowsDelivery: nativeAttemptTransport,
+            });
+            startCmd = nativeAttemptTransport
+                ? materializedTransport.wrapperRelativePath
+                : buildWorkerStartCommand(config);
+        }
+        else {
+            startCmd = buildWorkerStartCommand(config);
+        }
+        const transportKind = nativeAttemptTransport
+            ? 'attempt_wrapper'
+            : supervisedLaunch
+                ? 'attempt_descriptor'
+                : 'inline';
+        fingerprint = commandFingerprint(startCmd);
+        const commandBytes = Buffer.byteLength(startCmd, 'utf8');
+        logWorkerSpawnDiagnostic(`worker start delivery begin session=${sessionName} pane=${paneId} ` +
+            `worker=${config.workerName} cmdSha=${fingerprint} cmdBytes=${commandBytes} ` +
+            `transport=${transportKind}`);
+        if (isCmuxSurfaceTarget(paneId)) {
             await cmuxSendSurface(paneId, startCmd);
             await cmuxSendSurfaceKey(paneId, 'Enter');
-            logWorkerSpawnDiagnostic(`worker start delivery sent session=${sessionName} pane=${paneId} ` +
-                `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=0`);
+            await requireAcknowledgement();
+            logWorkerSpawnDiagnostic(`worker start delivery accepted session=${sessionName} pane=${paneId} ` +
+                `worker=${config.workerName} cmdSha=${fingerprint}`);
             return;
         }
-        catch (error) {
-            logWorkerSpawnDiagnostic(`worker start delivery failed session=${sessionName} pane=${paneId} ` +
-                `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=1 error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
-            throw error;
+        const shellReady = await waitForShellReady(paneId);
+        if (!shellReady) {
+            throw new Error(`worker_start_shell_not_ready:${config.workerName}:${paneId}:${fingerprint}`);
         }
-    }
-    const shellReady = await waitForShellReady(paneId);
-    if (!shellReady) {
-        const reason = `worker_start_shell_not_ready:${config.workerName}:${paneId}:${fingerprint}`;
-        logWorkerSpawnDiagnostic(`worker start delivery failed session=${sessionName} pane=${paneId} ` +
-            `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=not_attempted reason=shell_not_ready`);
-        throw new Error(reason);
-    }
-    try {
-        // Use -l (literal) flag to prevent tmux key-name parsing of the command string.
         const sendResult = await tmuxExecAsync([
-            'send-keys', '-t', paneId, '-l', startCmd
+            'send-keys', '-t', paneId, '-l', startCmd,
         ], { timeout: 5000 });
         logWorkerSpawnDiagnostic(`worker start send-keys literal session=${sessionName} pane=${paneId} ` +
-            `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=0 stderr=${JSON.stringify(sendResult.stderr.trim())}`);
-    }
-    catch (error) {
-        logWorkerSpawnDiagnostic(`worker start send-keys literal failed session=${sessionName} pane=${paneId} ` +
-            `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=1 error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
-        throw error;
-    }
-    const delivered = await verifyWorkerStartCommandDelivered(paneId, startCmd);
-    if (!delivered) {
-        const reason = `worker_start_delivery_unverified:${config.workerName}:${paneId}:${fingerprint}`;
-        logWorkerSpawnDiagnostic(`worker start delivery verification failed session=${sessionName} pane=${paneId} ` +
-            `worker=${config.workerName} cmdSha=${fingerprint} cmdPreview=${JSON.stringify(preview)}`);
-        throw new Error(reason);
-    }
-    try {
+            `worker=${config.workerName} cmdSha=${fingerprint} cmdBytes=${commandBytes} ` +
+            `sendStatus=0 stderr=${JSON.stringify(redactBoundedDiagnostic(sendResult.stderr))}`);
+        if (!config.launchAttempt) {
+            const delivered = await verifyWorkerStartCommandDelivered(paneId, startCmd);
+            if (!delivered) {
+                throw new Error(`worker_start_delivery_unverified:${config.workerName}:${paneId}:${fingerprint}`);
+            }
+        }
         const enterResult = await tmuxExecAsync(['send-keys', '-t', paneId, 'Enter'], { timeout: 5000 });
         logWorkerSpawnDiagnostic(`worker start submit key sent session=${sessionName} pane=${paneId} ` +
-            `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=0 stderr=${JSON.stringify(enterResult.stderr.trim())}`);
-        const submitted = await verifyWorkerStartCommandSubmitted(paneId, startCmd);
-        if (!submitted) {
-            const reason = `worker_start_submit_unverified:${config.workerName}:${paneId}:${fingerprint}`;
-            logWorkerSpawnDiagnostic(`worker start submit verification failed session=${sessionName} pane=${paneId} ` +
-                `worker=${config.workerName} cmdSha=${fingerprint} cmdPreview=${JSON.stringify(preview)}`);
-            throw new Error(reason);
+            `worker=${config.workerName} cmdSha=${fingerprint} cmdBytes=${commandBytes} ` +
+            `sendStatus=0 stderr=${JSON.stringify(redactBoundedDiagnostic(enterResult.stderr))}`);
+        if (nativeAttemptTransport) {
+            const [status, observation] = await Promise.all([
+                getPaneCurrentCommandStatus(paneId),
+                capturePaneObservation(paneId, { operation: 'worker-start-post-enter' }),
+            ]);
+            const captured = observation.ok ? observation.captured : '';
+            const captureSha = captured ? commandFingerprint(captured) : 'none';
+            logWorkerSpawnDiagnostic(`worker start post-enter observation session=${sessionName} pane=${paneId} ` +
+                `worker=${config.workerName} cmdSha=${fingerprint} paneStatus=${JSON.stringify(status
+                    ? `${status.dead ? '1' : '0'} ${redactBoundedDiagnostic(status.command, 96)}` : 'unavailable')} ` +
+                `captureOk=${observation.ok} captureBytes=${Buffer.byteLength(captured, 'utf8')} captureSha=${captureSha}`);
+        }
+        if (config.launchAttempt) {
+            await requireAcknowledgement();
+        }
+        else {
+            const submitted = await verifyWorkerStartCommandSubmitted(paneId, startCmd);
+            if (!submitted) {
+                throw new Error(`worker_start_submit_unverified:${config.workerName}:${paneId}:${fingerprint}`);
+            }
         }
     }
     catch (error) {
-        logWorkerSpawnDiagnostic(`worker start submit failed session=${sessionName} pane=${paneId} ` +
-            `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=1 error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
+        if (config.launchAttempt) {
+            await revokeWorkerLaunchAttempt(config.launchAttempt, 'launch_failed').catch(() => undefined);
+        }
+        if (config.launchAttempt
+            && (!materializedTransport || existsSync(materializedTransport.bootstrapDescriptorPath))) {
+            const cleaned = await cleanupWorkerLaunchTransport(config.launchAttempt, 'launch_failed')
+                .catch(() => false);
+            if (!cleaned) {
+                logWorkerSpawnDiagnostic(`worker start transport cleanup unverified session=${sessionName} pane=${paneId} ` +
+                    `worker=${config.workerName} cmdSha=${fingerprint}`);
+            }
+        }
+        logWorkerSpawnDiagnostic(`worker start failed session=${sessionName} pane=${paneId} worker=${config.workerName} ` +
+            `cmdSha=${fingerprint} error=${JSON.stringify(redactBoundedDiagnostic(error))}`);
+        throw error;
+    }
+}
+export async function spawnOwnedWorkerInPane(sessionName, ownership, config) {
+    if (!config.provider)
+        throw new Error('worker_launch_provider_missing');
+    if (!config.launchBootstrapPath)
+        throw new Error('worker_launch_bootstrap_path_missing');
+    if (!config.launchStateCwd)
+        throw new Error('worker_launch_state_cwd_missing');
+    const attempt = await prepareWorkerLaunchAttempt({
+        cwd: config.launchStateCwd,
+        teamName: config.teamName,
+        workerName: config.workerName,
+        paneId: ownership.paneId,
+        provider: config.provider,
+        runtimeCliPath: config.launchBootstrapPath,
+        ...(config.launchContext ? { context: config.launchContext } : {}),
+    });
+    try {
+        const launchEnv = {
+            ...config.envVars,
+            OMC_WORKER_LAUNCH_ATTEMPT_ID: attempt.attempt_id,
+        };
+        if (launchEnv.OMC_RECOVERY_GATE_SPEC) {
+            const gate = JSON.parse(launchEnv.OMC_RECOVERY_GATE_SPEC);
+            launchEnv.OMC_RECOVERY_GATE_SPEC = JSON.stringify({ ...gate, launchAttempt: attempt });
+        }
+        await spawnWorkerInPane(sessionName, ownership.paneId, {
+            ...config,
+            envVars: launchEnv,
+            launchAttempt: attempt,
+        });
+        return { ownership, attempt, provider: config.provider };
+    }
+    catch (error) {
+        const cleaned = await retireAndCleanupCurrentWorkerLaunchAttempt(attempt, 'launch_failed', async () => {
+            try {
+                await killOwnedWorkerPane(ownership);
+                return await getWorkerLiveness(ownership.paneId) === 'dead';
+            }
+            catch {
+                return false;
+            }
+        }).catch(() => false);
+        if (!cleaned)
+            throw new Error(`worker_launch_cleanup_unverified:${config.workerName}:${ownership.paneId}`);
         throw error;
     }
 }
@@ -1059,20 +1232,30 @@ function normalizeTmuxCapture(value) {
 function normalizeTmuxCaptureForDelivery(value) {
     return value.replace(/\r/g, '').replace(/\s+/g, '');
 }
-async function capturePaneAsync(paneId, opts = {}) {
+function safePaneDiagnosticToken(paneId) {
+    return paneId.replace(/[^A-Za-z0-9%._:-]/g, '?').slice(0, 128);
+}
+async function capturePaneObservation(paneId, opts = {}) {
     try {
         if (isCmuxSurfaceTarget(paneId)) {
-            return await cmuxCaptureSurface(paneId);
+            return { ok: true, captured: await cmuxCaptureSurface(paneId) };
         }
         const args = opts.joinWrappedLines
             ? ['capture-pane', '-J', '-t', paneId, '-p', '-S', '-80']
             : ['capture-pane', '-t', paneId, '-p', '-S', '-80'];
         const result = await tmuxExecAsync(args);
-        return result.stdout;
+        return { ok: true, captured: result.stdout };
     }
-    catch {
-        return '';
+    catch (error) {
+        const operation = (opts.operation ?? 'capture').replace(/[^A-Za-z0-9._-]/g, '?').slice(0, 64);
+        const message = redactBoundedDiagnostic(error);
+        logWorkerSpawnDiagnostic(`pane capture failed operation=${operation} pane=${safePaneDiagnosticToken(paneId)} error=${JSON.stringify(message)}`);
+        return { ok: false, error: message };
     }
+}
+async function capturePaneAsync(paneId, opts = {}) {
+    const observation = await capturePaneObservation(paneId, opts);
+    return observation.ok ? observation.captured : '';
 }
 export async function captureTeamPane(paneId) {
     return capturePaneAsync(paneId);
@@ -1091,13 +1274,41 @@ export async function killTeamPane(paneId) {
     }
     await tmuxExecAsync(['kill-pane', '-t', paneId]);
 }
-function detectPaneTrustPromptKind(captured) {
+export async function killOwnedWorkerPane(ownership) {
+    const membership = await verifyTeamTargetOwnership({
+        provider: ownership.provider,
+        providerTarget: ownership.providerTarget,
+        recipient: 'worker',
+        recipientRole: 'worker',
+        paneId: ownership.paneId,
+    });
+    if (membership.kind !== 'owned')
+        throw new Error('owned_pane_membership_unverified');
+    if (ownership.provider === 'cmux') {
+        await cmuxCloseSurface(ownership.paneId);
+        return;
+    }
+    await tmuxExecAsync(['kill-pane', '-t', ownership.paneId]);
+}
+function detectPaneTrustPromptKind(captured, provider) {
     const lines = captured.split('\n').map(l => l.replace(/\r/g, '').trim()).filter(l => l.length > 0);
     const tail = lines.slice(-12);
+    const hasCursorTrustBanner = tail.some(l => /Workspace Trust Required/i.test(l));
+    const hasCursorTrustHint = tail.some(l => /Pass\s+--trust,\s*--yolo,\s*or\s+-f/i.test(l));
+    if ((provider === undefined || provider === 'cursor')
+        && hasCursorTrustBanner && (hasCursorTrustHint || tail.some(l => /Do you trust the contents of this directory\?/i.test(l)))) {
+        return 'cursor_workspace_trust';
+    }
     const hasDirectoryQuestion = tail.some(l => /Do you trust the contents of this directory\?/i.test(l));
     const hasDirectoryChoices = tail.some(l => /Yes,\s*continue|No,\s*quit|Press enter to continue/i.test(l));
     if (hasDirectoryQuestion && hasDirectoryChoices)
         return 'directory';
+    // cursor-agent asks the same question but offers no selectable answer: it
+    // prints "Workspace Trust Required", tells the operator to pass --trust/-f,
+    // and exits. There is nothing to dismiss, so this is reported as its own
+    // kind and never answered with keystrokes. Launch args carry `--force
+    // --trust` precisely so this state is unreachable; seeing it means a pane
+    // was started without them.
     const hasHookReview = tail.some(l => /Hooks need review/i.test(l));
     const hasHookTrustChoice = tail.some(l => /Continue without trusting/i.test(l));
     const hasHookConfirm = tail.some(l => /Press enter to confirm or esc to go back/i.test(l));
@@ -1105,16 +1316,19 @@ function detectPaneTrustPromptKind(captured) {
         return 'codex_hooks';
     return null;
 }
-export function paneHasTrustPrompt(captured) {
-    return detectPaneTrustPromptKind(captured) !== null;
+export function paneHasTrustPrompt(captured, provider) {
+    return detectPaneTrustPromptKind(captured, provider) !== null;
 }
-function paneHasClaudeStartupBanner(captured) {
+export function paneHasCursorWorkspaceTrustPrompt(captured) {
+    return detectPaneTrustPromptKind(captured, 'cursor') === 'cursor_workspace_trust';
+}
+function paneHasClaudeStartupBanner(captured, provider) {
     const lines = captured
         .split('\n')
         .map((line) => line.replace(/\r/g, '').trim())
         .filter((line) => line.length > 0)
         .slice(-20);
-    const lastPromptIndex = lines.findLastIndex(paneLineLooksLikeIdlePrompt);
+    const lastPromptIndex = lines.findLastIndex(line => paneLineLooksLikeIdlePrompt(line, provider));
     // Claude Code v2.1.x renders the permission-mode indicator
     // ("⏵⏵ bypass permissions on (shift+tab to cycle)") *below* the prompt
     // as a persistent idle-state UI element. If a prompt is present anywhere
@@ -1127,8 +1341,8 @@ function paneHasClaudeStartupBanner(captured) {
         || /^⏵⏵\s+/.test(line));
     return lastStartupBannerIndex >= 0;
 }
-function paneIsBootstrapping(captured) {
-    if (paneHasClaudeStartupBanner(captured))
+function paneIsBootstrapping(captured, provider) {
+    if (paneHasClaudeStartupBanner(captured, provider))
         return true;
     const lines = captured
         .split('\n')
@@ -1138,9 +1352,11 @@ function paneIsBootstrapping(captured) {
         || /\bmodel:\s*loading\b/i.test(line)
         || /\bconnecting\s+to\b/i.test(line));
 }
-export function paneHasActiveTask(captured) {
+export function paneHasActiveTask(captured, provider) {
     const lines = captured.split('\n').map(l => l.replace(/\r/g, '').trim()).filter(l => l.length > 0);
     const tail = lines.slice(-40);
+    if (provider === 'cursor' && tail.some(l => /ctrl\+c\s+to\s+stop/i.test(l)))
+        return true;
     if (tail.some(l => /\b\d+\s+background terminal running\b/i.test(l)))
         return true;
     if (tail.some(l => /esc to interrupt/i.test(l)))
@@ -1151,14 +1367,7 @@ export function paneHasActiveTask(captured) {
         return true;
     return false;
 }
-function paneLineLooksLikeIdlePrompt(line) {
-    // Claude Code can render its idle input prompt inside a box/left gutter
-    // (for example "│ ❯"). Treat that as ready while still requiring the prompt
-    // glyph to be at the visual start of the line, not embedded in arbitrary
-    // output text.
-    return /^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯]\s*/u.test(line);
-}
-export function paneLooksReady(captured) {
+export function paneLooksReady(captured, provider) {
     const content = captured.trimEnd();
     if (content === '')
         return false;
@@ -1168,14 +1377,19 @@ export function paneLooksReady(captured) {
         .filter(line => line.trim() !== '');
     if (lines.length === 0)
         return false;
-    if (paneHasTrustPrompt(content))
+    // A dismissible trust prompt still means the CLI is up and answering. The
+    // cursor workspace-trust banner is the opposite: the process already exited,
+    // so the pane is not ready and never will be without `--trust`.
+    if (detectPaneTrustPromptKind(content, provider) === 'cursor_workspace_trust')
+        return false;
+    if (paneHasTrustPrompt(content, provider))
         return true;
-    if (paneIsBootstrapping(content))
+    if (paneIsBootstrapping(content, provider))
         return false;
     const lastLine = lines[lines.length - 1];
-    if (paneLineLooksLikeIdlePrompt(lastLine))
+    if (paneLineLooksLikeIdlePrompt(lastLine, provider))
         return true;
-    return lines.some(paneLineLooksLikeIdlePrompt);
+    return lines.some(line => paneLineLooksLikeIdlePrompt(line, provider));
 }
 export async function waitForPaneReady(paneId, opts = {}) {
     const envTimeout = Number.parseInt(process.env.OMC_SHELL_READY_TIMEOUT_MS ?? '', 10);
@@ -1188,7 +1402,7 @@ export async function waitForPaneReady(paneId, opts = {}) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         const captured = await capturePaneAsync(paneId);
-        if (paneLooksReady(captured) && !paneHasActiveTask(captured)) {
+        if (paneLooksReady(captured, opts.provider) && !paneHasActiveTask(captured, opts.provider)) {
             return true;
         }
         await sleep(pollIntervalMs);
@@ -1200,15 +1414,122 @@ export async function waitForPaneReady(paneId, opts = {}) {
 function paneTailContainsLiteralLine(captured, text) {
     return normalizeTmuxCapture(captured).includes(normalizeTmuxCapture(text));
 }
-async function paneInCopyMode(paneId) {
+async function paneCopyModeObservation(paneId) {
     if (isCmuxSurfaceTarget(paneId))
         return false;
     try {
         const result = await tmuxCmdAsync(['display-message', '-t', paneId, '-p', '#{pane_in_mode}']);
         return result.stdout.trim() === '1';
     }
+    catch (error) {
+        logWorkerSpawnDiagnostic(`pane query failed operation=copy-mode pane=${safePaneDiagnosticToken(paneId)} error=${JSON.stringify(redactBoundedDiagnostic(error))}`);
+        return null;
+    }
+}
+async function paneInCopyMode(paneId) {
+    return (await paneCopyModeObservation(paneId)) ?? false;
+}
+async function sendLiteralPaneText(paneId, text) {
+    if (isCmuxSurfaceTarget(paneId)) {
+        await cmuxSendSurface(paneId, text);
+        return;
+    }
+    await tmuxExecAsync(['send-keys', '-t', paneId, '-l', '--', text]);
+}
+async function startupContextIsActive(context, attemptAlreadyFenced = false) {
+    return context.ownership.paneId === context.attempt.pane_id
+        && context.provider === context.attempt.provider
+        && await isWorkerLaunchAttemptAccepted(context.attempt)
+        && (attemptAlreadyFenced || await isWorkerLaunchAttemptCurrent(context.attempt));
+}
+export async function waitForStartupPaneReady(context, opts = {}) {
+    if (context.ownership.paneId !== context.attempt.pane_id || context.provider !== context.attempt.provider) {
+        return { ok: false, reason: 'ownership_mismatch' };
+    }
+    const timeoutMs = Number.isFinite(opts.timeoutMs) && (opts.timeoutMs ?? 0) > 0 ? Number(opts.timeoutMs) : 30_000;
+    const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) && (opts.pollIntervalMs ?? 0) > 0 ? Number(opts.pollIntervalMs) : 250;
+    const deadline = Date.now() + timeoutMs;
+    const handledSelectors = new Set();
+    while (Date.now() < deadline) {
+        if (!await startupContextIsActive(context, opts.attemptAlreadyFenced))
+            return { ok: false, reason: 'attempt_inactive' };
+        const copyMode = await paneCopyModeObservation(context.ownership.paneId);
+        if (copyMode === null)
+            return { ok: false, reason: 'copy_mode_unknown' };
+        if (copyMode)
+            return { ok: false, reason: 'copy_mode' };
+        const observation = await capturePaneObservation(context.ownership.paneId, { operation: 'startup-readiness' });
+        if (!observation.ok)
+            return { ok: false, reason: 'capture_failed' };
+        const captured = observation.captured;
+        const selector = detectPaneTrustPromptKind(captured, context.provider);
+        if (selector) {
+            // cursor-agent's workspace-trust banner has no selectable answer and the
+            // process is already gone, so there is nothing to drive. Report it under
+            // its own reason instead of blocking until readiness_timeout.
+            if (selector === 'cursor_workspace_trust') {
+                return { ok: false, reason: 'cursor_workspace_untrusted' };
+            }
+            const providerSupportsSelector = selector === 'codex_hooks'
+                ? context.provider === 'codex'
+                : context.provider === 'codex' || context.provider === 'claude';
+            if (!providerSupportsSelector)
+                return { ok: false, reason: 'selector_unsupported' };
+            if (handledSelectors.has(selector))
+                return { ok: false, reason: 'selector_persistent' };
+            await sendLiteralPaneText(context.ownership.paneId, selector === 'directory' ? '1' : '3');
+            await sendTeamPaneKey(context.ownership.paneId, 'Enter');
+            handledSelectors.add(selector);
+            await sleep(pollIntervalMs);
+            continue;
+        }
+        if (paneHasActiveTask(captured, context.provider))
+            return { ok: false, reason: 'pane_busy' };
+        if (paneLooksReady(captured, context.provider))
+            return { ok: true };
+        await sleep(pollIntervalMs);
+    }
+    return { ok: false, reason: 'readiness_timeout' };
+}
+export async function deliverStartupInbox(context, message, options = {}) {
+    if (message.length > 200)
+        return { ok: false, reason: 'message_too_long' };
+    const ready = await waitForStartupPaneReady(context, { attemptAlreadyFenced: options.attemptAlreadyFenced });
+    if (!ready.ok)
+        return { ok: false, reason: ready.reason };
+    try {
+        await sendLiteralPaneText(context.ownership.paneId, message);
+        await sleep(100);
+        await sendTeamPaneKey(context.ownership.paneId, 'C-m');
+        await sleep(120);
+        await sendTeamPaneKey(context.ownership.paneId, 'C-m');
+        return { ok: true, kind: 'attempted_unconfirmed' };
+    }
+    catch (error) {
+        logWorkerSpawnDiagnostic(`startup inbox attempt failed pane=${safePaneDiagnosticToken(context.ownership.paneId)} ` +
+            `attempt=${context.attempt.attempt_id.slice(0, 12)} error=${JSON.stringify(redactBoundedDiagnostic(error))}`);
+        return { ok: false, reason: 'startup_send_failed' };
+    }
+}
+export async function retryStartupInboxSubmit(context, message, options = {}) {
+    if (!await startupContextIsActive(context, options.attemptAlreadyFenced))
+        return 'unavailable';
+    const copyMode = await paneCopyModeObservation(context.ownership.paneId);
+    if (copyMode !== false)
+        return 'unavailable';
+    const observation = await capturePaneObservation(context.ownership.paneId, { operation: 'startup-submit-retry' });
+    if (!observation.ok || detectPaneTrustPromptKind(observation.captured, context.provider))
+        return 'unavailable';
+    if (paneHasActiveTask(observation.captured, context.provider))
+        return 'pane_busy';
+    if (!paneTailContainsLiteralLine(observation.captured, message))
+        return 'unavailable';
+    try {
+        await sendTeamPaneKey(context.ownership.paneId, 'Enter');
+        return 'resubmitted';
+    }
     catch {
-        return false;
+        return 'unavailable';
     }
 }
 export function shouldAttemptAdaptiveRetry(args) {
@@ -1257,6 +1578,11 @@ export async function sendToWorker(_sessionName, paneId, message) {
         }
         const paneBusy = paneHasActiveTask(initialCapture);
         const trustPromptKind = detectPaneTrustPromptKind(initialCapture);
+        if (trustPromptKind === 'cursor_workspace_trust') {
+            // Nothing to dismiss: cursor-agent printed the banner and exited. Sending
+            // keys here would type into a dead pane.
+            return false;
+        }
         if (trustPromptKind === 'directory') {
             await sendKey('C-m');
             await sleep(120);
@@ -1468,17 +1794,8 @@ function dedupeWorkerPaneIds(paneIds, leaderPaneId) {
     }
     return [...unique];
 }
-export async function resolveSplitPaneWorkerPaneIds(sessionName, recordedPaneIds, leaderPaneId) {
-    const resolved = dedupeWorkerPaneIds(recordedPaneIds ?? [], leaderPaneId);
-    if (!sessionName.includes(':'))
-        return resolved;
-    try {
-        const paneResult = await tmuxCmdAsync(['list-panes', '-t', sessionName, '-F', '#{pane_id}']);
-        return dedupeWorkerPaneIds([...resolved, ...paneResult.stdout.split('\n').map((paneId) => paneId.trim())], leaderPaneId);
-    }
-    catch {
-        return resolved;
-    }
+export async function resolveSplitPaneWorkerPaneIds(_sessionName, recordedPaneIds, leaderPaneId) {
+    return dedupeWorkerPaneIds(recordedPaneIds ?? [], leaderPaneId);
 }
 /**
  * Kill the team tmux session or just the worker panes, depending on how the
@@ -1492,45 +1809,89 @@ export async function killTeamSession(sessionName, workerPaneIds, leaderPaneId, 
     const sessionMode = options.sessionMode
         ?? (sessionName.includes(':') ? 'split-pane' : 'detached-session');
     if (sessionMode === 'split-pane') {
+        // Missing/empty pane evidence is NOT successful cleanup — callers must
+        // supply validated pane identities or treat cleanup as incomplete.
         if (!workerPaneIds?.length)
-            return;
+            return false;
+        const provider = sessionName.startsWith('cmux:') ? 'cmux' : 'tmux';
+        let cleaned = true;
         for (const id of workerPaneIds) {
             if (id === leaderPaneId)
                 continue;
             try {
-                await killTeamPane(id);
+                const membership = await verifyTeamTargetOwnership({
+                    provider,
+                    providerTarget: sessionName,
+                    recipient: 'worker',
+                    recipientRole: 'worker',
+                    paneId: id,
+                });
+                if (membership.kind !== 'owned') {
+                    cleaned = false;
+                    continue;
+                }
+                if (provider === 'cmux')
+                    await cmuxCloseSurface(id);
+                else
+                    await tmuxExecAsync(['kill-pane', '-t', id]);
             }
-            catch { /* already gone */ }
+            catch {
+                cleaned = false;
+            }
         }
-        return;
+        return cleaned;
     }
     if (sessionMode === 'dedicated-window') {
         try {
             await tmuxExecAsync(['kill-window', '-t', sessionName]);
+            return true;
         }
         catch {
-            // Window may already be gone.
+            // The kill-window command may fail because the window is already gone.
+            // Verify absence: only a successful list-windows that does NOT list
+            // the exact target window is proof of cleanup. A list-windows command
+            // failure is unknown, not success.
+            try {
+                const result = await tmuxCmdAsync(['list-windows', '-t', sessionName.split(':')[0] ?? sessionName]);
+                const windows = result.stdout.trim();
+                if (!windows)
+                    return true;
+                const windowIndex = sessionName.split(':')[1];
+                if (!windowIndex)
+                    return false; // ambiguous: no window index in session name
+                // Canonical match: each line in list-windows starts with "<index>:<name>"
+                // Match the exact index at line start, not a substring collision.
+                const windowPresent = windows.split('\n').some(line => {
+                    const match = line.trim().match(/^(\d+):/);
+                    return match !== null && match[1] === windowIndex;
+                });
+                return !windowPresent;
+            }
+            catch {
+                // list-windows itself failed (tmux unavailable, control error).
+                // This is unknown, NOT confirmed absence.
+                return false;
+            }
         }
-        return;
     }
     const sessionTarget = sessionName.split(':')[0] ?? sessionName;
     if (process.env.OMC_TEAM_ALLOW_KILL_CURRENT_SESSION !== '1' && process.env.TMUX) {
         try {
             const current = await tmuxCmdAsync(['display-message', '-p', '#S']);
             const currentSessionName = current.stdout.trim();
-            if (currentSessionName && currentSessionName === sessionTarget) {
-                return;
-            }
+            if (currentSessionName && currentSessionName === sessionTarget)
+                return false;
         }
         catch {
-            // If we cannot resolve current session safely, continue with best effort.
+            return false;
         }
     }
     try {
         await tmuxExecAsync(['kill-session', '-t', sessionTarget]);
+        return true;
     }
     catch {
-        // Session may already be dead.
+        return false;
     }
 }
 //# sourceMappingURL=tmux-session.js.map

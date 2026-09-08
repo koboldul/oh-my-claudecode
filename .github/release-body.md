@@ -1,38 +1,43 @@
-# oh-my-claudecode v4.15.7: Bug Fixes
+# oh-my-claudecode v5.3.0: Remote Approvals, Shipyard Navigation, and Windows Reliability
 
 ## Release Notes
 
-Release with **4 bug fixes**, **1 other change** across **5 merged PRs**.
+Release with **5 new features**, **3 bug fixes** across **8 merged PRs**.
 
 ### Highlights
 
-- **fix(psm): fail closed on malformed worktree results** (#3531)
-- **fix(psm): use jira-cli --raw instead of non-existent --output json** (#3529)
-- **fix(psm): use tmux-safe session names so sessions stay manageable** (#3530)
+- **perf: batch Windows cache occupancy identity checks** (#3973)
+- **feat(skills): add loft — shipyard shape-before-steel discipline (opt-in, model-invoked)** (#3970)
+- **feat(skills): add ask-navigator — shipyard navigator for foggy efforts (opt-in)** (#3969)
+- **perf(hud): scope git path memoization per render** (#3961)
+- **feat(graph): remote approval gates + workspace checkpoints/rollback** (#3960)
+
+### New Features
+
+- **perf: batch Windows cache occupancy identity checks** (#3973)
+- **feat(skills): add loft — shipyard shape-before-steel discipline (opt-in, model-invoked)** (#3970)
+- **feat(skills): add ask-navigator — shipyard navigator for foggy efforts (opt-in)** (#3969)
+- **perf(hud): scope git path memoization per render** (#3961)
+- **feat(graph): remote approval gates + workspace checkpoints/rollback** (#3960)
 
 ### Bug Fixes
 
-- **fix(psm): fail closed on malformed worktree results** (#3531)
-- **fix(psm): use jira-cli --raw instead of non-existent --output json** (#3529)
-- **fix(psm): use tmux-safe session names so sessions stay manageable** (#3530)
-- **fix(windows): separate prompt host and worker timeouts** (#3525)
-
-### Other Changes
-
-- **ci: add main generated-artifact authorization trust root** (#3540)
+- **fix: preserve Windows occupancy tick precision** (#3974)
+- **fix(hooks): preserve stderr after early protocol stdout close** (#3964)
+- **fix(hooks): omit unsupported PostToolUse suppressOutput** (#3958)
 
 ### Stats
 
-- **5 PRs merged** | **0 new features** | **4 bug fixes** | **0 security/hardening improvements** | **1 other change**
+- **8 PRs merged** | **5 new features** | **3 bug fixes** | **0 security/hardening improvements** | **0 other changes**
 
 ### Install / Update
 
-The npm CLI and the Claude Code marketplace/plugin are separate install tracks, not either/or replacements. Update whichever track you use; if you have both installed, update both. CLI-dependent skill paths such as `ask`, `ccg`, and CLI-backed `team` require the `omc` CLI from the npm package.
+The npm CLI and the Claude Code marketplace/plugin are separate install tracks, not either/or replacements. Update whichever track you use; if you have both installed, update both. CLI-dependent skill paths such as `ask` and CLI-backed `team` require the `omc` CLI from the npm package.
 
 **CLI / runtime:**
 
 ```bash
-npm install -g oh-my-claude-sisyphus@4.15.7
+npm install -g oh-my-claude-sisyphus@5.3.0
 ```
 
 **Claude Code plugin:**
@@ -41,10 +46,12 @@ npm install -g oh-my-claude-sisyphus@4.15.7
 /plugin marketplace update omc
 ```
 
-**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v4.15.6...v4.15.7
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v5.2.0...v5.3.0
+
+**Release tracking and owner authorization:** #3975
 
 ## Contributors
 
 Thank you to all contributors who made this release possible!
 
-@Yeachan-Heo
+@cuijieshan3-collab @pangpang778 @Yeachan-Heo

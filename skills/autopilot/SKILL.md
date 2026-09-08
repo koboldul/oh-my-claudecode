@@ -93,13 +93,13 @@ V1 does not support `stageModels`, model routing, provider or role selection; in
    - Critic (Opus): Validate plan
    - Output: `.omc/plans/autopilot-impl.md`
 
-3. **Phase 2 - Execution**: Implement the plan using Ralph + Ultrawork
+3. **Phase 2 - Execution**: Implement the plan using executor agents with Ralph persistence when needed
    - Executor (Haiku): Simple tasks
    - Executor (Sonnet): Standard tasks
    - Executor (Opus): Complex tasks
    - Run independent tasks in parallel
 
-4. **Phase 3 - QA**: Cycle until all tests pass (UltraQA mode)
+4. **Phase 3 - QA**: Cycle until all tests pass
    - Build, lint, test, fix failures
    - Repeat up to 5 cycles
    - Stop early if the same error repeats 3 times (indicates a fundamental issue)
@@ -111,7 +111,7 @@ V1 does not support `stageModels`, model routing, provider or role selection; in
    - All must approve; fix and re-validate on rejection
 
 6. **Phase 5 - Cleanup**: Delete all state files on successful completion
-   - Remove `.omc/state/autopilot-state.json`, `ralph-state.json`, `ultrawork-state.json`, `ultraqa-state.json`
+   - Remove `.omc/state/autopilot-state.json`, `ralph-state.json` (plus stale retired `ultraqa-state.json`/`ultrawork-state.json` if legacy copies exist)
    - Run `/oh-my-claudecode:cancel` for clean exit
 </Steps>
 
@@ -119,7 +119,7 @@ V1 does not support `stageModels`, model routing, provider or role selection; in
 - Use `Task(subagent_type="oh-my-claudecode:architect", ...)` for Phase 4 architecture validation
 - Use `Task(subagent_type="oh-my-claudecode:security-reviewer", ...)` for Phase 4 security review
 - Use `Task(subagent_type="oh-my-claudecode:code-reviewer", ...)` for Phase 4 quality review
-- Agents form their own analysis first, then spawn Claude Task agents for cross-validation
+- Agents form their own analysis and return it; the LEAD then spawns any cross-validation agents itself. Do not rely on a subagent spawning further subagents without checking the Claude Code depth setting: Claude Code 2.1.217–2.1.218 defaulted `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` to 1, while 2.1.219+ defaults to 3. Keep cross-validation at the LEAD level unless nested delegation is deliberate and supported by the active runtime.
 - Never block on external tools; proceed with available agents if delegation fails
 </Tool_Usage>
 
@@ -212,8 +212,7 @@ or the Claude Code slash compatibility surface:
 ```
 
 Limitations:
-- Cursor workers are executor-style only: implementation, file edits, build/test fixes, and other plan execution tasks.
-- Keep reviewer, critic, security-review, validation verdict, and final approval roles on native Claude/OMC reviewer agents unless explicit safe support is added later.
+- Cursor workers support implementation and reviewer-style team roles. `critic`, `code-reviewer`, `security-reviewer`, and `test-engineer` workers must emit the structured verdict file consumed by the team leader; final approval remains a lead-session responsibility.
 - Cursor requires the `cursor-agent` CLI to be installed and authenticated. If `cursor-agent` is unavailable, report that setup requirement instead of silently falling back to Claude-only execution.
 
 ## Resume
@@ -263,5 +262,5 @@ When autopilot detects a ralplan consensus plan (`.omc/plans/ralplan-*.md` or `.
 - Architecture-reviewed (ralplan Architect agent)
 - Quality-checked (ralplan Critic agent)
 
-Autopilot starts directly at Phase 2 (Execution via Ralph + Ultrawork).
+Autopilot starts directly at Phase 2 using executor agents and Ralph persistence.
 </Advanced>

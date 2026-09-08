@@ -1,8 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { TeamRoleProvider } from '../../../shared/types.js';
 
 const mocks = vi.hoisted(() => ({
   loadConfig: vi.fn(),
-  detectCli: vi.fn(),
+  probeCli: vi.fn(),
 }));
 
 vi.mock('../../../config/loader.js', () => ({
@@ -10,7 +11,7 @@ vi.mock('../../../config/loader.js', () => ({
 }));
 
 vi.mock('../../../team/cli-detection.js', () => ({
-  detectCli: mocks.detectCli,
+  probeCli: mocks.probeCli,
 }));
 
 import { doctorTeamRoutingCommand } from '../doctor-team-routing.js';
@@ -25,9 +26,8 @@ describe('doctor team-routing Copilot provider', () => {
         },
       },
     });
-    mocks.detectCli.mockImplementation((binary: string) => ({
-      available: true,
-      runnable: true,
+    mocks.probeCli.mockImplementation((binary: string) => ({
+      found: true,
       path: `C:\\Tools\\${binary}.exe`,
       version: `${binary} 1.0.0`,
     }));
@@ -37,8 +37,8 @@ describe('doctor team-routing Copilot provider', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     try {
       expect(await doctorTeamRoutingCommand({ json: true })).toBe(0);
-      expect(mocks.detectCli).toHaveBeenCalledWith('claude');
-      expect(mocks.detectCli).toHaveBeenCalledWith('copilot');
+      expect(mocks.probeCli).toHaveBeenCalledWith('claude');
+      expect(mocks.probeCli).toHaveBeenCalledWith('copilot');
 
       const report = JSON.parse(String(log.mock.calls[0]?.[0]));
       expect(report.probes).toEqual(expect.arrayContaining([
@@ -46,7 +46,6 @@ describe('doctor team-routing Copilot provider', () => {
           provider: 'copilot',
           binary: 'copilot',
           found: true,
-          runnable: true,
           path: 'C:\\Tools\\copilot.exe',
         }),
       ]));
@@ -55,17 +54,14 @@ describe('doctor team-routing Copilot provider', () => {
     }
   });
 
-  it('reports a resolved provider with a failed probe as unusable', async () => {
-    mocks.detectCli.mockImplementation((binary: string) => binary === 'copilot'
+  it('reports a missing provider when probe fails to find', async () => {
+    mocks.probeCli.mockImplementation((binary: string) => binary === 'copilot'
       ? {
-          available: true,
-          runnable: false,
-          path: 'C:\\Tools\\copilot.exe',
-          error: 'Version probe timed out after 5000ms.',
+          found: false,
+          error: 'CLI resolver failed',
         }
       : {
-          available: true,
-          runnable: true,
+          found: true,
           path: `C:\\Tools\\${binary}.exe`,
           version: `${binary} 1.0.0`,
         });
@@ -74,18 +70,204 @@ describe('doctor team-routing Copilot provider', () => {
     try {
       expect(await doctorTeamRoutingCommand({ json: true })).toBe(0);
       const report = JSON.parse(String(log.mock.calls[0]?.[0]));
-      expect(report.missing).not.toContain('copilot');
-      expect(report.unusable).toContain('copilot');
+      expect(report.missing).toContain('copilot');
       expect(report.probes).toEqual(expect.arrayContaining([
         expect.objectContaining({
           provider: 'copilot',
-          found: true,
-          runnable: false,
-          error: 'Version probe timed out after 5000ms.',
+          found: false,
+          error: 'CLI resolver failed',
         }),
       ]));
     } finally {
       log.mockRestore();
     }
+  });
+});
+
+type Probe = {
+  found: boolean;
+  path?: string;
+  version?: string;
+  error?: string;
+};
+
+function configWithProviders(providers: TeamRoleProvider[]) {
+  return {
+    team: {
+      roleRouting: Object.fromEntries(
+        providers.map((provider, index) => [`role-${index}`, { provider }]),
+      ),
+    },
+  };
+}
+
+function output(spy: { mock: { calls: unknown[][] } }): string {
+  return spy.mock.calls.map((args) => args.map(String).join(' ')).join('\n');
+}
+
+describe('doctorTeamRoutingCommand', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    mocks.loadConfig.mockReset();
+    mocks.probeCli.mockReset();
+    mocks.loadConfig.mockReturnValue(configWithProviders([]));
+    mocks.probeCli.mockReturnValue({ found: false, error: 'CLI resolver failed' });
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
+  });
+
+  it('emits ordered JSON probes with resolved fields and only missing providers', async () => {
+    mocks.loadConfig.mockReturnValue(configWithProviders(['codex', 'gemini', 'codex']));
+    const probeResults: Record<string, Probe> = {
+      claude: { found: true, path: '/opt/claude', version: 'claude 1.0.0' },
+      codex: { found: true, path: '/opt/codex', version: 'codex 2.0.0' },
+      gemini: { found: false, error: 'CLI resolver failed' },
+    };
+    mocks.probeCli.mockImplementation((binary: string) => probeResults[binary]);
+
+    const exitCode = await doctorTeamRoutingCommand({ json: true });
+    const json = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as {
+      probes: Array<Probe & { provider: TeamRoleProvider; binary: string }>;
+      missing: TeamRoleProvider[];
+    };
+
+    expect(exitCode).toBe(0);
+    expect(json.probes.map((probe) => probe.provider)).toEqual(['claude', 'codex', 'gemini']);
+    expect(json.probes.map((probe) => probe.binary)).toEqual(['claude', 'codex', 'gemini']);
+    expect(json.probes[0]).toMatchObject({
+      provider: 'claude',
+      binary: 'claude',
+      found: true,
+      path: '/opt/claude',
+      version: 'claude 1.0.0',
+    });
+    expect(json.probes[2]).toMatchObject({
+      provider: 'gemini',
+      binary: 'gemini',
+      found: false,
+      error: 'CLI resolver failed',
+    });
+    expect(json.missing).toEqual(['gemini']);
+  });
+
+  it('keeps the all-available human output concise', async () => {
+    mocks.loadConfig.mockReturnValue(configWithProviders(['codex']));
+    mocks.probeCli.mockImplementation((binary: string) => ({
+      found: true,
+      path: `/opt/${binary}`,
+      version: `${binary} 1.0.0`,
+    }));
+
+    const exitCode = await doctorTeamRoutingCommand({});
+    const text = output(logSpy);
+
+    expect(exitCode).toBe(0);
+    expect(text).toContain('claude: /opt/claude (claude 1.0.0)');
+    expect(text).toContain('codex: /opt/codex (codex 1.0.0)');
+    expect(text).toContain('All configured providers are available.');
+    expect(text).not.toContain('missing');
+    expect(text).not.toContain('fallback');
+  });
+
+  it('says an external route can fall back when Claude is found', async () => {
+    mocks.loadConfig.mockReturnValue(configWithProviders(['codex']));
+    mocks.probeCli.mockImplementation((binary: string) => binary === 'claude'
+      ? { found: true, path: '/opt/claude' }
+      : { found: false, error: 'CLI resolver failed' });
+
+    const exitCode = await doctorTeamRoutingCommand({});
+    const text = output(logSpy);
+
+    expect(exitCode).toBe(0);
+    expect(text).toContain('codex: not found on PATH');
+    expect(text).toContain('can fall back to Claude');
+    expect(text).not.toContain('no available Claude fallback');
+    expect(text).not.toContain('orchestrator/fallback unavailable');
+  });
+
+  it('reports no available Claude fallback when an external route and Claude are missing', async () => {
+    mocks.loadConfig.mockReturnValue(configWithProviders(['codex']));
+    mocks.probeCli.mockReturnValue({ found: false, error: 'CLI resolver failed' });
+
+    const exitCode = await doctorTeamRoutingCommand({});
+    const text = output(logSpy);
+
+    expect(exitCode).toBe(0);
+    expect(text).toContain('codex: not found on PATH');
+    expect(text).toContain('no available Claude fallback');
+    expect(text).toContain('orchestrator/fallback unavailable');
+    expect(text).not.toContain('can fall back to Claude');
+  });
+
+  it('reports orchestrator and fallback unavailability without promising Claude fallback', async () => {
+    mocks.loadConfig.mockReturnValue(configWithProviders(['codex']));
+    mocks.probeCli.mockImplementation((binary: string) => binary === 'claude'
+      ? { found: false, error: 'CLI resolver failed' }
+      : { found: true, path: '/opt/codex', version: 'codex 2.0.0' });
+
+    const exitCode = await doctorTeamRoutingCommand({});
+    const text = output(logSpy);
+
+    expect(exitCode).toBe(0);
+    expect(text).toContain('claude: not found on PATH');
+    expect(text).toContain('orchestrator/fallback unavailable');
+    expect(text).not.toContain('Claude falls back to Claude');
+  });
+
+  it('keeps resolved providers found when version enrichment fails or returns blank output', async () => {
+    mocks.loadConfig.mockReturnValue(configWithProviders(['codex']));
+    mocks.probeCli.mockImplementation((binary: string) => binary === 'claude'
+      ? { found: true, path: '/opt/claude', error: 'version probe returned no output' }
+      : { found: true, path: '/opt/codex', error: 'version probe failed' });
+
+    const exitCode = await doctorTeamRoutingCommand({ json: true });
+    const json = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as {
+      probes: Array<Probe & { provider: TeamRoleProvider }>;
+      missing: TeamRoleProvider[];
+    };
+
+    expect(exitCode).toBe(0);
+    expect(json.missing).toEqual([]);
+    expect(json.probes).toEqual([
+      {
+        provider: 'claude',
+        binary: 'claude',
+        found: true,
+        path: '/opt/claude',
+        error: 'version probe returned no output',
+      },
+      {
+        provider: 'codex',
+        binary: 'codex',
+        found: true,
+        path: '/opt/codex',
+        error: 'version probe failed',
+      },
+    ]);
+
+    logSpy.mockClear();
+    await doctorTeamRoutingCommand({});
+    const text = output(logSpy);
+    expect(text).toContain('version unavailable');
+    expect(text).not.toContain('undefined');
+  });
+
+  it('returns one when configuration loading fails', async () => {
+    mocks.loadConfig.mockImplementation(() => {
+      throw new Error('invalid config');
+    });
+
+    const exitCode = await doctorTeamRoutingCommand({ json: true });
+
+    expect(exitCode).toBe(1);
+    expect(errorSpy).toHaveBeenCalledWith('[OMC] Failed to load config: invalid config');
+    expect(mocks.probeCli).not.toHaveBeenCalled();
   });
 });

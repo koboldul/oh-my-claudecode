@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, readFile, rm } from 'fs/promises';
+import { mkdtemp, rm } from 'fs/promises';
+import { existsSync } from 'node:fs';
 import { join, resolve } from 'path';
 import { tmpdir } from 'os';
 const tmuxUtilsMocks = vi.hoisted(() => ({
@@ -9,11 +10,13 @@ const tmuxUtilsMocks = vi.hoisted(() => ({
 const modelContractMocks = vi.hoisted(() => ({
     buildWorkerArgv: vi.fn(),
     getWorkerEnv: vi.fn(),
-    getPromptModeArgs: vi.fn(),
-    isPromptModeAgent: vi.fn(),
+    isPromptModeAgent: vi.fn(() => false),
+    getPromptModeArgs: vi.fn(() => []),
     resolveClaudeWorkerModel: vi.fn(),
-    resolveValidatedBinaryPath: vi.fn(),
+    resolveDefaultWorkerModel: vi.fn(),
     validateWorkerLaunchDescriptor: vi.fn((value) => value),
+    clearResolvedPathCache: vi.fn(),
+    resolveValidatedBinaryPath: vi.fn((agentType) => `/usr/bin/${agentType}`),
 }));
 const teamOpsMocks = vi.hoisted(() => ({
     teamReadConfig: vi.fn(),
@@ -35,7 +38,17 @@ const tmuxSessionMocks = vi.hoisted(() => ({
     isWorkerAlive: vi.fn(),
     getWorkerLiveness: vi.fn(),
     killWorkerPanes: vi.fn(),
-    buildWorkerStartCommand: vi.fn(() => 'start-worker'),
+    adoptWorkerPaneOwnership: vi.fn(async (input) => ({
+        ok: true,
+        ownership: { provider: 'tmux', providerTarget: input.providerTarget, paneId: input.paneId,
+            splitTarget: '', leaderPaneId: input.leaderPaneId, reservedPaneIds: [], source: 'adopted' },
+    })),
+    spawnOwnedWorkerInPane: vi.fn(async (_session, ownership, cfg) => ({
+        ownership,
+        provider: cfg.provider,
+        attempt: { attempt_id: `attempt-${ownership.paneId}`, currentPath: '/tmp/current', decisionPath: '/tmp/decision', startedPath: '/tmp/started' },
+    })),
+    killOwnedWorkerPane: vi.fn(),
     waitForPaneReady: vi.fn(),
 }));
 const gitWorktreeMocks = vi.hoisted(() => ({
@@ -46,17 +59,26 @@ const gitWorktreeMocks = vi.hoisted(() => ({
     checkWorkerWorktreeRemovalSafety: vi.fn(),
     prepareWorkerWorktreeForRemoval: vi.fn(),
 }));
+const workerLaunchMocks = vi.hoisted(() => ({
+    loadWorkerLaunchAttempt: vi.fn(async () => ({ attempt_id: 'attempt-loaded', currentPath: '/tmp/current', decisionPath: '/tmp/decision', startedPath: '/tmp/started' })),
+    isWorkerLaunchAttemptAccepted: vi.fn(async () => true),
+    retireWorkerLaunchAttempt: vi.fn(async () => true),
+    terminateWorkerLaunchProvider: vi.fn(async () => true),
+    retireAndCleanupCurrentWorkerLaunchAttempt: vi.fn(async (_attempt, _reason, cleanup) => cleanup()),
+}));
 vi.mock('../../cli/tmux-utils.js', () => ({
     tmuxExec: tmuxUtilsMocks.tmuxExec,
     tmuxSpawn: tmuxUtilsMocks.tmuxSpawn,
 }));
 vi.mock('../model-contract.js', () => ({
     buildWorkerArgv: modelContractMocks.buildWorkerArgv,
-    getWorkerEnv: modelContractMocks.getWorkerEnv,
-    getPromptModeArgs: modelContractMocks.getPromptModeArgs,
-    isPromptModeAgent: modelContractMocks.isPromptModeAgent,
-    resolveClaudeWorkerModel: modelContractMocks.resolveClaudeWorkerModel,
+    clearResolvedPathCache: modelContractMocks.clearResolvedPathCache,
     resolveValidatedBinaryPath: modelContractMocks.resolveValidatedBinaryPath,
+    getWorkerEnv: modelContractMocks.getWorkerEnv,
+    isPromptModeAgent: modelContractMocks.isPromptModeAgent,
+    getPromptModeArgs: modelContractMocks.getPromptModeArgs,
+    resolveClaudeWorkerModel: modelContractMocks.resolveClaudeWorkerModel,
+    resolveDefaultWorkerModel: modelContractMocks.resolveDefaultWorkerModel,
     validateWorkerLaunchDescriptor: modelContractMocks.validateWorkerLaunchDescriptor,
     assertHeadlessSupported: () => { },
     isHeadlessSupportedOnPlatform: () => true,
@@ -80,7 +102,9 @@ vi.mock('../tmux-session.js', () => ({
     isWorkerAlive: tmuxSessionMocks.isWorkerAlive,
     getWorkerLiveness: tmuxSessionMocks.getWorkerLiveness,
     killWorkerPanes: tmuxSessionMocks.killWorkerPanes,
-    buildWorkerStartCommand: tmuxSessionMocks.buildWorkerStartCommand,
+    adoptWorkerPaneOwnership: tmuxSessionMocks.adoptWorkerPaneOwnership,
+    spawnOwnedWorkerInPane: tmuxSessionMocks.spawnOwnedWorkerInPane,
+    killOwnedWorkerPane: tmuxSessionMocks.killOwnedWorkerPane,
     waitForPaneReady: tmuxSessionMocks.waitForPaneReady,
 }));
 vi.mock('../git-worktree.js', () => ({
@@ -91,11 +115,18 @@ vi.mock('../git-worktree.js', () => ({
     checkWorkerWorktreeRemovalSafety: gitWorktreeMocks.checkWorkerWorktreeRemovalSafety,
     prepareWorkerWorktreeForRemoval: gitWorktreeMocks.prepareWorkerWorktreeForRemoval,
 }));
+vi.mock('../runtime-owner-client.js', () => ({ resolveRuntimeCliPath: () => '/runtime-cli.js' }));
+vi.mock('../worker-launch-ack.js', () => workerLaunchMocks);
 import { scaleDown, scaleUp } from '../scaling.js';
-import { buildResolvedRoutingSnapshot } from '../stage-router.js';
 describe('scaleUp launch config', () => {
     let cwd;
     let config;
+    const launchMetadata = {
+        worker_cli: 'codex',
+        launch_attempt_id: 'attempt-1',
+        launch_descriptor: { schema_version: 1, provider: 'codex', model: null,
+            binary: '/usr/bin/codex', args: [] },
+    };
     function makeConfig(overrides = {}) {
         const base = {
             name: 'demo-team',
@@ -120,6 +151,7 @@ describe('scaleUp launch config', () => {
     beforeEach(async () => {
         cwd = await mkdtemp(join(tmpdir(), 'omc-scaling-launch-config-'));
         vi.clearAllMocks();
+        workerLaunchMocks.retireAndCleanupCurrentWorkerLaunchAttempt.mockImplementation(async (_attempt, _reason, cleanup) => cleanup());
         monitorMocks.currentConfig = null;
         monitorMocks.withScalingLock.mockImplementation(async (_teamName, _leaderCwd, fn) => fn());
         monitorMocks.migrateTeamConfigRevision.mockImplementation(async () => {
@@ -142,10 +174,6 @@ describe('scaleUp launch config', () => {
             OMC_TEAM_NAME: teamName,
             OMC_WORKER_AGENT_TYPE: agentType,
         }));
-        modelContractMocks.isPromptModeAgent.mockReturnValue(false);
-        modelContractMocks.getPromptModeArgs.mockReturnValue([]);
-        modelContractMocks.resolveClaudeWorkerModel.mockReturnValue(undefined);
-        modelContractMocks.resolveValidatedBinaryPath.mockImplementation((agentType) => `/usr/bin/${agentType === 'antigravity' ? 'agy' : agentType}`);
         tmuxUtilsMocks.tmuxSpawn.mockImplementation((args) => {
             if (args[0] === 'split-window') {
                 return { status: 0, stdout: '%12\n', stderr: '' };
@@ -180,18 +208,18 @@ describe('scaleUp launch config', () => {
         modelContractMocks.buildWorkerArgv.mockReturnValue(workerArgv);
         const result = await scaleUp('demo-team', 1, agentType, [{ subject: 'demo', description: 'demo task' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1' });
         expect(result).toMatchObject({ ok: true, newWorkerCount: 1, nextWorkerIndex: 2 });
-        expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith(agentType, expect.objectContaining({
+        expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith(agentType, {
             teamName: 'demo-team',
             workerName: 'worker-1',
             cwd: resolve(cwd),
             resolvedBinaryPath: workerArgv[0],
-        }));
-        expect(tmuxSessionMocks.buildWorkerStartCommand).toHaveBeenCalledWith(expect.objectContaining({
+        });
+        expect(tmuxSessionMocks.spawnOwnedWorkerInPane).toHaveBeenCalledWith('demo-session:0', expect.objectContaining({ paneId: '%12', providerTarget: 'demo-session:0' }), expect.objectContaining({
             teamName: 'demo-team',
             workerName: 'worker-1',
             launchBinary: workerArgv[0],
             launchArgs: workerArgv.slice(1),
-            cwd: resolve(cwd),
+            provider: agentType,
             envVars: expect.objectContaining({
                 OMC_TEAM_WORKER: 'demo-team/worker-1',
                 OMC_TEAM_NAME: 'demo-team',
@@ -215,83 +243,115 @@ describe('scaleUp launch config', () => {
             return candidate.workers.some(worker => worker.name === 'worker-1' && worker.operational_state === 'starting');
         })).toBeLessThan(tmuxUtilsMocks.tmuxSpawn.mock.invocationCallOrder[splitIndex]);
     });
-    it('scales Copilot as a one-shot prompt worker with persisted defaults and reviewer contract', async () => {
+    it('passes the immutable team defaults to scale-up resolution', async () => {
+        modelContractMocks.resolveDefaultWorkerModel.mockReturnValue('composer-2.5');
+        modelContractMocks.buildWorkerArgv.mockReturnValue(['/usr/bin/cursor', '--model', 'composer-2.5']);
         config = makeConfig({
-            copilot_defaults: {
-                model: 'gpt-5.5',
-                reasoning_effort: 'high',
-            },
-            resolved_routing: buildResolvedRoutingSnapshot({}),
+            external_models_defaults: { cursorModel: 'composer-2.5' },
         });
-        modelContractMocks.isPromptModeAgent.mockImplementation(agentType => agentType === 'copilot');
-        modelContractMocks.getPromptModeArgs.mockReturnValue(['-p', 'Open inbox.md']);
-        modelContractMocks.buildWorkerArgv.mockImplementation((_agentType, launchConfig) => [
-            '/usr/bin/copilot',
-            '--model', launchConfig.model,
-            '--effort', launchConfig.reasoningEffort,
-            '--allow-all',
-            '--no-ask-user',
-            '--silent',
-            '--stream=off',
-        ]);
-        const result = await scaleUp('demo-team', 1, 'copilot', [{
-                subject: 'Review implementation',
-                description: 'Return a structured verdict',
-                owner: 'worker-1',
-                role: 'code-reviewer',
-            }], cwd, { OMC_TEAM_SCALING_ENABLED: '1' });
-        expect(result).toMatchObject({ ok: true, newWorkerCount: 1 });
-        expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith('copilot', expect.objectContaining({
-            model: 'gpt-5.5',
-            reasoningEffort: 'high',
-            resolvedBinaryPath: '/usr/bin/copilot',
-        }));
-        const worker = result.addedWorkers[0];
-        expect(worker).toMatchObject({
-            worker_cli: 'copilot',
-            output_file: expect.stringContaining('verdict.json'),
-            launch_descriptor: {
-                provider: 'copilot',
-                model: 'gpt-5.5',
-                args: expect.arrayContaining([
-                    '--model', 'gpt-5.5',
-                    '--effort', 'high',
-                    '--allow-all',
-                    '--no-ask-user',
-                    '--silent',
-                    '--stream=off',
-                    '-p', 'Open inbox.md',
-                ]),
-            },
-        });
-        const inbox = await readFile(join(cwd, '.omc', 'state', 'team', 'demo-team', 'workers', 'worker-1', 'inbox.md'), 'utf-8');
-        expect(inbox).toContain('structured verdict');
-        expect(inbox).toContain('Review implementation');
+        const result = await scaleUp('demo-team', 1, 'cursor', [{ subject: 'demo', description: 'demo task' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1' });
+        expect(result).toMatchObject({ ok: true });
+        expect(modelContractMocks.resolveDefaultWorkerModel).toHaveBeenCalledWith('cursor', {}, { cursorModel: 'composer-2.5' });
+        expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith('cursor', expect.objectContaining({ model: 'composer-2.5' }));
     });
-    it('fails explicit Copilot scale-up instead of silently launching Claude', async () => {
+    it('preserves Claude model environment when external defaults are empty', async () => {
+        modelContractMocks.resolveDefaultWorkerModel.mockReturnValue('claude-env-model');
+        modelContractMocks.buildWorkerArgv.mockReturnValue(['/usr/bin/claude', '--model', 'claude-env-model']);
+        config = makeConfig({ external_models_defaults: {} });
+        const env = {
+            OMC_TEAM_SCALING_ENABLED: '1',
+            ANTHROPIC_MODEL: 'claude-env-model',
+        };
+        const result = await scaleUp('demo-team', 1, 'claude', [{ subject: 'demo', description: 'demo task' }], cwd, env);
+        expect(result).toMatchObject({ ok: true });
+        expect(modelContractMocks.resolveDefaultWorkerModel).toHaveBeenCalledWith('claude', env, {});
+        expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith('claude', expect.objectContaining({ model: 'claude-env-model' }));
+    });
+    it('does not apply the implicit Claude snapshot to an explicitly typed external worker', async () => {
+        modelContractMocks.resolveDefaultWorkerModel.mockReturnValue('codex-config-model');
+        modelContractMocks.buildWorkerArgv.mockReturnValue(['/usr/bin/codex', '--model', 'codex-config-model']);
         config = makeConfig({
-            resolved_routing: buildResolvedRoutingSnapshot({}),
-            copilot_defaults: {
-                model: 'gpt-5.6-sol',
-                reasoning_effort: 'max',
+            resolved_routing: {
+                executor: { primary: { provider: 'claude', model: '', agent: 'executor' }, fallback: { provider: 'claude', model: '', agent: 'executor' } },
             },
+            resolved_routing_roles: [],
         });
-        modelContractMocks.resolveValidatedBinaryPath.mockImplementation((agentType) => {
-            if (agentType === 'copilot')
-                throw new Error('copilot binary missing');
-            return `/usr/bin/${agentType}`;
+        const result = await scaleUp('demo-team', 1, 'codex', [{ subject: 'demo', description: 'demo task', owner: 'worker-1', role: 'executor' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1' });
+        expect(result).toMatchObject({ ok: true });
+        expect(modelContractMocks.resolveDefaultWorkerModel).toHaveBeenCalledWith('codex', expect.anything(), undefined);
+        expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith('codex', expect.objectContaining({ model: 'codex-config-model' }));
+    });
+    it('preserves an external configured route when an older team has no routing-role metadata', async () => {
+        modelContractMocks.resolveDefaultWorkerModel.mockReturnValue('gemini-config-model');
+        modelContractMocks.buildWorkerArgv.mockReturnValue(['/usr/bin/gemini', '--model', 'gemini-snapshot-model']);
+        config = makeConfig({
+            resolved_routing: {
+                executor: {
+                    primary: { provider: 'gemini', model: 'gemini-snapshot-model', agent: 'executor' },
+                    fallback: { provider: 'claude', model: '', agent: 'executor' },
+                },
+            },
+            resolved_routing_roles: undefined,
         });
-        const result = await scaleUp('demo-team', 1, 'copilot', [{
-                subject: 'Review implementation',
-                description: 'Return a structured verdict',
-                owner: 'worker-1',
-                role: 'code-reviewer',
-            }], cwd, { OMC_TEAM_SCALING_ENABLED: '1' });
-        expect(result).toMatchObject({
-            ok: false,
-            error: expect.stringContaining('no routed fallback'),
+        const result = await scaleUp('demo-team', 1, 'codex', [{ subject: 'demo', description: 'demo task', owner: 'worker-1', role: 'executor' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1' });
+        expect(result).toMatchObject({ ok: true });
+        expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith('gemini', expect.objectContaining({ model: 'gemini-snapshot-model' }));
+    });
+    it('preserves a Claude configured route when an older team has no routing-role metadata', async () => {
+        modelContractMocks.buildWorkerArgv.mockReturnValue(['/usr/bin/claude', '--model', 'legacy-claude-model']);
+        config = makeConfig({
+            resolved_routing: {
+                executor: {
+                    primary: { provider: 'claude', model: 'legacy-claude-model', agent: 'executor' },
+                    fallback: { provider: 'claude', model: 'legacy-claude-model', agent: 'executor' },
+                },
+            },
+            resolved_routing_roles: undefined,
         });
-        expect(modelContractMocks.buildWorkerArgv).not.toHaveBeenCalledWith('claude', expect.anything());
+        const result = await scaleUp('demo-team', 1, 'codex', [{ subject: 'demo', description: 'demo task', owner: 'worker-1', role: 'executor' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1' });
+        expect(result).toMatchObject({ ok: true });
+        expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith('claude', expect.objectContaining({ model: 'legacy-claude-model' }));
+    });
+    it('keeps the caller provider when the owned task has no explicit role', async () => {
+        modelContractMocks.resolveDefaultWorkerModel.mockReturnValue('codex-config-model');
+        modelContractMocks.buildWorkerArgv.mockReturnValue(['/usr/bin/codex', '--model', 'codex-config-model']);
+        config = makeConfig({
+            resolved_routing: {
+                executor: {
+                    primary: { provider: 'gemini', model: 'gemini-snapshot-model', agent: 'executor' },
+                    fallback: { provider: 'claude', model: '', agent: 'executor' },
+                },
+            },
+            resolved_routing_roles: ['executor'],
+        });
+        const result = await scaleUp('demo-team', 1, 'codex', [{ subject: 'implement the executor task', description: 'write code', owner: 'worker-1' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1' });
+        expect(result).toMatchObject({ ok: true });
+        expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith('codex', expect.objectContaining({ model: 'codex-config-model' }));
+    });
+    it('does not adopt a newly introduced environment default after an empty snapshot', async () => {
+        modelContractMocks.resolveDefaultWorkerModel.mockReturnValue(undefined);
+        modelContractMocks.buildWorkerArgv.mockReturnValue(['/usr/bin/cursor']);
+        config = makeConfig({ external_models_defaults: {} });
+        const result = await scaleUp('demo-team', 1, 'cursor', [{ subject: 'demo', description: 'demo task' }], cwd, {
+            OMC_TEAM_SCALING_ENABLED: '1',
+            OMC_CURSOR_DEFAULT_MODEL: 'introduced-after-start',
+        });
+        expect(result).toMatchObject({ ok: true });
+        expect(modelContractMocks.resolveDefaultWorkerModel).toHaveBeenCalledWith('cursor', {}, {});
+        expect(modelContractMocks.buildWorkerArgv.mock.calls[0]?.[1]).not.toHaveProperty('model');
+    });
+    it.each([
+        ["relative", "Resolved CLI binary 'codex' to relative path"],
+        ["untrusted", "Resolved CLI binary 'codex' to untrusted location: /tmp/shadow/codex"],
+        ["missing", "CLI binary 'codex' not found in PATH"],
+    ])('fails %s scale-up provider preflight before worker side effects', async (_case, reason) => {
+        modelContractMocks.resolveValidatedBinaryPath.mockImplementationOnce(() => { throw new Error(reason); });
+        const result = await scaleUp('demo-team', 1, 'codex', [{ subject: 'demo', description: 'demo task' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1' });
+        expect(result).toEqual({ ok: false, error: `Failed strict provider preflight for worker-1 (codex): ${reason}` });
+        expect(tmuxUtilsMocks.tmuxSpawn.mock.calls.some(([args]) => args[0] === 'split-window')).toBe(false);
+        expect(gitWorktreeMocks.ensureWorkerWorktree).not.toHaveBeenCalled();
+        expect(teamOpsMocks.teamWriteWorkerIdentity).not.toHaveBeenCalled();
+        expect(existsSync(join(resolve(cwd), '.omc', 'state', 'team', 'demo-team', 'workers', 'worker-1'))).toBe(false);
     });
     it('rejects scale-up before external effects when recovery is already reserved', async () => {
         config = makeConfig({ state_revision: 4, next_worker_index: 2,
@@ -333,9 +393,7 @@ describe('scaleUp launch config', () => {
             created: true,
             reused: false,
         });
-        tmuxSessionMocks.buildWorkerStartCommand.mockImplementationOnce(() => {
-            throw new Error('boom');
-        });
+        tmuxSessionMocks.spawnOwnedWorkerInPane.mockRejectedValueOnce(new Error('boom'));
         const result = await scaleUp('demo-team', 1, 'codex', [{ subject: 'demo', description: 'demo task' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1' });
         expect(result).toMatchObject({ ok: false });
         expect(gitWorktreeMocks.removeWorkerWorktree).toHaveBeenCalledWith('demo-team', 'worker-1', resolve(cwd));
@@ -365,7 +423,7 @@ describe('scaleUp launch config', () => {
         const result = await scaleUp('demo-team', 1, 'codex', [{ subject: 'demo', description: 'demo task' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1' });
         expect(result).toMatchObject({ ok: false, error: expect.stringContaining('Failed to install worker overlay') });
         expect(gitWorktreeMocks.removeWorkerWorktree).toHaveBeenCalledWith('demo-team', 'worker-1', resolve(cwd));
-        expect(tmuxSessionMocks.buildWorkerStartCommand).not.toHaveBeenCalled();
+        expect(tmuxSessionMocks.spawnOwnedWorkerInPane).not.toHaveBeenCalled();
     });
     it('restores managed overlays for reused worktrees during scale-down without deleting them', async () => {
         const config = {
@@ -376,7 +434,7 @@ describe('scaleUp launch config', () => {
             worker_count: 2,
             max_workers: 20,
             workers: [
-                { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%1', worktree_path: join(resolve(cwd), 'reuse'), worktree_created: false },
+                { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%1', worktree_path: join(resolve(cwd), 'reuse'), worktree_created: false, ...launchMetadata },
                 { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [], pane_id: '%2' },
             ],
             created_at: new Date().toISOString(),
@@ -396,6 +454,27 @@ describe('scaleUp launch config', () => {
         expect(result).toMatchObject({ ok: true, removedWorkers: ['worker-1'], newWorkerCount: 1 });
         expect(gitWorktreeMocks.prepareWorkerWorktreeForRemoval).toHaveBeenCalledWith('demo-team', 'worker-1', resolve(cwd), join(resolve(cwd), 'reuse'));
         expect(gitWorktreeMocks.removeWorkerWorktree).not.toHaveBeenCalled();
+        expect(workerLaunchMocks.retireAndCleanupCurrentWorkerLaunchAttempt).toHaveBeenCalledWith(expect.objectContaining({ attempt_id: 'attempt-loaded' }), 'scale_down', expect.any(Function));
+        expect(tmuxSessionMocks.killOwnedWorkerPane).not.toHaveBeenCalled();
+    });
+    it('preserves pane and state when scale-down launch ownership is not accepted', async () => {
+        const current = makeConfig({
+            worker_count: 2,
+            next_worker_index: 3,
+            workers: [
+                { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%1', ...launchMetadata },
+                { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [], pane_id: '%2' },
+            ],
+        });
+        teamOpsMocks.teamReadConfig.mockResolvedValue(current);
+        teamOpsMocks.teamReadWorkerStatus.mockResolvedValue({ state: 'idle', updated_at: new Date().toISOString() });
+        tmuxSessionMocks.getWorkerLiveness.mockResolvedValue('dead');
+        workerLaunchMocks.retireAndCleanupCurrentWorkerLaunchAttempt.mockResolvedValueOnce(false);
+        const result = await scaleDown('demo-team', cwd, { workerNames: ['worker-1'], drainTimeoutMs: 0 }, { OMC_TEAM_SCALING_ENABLED: '1' });
+        expect(result).toMatchObject({ ok: false, error: 'provider_cleanup_unverified:worker-1' });
+        expect(workerLaunchMocks.retireAndCleanupCurrentWorkerLaunchAttempt).toHaveBeenCalled();
+        expect(tmuxSessionMocks.killOwnedWorkerPane).not.toHaveBeenCalled();
+        expect(monitorMocks.currentConfig?.workers.map(worker => worker.name)).toEqual(['worker-1', 'worker-2']);
     });
     it('keeps reused worktree worker tracked if post-drain cleanup safety fails', async () => {
         const config = {
@@ -406,7 +485,7 @@ describe('scaleUp launch config', () => {
             worker_count: 2,
             max_workers: 20,
             workers: [
-                { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%1', worktree_path: join(resolve(cwd), 'reuse'), worktree_created: false },
+                { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%1', worktree_path: join(resolve(cwd), 'reuse'), worktree_created: false, ...launchMetadata },
                 { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [], pane_id: '%2' },
             ],
             created_at: new Date().toISOString(),
@@ -439,7 +518,7 @@ describe('scaleUp launch config', () => {
             worker_count: 2,
             max_workers: 20,
             workers: [
-                { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%1', worktree_path: join(resolve(cwd), 'created'), worktree_created: true },
+                { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%1', worktree_path: join(resolve(cwd), 'created'), worktree_created: true, ...launchMetadata },
                 { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [], pane_id: '%2' },
             ],
             created_at: new Date().toISOString(),
@@ -456,8 +535,8 @@ describe('scaleUp launch config', () => {
         teamOpsMocks.teamReadWorkerStatus.mockResolvedValue({ state: 'idle', updated_at: new Date().toISOString() });
         tmuxSessionMocks.getWorkerLiveness.mockResolvedValue('alive');
         const result = await scaleDown('demo-team', cwd, { workerNames: ['worker-1'], drainTimeoutMs: 0 }, { OMC_TEAM_SCALING_ENABLED: '1' });
-        expect(result).toMatchObject({ ok: false, error: expect.stringContaining('still alive') });
-        expect(tmuxSessionMocks.killWorkerPanes).toHaveBeenCalled();
+        expect(result).toMatchObject({ ok: false, error: expect.stringContaining('pane_still_alive') });
+        expect(tmuxSessionMocks.killOwnedWorkerPane).toHaveBeenCalled();
         expect(gitWorktreeMocks.removeWorkerWorktree).not.toHaveBeenCalled();
         expect(monitorMocks.saveTeamConfig).not.toHaveBeenCalled();
     });

@@ -1,11 +1,47 @@
-import { describe, it, expect, vi } from 'vitest';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync, mkdirSync } from 'fs';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import { existsSync, mkdtempSync as rawMkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createHash } from 'node:crypto';
-import { assertAutoMergeRuntimeSupported, buildCliOutput, buildTerminalCliResult, handleRecoverDeadWorkerV2Owner, fenceAllDeadRecoveryExpiry, hasPendingRecoveryAdmissionBeforeDeadline, hasPendingRecoveryIntentBeforeDeadline, updateAllDeadRecoveryGrace, checkWatchdogFailedMarker, getTerminalStatus, isTerseFinalSummary, processPendingRecoveryIntents, refreshRuntimeWorkerPaneIds, areAllAuthoritativeWorkersDead, classifyAllDeadRecoveryEvidence, readTaskOutputFallback, writeResultArtifact, runPersistentRecoveryOwnerLoop, finalizeRuntimeShutdown, } from '../runtime-cli.js';
+import { assertAutoMergeRuntimeSupported, buildCliOutput, buildTerminalCliResult, handleRecoverDeadWorkerV2Owner, fenceAllDeadRecoveryExpiry, hasPendingRecoveryAdmissionBeforeDeadline, hasPendingRecoveryIntentBeforeDeadline, updateAllDeadRecoveryGrace, checkWatchdogFailedMarker, getTerminalStatus, isTerseFinalSummary, processPendingRecoveryIntents, refreshRuntimeWorkerPaneIds, areAllAuthoritativeWorkersDead, classifyAllDeadRecoveryEvidence, readTaskOutputFallback, writeResultArtifact, runPersistentRecoveryOwnerLoop, finalizeRuntimeShutdown, createRuntimeStartupShutdownBarrier, runWorkerLaunchFromEnvironment, selectRuntimeCliMode, } from '../runtime-cli.js';
 import { aliasActiveRecoveryRequest, canonicalRecoveryPayloadHash, readRecoveryOutcome, reserveRecoveryRequest, writeRecoveryFinal } from '../recovery-request-store.js';
 import { absPath, TeamPaths } from '../state-paths.js';
+let fixtureRoot;
+let previousHome;
+let previousUserProfile;
+let previousStateDir;
+function mkdtempSync(prefix) {
+    const root = rawMkdtempSync(prefix);
+    if (!fixtureRoot) {
+        fixtureRoot = root;
+        previousHome = process.env.HOME;
+        previousUserProfile = process.env.USERPROFILE;
+        previousStateDir = process.env.OMC_STATE_DIR;
+        process.env.HOME = root;
+        process.env.USERPROFILE = root;
+        delete process.env.OMC_STATE_DIR;
+    }
+    return root;
+}
+beforeEach(() => { fixtureRoot = undefined; });
+afterEach(() => {
+    if (previousHome === undefined)
+        delete process.env.HOME;
+    else
+        process.env.HOME = previousHome;
+    if (previousUserProfile === undefined)
+        delete process.env.USERPROFILE;
+    else
+        process.env.USERPROFILE = previousUserProfile;
+    if (previousStateDir === undefined)
+        delete process.env.OMC_STATE_DIR;
+    else
+        process.env.OMC_STATE_DIR = previousStateDir;
+    fixtureRoot = undefined;
+    previousHome = undefined;
+    previousUserProfile = undefined;
+    previousStateDir = undefined;
+});
 describe('runtime-cli legacy watchdog shutdown', () => {
     it('quiesces v1 before snapshotting, shutdown, and publication', async () => {
         const cwd = mkdtempSync(join(tmpdir(), 'runtime-cli-shutdown-order-'));
@@ -53,6 +89,23 @@ describe('runtime-cli legacy watchdog shutdown', () => {
         await finalizeRuntimeShutdown({ stopWatchdog }, true, async () => undefined, async () => undefined, async () => undefined);
         expect(stopWatchdog).not.toHaveBeenCalled();
     });
+    it('holds signal-triggered shutdown until startup ownership settles', async () => {
+        const barrier = createRuntimeStartupShutdownBarrier();
+        barrier.requestShutdown();
+        let released = false;
+        const waiting = barrier.waitForStartup().then(() => { released = true; });
+        await Promise.resolve();
+        expect(barrier.isShutdownRequested()).toBe(true);
+        expect(released).toBe(false);
+        barrier.settleStartup();
+        await waiting;
+        expect(released).toBe(true);
+    });
+    it('does not publish a terminal result when shutdown cleanup fails', async () => {
+        const phases = [];
+        await expect(finalizeRuntimeShutdown(null, true, async () => { phases.push('collect'); return { status: 'failed' }; }, async () => { phases.push('shutdown'); throw new Error('team_shutdown_provider_cleanup_unverified:worker-1'); }, async () => { phases.push('publish'); })).rejects.toThrow('team_shutdown_provider_cleanup_unverified:worker-1');
+        expect(phases).toEqual(['collect', 'shutdown']);
+    });
 });
 describe('runtime-cli auto-merge compatibility', () => {
     it('rejects explicit auto-merge when runtime v2 is disabled', () => {
@@ -60,6 +113,43 @@ describe('runtime-cli auto-merge compatibility', () => {
     });
     it('allows v1 runtime when auto-merge is not requested', () => {
         expect(() => assertAutoMergeRuntimeSupported(false, false)).not.toThrow();
+    });
+});
+describe('runtime-cli worker launch bootstrap', () => {
+    it('rejects malformed launch JSON without echoing its secret payload', async () => {
+        process.env.OMC_WORKER_LAUNCH_SPEC = '{"provider_argv":["codex","--token","SUPERSECRET"],';
+        try {
+            await expect(runWorkerLaunchFromEnvironment()).rejects.toThrow('worker_launch_invalid_spec_json');
+        }
+        finally {
+            delete process.env.OMC_WORKER_LAUNCH_SPEC;
+        }
+    });
+    it('fails closed when inline and descriptor launch-spec sources conflict', async () => {
+        process.env.OMC_WORKER_LAUNCH_SPEC = '{}';
+        process.env.OMC_WORKER_LAUNCH_SPEC_FILE = join(tmpdir(), 'conflicting-worker-launch.json');
+        try {
+            await expect(runWorkerLaunchFromEnvironment()).rejects.toThrow('worker_launch_spec_source_conflict');
+        }
+        finally {
+            delete process.env.OMC_WORKER_LAUNCH_SPEC;
+            delete process.env.OMC_WORKER_LAUNCH_SPEC_FILE;
+        }
+    });
+    it('fails closed when the attempt-owned descriptor is missing', async () => {
+        process.env.OMC_WORKER_LAUNCH_SPEC_FILE = join(tmpdir(), 'missing-worker-launch.json');
+        try {
+            await expect(runWorkerLaunchFromEnvironment()).rejects.toThrow('worker_launch_descriptor_missing');
+        }
+        finally {
+            delete process.env.OMC_WORKER_LAUNCH_SPEC_FILE;
+        }
+    });
+    it('prioritizes explicit worker launch and recovery gate modes over inherited owner state', () => {
+        const inheritedOwner = { OMC_RECOVERY_OWNER_INPUT: '{"requestId":"stale"}' };
+        expect(selectRuntimeCliMode(['node', 'runtime-cli.cjs', '--worker-launch'], inheritedOwner)).toBe('worker-launch');
+        expect(selectRuntimeCliMode(['node', 'runtime-cli.cjs', '--recovery-gate'], inheritedOwner)).toBe('recovery-gate');
+        expect(selectRuntimeCliMode(['node', 'runtime-cli.cjs'], inheritedOwner)).toBe('recovery-owner');
     });
 });
 describe('runtime-cli terminal status helper', () => {

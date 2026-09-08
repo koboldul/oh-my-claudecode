@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { getOmcRoot, getGitTopLevel } from '../../lib/worktree-paths.js';
+import { getOmcRoot, probeGitTopLevel } from '../../lib/worktree-paths.js';
 import { getClaudeConfigDir } from '../../utils/config-dir.js';
 
 interface PermissionToolInput {
@@ -481,10 +481,11 @@ function isSafeRepoPath(
 
   // Literal git toplevel (no submodule→superproject climb) so the containment
   // boundary stays the actual repo the path lives in (#3349 / PR #3350).
-  const worktreeRoot = getGitTopLevel(cwd);
-  if (!worktreeRoot) {
+  const worktreeProbe = probeGitTopLevel(cwd);
+  if (worktreeProbe.status !== 'ok') {
     return false;
   }
+  const worktreeRoot = worktreeProbe.root;
   const resolvedPath = path.resolve(cwd, inputPath);
 
   let canonicalPath = resolvedPath;
@@ -952,7 +953,7 @@ export function isHeredocWithSafeBase(command: string): boolean {
 }
 
 /**
- * Check if an active mode (autopilot/ultrawork/ralph/team) is running
+ * Check if an active supported mode is running
  */
 export function isActiveModeRunning(directory: string): boolean {
   const stateDir = path.join(getOmcRoot(directory), 'state');
@@ -964,7 +965,6 @@ export function isActiveModeRunning(directory: string): boolean {
   const activeStateFiles = [
     'autopilot-state.json',
     'ralph-state.json',
-    'ultrawork-state.json',
     'team-state.json',
     'omc-teams-state.json',
   ];

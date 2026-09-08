@@ -2,7 +2,7 @@
  * Shared types for Oh-My-ClaudeCode
  */
 
-export type ModelType = "sonnet" | "opus" | "haiku" | "inherit";
+export type ModelType = "sonnet" | "opus" | "haiku" | "fable" | "inherit";
 
 export interface AgentConfig {
   name: string;
@@ -130,7 +130,6 @@ export interface PluginConfig {
 
   // Magic keyword customization
   magicKeywords?: {
-    ultrawork?: string[];
     search?: string[];
     analyze?: string[];
     ultrathink?: string[];
@@ -179,9 +178,9 @@ export interface PluginConfig {
      *   (useful on non-Anthropic backends without the nuclear forceInherit)
      * - `{ haiku: 'sonnet' }` — promote all haiku agents to sonnet tier
      *
-     * Env: OMC_MODEL_ALIAS_HAIKU, OMC_MODEL_ALIAS_SONNET, OMC_MODEL_ALIAS_OPUS
+     * Env: OMC_MODEL_ALIAS_HAIKU, OMC_MODEL_ALIAS_SONNET, OMC_MODEL_ALIAS_OPUS, OMC_MODEL_ALIAS_FABLE
      */
-    modelAliases?: Partial<Record<"haiku" | "sonnet" | "opus", ModelType>>;
+    modelAliases?: Partial<Record<"haiku" | "sonnet" | "opus" | "fable", ModelType>>;
     /** Keywords that force escalation to higher tier */
     escalationKeywords?: string[];
     /** Keywords that suggest lower tier */
@@ -365,6 +364,7 @@ export interface ExternalModelsDefaults {
   geminiModel?: string;
   grokModel?: string;
   antigravityModel?: string;
+  cursorModel?: string;
   copilotModel?: string;
   copilotReasoningEffort?: CopilotReasoningEffort;
 }
@@ -486,9 +486,6 @@ export const CANONICAL_TEAM_ROLES = [
 ] as const;
 
 export type CanonicalTeamRole = typeof CANONICAL_TEAM_ROLES[number];
-
-/** Cursor team workers are currently supported only for executor-style tasks. */
-export const CURSOR_EXECUTOR_TEAM_ROLES = ["executor"] as const;
 
 /** Provider for /team role routing. */
 export type TeamRoleProvider = 'claude' | 'codex' | 'gemini' | 'grok' | 'cursor' | 'antigravity' | 'copilot';

@@ -1,4 +1,6 @@
 import type { MailboxNotificationTarget, MailboxTargetOwnership } from './mailbox-notification-guard.js';
+import type { CliAgentType } from './model-contract.js';
+import { type WorkerLaunchAttempt, type WorkerLaunchContext } from './worker-launch-ack.js';
 export type TeamMultiplexerContext = 'tmux' | 'cmux' | 'none';
 export declare function detectTeamMultiplexerContext(env?: NodeJS.ProcessEnv): TeamMultiplexerContext;
 /**
@@ -6,7 +8,9 @@ export declare function detectTeamMultiplexerContext(env?: NodeJS.ProcessEnv): T
  * Tmux panes run bash in this environment, not cmd.exe.
  */
 export declare function isUnixLikeOnWindows(): boolean;
-export declare function applyMainVerticalLayout(teamTarget: string): Promise<void>;
+export declare function applyMainVerticalLayout(teamTarget: string, options?: {
+    required?: boolean;
+}): Promise<void>;
 type MailboxOwnershipCommand = (args: string[]) => Promise<{
     stdout: string;
     stderr: string;
@@ -62,6 +66,11 @@ export interface WorkerPaneConfig {
     /** @deprecated Prefer launchBinary + launchArgs for safe argv handling */
     launchCmd?: string;
     cwd: string;
+    provider?: CliAgentType;
+    launchBootstrapPath?: string;
+    launchStateCwd?: string;
+    launchContext?: WorkerLaunchContext;
+    launchAttempt?: WorkerLaunchAttempt;
 }
 export declare function getDefaultShell(): string;
 /** Shell + rc file pair used for worker pane launch */
@@ -84,6 +93,7 @@ export declare function resolveSupportedShellAffinity(shellPath?: string): Worke
  *   5. Fallback: /bin/sh
  */
 export declare function buildWorkerLaunchSpec(shellPath?: string): WorkerLaunchSpec;
+export declare function redactBoundedDiagnostic(error: unknown, maxLength?: number): string;
 export interface WaitForShellReadyOptions {
     timeoutMs?: number;
     pollIntervalMs?: number;
@@ -142,7 +152,48 @@ export interface WorkerPaneSplitEvidence {
     stderr: string;
     paneId: string | null;
 }
-export declare function splitTeamWorkerPaneWithEvidence(splitTarget: string, direction: 'right' | 'down', cwd: string): Promise<WorkerPaneSplitEvidence>;
+export interface WorkerPaneOwnership {
+    provider: WorkerPaneSplitEvidence['provider'];
+    providerTarget: string;
+    paneId: string;
+    splitTarget: string;
+    leaderPaneId: string;
+    reservedPaneIds: readonly string[];
+    source: 'split' | 'adopted';
+}
+export type WorkerPaneOwnershipResult = {
+    ok: true;
+    ownership: WorkerPaneOwnership;
+} | {
+    ok: false;
+    reason: 'split_failed' | 'pane_id_missing' | 'pane_id_malformed' | 'leader_alias' | 'split_target_alias' | 'reserved_worker_alias' | 'pane_foreign' | 'pane_membership_unavailable';
+};
+export interface StartupPaneContext {
+    ownership: WorkerPaneOwnership;
+    attempt: WorkerLaunchAttempt;
+    provider: CliAgentType;
+}
+export declare function proveWorkerPaneOwnership(evidence: WorkerPaneSplitEvidence, constraints: {
+    providerTarget: string;
+    leaderPaneId: string;
+    reservedPaneIds: readonly string[];
+    requireNewFromSplitTarget?: boolean;
+}): WorkerPaneOwnershipResult;
+export declare function adoptWorkerPaneOwnership(input: {
+    provider: WorkerPaneSplitEvidence['provider'];
+    providerTarget: string;
+    paneId: string;
+    leaderPaneId: string;
+    reservedPaneIds: readonly string[];
+    dependencies?: MailboxTargetOwnershipDependencies;
+}): Promise<WorkerPaneOwnershipResult>;
+export declare function workerPaneBelongsToProviderTarget(input: {
+    provider: WorkerPaneSplitEvidence['provider'];
+    providerTarget: string;
+    paneId: string;
+    dependencies?: MailboxTargetOwnershipDependencies;
+}): Promise<boolean>;
+export declare function splitTeamWorkerPaneWithEvidence(splitTarget: string, direction: 'right' | 'down', cwd: string, provider?: WorkerPaneSplitEvidence['provider']): Promise<WorkerPaneSplitEvidence>;
 export declare function splitTeamWorkerPane(splitTarget: string, direction: 'right' | 'down', cwd: string): Promise<string | null>;
 export declare function createTeamSession(teamName: string, workerCount: number, cwd: string, options?: CreateTeamSessionOptions): Promise<TeamSession>;
 /**
@@ -151,17 +202,58 @@ export declare function createTeamSession(teamName: string, workerCount: number,
  * Worker startup: env OMC_TEAM_WORKER={teamName}/workerName shell -lc "exec agentCmd"
  */
 export declare function spawnWorkerInPane(sessionName: string, paneId: string, config: WorkerPaneConfig): Promise<void>;
+export declare function spawnOwnedWorkerInPane(sessionName: string, ownership: WorkerPaneOwnership, config: WorkerPaneConfig): Promise<StartupPaneContext>;
+export type PaneCaptureObservation = {
+    ok: true;
+    captured: string;
+} | {
+    ok: false;
+    error: string;
+};
 export declare function captureTeamPane(paneId: string): Promise<string>;
 export declare function sendTeamPaneKey(paneId: string, key: string): Promise<void>;
 export declare function killTeamPane(paneId: string): Promise<void>;
-export declare function paneHasTrustPrompt(captured: string): boolean;
-export declare function paneHasActiveTask(captured: string): boolean;
-export declare function paneLooksReady(captured: string): boolean;
+export declare function killOwnedWorkerPane(ownership: WorkerPaneOwnership): Promise<void>;
+export declare function paneHasTrustPrompt(captured: string, provider?: CliAgentType): boolean;
+export declare function paneHasCursorWorkspaceTrustPrompt(captured: string): boolean;
+export declare function paneHasActiveTask(captured: string, provider?: CliAgentType): boolean;
+export declare function paneLooksReady(captured: string, provider?: CliAgentType): boolean;
 export interface WaitForPaneReadyOptions {
     timeoutMs?: number;
     pollIntervalMs?: number;
+    attemptAlreadyFenced?: boolean;
+    provider?: CliAgentType;
 }
 export declare function waitForPaneReady(paneId: string, opts?: WaitForPaneReadyOptions): Promise<boolean>;
+export type StartupPaneReadyResult = {
+    ok: true;
+} | {
+    ok: false;
+    reason: 'attempt_inactive' | 'ownership_mismatch' | 'copy_mode' | 'copy_mode_unknown' | 'capture_failed' | 'selector_unsupported' | 'selector_persistent' | 'cursor_workspace_untrusted' | 'pane_busy' | 'readiness_timeout';
+};
+export declare function waitForStartupPaneReady(context: StartupPaneContext, opts?: WaitForPaneReadyOptions): Promise<StartupPaneReadyResult>;
+export declare function deliverStartupInbox(context: StartupPaneContext, message: string, options?: {
+    attemptAlreadyFenced?: boolean;
+}): Promise<{
+    ok: true;
+    kind: 'attempted_unconfirmed';
+} | {
+    ok: false;
+    reason: string;
+}>;
+/**
+ * Outcome of a startup-inbox resubmit probe:
+ * - `resubmitted` — the trigger was still visibly pending and Enter was re-sent.
+ * - `pane_busy` — the owned pane shows an active task: the worker consumed the
+ *   trigger and is working, so resubmitting would duplicate the inbox. Callers
+ *   must keep waiting for startup evidence instead of tearing the launch down.
+ * - `unavailable` — the pane cannot be re-submitted into (inactive attempt,
+ *   copy mode, capture failure, selector, or the trigger text is gone).
+ */
+export type StartupInboxResubmitOutcome = 'resubmitted' | 'pane_busy' | 'unavailable';
+export declare function retryStartupInboxSubmit(context: StartupPaneContext, message: string, options?: {
+    attemptAlreadyFenced?: boolean;
+}): Promise<StartupInboxResubmitOutcome>;
 export declare function shouldAttemptAdaptiveRetry(args: {
     paneBusy: boolean;
     latestCapture: string | null;
@@ -203,7 +295,7 @@ export declare function killWorkerPanes(opts: {
     cwd: string;
     graceMs?: number;
 }): Promise<void>;
-export declare function resolveSplitPaneWorkerPaneIds(sessionName: string, recordedPaneIds?: string[], leaderPaneId?: string): Promise<string[]>;
+export declare function resolveSplitPaneWorkerPaneIds(_sessionName: string, recordedPaneIds?: string[], leaderPaneId?: string): Promise<string[]>;
 /**
  * Kill the team tmux session or just the worker panes, depending on how the
  * team was created.
@@ -214,6 +306,6 @@ export declare function resolveSplitPaneWorkerPaneIds(sessionName: string, recor
  */
 export declare function killTeamSession(sessionName: string, workerPaneIds?: string[], leaderPaneId?: string, options?: {
     sessionMode?: TeamSessionMode;
-}): Promise<void>;
+}): Promise<boolean>;
 export {};
 //# sourceMappingURL=tmux-session.d.ts.map

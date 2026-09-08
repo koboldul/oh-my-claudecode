@@ -22,6 +22,7 @@ interface ClaimTaskDeps extends TaskReadDeps {
     isTerminalTaskStatus: (status: TeamTaskStatus) => boolean;
     taskFilePath: (teamName: string, taskId: string, cwd: string) => string;
     writeAtomic: (path: string, data: string) => Promise<void>;
+    launchAttemptId?: string;
 }
 export declare function claimTask(taskId: string, workerName: string, expectedVersion: number | null, deps: ClaimTaskDeps): Promise<ClaimTaskResult>;
 interface TransitionDeps extends ClaimTaskDeps {
@@ -39,6 +40,7 @@ interface TransitionDeps extends ClaimTaskDeps {
 export declare function transitionTaskStatus(taskId: string, from: TeamTaskStatus, to: TeamTaskStatus, claimToken: string, terminalData: {
     result?: string;
     error?: string;
+    metadata?: Record<string, unknown>;
 } | undefined, deps: TransitionDeps): Promise<TransitionTaskResult>;
 type ReleaseDeps = ClaimTaskDeps;
 export declare function releaseTaskClaim(taskId: string, claimToken: string, _workerName: string, deps: ReleaseDeps): Promise<ReleaseTaskClaimResult>;

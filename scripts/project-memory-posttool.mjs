@@ -66,6 +66,17 @@ async function processProjectMemoryPostTool(
  * Main hook execution
  */
 async function main() {
+  const skipHooks = (process.env.OMC_SKIP_HOOKS || '').split(',').map((hook) => hook.trim());
+  if (
+    process.env.DISABLE_OMC === '1' ||
+    process.env.DISABLE_OMC === 'true' ||
+    skipHooks.includes('project-memory-posttool') ||
+    skipHooks.includes('post-tool-use')
+  ) {
+    console.log(JSON.stringify({ continue: true }));
+    return;
+  }
+
   try {
     const runtime = loadHookRuntime();
     const [

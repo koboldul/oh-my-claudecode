@@ -86,9 +86,9 @@ export function writeStdinCache(stdin) {
  * path is authoritative. Otherwise — e.g. `omc hud --watch` running as a
  * detached CLI/tmux process that never inherited the parent's session
  * env — we still need a way to surface the active session's cache; we
- * fall back first to the legacy flat path, and then to the most recently
- * updated `state/sessions/{id}/hud-stdin-cache.json` so the watch pane
- * does not stay stuck on an empty/starting view.
+ * prefer the most recently updated valid `state/sessions/{id}/hud-stdin-cache.json`
+ * and then fall back to the legacy flat path so the watch pane does not stay
+ * stuck on an empty/starting view.
  *
  * Returns null if no cache exists or it is unreadable.
  */
@@ -99,36 +99,43 @@ export function readStdinCache() {
         try {
             if (!existsSync(p))
                 return null;
-            return JSON.parse(readFileSync(p, 'utf-8'));
+            return parseCachedStdin(readFileSync(p, 'utf-8'));
         }
         catch {
             return null;
         }
     };
-    const scoped = tryRead(scopedPath);
-    if (scoped)
-        return scoped;
     // If the scoped path already *is* the legacy flat path (no session id
     // was available), there's no further lookup to try.
     const legacyPath = resolveOmcPath('state/hud-stdin-cache.json', root);
     if (scopedPath !== legacyPath) {
-        return null;
+        return tryRead(scopedPath);
     }
-    // Env-less reader: pick the most recent session-scoped cache as a
-    // best-effort surface of "the active session's HUD".
-    return readMostRecentSessionCache(root);
+    // Env-less reader: compare the legacy and session-scoped caches by mtime and
+    // return the newest valid entry. This lets a current session cache outrank a
+    // stale legacy snapshot without allowing an older session cache to hide a
+    // newer flat cache written by a statusline process without session context.
+    return readMostRecentCache(root, legacyPath);
+}
+/** Parse only object-shaped cache entries; malformed values are not cache hits. */
+function parseCachedStdin(raw) {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+        return null;
+    return parsed;
 }
 /**
- * Scan `state/sessions/{id}/hud-stdin-cache.json` and return the contents
- * of the most recently modified one. Only used as a fallback when no
- * session id is available in the environment (e.g. a tmux-hosted
- * `omc hud --watch` reader that did not inherit `CLAUDE_SESSION_ID`).
+ * Scan the legacy and session-scoped cache paths and return the contents of
+ * the most recently modified valid one. Only used when no session id is
+ * available in the environment (e.g. a tmux-hosted `omc hud --watch` reader
+ * that did not inherit `CLAUDE_SESSION_ID`). Malformed newest entries are
+ * skipped so they do not hide an older valid cache.
  *
  * Uses the same OMC-root helpers as the writers (`listSessionIds` /
  * `getSessionStateDir`) so this fallback honors `OMC_STATE_DIR` and any
  * other centralized-state configuration.
  */
-function readMostRecentSessionCache(root) {
+function readMostRecentCache(root, legacyPath) {
     let sessionIds;
     try {
         sessionIds = listSessionIds(root);
@@ -136,8 +143,15 @@ function readMostRecentSessionCache(root) {
     catch {
         return null;
     }
-    let bestPath = null;
-    let bestMtime = -Infinity;
+    const candidates = [];
+    try {
+        const st = statSync(legacyPath);
+        if (st.isFile())
+            candidates.push({ path: legacyPath, mtimeMs: st.mtimeMs });
+    }
+    catch {
+        // The legacy cache is optional.
+    }
     for (const sid of sessionIds) {
         let candidate;
         try {
@@ -150,23 +164,24 @@ function readMostRecentSessionCache(root) {
             const st = statSync(candidate);
             if (!st.isFile())
                 continue;
-            if (st.mtimeMs > bestMtime) {
-                bestMtime = st.mtimeMs;
-                bestPath = candidate;
-            }
+            candidates.push({ path: candidate, mtimeMs: st.mtimeMs });
         }
         catch {
             // Skip unreadable entries
         }
     }
-    if (!bestPath)
-        return null;
-    try {
-        return JSON.parse(readFileSync(bestPath, 'utf-8'));
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || a.path.localeCompare(b.path));
+    for (const candidate of candidates) {
+        try {
+            const parsed = parseCachedStdin(readFileSync(candidate.path, 'utf-8'));
+            if (parsed)
+                return parsed;
+        }
+        catch {
+            // A corrupt newest cache must not hide an older valid session cache.
+        }
     }
-    catch {
-        return null;
-    }
+    return null;
 }
 // ============================================================================
 // Stdin Reader
@@ -330,12 +345,16 @@ export function getRateLimitsFromStdin(stdin) {
     if (fiveHour == null && sevenDay == null) {
         return null;
     }
-    return {
-        fiveHourPercent: clampPercent(fiveHour),
-        weeklyPercent: sevenDay == null ? undefined : clampPercent(sevenDay),
-        fiveHourResetsAt: parseResetDate(stdin.rate_limits?.five_hour?.resets_at),
-        weeklyResetsAt: parseResetDate(stdin.rate_limits?.seven_day?.resets_at),
-    };
+    const result = {};
+    if (fiveHour != null) {
+        result.fiveHourPercent = clampPercent(fiveHour);
+        result.fiveHourResetsAt = parseResetDate(stdin.rate_limits?.five_hour?.resets_at);
+    }
+    if (sevenDay != null) {
+        result.weeklyPercent = clampPercent(sevenDay);
+        result.weeklyResetsAt = parseResetDate(stdin.rate_limits?.seven_day?.resets_at);
+    }
+    return result;
 }
 /**
  * Get model display name from stdin.

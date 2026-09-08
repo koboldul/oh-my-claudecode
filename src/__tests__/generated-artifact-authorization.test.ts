@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,7 @@ const LIVE_BASE_SHA = '21a6e488ce12d79b9a22d37e1093ac8e79f21029';
 const HEAD_SHA = '10078ece166ad36332390ecbaab2d5e247852bbc';
 const MAIN_SHA = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const PULL_NUMBER = 3537;
+const FIXTURE_NOW = new Date('2026-08-01T00:00:00.000Z');
 const ROOT = process.cwd();
 const WORKFLOW_PATH = join(ROOT, '.github', 'workflows', 'generated-artifact-authorization.yml');
 const MANIFEST_PATH = join(ROOT, '.github', 'generated-artifact-authorizations.json');
@@ -49,6 +50,7 @@ type ApiFile = {
 };
 
 type MutableInput = {
+  now: Date;
   environment: {
     githubEventName: string;
     githubRepository: string;
@@ -88,7 +90,13 @@ type MutableInput = {
     merge_base_commit: { sha: string };
     files?: unknown;
   };
-  commit: { sha: string; commit: { verification: { verified: boolean } }; author: { login: string } };
+
+  commit: {
+    sha: string;
+    commit: { verification: { verified: boolean } };
+    author: { login: string };
+    committer: { login: string };
+  };
   signature: { oid: string; signature: { isValid: boolean; signer: { login: string } } };
   files: ApiFile[];
 };
@@ -103,6 +111,7 @@ type VerifierModule = {
     token: string;
     fetchImpl: typeof fetch;
     repositoryRoot: string;
+    now?: Date;
   }): Promise<unknown>;
   validateAuthorizationManifest(manifest: unknown): unknown;
   readDetachedCheckoutHead(repositoryRoot: string): string;
@@ -122,6 +131,8 @@ const exactAuthorization = (() => {
   if (!authorization) throw new Error('Missing exact #3537 base-owned authorization fixture');
   return authorization;
 })();
+const EXPIRES_AT = exactAuthorization.expiresAt;
+const EXPIRY_INSTANT = Date.parse(EXPIRES_AT);
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -139,6 +150,7 @@ function apiFiles(records = exactAuthorization.generatedFiles): ApiFile[] {
 function authorizedInput(): MutableInput {
   const files = apiFiles();
   return {
+    now: new Date(FIXTURE_NOW),
     environment: {
       githubEventName: 'pull_request_target',
       githubRepository: REPOSITORY,
@@ -185,6 +197,7 @@ function authorizedInput(): MutableInput {
       sha: HEAD_SHA,
       commit: { verification: { verified: true } },
       author: { login: OWNER },
+      committer: { login: OWNER },
     },
     signature: {
       oid: HEAD_SHA,
@@ -237,22 +250,59 @@ describe('generated-artifact base trust root workflow', () => {
     expect(workflow).not.toMatch(/^\s+run: (?!node scripts\/verify-generated-artifact-authorization\.mjs$)/m);
   });
 
-  it('covers both the main promotion and the retained dev authorization targets', () => {
+  it('allows future bounded authorization entries while enforcing manifest invariants', () => {
     const workflow = readFileSync(WORKFLOW_PATH, 'utf8');
 
     expect(workflow).toContain('workflow bytes from the default branch, main');
     expect(workflow).toContain('branches: [main, dev]');
-    expect(manifest.authorizations.map(entry => [entry.pullNumber, entry.targetRef])).toEqual([
-      [3537, 'main'],
-      [3538, 'dev'],
-      [3539, 'dev'],
-      [3541, 'dev'],
-    ]);
-    expect(manifest.authorizations.find(entry => entry.pullNumber === 3538)).toMatchObject({
-      targetRef: 'dev',
-      headSha: 'e798c12426f1f11701dede43a0f35c183651627e',
-      mergeBaseSha: '10078ece166ad36332390ecbaab2d5e247852bbc',
+    expect(manifest.authorizations).not.toHaveLength(0);
+    expect(verifier.validateAuthorizationManifest(manifest)).toMatchObject({
+      repository: REPOSITORY,
+      owner: OWNER,
+      authorizations: expect.arrayContaining([
+        expect.objectContaining({
+          pullNumber: expect.any(Number),
+          targetRef: expect.any(String),
+          mergeBaseSha: expect.stringMatching(/^[0-9a-f]{40}$/),
+          headSha: expect.stringMatching(/^[0-9a-f]{40}$/),
+          generatedDelta: {
+            count: expect.any(Number),
+            sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+          },
+          generatedFiles: expect.any(Array),
+        }),
+      ]),
     });
+
+    const malformedRecord = clone(manifest);
+    delete (malformedRecord.authorizations[0].generatedFiles[0] as Partial<CanonicalRecord>).sha;
+    expect(() => verifier.validateAuthorizationManifest(malformedRecord)).toThrow('unexpected or missing fields');
+
+    const duplicate = clone(manifest);
+    duplicate.authorizations.push(clone(duplicate.authorizations[0]));
+    expect(() => verifier.validateAuthorizationManifest(duplicate)).toThrow('duplicate pull numbers');
+
+    for (const targetRef of ['*', 'main/**', '../main']) {
+      const wildcardOrFallback = clone(manifest);
+      wildcardOrFallback.authorizations[0].targetRef = targetRef;
+      expect(() => verifier.validateAuthorizationManifest(wildcardOrFallback)).toThrow('targetRef is not a canonical ref name');
+    }
+
+    const invalidMergeBase = clone(manifest);
+    invalidMergeBase.authorizations[0].mergeBaseSha = 'A'.repeat(40);
+    expect(() => verifier.validateAuthorizationManifest(invalidMergeBase)).toThrow('mergeBaseSha must be a lowercase 40-character SHA-1');
+
+    const invalidHead = clone(manifest);
+    invalidHead.authorizations[0].headSha = 'A'.repeat(40);
+    expect(() => verifier.validateAuthorizationManifest(invalidHead)).toThrow('headSha must be a lowercase 40-character SHA-1');
+
+    const invalidCount = clone(manifest);
+    invalidCount.authorizations[0].generatedDelta.count += 1;
+    expect(() => verifier.validateAuthorizationManifest(invalidCount)).toThrow('count and digest');
+
+    const invalidDigest = clone(manifest);
+    invalidDigest.authorizations[0].generatedDelta.sha256 = 'b'.repeat(64);
+    expect(() => verifier.validateAuthorizationManifest(invalidDigest)).toThrow('count and digest');
   });
 
   it('is immune to candidate workflow and checker replacement because the trusted workflow checks out only base bytes', () => {
@@ -294,7 +344,7 @@ describe('generated-artifact base-owned authorization decision', () => {
       mergeBaseSha: MERGE_BASE_SHA,
       headSha: HEAD_SHA,
       owner: OWNER,
-      expiresAt: '2026-08-05T00:00:00.000Z',
+      expiresAt: '2026-08-19T00:00:00.000Z',
       generatedDelta: {
         count: 199,
         sha256: '3c1987d239441a787e5428d38b74e9bff51d694ad554d9fe34eae72cd78b059f',
@@ -492,6 +542,36 @@ describe('generated-artifact base-owned authorization decision', () => {
     }, 'signature signer');
   });
 
+  it('accepts GitHub web-flow signatures only for matching GitHub-committed owner heads', () => {
+    const input = authorizedInput();
+    input.signature.signature.signer.login = 'web-flow';
+    input.commit.committer.login = 'web-flow';
+    expect(verifier.evaluateGeneratedArtifactAuthorization(input)).toMatchObject({ allowed: true });
+
+    expectDenied(candidate => {
+      candidate.signature.signature.signer.login = 'web-flow';
+      candidate.commit.committer.login = 'attacker';
+    }, 'web-flow signature does not match');
+  });
+
+  it('rejects any live head or merge-base mismatch from the authorized tuple', () => {
+    const input = authorizedInput();
+    const authorizedHeadSha = 'b'.repeat(40);
+    const authorizedMergeBaseSha = 'c'.repeat(40);
+    input.manifest.authorizations[0].headSha = authorizedHeadSha;
+    input.manifest.authorizations[0].mergeBaseSha = authorizedMergeBaseSha;
+    expect(verifier.evaluateGeneratedArtifactAuthorization(input)).toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('authorized PR/target/head identity'),
+    });
+
+    input.manifest.authorizations[0].headSha = HEAD_SHA;
+    expect(verifier.evaluateGeneratedArtifactAuthorization(input)).toMatchObject({
+      allowed: false,
+      reason: expect.stringContaining('authorized merge base SHA'),
+    });
+  });
+
   it('rejects missing base authorization and any generated closure or digest violation', () => {
     expectDenied(input => {
       input.manifest.authorizations = [];
@@ -509,6 +589,93 @@ describe('generated-artifact base-owned authorization decision', () => {
       input.files.push({ status: 'added', filename: 'dist/extra.js', sha: 'd'.repeat(40) });
       input.livePull.changed_files += 1;
     }, 'authorized closure');
+  });
+
+  it('enforces the exact expiry boundary of the authorized manifest entry', () => {
+    const lastValid = authorizedInput();
+    lastValid.now = new Date(EXPIRY_INSTANT - 1);
+    expect(verifier.evaluateGeneratedArtifactAuthorization(lastValid)).toMatchObject({ allowed: true });
+
+    const expired = authorizedInput();
+    expired.now = new Date(EXPIRY_INSTANT);
+    expect(verifier.evaluateGeneratedArtifactAuthorization(expired)).toEqual({
+      allowed: false,
+      reason: 'generated-artifact authorization has expired',
+    });
+
+    const farFuture = authorizedInput();
+    farFuture.now = new Date('2999-01-01T00:00:00.000Z');
+    expect(verifier.evaluateGeneratedArtifactAuthorization(farFuture)).toEqual({
+      allowed: false,
+      reason: 'generated-artifact authorization has expired',
+    });
+  });
+
+  it('keeps the live decision green under a wall clock far past the fixture expiry', async () => {
+    // #3759 regression: the live path must consult the injected fixture clock,
+    // never the system clock. Freeze the system clock far past every manifest
+    // expiry and prove the exact-head live verification still authorizes.
+    vi.useFakeTimers({
+      now: new Date('2999-01-01T00:00:00.000Z'),
+      toFake: ['Date'],
+    });
+    try {
+      expect(Date.now()).toBe(Date.parse('2999-01-01T00:00:00.000Z'));
+
+      const checkoutRoot = mkdtempSync(join(tmpdir(), 'generated-artifact-authorization-'));
+      mkdirSync(join(checkoutRoot, '.git'));
+      writeFileSync(join(checkoutRoot, '.git', 'HEAD'), `${LIVE_BASE_SHA}\n`);
+      try {
+        const input = authorizedInput();
+        const fetchImpl: typeof fetch = async request => {
+          const url = new URL(
+            typeof request === 'string' ? request : request instanceof URL ? request.href : request.url,
+          );
+          const path = `${url.pathname}${url.search}`;
+          let body: unknown;
+          if (path === `/repos/${REPOSITORY}`) body = input.repositoryMetadata;
+          else if (path === `/repos/${REPOSITORY}/commits/main`) body = input.runtimeCommit;
+          else if (path === `/repos/${REPOSITORY}/pulls/${PULL_NUMBER}`) body = input.livePull;
+          else if (path.includes(`/pulls/${PULL_NUMBER}/files`) && path.endsWith('page=1')) body = input.files.slice(0, 100);
+          else if (path.includes(`/pulls/${PULL_NUMBER}/files`) && path.endsWith('page=2')) body = input.files.slice(100);
+          else if (path.includes(`/pulls/${PULL_NUMBER}/files`) && path.endsWith('page=3')) body = [];
+          else if (path.startsWith(`/repos/${REPOSITORY}/compare/`)) body = input.compare;
+          else if (path === `/repos/${REPOSITORY}/commits/${HEAD_SHA}`) body = input.commit;
+          else if (path === '/graphql') body = { data: { repository: { object: input.signature } } };
+          else throw new Error(`Unexpected GitHub API path ${path}`);
+          return { ok: true, json: async () => body } as Response;
+        };
+
+        await expect(
+          verifier.verifyLiveGeneratedArtifactAuthorization({
+            event: input.event,
+            manifest: input.manifest,
+            environment: input.environment,
+            token: 'test-token',
+            fetchImpl,
+            repositoryRoot: checkoutRoot,
+            now: input.now,
+          }),
+        ).resolves.toMatchObject({ requiresAuthorization: true, pullNumber: PULL_NUMBER });
+
+        // The same live input must fail closed without the injected clock once
+        // the real (faked far-future) clock is consulted: expiry still bites.
+        await expect(
+          verifier.verifyLiveGeneratedArtifactAuthorization({
+            event: input.event,
+            manifest: input.manifest,
+            environment: input.environment,
+            token: 'test-token',
+            fetchImpl,
+            repositoryRoot: checkoutRoot,
+          }),
+        ).rejects.toThrow('generated-artifact authorization has expired');
+      } finally {
+        rmSync(checkoutRoot, { recursive: true, force: true });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('requires exact authorization for generated-path rename, copy, and deletion records', () => {
@@ -758,11 +925,84 @@ describe('generated-artifact base-owned authorization decision', () => {
           token: 'test-token',
           fetchImpl,
           repositoryRoot: checkoutRoot,
+          now: input.now,
         }),
       ).resolves.toMatchObject({ requiresAuthorization: true, pullNumber: PULL_NUMBER });
       expect(requestedPaths).toContain(`/repos/${REPOSITORY}/commits/main`);
       expect(requestedPaths.indexOf(`/repos/${REPOSITORY}`)).toBeLessThan(
         requestedPaths.indexOf(`/repos/${REPOSITORY}/commits/main`),
+      );
+
+      const advancedInput = authorizedInput();
+      const authorizedHeadSha = 'b'.repeat(40);
+      advancedInput.manifest.authorizations[0].headSha = authorizedHeadSha;
+      const advancePaths: string[] = [];
+      const advanceFetch: typeof fetch = async request => {
+        const url = new URL(
+          typeof request === 'string' ? request : request instanceof URL ? request.href : request.url,
+        );
+        const path = `${url.pathname}${url.search}`;
+        advancePaths.push(path);
+        let body: unknown;
+        if (path === `/repos/${REPOSITORY}`) body = advancedInput.repositoryMetadata;
+        else if (path === `/repos/${REPOSITORY}/commits/main`) body = advancedInput.runtimeCommit;
+        else if (path === `/repos/${REPOSITORY}/pulls/${PULL_NUMBER}`) body = advancedInput.livePull;
+        else if (path.includes(`/pulls/${PULL_NUMBER}/files`) && path.endsWith('page=1')) body = advancedInput.files.slice(0, 100);
+        else if (path.includes(`/pulls/${PULL_NUMBER}/files`) && path.endsWith('page=2')) body = advancedInput.files.slice(100);
+        else if (path.includes(`/pulls/${PULL_NUMBER}/files`) && path.endsWith('page=3')) body = [];
+        else if (path === `/repos/${REPOSITORY}/compare/${LIVE_BASE_SHA}...${HEAD_SHA}?per_page=1&page=1`) body = advancedInput.compare;
+        else if (path === `/repos/${REPOSITORY}/commits/${HEAD_SHA}`) body = advancedInput.commit;
+        else if (path === '/graphql') body = { data: { repository: { object: advancedInput.signature } } };
+        else throw new Error(`Unexpected GitHub API path ${path}`);
+        return { ok: true, json: async () => body } as Response;
+      };
+      await expect(verifier.verifyLiveGeneratedArtifactAuthorization({
+        event: advancedInput.event,
+        manifest: advancedInput.manifest,
+        environment: advancedInput.environment,
+        token: 'test-token',
+        fetchImpl: advanceFetch,
+        repositoryRoot: checkoutRoot,
+        now: advancedInput.now,
+      })).rejects.toThrow('authorized PR/target/head identity');
+      expect(advancePaths).not.toContain(
+        `/repos/${REPOSITORY}/compare/${authorizedHeadSha}...${HEAD_SHA}?per_page=100&page=1`,
+      );
+
+      const mergeBaseAdvancedInput = authorizedInput();
+      const authorizedMergeBaseSha = 'c'.repeat(40);
+      mergeBaseAdvancedInput.manifest.authorizations[0].mergeBaseSha = authorizedMergeBaseSha;
+      const mergeBaseAdvancePaths: string[] = [];
+      const mergeBaseAdvanceFetch: typeof fetch = async request => {
+        const url = new URL(
+          typeof request === 'string' ? request : request instanceof URL ? request.href : request.url,
+        );
+        const path = `${url.pathname}${url.search}`;
+        mergeBaseAdvancePaths.push(path);
+        let body: unknown;
+        if (path === `/repos/${REPOSITORY}`) body = mergeBaseAdvancedInput.repositoryMetadata;
+        else if (path === `/repos/${REPOSITORY}/commits/main`) body = mergeBaseAdvancedInput.runtimeCommit;
+        else if (path === `/repos/${REPOSITORY}/pulls/${PULL_NUMBER}`) body = mergeBaseAdvancedInput.livePull;
+        else if (path.includes(`/pulls/${PULL_NUMBER}/files`) && path.endsWith('page=1')) body = mergeBaseAdvancedInput.files.slice(0, 100);
+        else if (path.includes(`/pulls/${PULL_NUMBER}/files`) && path.endsWith('page=2')) body = mergeBaseAdvancedInput.files.slice(100);
+        else if (path.includes(`/pulls/${PULL_NUMBER}/files`) && path.endsWith('page=3')) body = [];
+        else if (path === `/repos/${REPOSITORY}/compare/${LIVE_BASE_SHA}...${HEAD_SHA}?per_page=1&page=1`) body = mergeBaseAdvancedInput.compare;
+        else if (path === `/repos/${REPOSITORY}/commits/${HEAD_SHA}`) body = mergeBaseAdvancedInput.commit;
+        else if (path === '/graphql') body = { data: { repository: { object: mergeBaseAdvancedInput.signature } } };
+        else throw new Error(`Unexpected GitHub API path ${path}`);
+        return { ok: true, json: async () => body } as Response;
+      };
+      await expect(verifier.verifyLiveGeneratedArtifactAuthorization({
+        event: mergeBaseAdvancedInput.event,
+        manifest: mergeBaseAdvancedInput.manifest,
+        environment: mergeBaseAdvancedInput.environment,
+        token: 'test-token',
+        fetchImpl: mergeBaseAdvanceFetch,
+        repositoryRoot: checkoutRoot,
+        now: mergeBaseAdvancedInput.now,
+      })).rejects.toThrow('authorized merge base SHA');
+      expect(mergeBaseAdvancePaths).not.toContain(
+        `/repos/${REPOSITORY}/compare/${authorizedMergeBaseSha}...${MERGE_BASE_SHA}?per_page=100&page=1`,
       );
 
       const racedInput = authorizedInput();
@@ -789,6 +1029,7 @@ describe('generated-artifact base-owned authorization decision', () => {
           token: 'test-token',
           fetchImpl: raceFetch,
           repositoryRoot: checkoutRoot,
+          now: racedInput.now,
         }),
       ).rejects.toThrow('GITHUB_SHA does not match the current protected default-main commit SHA');
       expect(racePaths).toEqual([`/repos/${REPOSITORY}`, `/repos/${REPOSITORY}/commits/main`]);
@@ -821,6 +1062,7 @@ describe('generated-artifact base-owned authorization decision', () => {
           token: 'test-token',
           fetchImpl,
           repositoryRoot: checkoutRoot,
+          now: input.now,
         }),
       ).rejects.toThrow('default branch is not main');
       expect(requestedPaths).toEqual([`/repos/${REPOSITORY}`]);

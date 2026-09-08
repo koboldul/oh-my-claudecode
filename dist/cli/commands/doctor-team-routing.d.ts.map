@@ -1,1 +1,1 @@
-{"version":3,"file":"doctor-team-routing.d.ts","sourceRoot":"","sources":["../../../src/cli/commands/doctor-team-routing.ts"],"names":[],"mappings":"AAAA;;;;;;GAMG;AAyDH,wBAAsB,wBAAwB,CAAC,OAAO,EAAE;IAAE,IAAI,CAAC,EAAE,OAAO,CAAA;CAAE,GAAG,OAAO,CAAC,MAAM,CAAC,CAmD3F"}
+{"version":3,"file":"doctor-team-routing.d.ts","sourceRoot":"","sources":["../../../src/cli/commands/doctor-team-routing.ts"],"names":[],"mappings":"AAAA;;;;;;GAMG;AAqDH,wBAAsB,wBAAwB,CAAC,OAAO,EAAE;IAAE,IAAI,CAAC,EAAE,OAAO,CAAA;CAAE,GAAG,OAAO,CAAC,MAAM,CAAC,CA6D3F"}

@@ -3,7 +3,7 @@ import { execSync } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { clearWorktreeCache } from '../../lib/worktree-paths.js';
 import {
   addUltragoalGoal,
@@ -18,9 +18,21 @@ import {
 
 async function withTempRepo<T>(run: (cwd: string) => Promise<T>): Promise<T> {
   const cwd = await mkdtemp(join(tmpdir(), 'omc-ultragoal-'));
+  const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
+  const originalStateDir = process.env.OMC_STATE_DIR;
+  process.env.HOME = cwd;
+  process.env.USERPROFILE = cwd;
+  delete process.env.OMC_STATE_DIR;
   try {
     return await run(cwd);
   } finally {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
+    if (originalStateDir === undefined) delete process.env.OMC_STATE_DIR;
+    else process.env.OMC_STATE_DIR = originalStateDir;
     await rm(cwd, { recursive: true, force: true });
   }
 }
@@ -92,6 +104,41 @@ describe('ultragoal artifacts', () => {
       expect(instruction).not.toMatch(/create_goal/);
       expect(instruction).not.toMatch(/update_goal/);
       expect(instruction).not.toMatch(/\bcodex\b/i);
+    });
+  });
+
+  it('targets named goals, preserves attempts on resume, and rejects conflicting or ineligible ids', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [
+          { title: 'First', objective: 'first' },
+          { title: 'Second', objective: 'second' },
+          { title: 'Third', objective: 'third' },
+        ],
+      });
+      const named = await startNextUltragoal(cwd, { goalId: 'G003-third' });
+      expect(named.goal?.id).toBe('G003-third');
+      expect(named.goal?.attempt).toBe(1);
+      const resumed = await startNextUltragoal(cwd, { goalId: 'G003-third' });
+      expect(resumed.resumed).toBe(true);
+      expect(resumed.goal?.attempt).toBe(1);
+      await expect(startNextUltragoal(cwd, { goalId: 'G002-second' })).rejects.toThrow(/active goal G003-third/);
+      const unchanged = await readUltragoalPlan(cwd);
+      expect(unchanged.activeGoalId).toBe('G003-third');
+      expect(unchanged.goals.find((goal) => goal.id === 'G002-second')?.status).toBe('pending');
+    });
+  });
+
+  it('requires explicit retry for a named failed goal', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, { brief: 'brief', goals: [{ title: 'First', objective: 'first' }] });
+      const started = await startNextUltragoal(cwd);
+      await checkpointUltragoal(cwd, { goalId: started.goal!.id, status: 'failed', evidence: 'failed' });
+      await expect(startNextUltragoal(cwd, { goalId: started.goal!.id })).rejects.toThrow(/without --retry-failed/);
+      const retried = await startNextUltragoal(cwd, { goalId: started.goal!.id, retryFailed: true });
+      expect(retried.goal?.id).toBe(started.goal!.id);
+      expect(retried.goal?.attempt).toBe(2);
     });
   });
 
@@ -654,7 +701,7 @@ describe('ultragoal artifacts', () => {
 
   describe('multi-repo workspace anchor', () => {
     it('writes artifacts to the workspace anchor .omc/ when .omc-workspace marker exists in a parent dir', async () => {
-      const workspaceRoot = await mkdtemp(join(tmpdir(), 'omc-workspace-anchor-'));
+      const workspaceRoot = await mkdtemp(join(homedir(), 'omc-workspace-anchor-'));
       try {
         // Create workspace marker so getOmcRoot() anchors to workspaceRoot
         writeFileSync(join(workspaceRoot, '.omc-workspace'), '{}');

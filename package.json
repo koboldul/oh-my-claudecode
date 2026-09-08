@@ -1,6 +1,6 @@
 {
   "name": "oh-my-claude-sisyphus",
-  "version": "4.15.8",
+  "version": "5.3.0",
   "description": "Multi-agent orchestration system for Claude Code - Inspired by oh-my-opencode",
   "type": "module",
   "main": "dist/index.js",
@@ -9,6 +9,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./team": {
+      "import": "./dist/team/index.js",
+      "types": "./dist/team/index.d.ts"
     }
   },
   "bin": {
@@ -45,7 +49,10 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "node scripts/generate-copilot-agents.mjs && node scripts/generate-copilot-prompts.mjs && tsc && npm run build:hook-runtime && npm run build:hud-runtime && node scripts/build-workflow-stage-prompts.mjs && node scripts/build-skill-bridge.mjs && node scripts/build-mcp-server.mjs && node scripts/build-bridge-entry.mjs && npm run compose-docs && npm run build:claude-md-coordinator && npm run build:runtime-cli && npm run build:team-server && npm run build:cli",
+    "prompt-ssot:build": "tsx scripts/build-prompt-ssot.ts",
+    "prompt-ssot:check": "tsx scripts/build-prompt-ssot.ts --check",
+    "prompt-ssot:measure": "tsx scripts/measure-prompt-ssot.ts",
+    "build": "node scripts/generate-copilot-agents.mjs && node scripts/generate-copilot-prompts.mjs && node scripts/generate-skill-entitlements.mjs --verify && tsc && npm run build:hook-runtime && npm run build:hud-runtime && node scripts/build-workflow-stage-prompts.mjs && node scripts/build-skill-bridge.mjs && node scripts/build-mcp-server.mjs && node scripts/build-bridge-entry.mjs && npm run compose-docs && npm run generate:prompt-projections && npm run build:claude-md-coordinator && npm run build:runtime-cli && npm run build:team-server && npm run build:cli",
     "build:bridge": "node scripts/build-skill-bridge.mjs",
     "build:bridge-entry": "node scripts/build-bridge-entry.mjs",
     "build:claude-md-coordinator": "node scripts/build-claude-md-coordinator.mjs",
@@ -79,9 +86,15 @@
     "sync-metadata": "tsx scripts/sync-metadata.ts",
     "sync-metadata:verify": "tsx scripts/sync-metadata.ts --verify",
     "sync-metadata:dry-run": "tsx scripts/sync-metadata.ts --dry-run",
+    "generate:inventory": "node scripts/generate-inventory-graph.mjs --write",
+    "generate:inventory:verify": "node scripts/generate-inventory-graph.mjs --verify",
     "release": "tsx scripts/release.ts",
     "prepublishOnly": "npm run build",
-    "version": "bash scripts/sync-version.sh"
+    "version": "bash scripts/sync-version.sh",
+    "generate:skill-entitlements": "node scripts/generate-skill-entitlements.mjs",
+    "verify:skill-entitlements": "node scripts/generate-skill-entitlements.mjs --verify",
+    "generate:prompt-projections": "node scripts/generate-prompt-projections.mjs",
+    "verify:prompt-projections": "node scripts/generate-prompt-projections.mjs --verify"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.0",
@@ -89,7 +102,7 @@
     "@modelcontextprotocol/sdk": "^1.26.0",
     "@types/better-sqlite3": "^7.6.13",
     "ajv": "^8.17.1",
-    "better-sqlite3": "^12.6.2",
+    "better-sqlite3": "^12.10.0",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
     "jsonc-parser": "^3.3.1",
@@ -114,7 +127,7 @@
     "vitest": "^4.0.17"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": "20.x || 22.x || 23.x || 24.x || 25.x || 26.x"
   },
   "repository": {
     "type": "git",

@@ -16,9 +16,10 @@ import { waitForSentinelReadiness } from './sentinel-gate.js';
 import { isRuntimeV2Enabled, startTeamV2, monitorTeamV2, shutdownTeamV2, executeRecoverDeadWorkerV2Owner, prepareRecoveryOwnerBootstrap, reconcileCommittedTeamServices } from './runtime-v2.js';
 import { createSwallowedErrorLogger } from '../lib/swallowed-error.js';
 import { parseRecoveryIntent, setRuntimeOwnerDispatch } from './runtime-owner-client.js';
-import { absPath, TeamPaths } from './state-paths.js';
+import { absPath, TeamPaths, teamStateRoot } from './state-paths.js';
 import { canonicalRecoveryPayloadHash, isSafeRecoveryRequestId, readRecoveryFinalState, readRecoveryOutcome, readRecoveryRequestReservation } from './recovery-request-store.js';
 import { runWorkerActivationGate } from './worker-activation-gate.js';
+import { readAndConsumeWorkerLaunchDescriptor, runWorkerLaunchBootstrap } from './worker-launch-ack.js';
 import { readRevisionedTeamConfig, saveTeamConfigAtRevision } from './monitor.js';
 import { withProcessIdentityFileLock } from './process-identity-lock.js';
 import { checkOwnerFence, currentProcessStartIdentity, requireOwnerProcessIdentity } from './team-owner-epoch.js';
@@ -135,7 +136,15 @@ export async function updateAllDeadRecoveryGrace(teamName, cwd, evidence, nowMs 
             all_dead_recovery: evidence === 'all_dead'
                 ? { detected_at: new Date(nowMs).toISOString(), deadline_at: new Date(deadlineAt).toISOString(), state_revision: nextRevision }
                 : undefined };
-        if (await saveTeamConfigAtRevision(nextConfig, current.stateRevision, cwd)) {
+        if (await saveTeamConfigAtRevision(nextConfig, current.stateRevision, cwd, undefined, {
+            ...(current.config.all_dead_recovery && evidence !== 'all_dead'
+                ? { release: { all_dead_recovery: true } }
+                : {}),
+            ...(current.config.all_dead_recovery && evidence === 'all_dead'
+                && current.config.all_dead_recovery.deadline_at !== nextConfig.all_dead_recovery?.deadline_at
+                ? { reclaim: { all_dead_recovery: true } }
+                : {}),
+        })) {
             return { deadlineAt: evidence === 'all_dead' ? deadlineAt : null, expired: false };
         }
     }
@@ -295,8 +304,17 @@ export async function fenceAllDeadRecoveryExpiry(teamName, cwd, deadlineAt) {
             || hasPendingRecoveryIntentBeforeDeadline(teamName, cwd, deadlineAt))
             return false;
         const nextRevision = current.stateRevision + 1;
+        const processStartedAt = currentProcessStartIdentity();
+        if (!processStartedAt)
+            return false;
+        const expiryNonce = `all-dead-expiry:${deadlineAt}`;
         return saveTeamConfigAtRevision({ ...current.config, lifecycle_state: 'shutting_down', all_dead_recovery: undefined,
-            state_revision: nextRevision }, current.stateRevision, cwd);
+            shutdown_attempt: { nonce: expiryNonce, pid: process.pid, process_started_at: processStartedAt,
+                state_revision: nextRevision, created_at: new Date().toISOString() },
+            state_revision: nextRevision }, current.stateRevision, cwd, undefined, {
+            release: { all_dead_recovery: true },
+            ...(current.config.shutdown_attempt ? { reclaim: { shutdown_attempt: true } } : {}),
+        });
     });
 }
 function ownsPersistentRecoveryFence(input, fence, expectedEpoch) {
@@ -683,6 +701,26 @@ export async function finalizeRuntimeShutdown(runtime, useV2, collectOutput, shu
     await publishOutput(output);
     return output;
 }
+export function createRuntimeStartupShutdownBarrier() {
+    let settled = false;
+    let requested = false;
+    let resolveCompletion;
+    const completion = new Promise(resolve => { resolveCompletion = resolve; });
+    return {
+        requestShutdown: () => { requested = true; },
+        settleStartup: () => {
+            if (settled)
+                return;
+            settled = true;
+            resolveCompletion();
+        },
+        waitForStartup: async () => {
+            if (!settled)
+                await completion;
+        },
+        isShutdownRequested: () => requested,
+    };
+}
 async function main() {
     const startTime = Date.now();
     const logLeaderNudgeEventFailure = createSwallowedErrorLogger('team.runtime-cli main appendTeamEvent failed');
@@ -716,7 +754,7 @@ async function main() {
     }
     const { teamName, agentTypes, tasks, cwd, newWindow = false, pollIntervalMs = 5000, sentinelGateTimeoutMs = 30_000, sentinelGatePollIntervalMs = 250, autoMerge = false, } = input;
     const workerCount = input.workerCount ?? agentTypes.length;
-    const stateRoot = join(cwd, `.omc/state/team/${teamName}`);
+    const stateRoot = teamStateRoot(cwd, teamName);
     const config = {
         teamName,
         workerCount,
@@ -736,7 +774,10 @@ async function main() {
     let runtime = null;
     let finalStatus = 'failed';
     let pollActive = true;
-    async function doShutdown(status) {
+    const startupShutdown = createRuntimeStartupShutdownBarrier();
+    let shutdownInFlight = null;
+    async function performShutdown(status) {
+        await startupShutdown.waitForStartup();
         pollActive = false;
         finalStatus = status;
         const output = await finalizeRuntimeShutdown(runtime, useV2, async () => buildCliOutput(stateRoot, teamName, finalStatus, workerCount, startTime), async () => {
@@ -744,14 +785,20 @@ async function main() {
                 return;
             try {
                 if (useV2) {
-                    await shutdownTeamV2(runtime.teamName, runtime.cwd, { force: true });
+                    const shutdown = await shutdownTeamV2(runtime.teamName, runtime.cwd, { force: true });
+                    if (shutdown.outcome !== 'cleaned') {
+                        throw new Error(`team_shutdown_${shutdown.outcome}:${shutdown.reason}`);
+                    }
                 }
                 else {
-                    await shutdownTeam(runtime.teamName, runtime.sessionName, runtime.cwd, 2_000, runtime.workerPaneIds, runtime.leaderPaneId, runtime.ownsWindow);
+                    const cleaned = await shutdownTeam(runtime.teamName, runtime.sessionName, runtime.cwd, 2_000, runtime.workerPaneIds, runtime.leaderPaneId, runtime.ownsWindow);
+                    if (!cleaned)
+                        throw new Error('team_shutdown_failed:legacy_cleanup_unverified');
                 }
             }
             catch (err) {
                 process.stderr.write(`[runtime-cli] shutdown error: ${err}\n`);
+                throw err;
             }
         }, async (publishedOutput) => {
             const finishedAt = new Date().toISOString();
@@ -767,6 +814,11 @@ async function main() {
         // 4. Exit
         process.exit(status === 'completed' ? 0 : 1);
     }
+    function doShutdown(status) {
+        if (!shutdownInFlight)
+            shutdownInFlight = performShutdown(status);
+        return shutdownInFlight;
+    }
     function exitWithoutShutdown(phase) {
         pollActive = false;
         finalStatus = phase === 'complete' ? 'completed' : 'failed';
@@ -777,10 +829,12 @@ async function main() {
     }
     // Register signal handlers before poll loop
     process.on('SIGINT', () => {
+        startupShutdown.requestShutdown();
         process.stderr.write('[runtime-cli] Received SIGINT, shutting down...\n');
         doShutdown('failed').catch(() => process.exit(1));
     });
     process.on('SIGTERM', () => {
+        startupShutdown.requestShutdown();
         process.stderr.write('[runtime-cli] Received SIGTERM, shutting down...\n');
         doShutdown('failed').catch(() => process.exit(1));
     });
@@ -818,8 +872,15 @@ async function main() {
     }
     catch (err) {
         process.stderr.write(`[runtime-cli] startTeam failed: ${err}\n`);
-        process.exit(1);
+        if (!startupShutdown.isShutdownRequested())
+            process.exit(1);
+        return;
     }
+    finally {
+        startupShutdown.settleStartup();
+    }
+    if (startupShutdown.isShutdownRequested())
+        return;
     // Persist pane IDs so MCP server can clean up explicitly via omc_run_team_cleanup.
     const jobId = process.env.OMC_JOB_ID;
     const expectedTaskCount = tasks.length;
@@ -1046,13 +1107,43 @@ async function main() {
     }
 }
 async function runRecoveryGateFromEnvironment() {
-    const raw = process.env.OMC_RECOVERY_GATE_SPEC;
+    const raw = process.env.OMC_RECOVERY_GATE_SPEC
+        ?? (process.env.OMC_RECOVERY_GATE_SPEC_B64
+            ? Buffer.from(process.env.OMC_RECOVERY_GATE_SPEC_B64, 'base64').toString('utf8')
+            : undefined);
     if (!raw)
         throw new Error('OMC_RECOVERY_GATE_SPEC is required');
     const gate = JSON.parse(raw);
     const result = await runWorkerActivationGate(gate);
     if (result.outcome !== 'ran')
         throw new Error(`recovery_gate_${result.outcome}`);
+    if (result.signal)
+        process.kill(process.pid, result.signal);
+    process.exit(result.exitCode ?? 0);
+}
+export async function runWorkerLaunchFromEnvironment() {
+    const descriptorPath = process.env.OMC_WORKER_LAUNCH_SPEC_FILE;
+    const raw = process.env.OMC_WORKER_LAUNCH_SPEC
+        ?? (process.env.OMC_WORKER_LAUNCH_SPEC_B64
+            ? Buffer.from(process.env.OMC_WORKER_LAUNCH_SPEC_B64, 'base64').toString('utf8')
+            : undefined);
+    if (descriptorPath && raw)
+        throw new Error('worker_launch_spec_source_conflict');
+    if (!descriptorPath) {
+        if (!raw)
+            throw new Error('OMC_WORKER_LAUNCH_SPEC is required');
+        try {
+            JSON.parse(raw);
+        }
+        catch {
+            throw new Error('worker_launch_invalid_spec_json');
+        }
+        throw new Error('worker_launch_descriptor_required');
+    }
+    const spec = await readAndConsumeWorkerLaunchDescriptor(descriptorPath);
+    const result = await runWorkerLaunchBootstrap(spec);
+    if (result.outcome !== 'ran')
+        throw new Error(`worker_launch_${result.outcome}`);
     if (result.signal)
         process.kill(process.pid, result.signal);
     process.exit(result.exitCode ?? 0);
@@ -1100,10 +1191,21 @@ export async function runRecoveryOwnerFromEnvironment() {
         bootstrap,
     }, { expectedEpoch });
 }
+export function selectRuntimeCliMode(argv = process.argv, env = process.env) {
+    if (argv.includes('--worker-launch'))
+        return 'worker-launch';
+    if (argv.includes('--recovery-gate'))
+        return 'recovery-gate';
+    if (env.OMC_RECOVERY_OWNER_INPUT)
+        return 'recovery-owner';
+    return 'main';
+}
 if (require.main === module) {
-    const entry = process.env.OMC_RECOVERY_OWNER_INPUT
-        ? runRecoveryOwnerFromEnvironment
-        : process.argv.includes('--recovery-gate') ? runRecoveryGateFromEnvironment : main;
+    const mode = selectRuntimeCliMode();
+    const entry = mode === 'worker-launch' ? runWorkerLaunchFromEnvironment
+        : mode === 'recovery-gate' ? runRecoveryGateFromEnvironment
+            : mode === 'recovery-owner' ? runRecoveryOwnerFromEnvironment
+                : main;
     entry().catch(err => {
         process.stderr.write(`[runtime-cli] Fatal error: ${err}\n`);
         process.exit(1);

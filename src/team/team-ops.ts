@@ -15,9 +15,9 @@ import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { TeamPaths, absPath } from './state-paths.js';
-import { normalizeTeamManifest } from './governance.js';
+import { normalizeTeamManifest, resolveMaxWorkers } from './governance.js';
 import { normalizeTeamGovernance } from './governance.js';
-import { migrateTeamConfigRevision, readRevisionedTeamConfig, saveTeamConfigAtRevision } from './monitor.js';
+import { isValidPersistedMaxWorkers, migrateTeamConfigRevision, readRevisionedTeamConfig, saveTeamConfigAtRevision } from './monitor.js';
 import { withProcessIdentityFileLock } from './process-identity-lock.js';
 import {
   isTerminalTeamTaskStatus,
@@ -238,6 +238,9 @@ function configFromManifest(manifest: TeamManifestV2): TeamConfig {
     resize_hook_name: manifest.resize_hook_name,
     resize_hook_target: manifest.resize_hook_target,
     next_worker_index: manifest.next_worker_index,
+    resolved_routing: manifest.resolved_routing,
+    resolved_routing_roles: manifest.resolved_routing_roles,
+    external_models_defaults: manifest.external_models_defaults,
   };
 }
 
@@ -255,7 +258,7 @@ function mergeTeamConfigSources(config: TeamConfig | null, manifest: TeamManifes
     workers: [...(config.workers ?? []), ...(manifest.workers ?? [])],
     worker_count: Math.max(config.worker_count ?? 0, manifest.worker_count ?? 0),
     next_task_id: Math.max(config.next_task_id ?? 1, manifest.next_task_id ?? 1),
-    max_workers: Math.max(config.max_workers ?? 0, 20),
+    max_workers: resolveMaxWorkers(config.max_workers),
   });
 }
 
@@ -264,9 +267,24 @@ export async function teamReadConfig(teamName: string, cwd: string): Promise<Tea
   const manifestPath = absPath(cwd, TeamPaths.manifest(teamName));
   const [manifest, config] = await Promise.all([
     teamReadManifest(teamName, cwd),
-    readJsonSafe<TeamConfig>(configPath),
+    readJsonSafe<TeamConfig & { agentTypes?: unknown[] }>(configPath),
   ]);
   if (!config && existsSync(configPath)) throw new Error('invalid_persisted_state');
+  if (config && !isValidPersistedMaxWorkers(config.max_workers)) throw new Error('invalid_persisted_state');
+  // Preserve raw V1 agentTypes provenance before any worker canonicalization.
+  // Canonicalization must not erase the only signal used to route legacy cleanup.
+  if (config && Array.isArray((config as { agentTypes?: unknown[] }).agentTypes)) {
+    const agentTypes = (config as { agentTypes: unknown[] }).agentTypes;
+    // Do not inject empty workers that would reclassify this as V2.
+    const { workers: _drop, ...rest } = config as TeamConfig & { workers?: unknown; agentTypes?: unknown[] };
+    // Preserve agentTypes provenance; only keep workers if the raw file already had them.
+    const rawWorkers = (config as { workers?: unknown }).workers;
+    return {
+      ...rest,
+      agentTypes,
+      workers: Array.isArray(rawWorkers) ? rawWorkers as TeamConfig['workers'] : [],
+    } as unknown as TeamConfig;
+  }
   if (config && typeof config.state_revision === 'number' && Number.isSafeInteger(config.state_revision)) {
     return canonicalizeTeamConfigWorkers(config);
   }
@@ -506,6 +524,7 @@ export async function teamClaimTask(
     isTerminalTaskStatus: isTerminalTeamTaskStatus,
     taskFilePath: (tn: string, tid: string, c: string) => canonicalTaskFilePath(tn, tid, c),
     writeAtomic,
+    launchAttemptId: process.env.OMC_WORKER_LAUNCH_ATTEMPT_ID,
   });
 }
 
@@ -516,7 +535,7 @@ export async function teamTransitionTaskStatus(
   to: TeamTaskStatus,
   claimToken: string,
   cwd: string,
-  terminalData?: { result?: string; error?: string },
+  terminalData?: { result?: string; error?: string; metadata?: Record<string, unknown> },
 ): Promise<TransitionTaskResult> {
   return transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
     teamName,
@@ -555,12 +574,13 @@ export async function teamReleaseTaskClaim(
   });
 }
 
-function recoveryTransitionDeps(teamName: string, cwd: string) {
+function recoveryTransitionDeps(teamName: string, cwd: string, launchAttemptId?: string) {
   return {
     teamName, cwd, readTask: teamReadTask,
     readTeamConfig: teamReadConfig as (tn: string, c: string) => Promise<{ workers: Array<{ name: string }> } | null>,
     withTaskClaimLock, normalizeTask, isTerminalTaskStatus: isTerminalTeamTaskStatus,
     taskFilePath: (tn: string, tid: string, c: string) => canonicalTaskFilePath(tn, tid, c), writeAtomic,
+    ...(launchAttemptId ? { launchAttemptId } : {}),
     readRecoverySidecar: async (tn: string, recoveryId: string, tid: string, c: string): Promise<TaskRecoveryRequeueSidecar | null | 'malformed'> => {
       const path = absPath(c, TeamPaths.taskRecoverySidecar(tn, recoveryId, tid));
       if (!existsSync(path)) return null;
@@ -583,8 +603,8 @@ export async function teamRequeueRecoveredTask(teamName: string, cwd: string, in
 }
 
 /** Runtime-owner-only continuation adoption; call before provider launch. */
-export async function teamAdoptRecoveryReservations(teamName: string, cwd: string, taskIds: string[], workerName: string, proof: TaskRecoveryAdoptionProof): Promise<TaskRecoveryAdoptionResult[]> {
-  return adoptRecoveryReservationsImpl(taskIds, workerName, proof, recoveryTransitionDeps(teamName, cwd));
+export async function teamAdoptRecoveryReservations(teamName: string, cwd: string, taskIds: string[], workerName: string, proof: TaskRecoveryAdoptionProof, launchAttemptId?: string): Promise<TaskRecoveryAdoptionResult[]> {
+  return adoptRecoveryReservationsImpl(taskIds, workerName, proof, recoveryTransitionDeps(teamName, cwd, launchAttemptId));
 }
 
 // ---------------------------------------------------------------------------

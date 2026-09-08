@@ -16,22 +16,30 @@
 import { pathToFileURL } from "url";
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
   readdirSync,
-  renameSync,
   rmdirSync,
-  unlinkSync,
-  writeFileSync,
 } from "fs";
 import { dirname, join } from "path";
-import { resolveToWorktreeRoot, getOmcRoot } from "../lib/worktree-paths.js";
 import {
+  resolveToWorktreeRoot,
+  getOmcRoot,
+  getSessionStateDir as resolveSessionStateDir,
+  listSessionIds,
+  resolveStatePath,
+  resolveSessionStatePath,
+} from "../lib/worktree-paths.js";
+import {
+  canClearStateForSession,
+  clearStateFileLockedIf,
   confirmSkillModeStatesLocked,
   readModeState,
+  readModeStateWithMeta,
   writeModeState,
+  writeStateFileLockedCreateIf,
+  writeStateFileLockedIf,
 } from "../lib/mode-state-io.js";
-import { SESSION_END_MODE_STATE_FILES } from "../lib/mode-names.js";
+import { SESSION_END_MODE_STATE_FILES, MODE_CONFIRMATION_SKILL_MAP } from "../lib/mode-names.js";
 import { formatOmcCliInvocation } from "../utils/omc-cli-rendering.js";
 import { createSwallowedErrorLogger } from "../lib/swallowed-error.js";
 import { dispatchDetachedNotificationInBackground } from "./background-notifications.js";
@@ -44,6 +52,8 @@ import {
   applyRalplanGate,
   sanitizeForKeywordDetection,
   NON_LATIN_SCRIPT_PATTERN,
+  parseExplicitWorkflowSlashInvocation,
+  isRetiredWorkflowSlashInvocation,
 } from "./keyword-detector/index.js";
 import {
   processOrchestratorPreTool,
@@ -88,7 +98,7 @@ import {
   mutateSkillActiveStateLocked,
   type ActiveSkillSlot,
 } from "./skill-state/index.js";
-import { parseExplicitWorkflowSlashInvocation } from "./keyword-detector/index.js";
+import { resolveWorkflowInputWithWarning } from "../workflow/alias-resolver.js";
 import {
   ULTRATHINK_MESSAGE,
   SEARCH_MESSAGE,
@@ -99,7 +109,6 @@ import {
   RALPH_MESSAGE,
   PROMPT_TRANSLATION_MESSAGE,
 } from "../installer/hooks.js";
-import { getUltraworkMessage } from "./keyword-detector/ultrawork/index.js";
 // Agent dashboard is used in pre/post-tool-use hot path
 import { getAgentDashboard } from "./subagent-tracker/index.js";
 // Session replay recordFileTouch is used in pre-tool-use hot path
@@ -120,12 +129,22 @@ import type { SessionEndInput } from "./session-end/index.js";
 import type { StopContext } from "./todo-continuation/index.js";
 // Security: wrap untrusted file content to prevent prompt injection
 import { wrapUntrustedFileContent } from "../agents/prompt-helpers.js";
+import {
+  isHookShadowEnabled,
+  runShadowObservation,
+} from "./registry/index.js";
+import {
+  isFamilyCutoverEnabled,
+  hasHookProtocolDeny,
+  recordDispatchTelemetry,
+  shouldLoosenOrdinaryEnforcement,
+} from "./registry/cutover.js";
 
 const PKILL_F_FLAG_PATTERN = /\bpkill\b.*\s-f\b/;
 const PKILL_FULL_FLAG_PATTERN = /\bpkill\b.*--full\b/;
 const WORKER_BLOCKED_TMUX_PATTERN = /\btmux\s+/i;
 const WORKER_BLOCKED_TEAM_CLI_PATTERN = /\bom[cx]\s+team\b(?!\s+api\b)/i;
-const WORKER_BLOCKED_SKILL_PATTERN = /\$(team|ultrawork|autopilot|ralph)\b/i;
+const WORKER_BLOCKED_SKILL_PATTERN = /\$(team|autopilot|ralph)\b/i;
 
 const TEAM_TERMINAL_VALUES = new Set([
   "completed",
@@ -190,7 +209,6 @@ function buildSessionStartAdditionalContext(messages: string[]): string {
   const priorityOrder = [
     /\[MODEL ROUTING OVERRIDE/,
     /\[AUTOPILOT MODE RESTORED\]/,
-    /\[ULTRAWORK MODE RESTORED\]/,
     /\[RALPLAN MODE RESTORED\]/,
     /\[TEAM MODE RESTORED\]/,
     /\[ROOT AGENTS\.md LOADED\]/,
@@ -240,7 +258,7 @@ function readLinuxBootId(): string | undefined {
 }
 
 function sessionStateDir(directory: string, sessionId: string): string {
-  return join(getOmcRoot(directory), "state", "sessions", sessionId);
+  return resolveSessionStateDir(sessionId, directory);
 }
 
 function sessionStartedMarkerPath(directory: string, sessionId: string): string {
@@ -263,8 +281,6 @@ function writeSessionStartedMarker(directory: string, sessionId?: string): void 
   if (!sessionId || !SAFE_SESSION_ID_PATTERN.test(sessionId)) return;
 
   try {
-    const dir = sessionStateDir(directory, sessionId);
-    mkdirSync(dir, { recursive: true });
     const marker: SessionStartedMarker = {
       session_id: sessionId,
       started_at: new Date().toISOString(),
@@ -276,10 +292,12 @@ function writeSessionStartedMarker(directory: string, sessionId?: string): void 
       // later SessionStart hooks to falsely clean live session state.
       boot_id: readLinuxBootId(),
     };
-    writeFileSync(sessionStartedMarkerPath(directory, sessionId), JSON.stringify(marker, null, 2), {
-      encoding: "utf-8",
-      mode: 0o600,
-    });
+    const markerPath = sessionStartedMarkerPath(directory, sessionId);
+    writeStateFileLockedCreateIf(
+      markerPath,
+      (current) => current === null || canClearStateForSession(current, sessionId),
+      () => marker as unknown as Record<string, unknown>,
+    );
   } catch {
     // SessionStart markers are best-effort and must never block startup.
   }
@@ -290,9 +308,10 @@ function removeSessionStartedMarker(directory: string, sessionId?: string): void
 
   try {
     const markerPath = sessionStartedMarkerPath(directory, sessionId);
-    if (existsSync(markerPath)) {
-      unlinkSync(markerPath);
-    }
+    clearStateFileLockedIf(
+      markerPath,
+      (current) => current.session_id === sessionId && canClearStateForSession(current, sessionId),
+    );
   } catch {
     // Best-effort marker cleanup only.
   }
@@ -303,46 +322,62 @@ function hasSessionEndSummary(directory: string, sessionId: string): boolean {
 }
 
 function cleanupSessionModeStateFiles(directory: string, sessionId: string): void {
-  const dir = sessionStateDir(directory, sessionId);
-
-  for (const { file } of SESSION_END_MODE_STATE_FILES) {
-    const filePath = join(dir, file);
-    const state = readJsonObject(filePath);
+  for (const { file, mode } of SESSION_END_MODE_STATE_FILES) {
+    let filePath: string;
+    try {
+      filePath = resolveSessionStatePath(mode, sessionId, directory);
+    } catch {
+      continue;
+    }
 
     // SessionStart reconciliation is intentionally narrower than SessionEnd:
     // only remove files inside the explicit stale session directory. Do not
     // touch legacy/global state, even if it is unowned or shares a mode name.
-    if (state?.active === true || file === "skill-active-state.json") {
-      try {
-        unlinkSync(filePath);
-      } catch {
-        // Leave files in place when deletion fails.
-      }
-    }
+    // Re-check ownership while holding the mutation lock so metadata-only
+    // foreign state cannot be removed by a stale-session cleanup.
+    clearStateFileLockedIf(
+      filePath,
+      (current) =>
+        !Array.isArray(current) &&
+        (current.active === true || file === "skill-active-state.json") &&
+        canClearStateForSession(current, sessionId),
+    );
   }
 }
 
 function cleanupMissionStateForSession(directory: string, sessionId: string): void {
-  const missionStatePath = join(getOmcRoot(directory), "state", "mission-state.json");
-  const parsed = readJsonObject(missionStatePath) as {
-    updatedAt?: string;
-    missions?: Array<Record<string, unknown>>;
-  } | null;
-
-  if (!Array.isArray(parsed?.missions)) return;
-
-  const before = parsed.missions.length;
-  parsed.missions = parsed.missions.filter((mission) => {
-    if (mission.source !== "session") return true;
-    const missionId = typeof mission.id === "string" ? mission.id : "";
-    return !missionId.includes(sessionId);
-  });
-
-  if (parsed.missions.length === before) return;
-
   try {
-    parsed.updatedAt = new Date().toISOString();
-    writeFileSync(missionStatePath, JSON.stringify(parsed, null, 2));
+    const missionStatePath = resolveStatePath("mission-state", directory);
+    writeStateFileLockedIf(
+      missionStatePath,
+      (current) => {
+        if (!canClearStateForSession(current, sessionId) || !Array.isArray(current.missions)) {
+          return false;
+        }
+        return current.missions.some((mission) => {
+          if (!mission || typeof mission !== "object" || (mission as Record<string, unknown>).source !== "session") {
+            return false;
+          }
+          const missionId = typeof (mission as Record<string, unknown>).id === "string"
+            ? (mission as Record<string, unknown>).id as string
+            : "";
+          return missionId === `session:${sessionId}` || missionId.startsWith(`session:${sessionId}:`) || missionId.endsWith(`-${sessionId}`);
+        });
+      },
+      (current) => ({
+        ...current,
+        updatedAt: new Date().toISOString(),
+        missions: (current.missions as unknown[]).filter((mission) => {
+          if (!mission || typeof mission !== "object" || (mission as Record<string, unknown>).source !== "session") {
+            return true;
+          }
+          const missionId = typeof (mission as Record<string, unknown>).id === "string"
+            ? (mission as Record<string, unknown>).id as string
+            : "";
+          return !(missionId === `session:${sessionId}` || missionId.startsWith(`session:${sessionId}:`) || missionId.endsWith(`-${sessionId}`));
+        }),
+      }),
+    );
   } catch {
     // Best-effort cleanup only.
   }
@@ -373,18 +408,8 @@ function hasDurableAbandonmentEvidence(marker: SessionStartedMarker): boolean {
 }
 
 async function reconcileAbandonedSessionStarts(directory: string, currentSessionId?: string): Promise<void> {
-  const sessionsDir = join(getOmcRoot(directory), "state", "sessions");
-  if (!existsSync(sessionsDir)) return;
-
-  let entries: string[];
-  try {
-    entries = readdirSync(sessionsDir);
-  } catch {
-    return;
-  }
-
-  for (const sessionId of entries) {
-    if (!SAFE_SESSION_ID_PATTERN.test(sessionId) || sessionId === currentSessionId) continue;
+  for (const sessionId of listSessionIds(directory)) {
+    if (sessionId === currentSessionId) continue;
 
     const markerPath = sessionStartedMarkerPath(directory, sessionId);
     const marker = readJsonObject(markerPath) as SessionStartedMarker | null;
@@ -426,16 +451,6 @@ function getExtraField(input: HookInput, key: string): unknown {
 function getHookToolUseId(input: HookInput): string | undefined {
   const value = getExtraField(input, "tool_use_id");
   return typeof value === "string" && value.trim().length > 0 ? value : undefined;
-}
-
-function getHookContextString(input: HookInput, ...keys: string[]): string | undefined {
-  for (const key of keys) {
-    const value = getExtraField(input, key);
-    if (typeof value === "string" && value.trim().length > 0) {
-      return value.trim();
-    }
-  }
-  return undefined;
 }
 
 function extractAsyncAgentId(toolOutput: unknown): string | undefined {
@@ -493,11 +508,14 @@ function taskLaunchDidFail(toolOutput: unknown): boolean {
 }
 
 function getSessionStateDir(directory: string, sessionId?: string): string {
-  const stateDir = join(getOmcRoot(directory), "state");
   if (sessionId && SAFE_SESSION_ID_PATTERN.test(sessionId)) {
-    return join(stateDir, "sessions", sessionId);
+    return resolveSessionStateDir(sessionId, directory);
   }
-  return stateDir;
+  return dirname(resolveStatePath("session-state", directory));
+}
+
+function getStateDir(directory: string): string {
+  return dirname(resolveStatePath("team", directory));
 }
 
 function getScheduledWakeupStatePath(directory: string, sessionId?: string): string {
@@ -537,21 +555,20 @@ function parseWakeupDueAt(toolInput: unknown): string | undefined {
 function recordScheduledWakeup(directory: string, sessionId: string | undefined, toolInput: unknown): void {
   try {
     const statePath = getScheduledWakeupStatePath(directory, sessionId);
-    mkdirSync(dirname(statePath), { recursive: true });
-    writeFileSync(
+    writeStateFileLockedCreateIf(
       statePath,
-      JSON.stringify(
-        {
-          active: true,
-          pending: true,
-          status: "pending",
-          session_id: sessionId,
-          created_at: new Date().toISOString(),
-          due_at: parseWakeupDueAt(toolInput),
-        },
-        null,
-        2,
-      ),
+      (current) =>
+        current === null ||
+        !sessionId ||
+        canClearStateForSession(current, sessionId),
+      () => ({
+        active: true,
+        pending: true,
+        status: "pending",
+        session_id: sessionId,
+        created_at: new Date().toISOString(),
+        due_at: parseWakeupDueAt(toolInput),
+      }),
     );
   } catch {
     // Wakeup state is best-effort; never fail the hook.
@@ -559,14 +576,13 @@ function recordScheduledWakeup(directory: string, sessionId: string | undefined,
 }
 
 function getModeStatePaths(directory: string, modeName: string, sessionId?: string): string[] {
-  const stateDir = join(getOmcRoot(directory), "state");
   const safeSessionId = typeof sessionId === "string" && SAFE_SESSION_ID_PATTERN.test(sessionId)
     ? sessionId
     : undefined;
 
   return [
-    safeSessionId ? join(stateDir, "sessions", safeSessionId, `${modeName}-state.json`) : null,
-    join(stateDir, `${modeName}-state.json`),
+    safeSessionId ? resolveSessionStatePath(modeName, safeSessionId, directory) : null,
+    resolveStatePath(modeName, directory),
   ].filter((statePath): statePath is string => Boolean(statePath));
 }
 
@@ -577,29 +593,30 @@ function updateModeAwaitingConfirmation(
   awaitingConfirmation: boolean,
 ): void {
   for (const statePath of getModeStatePaths(directory, modeName, sessionId)) {
-    if (!existsSync(statePath)) {
-      continue;
-    }
-
     try {
-      const state = JSON.parse(readFileSync(statePath, "utf-8")) as Record<string, unknown>;
-      if (!state || typeof state !== "object") {
-        continue;
-      }
+      writeStateFileLockedIf(
+        statePath,
+        (state) => {
+          if (sessionId && !canClearStateForSession(state, sessionId)) {
+            return false;
+          }
+          return awaitingConfirmation || state.awaiting_confirmation === true;
+        },
+        (state) => {
+          if (awaitingConfirmation) {
+            return {
+              ...state,
+              awaiting_confirmation: true,
+              awaiting_confirmation_set_at: new Date().toISOString(),
+            };
+          }
 
-      if (awaitingConfirmation) {
-        state.awaiting_confirmation = true;
-        state.awaiting_confirmation_set_at = new Date().toISOString();
-      } else if (state.awaiting_confirmation === true) {
-        delete state.awaiting_confirmation;
-        delete state.awaiting_confirmation_set_at;
-      } else {
-        continue;
-      }
-
-      const tmpPath = `${statePath}.${process.pid}.${Date.now()}.tmp`;
-      writeFileSync(tmpPath, JSON.stringify(state, null, 2));
-      renameSync(tmpPath, statePath);
+          const next = { ...state };
+          delete next.awaiting_confirmation;
+          delete next.awaiting_confirmation_set_at;
+          return next;
+        },
+      );
     } catch {
       // Best-effort state sync only.
     }
@@ -769,14 +786,12 @@ async function seedAutopilotStartupState(
     },
     execution: {
       ralph_iterations: 0,
-      ultrawork_active: false,
       tasks_completed: 0,
       tasks_total: 0,
       files_created: [],
       files_modified: [],
     },
     qa: {
-      ultraqa_cycles: 0,
       build_status: "pending",
       lint_status: "pending",
       test_status: "pending",
@@ -837,39 +852,32 @@ function readTeamStagedState(
   directory: string,
   sessionId?: string,
 ): TeamStagedState | null {
-  const stateDir = join(getOmcRoot(directory), "state");
-  const statePaths = sessionId
+  const stateCandidates = sessionId
     ? [
-        join(stateDir, "sessions", sessionId, "team-state.json"),
-        join(stateDir, "team-state.json"),
+        readModeStateWithMeta<Record<string, unknown>>("team", directory, sessionId),
+        readModeStateWithMeta<Record<string, unknown>>("team", directory),
       ]
-    : [join(stateDir, "team-state.json")];
+    : [readModeStateWithMeta<Record<string, unknown>>("team", directory)];
 
   let coarseState: TeamStagedState | null = null;
-  for (const statePath of statePaths) {
-    if (!existsSync(statePath)) {
+  for (const candidate of stateCandidates) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
       continue;
     }
 
-    try {
-      const parsed = JSON.parse(
-        readFileSync(statePath, "utf-8"),
-      ) as TeamStagedState;
-      if (typeof parsed !== "object" || parsed === null) {
-        continue;
-      }
-
-      const stateSessionId = parsed.session_id || parsed.sessionId;
-      if (sessionId && stateSessionId && stateSessionId !== sessionId) {
-        continue;
-      }
-
-      coarseState = parsed;
-      if (parsed.active === true && !isTeamStateTerminal(parsed)) {
-        return parsed;
-      }
-    } catch {
+    if (sessionId && !canClearStateForSession(candidate, sessionId)) {
       continue;
+    }
+
+    const parsed = candidate as TeamStagedState;
+    const stateSessionId = parsed.session_id || parsed.sessionId;
+    if (sessionId && stateSessionId && stateSessionId !== sessionId) {
+      continue;
+    }
+
+    coarseState = parsed;
+    if (parsed.active === true && !isTeamStateTerminal(parsed)) {
+      return parsed;
     }
   }
 
@@ -930,10 +938,9 @@ function readTeamStopBreakerCount(
   directory: string,
   sessionId?: string,
 ): number {
-  const stateDir = join(getOmcRoot(directory), "state");
   const breakerPath = sessionId
-    ? join(stateDir, "sessions", sessionId, "team-stop-breaker.json")
-    : join(stateDir, "team-stop-breaker.json");
+    ? join(getSessionStateDir(directory, sessionId), "team-stop-breaker.json")
+    : join(dirname(resolveStatePath("team", directory)), "team-stop-breaker.json");
 
   try {
     if (!existsSync(breakerPath)) {
@@ -943,6 +950,9 @@ function readTeamStopBreakerCount(
       count?: unknown;
       updated_at?: unknown;
     };
+    if (sessionId && !canClearStateForSession(parsed, sessionId)) {
+      return 0;
+    }
     if (typeof parsed.updated_at === "string") {
       const updatedAt = new Date(parsed.updated_at).getTime();
       if (
@@ -964,17 +974,17 @@ function writeTeamStopBreakerCount(
   sessionId: string | undefined,
   count: number,
 ): void {
-  const stateDir = join(getOmcRoot(directory), "state");
   const breakerPath = sessionId
-    ? join(stateDir, "sessions", sessionId, "team-stop-breaker.json")
-    : join(stateDir, "team-stop-breaker.json");
+    ? join(getSessionStateDir(directory, sessionId), "team-stop-breaker.json")
+    : join(dirname(resolveStatePath("team", directory)), "team-stop-breaker.json");
   const safeCount = Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
 
   if (safeCount === 0) {
     try {
-      if (existsSync(breakerPath)) {
-        unlinkSync(breakerPath);
-      }
+      clearStateFileLockedIf(
+        breakerPath,
+        (current) => !sessionId || canClearStateForSession(current, sessionId),
+      );
     } catch {
       // no-op
     }
@@ -982,15 +992,13 @@ function writeTeamStopBreakerCount(
   }
 
   try {
-    mkdirSync(dirname(breakerPath), { recursive: true });
-    writeFileSync(
+    writeStateFileLockedCreateIf(
       breakerPath,
-      JSON.stringify(
-        { count: safeCount, updated_at: new Date().toISOString() },
-        null,
-        2,
-      ),
-      "utf-8",
+      (current) =>
+        current === null ||
+        !sessionId ||
+        canClearStateForSession(current, sessionId),
+      () => ({ count: safeCount, updated_at: new Date().toISOString() }),
     );
   } catch {
     // no-op
@@ -1050,7 +1058,7 @@ function workerBashBlockReason(command: string): string | null {
     return `Team worker cannot run team orchestration commands. Use only \`${formatOmcCliInvocation("team api ... --json")}\`.`;
   }
   if (WORKER_BLOCKED_SKILL_PATTERN.test(command)) {
-    return "Team worker cannot invoke orchestration skills (`$team`, `$ultrawork`, `$autopilot`, `$ralph`).";
+    return "Team worker cannot invoke orchestration skills (`$team`, `$autopilot`, `$ralph`).";
   }
   return null;
 }
@@ -1392,9 +1400,7 @@ function tombstoneWorkflowSlot(
 
 function resolveStatePathSafe(stateName: string, directory: string): string {
   try {
-    // Lazy resolve to avoid a circular import; same module is imported in
-    // skill-state via the mode-paths registry.
-    return join(getOmcRoot(directory), "state", `${stateName}-state.json`);
+    return resolveStatePath(stateName, directory);
   } catch {
     return "";
   }
@@ -1406,13 +1412,7 @@ function resolveSessionStatePathSafe(
   directory: string,
 ): string {
   try {
-    return join(
-      getOmcRoot(directory),
-      "state",
-      "sessions",
-      sessionId,
-      `${stateName}-state.json`,
-    );
+    return resolveSessionStatePath(stateName, sessionId, directory);
   } catch {
     return "";
   }
@@ -1438,7 +1438,7 @@ async function seedModeStateForExplicitWorkflowSlash(
       await seedAutopilotStartupState(directory, promptText, sessionId);
       return;
     default:
-      // ralph / ultrawork / team / ultraqa / deep-interview / self-improve
+      // ralph / team / deep-interview / self-improve
       // own their state activation inside their own Skill PostToolUse handlers.
       // Pre-Skill seeding for these would clobber existing in-flight state
       // (e.g. nested `autopilot → ralph`); the workflow slot alone is enough
@@ -1450,7 +1450,7 @@ async function seedModeStateForExplicitWorkflowSlash(
 /**
  * Process keyword detection hook
  * Detects magic keywords and returns injection message
- * Also activates persistent state for modes that require it (ralph, ultrawork)
+ * Also activates persistent state for modes that require it.
  */
 async function processKeywordDetector(input: HookInput): Promise<HookOutput> {
   // Team worker guard: prevent keyword detection inside team workers to avoid
@@ -1461,6 +1461,10 @@ async function processKeywordDetector(input: HookInput): Promise<HookOutput> {
 
   const promptText = getPromptText(input);
   if (!promptText) {
+    return { continue: true };
+  }
+
+  if (isRetiredWorkflowSlashInvocation(promptText)) {
     return { continue: true };
   }
 
@@ -1478,9 +1482,8 @@ async function processKeywordDetector(input: HookInput): Promise<HookOutput> {
   const directory = resolveToWorktreeRoot(input.directory);
   const messages: string[] = [];
 
-  // Unified explicit slash invocation handler — covers all 8 canonical
-  // workflow skills (autopilot, ralph, team, ultrawork, ultraqa,
-  // deep-interview, ralplan, self-improve). Seeds the workflow slot via the
+  // Unified explicit slash invocation handler for active workflow skills.
+  // Seeds the workflow slot via the
   // sanctioned dual-copy helper BEFORE the Skill tool fires, and seeds the
   // mode-specific state file when the mode requires pre-Skill state. The
   // ralplan path additionally returns the legacy [RALPLAN INIT] context
@@ -1501,6 +1504,17 @@ async function processKeywordDetector(input: HookInput): Promise<HookOutput> {
     };
   }
   if (explicitSlash) {
+    // Alias resolver: route slash invocations through Tier-0 mapping, emit once/session warning, retain diagnostics/telemetry.
+    // For explicit slash, we record alias telemetry and optionally emit a concise actionable warning.
+    // The underlying skill name remains the alias for compatibility (no breaking invocation), but telemetry maps it.
+    try {
+      const aliasRes = resolveWorkflowInputWithWarning(explicitSlash.skill, sessionId ?? undefined, directory);
+      if (aliasRes.warningToEmit && aliasRes.canonical && aliasRes.canonical !== explicitSlash.skill.toLowerCase()) {
+        messages.push(aliasRes.warningToEmit);
+      }
+    } catch {
+      // never break slash flow on alias resolver failure
+    }
     seedWorkflowSlotForSkill(
       directory,
       explicitSlash.skill,
@@ -1625,6 +1639,25 @@ async function processKeywordDetector(input: HookInput): Promise<HookOutput> {
     messages.push(PROMPT_TRANSLATION_MESSAGE);
   }
 
+  // Alias resolver: concise actionable warning once/session, diagnostics retain full mapping.
+  // Telemetry/receipts are recorded inside resolveWorkflowInputWithWarning; explicit slash
+  // invocations are also covered via the invocation path below. For keyword-detected paths,
+  // emit at most one alias warning per detected keyword (deduped per session).
+  {
+    const aliasWarnings: string[] = [];
+    for (const kw of keywords) {
+      // normalize to resolver input form (keyword detector already lowercases)
+      const res = resolveWorkflowInputWithWarning(kw, sessionId ?? undefined, directory);
+      if (res.warningToEmit) aliasWarnings.push(res.warningToEmit);
+      // also handle explicit release via keyword-like "release" if ever surfaced as keyword — defensive
+    }
+    // Dedupe alias warnings across multiple keywords that map to same canonical
+    const uniqueAliasWarnings = [...new Set(aliasWarnings)];
+    for (const w of uniqueAliasWarnings) {
+      messages.push(w);
+    }
+  }
+
   // Wake OpenClaw gateway for keyword-detector (non-blocking, fires for all prompts)
   if (input.sessionId) {
     _openclaw.wake("keyword-detector", {
@@ -1655,7 +1688,7 @@ async function processKeywordDetector(input: HookInput): Promise<HookOutput> {
         const criticMode = detectCriticModeFlag(promptText) ?? undefined;
         const cleanPrompt = stripCriticModeFlag(promptText);
 
-        // Activate ralph state which also auto-activates ultrawork
+        // Activate Ralph state.
         const hook = createRalphLoopHook(directory);
         const started = hook.startLoop(
           sessionId,
@@ -1665,27 +1698,10 @@ async function processKeywordDetector(input: HookInput): Promise<HookOutput> {
           },
         );
         if (started) {
-          markModeAwaitingConfirmation(directory, sessionId, 'ralph', 'ultrawork');
+          markModeAwaitingConfirmation(directory, sessionId, 'ralph');
         }
 
         messages.push(RALPH_MESSAGE);
-        break;
-      }
-
-      case "ultrawork": {
-        // Lazy-load ultrawork module
-        const { activateUltrawork } = await import("./ultrawork/index.js");
-        // Activate persistent ultrawork state
-        const activated = activateUltrawork(promptText, sessionId, directory);
-        if (activated) {
-          markModeAwaitingConfirmation(directory, sessionId, 'ultrawork');
-        }
-        messages.push(
-          getUltraworkMessage(
-            getHookContextString(input, "agentName", "agent_name"),
-            getHookContextString(input, "model", "modelId", "model_id"),
-          ),
-        );
         break;
       }
 
@@ -1771,13 +1787,13 @@ async function processStopContinuation(_input: HookInput): Promise<HookOutput> {
 
 /**
  * Process persistent mode hook (enhanced stop continuation)
- * Unified handler for ultrawork, ralph, and todo-continuation.
+ * Unified handler for ralph and todo-continuation.
  *
  * NOTE: The legacy `processRalph` function was removed in issue #1058.
  * Ralph is now handled exclusively by `checkRalphLoop` inside
  * `persistent-mode/index.ts`, which has richer logic (PRD checks,
  * team pipeline coordination, tool-error injection, cancel caching,
- * ultrawork self-heal, and architect rejection handling).
+ * architect rejection handling).
  */
 async function processPersistentMode(input: HookInput): Promise<HookOutput> {
   const rawSessionId = (input as Record<string, unknown>).session_id as
@@ -1862,7 +1878,7 @@ async function processPersistentMode(input: HookInput): Promise<HookOutput> {
       if (!isAbort && !isContextLimit) {
         // Per-session cooldown: prevent notification spam when the session idles repeatedly.
         // Uses session-scoped state so one session does not suppress another.
-        const stateDir = join(getOmcRoot(directory), "state");
+        const stateDir = getStateDir(directory);
         const { getIdleNotificationRepoState } = await import("./persistent-mode/idle-repo-state.js");
         const idleRepoState = getIdleNotificationRepoState(directory);
         if (shouldWakeOpenClawOnStop(stateDir, sessionId, idleRepoState)) {
@@ -1955,7 +1971,6 @@ async function processSessionStart(input: HookInput): Promise<HookOutput> {
   // Lazy-load session-start dependencies
   const { initSilentAutoUpdate } = await import("../features/auto-update.js");
   const { readAutopilotState } = await import("./autopilot/index.js");
-  const { readUltraworkState } = await import("./ultrawork/index.js");
   const { checkIncompleteTodos } = await import("./todo-continuation/index.js");
   const { buildAgentsOverlay } = await import("./agents-overlay.js");
 
@@ -2025,25 +2040,6 @@ Original idea: ${autopilotState.originalIdea}
 Current phase: ${autopilotState.phase}
 
 Treat this as prior-session context only. Prioritize the user's newest request, and resume autopilot only if the user explicitly asks to continue it.
-
-</session-restore>
-
----
-
-`);
-  }
-
-  // Check for active ultrawork state - only restore if it belongs to this session
-  const ultraworkState = readUltraworkState(directory, sessionId);
-  if (ultraworkState?.active && ultraworkState.session_id === sessionId) {
-    messages.push(`<session-restore>
-
-[ULTRAWORK MODE RESTORED]
-
-You have an active ultrawork session from ${ultraworkState.started_at}.
-Original task: ${ultraworkState.original_prompt}
-
-Treat this as prior-session context only. Prioritize the user's newest request, and resume ultrawork only if the user explicitly asks to continue it.
 
 </session-restore>
 
@@ -2374,7 +2370,11 @@ function processPreToolUse(input: HookInput): HookOutput {
     }
   }
 
-  // Check delegation enforcement FIRST
+  // Check delegation enforcement FIRST — material delegation/security
+  // boundaries remain hard per owner direction; only duplicated
+  // injection/procedure (prompt prerequisites) collapses to advisory
+  // behind the dispatcher. Routing/instrumentation exceptions fail open,
+  // handler-produced block/deny results propagate unchanged.
   const enforcementResult = processOrchestratorPreTool({
     toolName: input.toolName || "",
     toolInput: (input.toolInput as Record<string, unknown>) || {},
@@ -2382,7 +2382,6 @@ function processPreToolUse(input: HookInput): HookOutput {
     directory,
   });
 
-  // If enforcement blocks, return immediately
   if (!enforcementResult.continue) {
     return {
       continue: false,
@@ -2390,6 +2389,7 @@ function processPreToolUse(input: HookInput): HookOutput {
       message: enforcementResult.message,
     };
   }
+
 
   const preToolMessages = enforcementResult.message
     ? [enforcementResult.message]
@@ -2399,20 +2399,43 @@ function processPreToolUse(input: HookInput): HookOutput {
   // Check blocking BEFORE recording progress — otherwise a denied tool
   // (e.g. Edit) that also matches a prerequisite would have its progress
   // persisted even though the tool never actually executed.
+  // Under dispatcher cutover (#3708) ordinary prompt prerequisites are
+  // advisory — collapsed behind the dispatcher per owner direction; only
+  // material-risk families stay hard. Preserve hookSpecificOutput deny only
+  // when PreToolUse is not in cutover (rollback) so hard permission/security
+  // semantics remain; otherwise demote to an advisory warning.
   const promptPrerequisiteState = readPromptPrerequisiteState(directory, input.sessionId);
   if (
     promptPrerequisiteState?.active
     && isPromptPrerequisiteBlockingTool(input.toolName, promptPrerequisiteConfig)
   ) {
-    return {
-      continue: true,
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: buildPromptPrerequisiteDenyReason(promptPrerequisiteState, input.toolName),
-      },
-    } as HookOutput & { hookSpecificOutput: Record<string, unknown> };
+    if (shouldLoosenOrdinaryEnforcement('PreToolUse')) {
+      const advisoryReason = buildPromptPrerequisiteDenyReason(promptPrerequisiteState, input.toolName);
+      preToolMessages.push(`[ADVISORY] ${advisoryReason}`);
+      recordDispatchTelemetry({
+        schemaVersion: 1,
+        event: 'PreToolUse',
+        hookType: 'pre-tool-use',
+        hookId: 'PreToolUse:*:prompt-prerequisites',
+        riskClass: 'advisory',
+        failMode: 'fail-open',
+        appliedDecision: 'advisory',
+        durationMs: 0,
+        verdict: 'advisory-demoted',
+        recordedAt: new Date().toISOString(),
+      }, directory);
+    } else {
+      return {
+        continue: true,
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: buildPromptPrerequisiteDenyReason(promptPrerequisiteState, input.toolName),
+        },
+      } as HookOutput & { hookSpecificOutput: Record<string, unknown> };
+    }
   }
+
 
   const promptPrerequisiteProgress = recordPromptPrerequisiteProgress(
     directory,
@@ -3079,7 +3102,7 @@ export function resetSkipHooksCache(): void {
  * Main hook processor
  * Routes to specific hook handler based on type
  */
-export async function processHook(
+async function processHookImpl(
   hookType: HookType,
   rawInput: HookInput,
 ): Promise<HookOutput> {
@@ -3176,6 +3199,8 @@ export async function processHook(
           hook_event_name: "SubagentStart",
           prompt: normalized.prompt as string | undefined,
           model: normalized.model as string | undefined,
+          name: normalized.name as string | undefined,
+          description: normalized.description as string | undefined,
         };
         // recordAgentStart is already called inside processSubagentStart,
         // so we don't call it here to avoid duplicate session replay entries.
@@ -3313,6 +3338,79 @@ export async function processHook(
     console.error(`[hook-bridge] Error in ${hookType}:`, error);
     return { continue: true };
   }
+}
+
+/**
+ * Main hook processor (epic #3698, issues #3707 + #3708).
+ *
+ * Thin wrapper over the legacy dispatcher: runs the legacy path unchanged,
+ * then records shadow and cutover observations. Shadow mode is gated behind
+ * OMC_HOOK_SHADOW; cutover dispatch telemetry is recorded boundedly per
+ * event family (with advisory fail-open by default, hard only for approved
+ * risk classes) and per-family rollback via OMC_HOOK_ROLLBACK /
+ * OMC_HOOK_DISPATCHER_ROLLBACK. Unknown failures remain advisory.
+ */
+export async function processHook(
+  hookType: HookType,
+  rawInput: HookInput,
+): Promise<HookOutput> {
+  const legacyStarted = performance.now();
+  const rawRecord =
+    rawInput && typeof rawInput === "object"
+      ? rawInput as unknown as Record<string, unknown>
+      : {};
+  const inputDirectory =
+    typeof rawRecord.cwd === "string"
+      ? rawRecord.cwd
+      : typeof rawRecord.directory === "string"
+        ? rawRecord.directory
+        : undefined;
+  const projectDirectory = resolveToWorktreeRoot(inputDirectory);
+  const output = await processHookImpl(hookType, rawInput);
+  // Cutover telemetry: one bounded privacy-preserving record per invocation
+  // when the hook's family is cut over (event-family cutover, advisory default).
+  try {
+    const evt = (
+      hookType === 'keyword-detector' ? 'UserPromptSubmit'
+      : hookType === 'session-start' || hookType === 'setup-init' || hookType === 'setup-maintenance' ? 'SessionStart'
+      : hookType === 'pre-tool-use' ? 'PreToolUse'
+      : hookType === 'permission-request' ? 'PermissionRequest'
+      : hookType === 'post-tool-use' ? 'PostToolUse'
+      : hookType === 'subagent-start' ? 'SubagentStart'
+      : hookType === 'subagent-stop' ? 'SubagentStop'
+      : hookType === 'pre-compact' ? 'PreCompact'
+      : hookType === 'stop-continuation' || hookType === 'persistent-mode' || hookType === 'ralph' || hookType === 'code-simplifier' ? 'Stop'
+      : hookType === 'session-end' ? 'SessionEnd'
+      : null
+    ) as unknown as string | null;
+    if (evt && isFamilyCutoverEnabled(evt as never)) {
+      const hard = evt === 'PermissionRequest' || evt === 'PreToolUse';
+      const hasHardDecision = output.continue === false || hasHookProtocolDeny(output);
+      const applied = hasHardDecision ? (hard ? 'hard' : 'advisory') : 'none';
+      recordDispatchTelemetry({
+        schemaVersion: 1,
+        event: evt as never,
+        hookType,
+        appliedDecision: applied as never,
+        durationMs: performance.now() - legacyStarted,
+        recordedAt: new Date().toISOString(),
+      }, projectDirectory);
+    }
+  } catch {
+    // telemetry is bounded and advisory-only
+  }
+  if (isHookShadowEnabled()) {
+    try {
+      await runShadowObservation(
+        hookType,
+        output,
+        performance.now() - legacyStarted,
+      );
+    } catch {
+      // Shadow observation is advisory and must never change hook behavior.
+    }
+  }
+  return output;
 }
 
 /**

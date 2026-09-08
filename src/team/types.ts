@@ -9,7 +9,7 @@
 import type { TeamTaskStatus } from './contracts.js';
 import type { TeamPhase } from './phase-controller.js';
 import type { TeamLeaderNextAction } from './leader-nudge-guidance.js';
-import type { CanonicalTeamRole, CopilotReasoningEffort, RoleAssignment } from '../shared/types.js';
+import type { CanonicalTeamRole, CopilotReasoningEffort, ExternalModelsDefaults, RoleAssignment } from '../shared/types.js';
 
 /** Bridge daemon configuration — passed via --config file to bridge-entry.ts */
 export interface BridgeConfig {
@@ -189,6 +189,7 @@ export interface TeamTaskClaim {
   owner: string;
   token: string;
   leased_until: string;
+  launch_attempt_id?: string;
 }
 
 /** Base team task matching OMX shape */
@@ -202,6 +203,7 @@ export interface TeamTask {
   owner?: string;
   result?: string;
   error?: string;
+  metadata?: Record<string, unknown>;
   blocked_by?: string[];
   depends_on?: string[];
   version?: number;
@@ -305,7 +307,7 @@ export type RecoverDeadWorkerV2Error =
   | 'worker_liveness_unknown' | 'recovery_checkpoint_missing' | 'recovery_checkpoint_malformed'
   | 'recovery_checkpoint_ambiguous' | 'recovery_checkpoint_stale' | 'task_requeue_failed'
   | 'launch_metadata_incomplete' | 'launch_descriptor_unresolvable' | 'spawn_failed'
-  | 'startup_ack_timeout' | 'worker_activation_failed' | 'auto_merge_unavailable'
+  | 'startup_ack_timeout' | 'worker_activation_failed' | 'worker_cleanup_incomplete' | 'auto_merge_unavailable'
   | 'stale_state_revision' | 'config_commit_failed';
 
 export interface RecoverDeadWorkerV2OutcomeBase {
@@ -352,7 +354,7 @@ export interface TeamRuntimeOwnerEpoch {
 /** Durable lifecycle fence for a scale-up operation. */
 export interface TeamScaleUpAttempt {
   operation_id: string;
-  phase: 'reserved' | 'effects' | 'failed';
+  phase: 'reserved' | 'effects' | 'committed' | 'failed';
   pid: number;
   process_started_at: string;
   state_revision: number;
@@ -455,6 +457,9 @@ export interface TeamManifestV2 {
   resize_hook_name: string | null;
   resize_hook_target: string | null;
   next_worker_index?: number;
+  resolved_routing?: Record<CanonicalTeamRole, { primary: RoleAssignment; fallback: RoleAssignment }>;
+  resolved_routing_roles?: CanonicalTeamRole[];
+  external_models_defaults?: ExternalModelsDefaults;
   service_descriptor?: TeamServiceDescriptor;
 }
 
@@ -476,13 +481,14 @@ export interface WorkerInfo {
   team_state_root?: string;
   /**
    * Verdict-output file path for CLI-worker output contract (AC-7).
-   * Set when the worker was spawned for a reviewer role on codex/gemini/grok.
-   * Consumed by the worker-completion handler in runtime-v2.
+   * Set when the worker was spawned for a reviewer role on any non-Claude
+   * provider. Consumed by the worker-completion handler in runtime-v2.
    */
   output_file?: string;
   recovery_id?: string;
   replacement_generation?: number;
   pane_attempt_id?: string;
+  launch_attempt_id?: string;
   operational_state?: 'starting' | 'active' | 'dead' | 'stopped';
   launch_descriptor?: WorkerLaunchDescriptor;
 }
@@ -538,7 +544,11 @@ export interface TeamConfig {
    * `scaleUp`, worker restart, and spawn paths. Immutable for the team's lifetime.
    */
   resolved_routing?: Record<CanonicalTeamRole, { primary: RoleAssignment; fallback: RoleAssignment }>;
+  /** Canonical roles explicitly configured for routing; defaults are not opt-in routes. */
+  resolved_routing_roles?: CanonicalTeamRole[];
   configured_routing_roles?: CanonicalTeamRole[];
+  /** Immutable provider defaults captured at team creation for scale-up parity. */
+  external_models_defaults?: ExternalModelsDefaults;
   copilot_defaults?: {
     model: string;
     reasoning_effort: CopilotReasoningEffort;
@@ -618,6 +628,10 @@ export interface TeamEvent {
   reason?: string;
   next_action?: TeamLeaderNextAction;
   message?: string;
+  /** Undelivered directed messages addressed TO the worker (issue #3662). */
+  undelivered_inbound_count?: number;
+  /** Undelivered directed messages FROM the worker (owed reports/acks, issue #3662). */
+  undelivered_outbound_count?: number;
   created_at: string;
 }
 
@@ -749,6 +763,7 @@ export interface WorkerStatus {
   state: 'idle' | 'working' | 'blocked' | 'done' | 'failed' | 'draining' | 'unknown';
   current_task_id?: string;
   reason?: string;
+  launch_attempt_id?: string;
   updated_at: string;
 }
 

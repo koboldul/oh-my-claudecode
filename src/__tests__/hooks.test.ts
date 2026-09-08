@@ -30,16 +30,6 @@ import {
 import {
   resetTodoContinuationAttempts
 } from '../hooks/persistent-mode/index.js';
-import {
-  startUltraQA,
-  clearUltraQAState,
-  isRalphLoopActive
-} from '../hooks/ultraqa/index.js';
-import {
-  createRalphLoopHook,
-  clearRalphState,
-  isUltraQAActive
-} from '../hooks/ralph/index.js';
 import { processHook, type HookInput } from '../hooks/bridge.js';
 
 function writeTranscriptWithContext(filePath: string, contextWindow: number, inputTokens: number): void {
@@ -147,18 +137,14 @@ describe('Keyword Detector', () => {
   });
 
   describe('detectKeywordsWithType', () => {
-    it('should detect ultrawork keyword', () => {
+    it('should NOT detect retired ultrawork keyword', () => {
       const detected = detectKeywordsWithType('I need ultrawork mode');
-      expect(detected).toHaveLength(1);
-      expect(detected[0].type).toBe('ultrawork');
-      expect(detected[0].keyword).toBe('ultrawork');
+      expect(detected).toEqual([]);
     });
 
-    it('should detect ulw abbreviation', () => {
+    it('should NOT detect retired ulw abbreviation', () => {
       const detected = detectKeywordsWithType('Use ulw for this task');
-      expect(detected).toHaveLength(1);
-      expect(detected[0].type).toBe('ultrawork');
-      expect(detected[0].keyword).toBe('ulw');
+      expect(detected).toEqual([]);
     });
 
     it('should detect ultrathink keyword', () => {
@@ -205,8 +191,7 @@ describe('Keyword Detector', () => {
       const variants = ['ULTRAWORK', 'UltraWork', 'uLtRaWoRk'];
       for (const variant of variants) {
         const detected = detectKeywordsWithType(variant);
-        expect(detected).toHaveLength(1);
-        expect(detected[0].type).toBe('ultrawork');
+        expect(detected).toEqual([]);
       }
     });
 
@@ -214,8 +199,7 @@ describe('Keyword Detector', () => {
       // Should not match partial words
       const text = 'multiwork is not ultrawork';
       const detected = detectKeywordsWithType(text);
-      expect(detected).toHaveLength(1);
-      expect(detected[0].keyword).toBe('ultrawork');
+      expect(detected).toEqual([]);
     });
 
     it('should include position information', () => {
@@ -376,7 +360,7 @@ describe('Keyword Detector', () => {
 
   describe('hasKeyword', () => {
     it('should return true when keyword exists', () => {
-      expect(hasKeyword('use ultrawork mode')).toBe(true);
+      expect(hasKeyword('use ultrawork mode')).toBe(false);
       expect(hasKeyword('search the codebase')).toBe(true);
       expect(hasKeyword('deep analyze the bug')).toBe(true);
     });
@@ -403,11 +387,11 @@ describe('Keyword Detector', () => {
 
   describe('getPrimaryKeyword', () => {
     it('should return highest priority keyword', () => {
-      // ultrawork has highest priority
-      const text = 'search and analyze with ultrawork';
+      // Retired ultrawork must not displace surviving search detection.
+      const text = 'search the codebase and analyze with ultrawork';
       const primary = getPrimaryKeyword(text);
       expect(primary).not.toBeNull();
-      expect(primary!.type).toBe('ultrawork');
+      expect(primary!.type).toBe('deepsearch');
     });
 
     it('should return ultrathink when present', () => {
@@ -1243,14 +1227,14 @@ describe('Hook Output Structure', () => {
     it('should serialize to valid JSON', () => {
       const output = {
         continue: true,
-        message: 'ULTRAWORK MODE ACTIVATED'
+        message: 'AUTOPILOT MODE ACTIVATED'
       };
 
       const json = JSON.stringify(output);
       const parsed = JSON.parse(json);
 
       expect(parsed.continue).toBe(true);
-      expect(parsed.message).toBe('ULTRAWORK MODE ACTIVATED');
+      expect(parsed.message).toBe('AUTOPILOT MODE ACTIVATED');
     });
 
     it('should handle multiline messages', () => {
@@ -1298,12 +1282,12 @@ describe('Hook Output Structure', () => {
 
     it('should format keyword detection message', () => {
       const keyword: DetectedKeyword = {
-        type: 'ultrawork',
-        keyword: 'ultrawork',
+        type: 'autopilot',
+        keyword: 'autopilot',
         position: 0
       };
-      const message = `ULTRAWORK MODE ACTIVATED - Detected keyword: ${keyword.keyword}`;
-      expect(message).toContain('ULTRAWORK MODE');
+      const message = `AUTOPILOT MODE ACTIVATED - Detected keyword: ${keyword.keyword}`;
+      expect(message).toContain('AUTOPILOT MODE');
       expect(message).toContain(keyword.keyword);
     });
 
@@ -1356,13 +1340,13 @@ Now deep analyze the bug
     expect(detected.some(d => d.type === 'deepsearch')).toBe(true);
   });
 
-  it('should prioritize ultrawork even with other keywords', () => {
+  it('should preserve surviving search detection alongside retired ultrawork', () => {
     const text = 'search the codebase, deep analyze the bug, and use ultrawork mode';
     const primary = getPrimaryKeyword(text);
 
     expect(primary).not.toBeNull();
-    expect(primary!.type).toBe('ultrawork');
-    expect(primary!.keyword).toBe('ultrawork');
+    expect(primary!.type).toBe('deepsearch');
+    expect(primary!.keyword).toBe('search the codebase');
   });
 });
 
@@ -1429,121 +1413,6 @@ describe('Edge Cases', () => {
   });
 });
 
-describe('UltraQA Loop', () => {
-  describe('State Management', () => {
-    it('should define valid UltraQA goal types', () => {
-      const validGoalTypes = ['tests', 'build', 'lint', 'typecheck', 'custom'];
-      validGoalTypes.forEach(goalType => {
-        expect(typeof goalType).toBe('string');
-      });
-    });
-
-    it('should have valid state structure', () => {
-      const state = {
-        active: true,
-        goal_type: 'tests',
-        goal_pattern: null,
-        cycle: 1,
-        max_cycles: 5,
-        failures: [],
-        started_at: new Date().toISOString(),
-        session_id: 'test-session'
-      };
-
-      expect(state.active).toBe(true);
-      expect(state.goal_type).toBe('tests');
-      expect(state.cycle).toBe(1);
-      expect(state.max_cycles).toBe(5);
-      expect(Array.isArray(state.failures)).toBe(true);
-    });
-
-    it('should track failure history', () => {
-      const failures = ['Error 1', 'Error 2', 'Error 1'];
-      expect(failures).toHaveLength(3);
-      expect(failures.filter(f => f === 'Error 1')).toHaveLength(2);
-    });
-  });
-
-  describe('Cycle Limits', () => {
-    it('should respect max cycles limit', () => {
-      const state = {
-        cycle: 5,
-        max_cycles: 5
-      };
-      expect(state.cycle).toBe(state.max_cycles);
-      expect(state.cycle <= state.max_cycles).toBe(true);
-    });
-
-    it('should allow incrementing cycles within limit', () => {
-      let cycle = 1;
-      const maxCycles = 5;
-      while (cycle < maxCycles) {
-        cycle++;
-        expect(cycle <= maxCycles).toBe(true);
-      }
-      expect(cycle).toBe(maxCycles);
-    });
-  });
-
-  describe('Result Types', () => {
-    it('should have valid success result', () => {
-      const result = {
-        success: true,
-        cycles: 3,
-        reason: 'goal_met' as const
-      };
-      expect(result.success).toBe(true);
-      expect(result.reason).toBe('goal_met');
-    });
-
-    it('should have valid failure result', () => {
-      const result = {
-        success: false,
-        cycles: 5,
-        reason: 'max_cycles' as const,
-        diagnosis: 'Unable to fix recurring issue'
-      };
-      expect(result.success).toBe(false);
-      expect(result.reason).toBe('max_cycles');
-      expect(result.diagnosis).toBeDefined();
-    });
-
-    it('should detect same failure pattern', () => {
-      const failures = ['Error A', 'Error A', 'Error A'];
-      const allSame = failures.every(f => f === failures[0]);
-      expect(allSame).toBe(true);
-    });
-  });
-
-  describe('Goal Commands', () => {
-    it('should map goal types to commands', () => {
-      const goalCommands: Record<string, string> = {
-        tests: 'npm test',
-        build: 'npm run build',
-        lint: 'npm run lint',
-        typecheck: 'npm run typecheck || tsc --noEmit'
-      };
-
-      expect(goalCommands.tests).toBe('npm test');
-      expect(goalCommands.build).toBe('npm run build');
-      expect(goalCommands.lint).toBe('npm run lint');
-    });
-  });
-
-  describe('Progress Formatting', () => {
-    it('should format progress message', () => {
-      const cycle = 2;
-      const maxCycles = 5;
-      const status = 'Running tests...';
-      const message = `[ULTRAQA Cycle ${cycle}/${maxCycles}] ${status}`;
-
-      expect(message).toBe('[ULTRAQA Cycle 2/5] Running tests...');
-      expect(message).toContain('ULTRAQA');
-      expect(message).toContain(`${cycle}/${maxCycles}`);
-    });
-  });
-});
-
 describe('Persistent Mode - Max Attempts Counter', () => {
   const testSessionId = 'test-session-123';
 
@@ -1573,174 +1442,6 @@ describe('Persistent Mode - Max Attempts Counter', () => {
     expect(true).toBe(true);
   });
 });
-
-describe('Mutual Exclusion - UltraQA and Ralph', () => {
-  let testDir: string;
-
-  beforeEach(() => {
-    // Create a unique temp directory for each test
-    testDir = join(tmpdir(), `omc-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    mkdirSync(testDir, { recursive: true });
-    mkdirSync(join(testDir, '.omc'), { recursive: true });
-    mkdirSync(join(testDir, '.omc', 'state'), { recursive: true });
-  });
-
-  afterEach(() => {
-    // Clean up temp directory
-    try {
-      rmSync(testDir, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup errors
-    }
-  });
-
-  describe('isUltraQAActive', () => {
-    it('should return false when no ultraqa state exists', () => {
-      expect(isUltraQAActive(testDir)).toBe(false);
-    });
-
-    it('should return true when ultraqa is active', () => {
-      const stateFile = join(testDir, '.omc', 'state', 'ultraqa-state.json');
-      writeFileSync(stateFile, JSON.stringify({ active: true }));
-      expect(isUltraQAActive(testDir)).toBe(true);
-    });
-
-    it('should return false when ultraqa is not active', () => {
-      const stateFile = join(testDir, '.omc', 'state', 'ultraqa-state.json');
-      writeFileSync(stateFile, JSON.stringify({ active: false }));
-      expect(isUltraQAActive(testDir)).toBe(false);
-    });
-
-    it('should return false for invalid JSON', () => {
-      const stateFile = join(testDir, '.omc', 'state', 'ultraqa-state.json');
-      writeFileSync(stateFile, 'invalid json');
-      expect(isUltraQAActive(testDir)).toBe(false);
-    });
-  });
-
-  describe('isRalphLoopActive', () => {
-    it('should return false when no ralph state exists', () => {
-      expect(isRalphLoopActive(testDir)).toBe(false);
-    });
-
-    it('should return true when ralph is active', () => {
-      const stateFile = join(testDir, '.omc', 'state', 'ralph-state.json');
-      writeFileSync(stateFile, JSON.stringify({ active: true }));
-      expect(isRalphLoopActive(testDir)).toBe(true);
-    });
-
-    it('should return false when ralph is not active', () => {
-      const stateFile = join(testDir, '.omc', 'state', 'ralph-state.json');
-      writeFileSync(stateFile, JSON.stringify({ active: false }));
-      expect(isRalphLoopActive(testDir)).toBe(false);
-    });
-  });
-
-  describe('UltraQA mutual exclusion', () => {
-    it('should fail to start UltraQA when Ralph is active', () => {
-      // Activate Ralph first - write to session-scoped path since startUltraQA
-      // passes sessionId which makes readRalphState check session path only
-      const sessionDir = join(testDir, '.omc', 'state', 'sessions', 'test-session');
-      mkdirSync(sessionDir, { recursive: true });
-      const ralphStateFile = join(sessionDir, 'ralph-state.json');
-      writeFileSync(ralphStateFile, JSON.stringify({ active: true }));
-
-      // Try to start UltraQA
-      const result = startUltraQA(testDir, 'tests', 'test-session');
-
-      expect(result.success).toBe(false);
-      expect(result.error).toContain('Cannot start UltraQA while Ralph Loop is active');
-    });
-
-    it('should succeed starting UltraQA when Ralph is not active', () => {
-      const result = startUltraQA(testDir, 'tests', 'test-session');
-
-      expect(result.success).toBe(true);
-      expect(result.error).toBeUndefined();
-
-      // Clean up
-      clearUltraQAState(testDir);
-    });
-
-    it('should succeed starting UltraQA when ralph state exists but inactive', () => {
-      const ralphStateFile = join(testDir, '.omc', 'state', 'ralph-state.json');
-      writeFileSync(ralphStateFile, JSON.stringify({ active: false }));
-
-      const result = startUltraQA(testDir, 'tests', 'test-session');
-
-      expect(result.success).toBe(true);
-
-      // Clean up
-      clearUltraQAState(testDir);
-    });
-  });
-
-  describe('Ralph mutual exclusion', () => {
-    it('should fail to start Ralph when UltraQA is active', () => {
-      // Activate UltraQA first - write to session-scoped path since startLoop
-      // passes sessionId which makes isUltraQAActive check session path only
-      const sessionDir = join(testDir, '.omc', 'state', 'sessions', 'test-session');
-      mkdirSync(sessionDir, { recursive: true });
-      const ultraqaStateFile = join(sessionDir, 'ultraqa-state.json');
-      writeFileSync(ultraqaStateFile, JSON.stringify({ active: true }));
-
-      // Try to start Ralph
-      const hook = createRalphLoopHook(testDir);
-      const result = hook.startLoop('test-session', 'test prompt');
-
-      expect(result).toBe(false);
-    });
-
-    it('should succeed starting Ralph when UltraQA is not active', () => {
-      const hook = createRalphLoopHook(testDir);
-      const result = hook.startLoop('test-session', 'test prompt');
-
-      expect(result).toBe(true);
-
-      // Clean up
-      clearRalphState(testDir);
-    });
-
-    it('should succeed starting Ralph when ultraqa state exists but inactive', () => {
-      const ultraqaStateFile = join(testDir, '.omc', 'state', 'ultraqa-state.json');
-      writeFileSync(ultraqaStateFile, JSON.stringify({ active: false }));
-
-      const hook = createRalphLoopHook(testDir);
-      const result = hook.startLoop('test-session', 'test prompt');
-
-      expect(result).toBe(true);
-
-      // Clean up
-      clearRalphState(testDir);
-    });
-  });
-
-  describe('State cleanup', () => {
-    it('should clear UltraQA state properly', () => {
-      const result = startUltraQA(testDir, 'tests', 'test-session');
-      expect(result.success).toBe(true);
-
-      const cleared = clearUltraQAState(testDir);
-      expect(cleared).toBe(true);
-
-      expect(isRalphLoopActive(testDir)).toBe(false);
-    });
-
-    it('should clear Ralph state properly', () => {
-      const hook = createRalphLoopHook(testDir);
-      hook.startLoop('test-session', 'test prompt');
-
-      const cleared = clearRalphState(testDir);
-      expect(cleared).toBe(true);
-
-      expect(isUltraQAActive(testDir)).toBe(false);
-    });
-  });
-});
-
-// ===========================================================================
-// Skill-Active State Clearing on Skill Completion
-// ===========================================================================
 
 describe('Skill-active state lifecycle', () => {
   let testDir: string;

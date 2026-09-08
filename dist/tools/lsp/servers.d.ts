@@ -18,6 +18,8 @@ export declare function getTypeScriptServerForWorkspace(workspaceRoot: string): 
  * Known LSP servers and their configurations
  */
 export declare const LSP_SERVERS: Record<string, LspServerConfig>;
+/** Resolve the supported Python language server. Only exact basedpyright opts in. */
+export declare function resolvePythonServer(): LspServerConfig;
 /**
  * Check if a command exists in PATH.
  *

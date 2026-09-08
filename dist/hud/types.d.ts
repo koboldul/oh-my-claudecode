@@ -8,6 +8,7 @@ import type { ApiKeySource } from './elements/api-key-source.js';
 import type { SessionSummaryState } from './elements/session-summary.js';
 import type { PayloadEstimate } from './payload-estimate.js';
 import type { MissionBoardConfig, MissionBoardState } from './mission-board.js';
+import type { AgentKind, IncomingAgentMessage } from './agent-kind.js';
 export type { AutopilotStateForHud, ApiKeySource, SessionSummaryState };
 export interface BackgroundTask {
     id: string;
@@ -32,6 +33,12 @@ export interface OmcHudState {
 export interface StatuslineStdin {
     /** Transcript path for parsing conversation history */
     transcript_path?: string;
+    /**
+     * Claude Code version, e.g. "2.1.232". Claude Code puts this in every
+     * statusline payload; it is the version the session is actually running, and
+     * it is what the usage API's User-Agent must name (see buildUserAgent).
+     */
+    version?: string;
     /** Current working directory */
     cwd?: string;
     /** Host-normalized model information from statusline stdin */
@@ -79,6 +86,17 @@ export interface ActiveAgent {
     status: 'running' | 'completed';
     startTime: Date;
     endTime?: Date;
+    /**
+     * Which mechanism owns this agent (issue #3666). Deterministically derived
+     * from the spawning tool call: named spawns are teammates, unnamed spawns
+     * are subagents. Absent on legacy data that predates this field.
+     */
+    kind?: AgentKind;
+    /**
+     * Session id that issued the spawning tool call, when observable. Absent for
+     * legacy transcripts or when the spawner cannot be determined.
+     */
+    spawnedBy?: string;
 }
 export interface SkillInvocation {
     name: string;
@@ -106,6 +124,13 @@ export interface LastRequestTokenUsage {
 }
 export interface TranscriptData {
     agents: ActiveAgent[];
+    /**
+     * Classified incoming agent wrapper messages observed in the transcript
+     * (issue #3666). Each entry identifies the sender's kind and identity from
+     * the wrapper's own attributes with the payload redacted. Never populated
+     * from tool_result content, so agent outputs cannot spoof a message.
+     */
+    incomingMessages?: IncomingAgentMessage[];
     todos: TodoItem[];
     sessionStart?: Date;
     lastActivatedSkill?: SkillInvocation;
@@ -136,8 +161,8 @@ export interface PrdStateForHud {
     total: number;
 }
 export interface RateLimits {
-    /** 5-hour rolling window usage percentage (0-100) - all models combined */
-    fiveHourPercent: number;
+    /** 5-hour rolling window usage percentage (0-100) - all models combined; absent when provider omitted this bucket */
+    fiveHourPercent?: number;
     /** Weekly usage percentage (0-100) - all models combined (undefined if not applicable) */
     weeklyPercent?: number;
     /** When the 5-hour limit resets (null if unavailable) */
@@ -152,6 +177,24 @@ export interface RateLimits {
     opusWeeklyPercent?: number;
     /** Opus weekly reset time */
     opusWeeklyResetsAt?: Date | null;
+    /**
+     * Weekly scoped per-model quotas from `limits[]` (`kind: "weekly_scoped"`) that
+     * did not map onto the recognized Sonnet/Opus families above — e.g. new/unnamed
+     * tiers such as "Fable". Rendered generically so new tiers don't need a source
+     * release (see issue #3576). Deduped by normalized `scope.model.display_name`.
+     */
+    scopedWeeklyBuckets?: Array<{
+        /** Stable identifier for the bucket: `scope.model.id` when present, else the normalized display name */
+        id: string;
+        /** Display label as returned by the API (e.g. "Fable") */
+        label: string;
+        /** Usage percentage (0-100) */
+        percent: number;
+        /** When this bucket resets (null if unavailable) */
+        resetsAt: Date | null;
+        /** Whether the API flagged this bucket as the currently-active/limiting one */
+        isActive: boolean;
+    }>;
     /** Monthly usage percentage (0-100), if available from API */
     monthlyPercent?: number;
     /** When the monthly limit resets (null if unavailable) */
@@ -304,6 +347,12 @@ export interface HudRenderContext {
     omcVersion: string | null;
     /** Latest available version from npm registry (null if up to date or unknown) */
     updateAvailable: string | null;
+    /** Update channel the cached OMC update belongs to (null if unknown) */
+    omcUpdateSource?: 'npm' | 'marketplace' | null;
+    /** Installed Claude Code version reported by the statusline stdin payload */
+    claudeCodeVersion?: string | null;
+    /** Latest available Claude Code version (null if up to date or unknown) */
+    claudeCodeUpdateAvailable?: string | null;
     /** Total tool_use blocks seen in transcript */
     toolCallCount: number;
     /** Total Task/proxy_Task calls seen in transcript */

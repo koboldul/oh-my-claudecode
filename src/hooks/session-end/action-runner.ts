@@ -4,7 +4,7 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { atomicWriteJsonSync } from '../../lib/atomic-write.js';
 import type { OpenClawRoutingSnapshot, SessionEndActionName, SessionEndActionState, SessionEndJobV1 } from './cleanup-manifest.js';
-import { getProcessStartIdentity, killProcessTree } from '../../platform/process-utils.js';
+import { getProcessStartIdentitySync, terminateOwnedProcessTree } from '../../platform/process-utils.js';
 import { markSessionEndActionRunner, readSessionEndJob } from './cleanup-manifest.js';
 import { getOmcRoot } from '../../lib/worktree-paths.js';
 
@@ -48,6 +48,11 @@ export async function runSessionEndAction(context: ActionRunContext, _execute: (
     if (Date.now() >= context.deadlineAt) return { code: 'deadline-before-arm', completed: false };
     const childInput = { directory: context.directory, sessionId: context.sessionId, jobId: context.job.jobId, actionName: context.actionName, attempt: context.action.attempts, ownerNonce: context.ownerNonce, runnerNonce: context.runnerNonce, runPath, deadlineAt: context.deadlineAt };
     const child = spawn(process.execPath, [fileURLToPath(import.meta.url), RUNNER_ARG, JSON.stringify(childInput)], { detached: true, stdio: 'ignore', windowsHide: true, env: runnerEnvironment(context) });
+    // Capture identity synchronously, in the same tick as spawn, before
+    // child.unref() or any async operation. This eliminates the PID-reuse
+    // window that an async identity lookup would create. If the child already
+    // exited or /proc is unreadable, identity is null and we fail closed.
+    const identity = child.pid ? getProcessStartIdentitySync(child.pid) : null;
     child.unref();
     let settled = false;
     let exitCode: number | null = null;
@@ -70,14 +75,25 @@ export async function runSessionEndAction(context: ActionRunContext, _execute: (
         const timer = setTimeout(resolve, Math.max(1, context.deadlineAt + POST_KILL_SETTLE_MS - Date.now()));
         timer.unref();
       });
-      await Promise.race([Promise.resolve(killProcessTree(child.pid!, 'SIGKILL')).catch(() => false), postKillWait]);
+      if (identity && child.pid) {
+        await Promise.race([terminateOwnedProcessTree({
+          pid: child.pid, expectedStartIdentity: identity,
+          deadlineAt: new Date(context.deadlineAt + POST_KILL_SETTLE_MS).toISOString(), force: true,
+        }).catch(() => 'unknown' as const), postKillWait]);
+      }
       await Promise.race([childExit, postKillWait]);
     };
+    if (!identity || !child.pid) {
+      // Identity capture failed: fail closed WITHOUT signalling any PID or
+      // process group. The child has its own deadline timer (set in the
+      // runner entrypoint) and will self-exit. Signalling a raw PID/group
+      // after identity failure could hit a reused PID.
+      await Promise.race([childExit, new Promise<void>(resolve => setTimeout(resolve, POST_KILL_SETTLE_MS))]);
+      return { code: 'runner-identity-unavailable', completed: false };
+    }
     const timeout = setTimeout(() => {
       deadlineTermination ??= terminate().finally(resolveTermination);
     }, Math.max(1, context.deadlineAt - Date.now()));
-    const identity = await getProcessStartIdentity(child.pid!, context.deadlineAt);
-    if (!identity) { clearTimeout(timeout); await terminate(); return { code: 'runner-identity-unavailable', completed: false }; }
     if (settled) { clearTimeout(timeout); return { code: exitCode === null ? 'runner-deadline' : `runner-exit-${exitCode}`, completed: false }; }
     atomicWriteJsonSync(path.join(runPath, 'control.json'), { jobId: context.job.jobId, action: context.actionName, attempt: context.action.attempts, runnerNonce: context.runnerNonce, ownerNonce: context.ownerNonce, runner: { pid: child.pid, processStartIdentity: identity }, deadlineAt: new Date(context.deadlineAt).toISOString(), idempotencyKey: context.action.idempotencyKey });
     atomicWriteJsonSync(path.join(runPath, 'arm.json'), { runnerNonce: context.runnerNonce, ownerNonce: context.ownerNonce, armedAt: new Date().toISOString() });

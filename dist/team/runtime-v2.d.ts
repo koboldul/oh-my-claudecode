@@ -18,7 +18,7 @@
 import type { TeamConfig, TeamManifestV2, TeamTask, TeamTaskDelegationPlan, WorkerInfo, WorkerStatus, WorkerHeartbeat } from './types.js';
 import type { TeamPhase } from './phase-controller.js';
 import type { CliAgentType } from './model-contract.js';
-import { type WorkerPaneLiveness } from './tmux-session.js';
+import { type StartupInboxResubmitOutcome, type WorkerPaneLiveness } from './tmux-session.js';
 import type { CanonicalTeamRole, PluginConfig, RoleAssignment, TeamRoleAssignmentSpec } from '../shared/types.js';
 import { type CliWorkerOutputPayload } from './cli-worker-contract.js';
 import { type RecoveryDurableOutcome } from './recovery-request-store.js';
@@ -100,6 +100,17 @@ export interface ShutdownOptionsV2 {
     ralph?: boolean;
     timeoutMs?: number;
 }
+export type ShutdownTeamV2Result = {
+    outcome: 'cleaned';
+} | {
+    outcome: 'preserved';
+    reason: 'config_missing_cleanup_evidence' | 'provider_cleanup_unverified' | 'worker_panes_alive' | 'worker_pane_liveness_unknown' | 'worktrees_preserved';
+    workers: string[];
+} | {
+    outcome: 'failed';
+    reason: 'tmux_cleanup_failed' | 'worktree_cleanup_failed' | 'state_cleanup_failed';
+    detail: string;
+};
 /**
  * Resolve a per-task routing assignment from the team's routing snapshot.
  *
@@ -158,12 +169,36 @@ export interface StartTeamV2Config {
      */
     autoMerge?: boolean;
 }
+export interface WorkerStartupEvidencePolicy {
+    initialBudgetMs: number;
+    finalRecheckBudgetMs: number;
+    resubmitAttempts: number;
+    resubmitBudgetMs: number;
+    /** Read-only evidence recheck granted only when the owned pane was observed
+     * actively working (the worker demonstrably consumed the startup trigger). */
+    engagedPaneRecheckBudgetMs: number;
+}
+export declare function getWorkerStartupEvidencePolicy(agentType: CliAgentType): WorkerStartupEvidencePolicy;
+export declare function waitForStartupEvidenceBudget(hasEvidence: () => Promise<boolean>, budgetMs: number, delayMs?: number): Promise<boolean>;
+/**
+ * Settle worker startup evidence under a provider-aware policy.
+ *
+ * The resubmit loop exists to recover a lost interactive submit. When the probe
+ * reports `pane_busy`, the owned worker demonstrably consumed the trigger and is
+ * actively working, so resubmitting would duplicate the inbox and stopping the
+ * wait would tear down a healthy provider (issue #3849). In that case the loop
+ * stops resubmitting and one bounded read-only engaged-pane recheck runs before
+ * the caller's fail-closed teardown. Panes that are idle, wrong, or dead never
+ * earn that recheck and keep the existing fast failure path.
+ */
+export declare function settleStartupEvidence(policy: WorkerStartupEvidencePolicy, waitForCurrentEvidence: (budgetMs: number) => Promise<boolean>, resubmit?: () => Promise<StartupInboxResubmitOutcome>): Promise<boolean>;
+export declare function promptModeRecoveryRequiresProgressEvidence(promptMode: boolean, continuationCount: number): boolean;
 interface RecoveryOwnerFinalizationDeps {
     readRevisionedConfig: (teamName: string, cwd: string) => Promise<{
         config: TeamConfig;
         stateRevision: number;
     } | null>;
-    saveConfigAtRevision: (config: TeamConfig, expectedRevision: number, cwd: string, afterCommit?: () => Promise<void> | void) => Promise<boolean>;
+    saveConfigAtRevision: (config: TeamConfig, expectedRevision: number, cwd: string, afterCommit?: () => Promise<void> | void, options?: import('./monitor.js').SaveTeamConfigAtRevisionOptions) => Promise<boolean>;
     withConfigLock?: <T>(teamName: string, cwd: string, fn: () => Promise<T> | T) => Promise<T>;
     publishFinal: (input: RecoverDeadWorkerOwnerInput, recoveryId: string, result: RecoverDeadWorkerV2Result) => RecoverDeadWorkerV2Result;
     readDurableContinuation?: (cwd: string, requestId: string, recoveryId: string) => 'none' | 'selected' | 'reserved' | 'adopted';
@@ -230,17 +265,18 @@ export interface CliWorkerVerdictResult {
     reason?: string;
 }
 /**
- * Post-exit handler for CLI workers that emitted a structured verdict
- * (AC-7). Scans workers whose panes have exited and whose WorkerInfo
+ * Completion handler for CLI workers that emitted a structured verdict
+ * (AC-7). Scans workers whose panes have exited, plus live Cursor panes whose
+ * persistent reviewer session has published a verdict, and whose WorkerInfo
  * carries `output_file`. For each:
  *   - Reads + validates the JSON payload via `parseCliWorkerVerdict`.
  *   - Locates the worker's in_progress task and writes a terminal status
  *     (completed for `approve`, failed for `revise`/`reject`) plus verdict
- *     metadata directly to the task file — the worker process is gone and
- *     cannot re-enter `transitionTaskStatus` with its claim token.
- *   - Renames `verdict.json` to `verdict.processed.json` so a subsequent
- *     monitor cycle does not reprocess it.
- *   - Emits a team event describing the outcome.
+ *     metadata through the canonical `transitionTaskStatus` path so lease,
+ *     delegation, event, and monitor-snapshot invariants remain authoritative.
+ *   - Renames the assignment-scoped verdict artifact to `.processed` so a
+ *     subsequent monitor cycle does not reprocess it.
+ *   - Quarantines stale `.processing` artifacts when replacement output exists.
  * On parse failure, emits a warning event and leaves the task untouched
  * for human review (per plan AC-7).
  */
@@ -258,7 +294,7 @@ export declare function monitorTeamV2(teamName: string, cwd: string): Promise<Te
  * 4. Force kill remaining tmux panes
  * 5. Clean up state
  */
-export declare function shutdownTeamV2(teamName: string, cwd: string, options?: ShutdownOptionsV2): Promise<void>;
+export declare function shutdownTeamV2(teamName: string, cwd: string, options?: ShutdownOptionsV2): Promise<ShutdownTeamV2Result>;
 export declare function resumeTeamV2(teamName: string, cwd: string): Promise<TeamRuntimeV2 | null>;
 export declare function findActiveTeamsV2(cwd: string): Promise<string[]>;
 //# sourceMappingURL=runtime-v2.d.ts.map

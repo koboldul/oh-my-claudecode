@@ -7,11 +7,19 @@ import { ultragoalCommand } from '../ultragoal.js';
 async function withTempCwd<T>(run: (cwd: string) => Promise<T>): Promise<T> {
   const cwd = await mkdtemp(join(tmpdir(), 'omc-ultragoal-cli-'));
   const original = process.cwd();
+  const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
   process.chdir(cwd);
+  process.env.HOME = cwd;
+  process.env.USERPROFILE = cwd;
   try {
     return await run(cwd);
   } finally {
     process.chdir(original);
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
     await rm(cwd, { recursive: true, force: true });
   }
 }
@@ -95,6 +103,31 @@ describe('omc ultragoal CLI', () => {
       expect(joined).toMatch(/Complete first milestone/);
       expect(joined).not.toMatch(/\bomx\b/);
       expect(joined).not.toMatch(/get_goal|create_goal|update_goal/);
+    });
+  });
+
+  it('complete-goals positional id starts exactly the named pending goal', async () => {
+    await withTempCwd(async (cwd) => {
+      await ultragoalCommand(['create-goals', '--brief', 'brief', '--goal', 'First::first', '--goal', 'Second::second', '--goal', 'Third::third']);
+      captured.out.length = 0;
+      await ultragoalCommand(['complete-goals', 'G003-third', '--json']);
+      const result = JSON.parse(captured.out.join('')) as { goal: { id: string } };
+      expect(result.goal.id).toBe('G003-third');
+      const plan = JSON.parse(await readFile(join(cwd, '.omc/ultragoal/goals.json'), 'utf-8')) as { activeGoalId?: string; goals: Array<{ id: string; status: string; attempt: number }> };
+      expect(plan.activeGoalId).toBe('G003-third');
+      expect(plan.goals.find((goal) => goal.id === 'G001-first')?.status).toBe('pending');
+      expect(plan.goals.find((goal) => goal.id === 'G003-third')?.attempt).toBe(1);
+    });
+  });
+
+  it('rejects an unknown positional id without mutating artifacts', async () => {
+    await withTempCwd(async (cwd) => {
+      await ultragoalCommand(['create-goals', '--brief', 'brief', '--goal', 'First::first', '--goal', 'Second::second']);
+      const before = await readFile(join(cwd, '.omc/ultragoal/goals.json'), 'utf-8');
+      await ultragoalCommand(['complete-goals', 'G999-missing']);
+      expect(process.exitCode).toBe(1);
+      expect(captured.err.join('\n')).toMatch(/Unknown ultragoal id: G999-missing/);
+      expect(await readFile(join(cwd, '.omc/ultragoal/goals.json'), 'utf-8')).toBe(before);
     });
   });
 

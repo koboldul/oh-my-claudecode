@@ -40,7 +40,7 @@ export declare const SKILL_SEEN_INTENT_LIMIT = 128;
  * Non-workflow skills keep today's `light/medium/heavy` protection via the
  * `support_skill` branch.
  */
-export declare const CANONICAL_WORKFLOW_SKILLS: readonly ["autopilot", "ralph", "team", "ultrawork", "ultraqa", "deep-interview", "ralplan", "self-improve"];
+export declare const CANONICAL_WORKFLOW_SKILLS: readonly ["autopilot", "ralph", "team", "deep-interview", "ralplan", "self-improve"];
 export type CanonicalWorkflowSkill = typeof CANONICAL_WORKFLOW_SKILLS[number];
 export declare function isCanonicalWorkflowSkill(skillName: string): skillName is CanonicalWorkflowSkill;
 export type SkillProtectionLevel = 'none' | 'light' | 'medium' | 'heavy';

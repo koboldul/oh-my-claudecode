@@ -60,6 +60,148 @@ describe('sessionName', () => {
   });
 });
 
+describe('applyMainVerticalLayout', () => {
+  it('sets the 80-column main width before its sole layout selection', async () => {
+    const calls: string[][] = [];
+    let mainPaneWidth: number | undefined;
+    const selectedPaneWidths: Array<number | undefined> = [];
+
+    vi.resetModules();
+    vi.doMock('../../cli/tmux-utils.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../cli/tmux-utils.js')>();
+      return {
+        ...actual,
+        tmuxCmdAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          return { stdout: '80\n', stderr: '' };
+        }),
+        tmuxExecAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          if (args[0] === 'set-window-option') mainPaneWidth = Number(args[args.length - 1]);
+          if (args[0] === 'select-layout') selectedPaneWidths.push(mainPaneWidth);
+          return { stdout: '', stderr: '' };
+        }),
+      };
+    });
+
+    try {
+      const { applyMainVerticalLayout } = await import('../tmux-session.js');
+      await applyMainVerticalLayout('team-session');
+    } finally {
+      vi.doUnmock('../../cli/tmux-utils.js');
+      vi.resetModules();
+    }
+
+    expect(calls).toEqual([
+      ['display-message', '-p', '-t', 'team-session', '#{window_width}'],
+      ['set-window-option', '-t', 'team-session', 'main-pane-width', '40'],
+      ['select-layout', '-t', 'team-session', 'main-vertical'],
+    ]);
+    expect(calls.filter(([command]) => command === 'select-layout')).toHaveLength(1);
+    expect(selectedPaneWidths).toEqual([40]);
+  });
+
+  it('fails required startup layout before selecting when width is invalid', async () => {
+    const calls: string[][] = [];
+
+    vi.resetModules();
+    vi.doMock('../../cli/tmux-utils.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../cli/tmux-utils.js')>();
+      return {
+        ...actual,
+        tmuxCmdAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          return { stdout: 'not-a-width\n', stderr: '' };
+        }),
+        tmuxExecAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          return { stdout: '', stderr: '' };
+        }),
+      };
+    });
+
+    try {
+      const { applyMainVerticalLayout } = await import('../tmux-session.js');
+      await expect(applyMainVerticalLayout('team-session', { required: true }))
+        .rejects.toThrow('team_layout_window_width_invalid:not-a-width');
+    } finally {
+      vi.doUnmock('../../cli/tmux-utils.js');
+      vi.resetModules();
+    }
+
+    expect(calls).toEqual([
+      ['display-message', '-p', '-t', 'team-session', '#{window_width}'],
+    ]);
+  });
+
+  it('rejects a required layout below the startup width boundary', async () => {
+    const calls: string[][] = [];
+
+    vi.resetModules();
+    vi.doMock('../../cli/tmux-utils.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../cli/tmux-utils.js')>();
+      return {
+        ...actual,
+        tmuxCmdAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          return { stdout: '39\n', stderr: '' };
+        }),
+        tmuxExecAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          return { stdout: '', stderr: '' };
+        }),
+      };
+    });
+
+    try {
+      const { applyMainVerticalLayout } = await import('../tmux-session.js');
+      await expect(applyMainVerticalLayout('team-session', { required: true }))
+        .rejects.toThrow('team_layout_window_width_invalid:39');
+    } finally {
+      vi.doUnmock('../../cli/tmux-utils.js');
+      vi.resetModules();
+    }
+
+    expect(calls).toEqual([
+      ['display-message', '-p', '-t', 'team-session', '#{window_width}'],
+    ]);
+  });
+
+  it('never selects a best-effort layout when main-pane-width cannot be set', async () => {
+    const calls: string[][] = [];
+
+    vi.resetModules();
+    vi.doMock('../../cli/tmux-utils.js', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../cli/tmux-utils.js')>();
+      return {
+        ...actual,
+        tmuxCmdAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          return { stdout: '80\n', stderr: '' };
+        }),
+        tmuxExecAsync: vi.fn(async (args: string[]) => {
+          calls.push(args);
+          if (args[0] === 'set-window-option') throw new Error('set failed');
+          return { stdout: '', stderr: '' };
+        }),
+      };
+    });
+
+    try {
+      const { applyMainVerticalLayout } = await import('../tmux-session.js');
+      await expect(applyMainVerticalLayout('team-session')).resolves.toBeUndefined();
+    } finally {
+      vi.doUnmock('../../cli/tmux-utils.js');
+      vi.resetModules();
+    }
+
+    expect(calls).toEqual([
+      ['display-message', '-p', '-t', 'team-session', '#{window_width}'],
+      ['set-window-option', '-t', 'team-session', 'main-pane-width', '40'],
+    ]);
+  });
+});
+
 describe('getDefaultShell', () => {
   it('uses COMSPEC on win32', () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
@@ -147,9 +289,106 @@ describe('buildWorkerStartCommand', () => {
 
     expect(cmd).toBe(
       'C:\\Windows\\System32\\cmd.exe /d /s /c "set "OMC_TEAM_WORKER=team/worker-1" && ' +
-      '"C:\\Users\\tester\\AppData\\Local\\Programs\\claude\\claude.exe" "--agent-id" "worker-1""'
+      '"C:\\Users\\tester\\AppData\\Local\\Programs\\claude\\claude.exe" "--agent-id" "worker-1"" & exit /b'
     );
     expect(cmd).not.toContain('$env:OMC_TEAM_WORKER');
+  });
+
+  it('preserves POSIX argv-style exec while routing launch through the acknowledgement bootstrap', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+    vi.stubEnv('SHELL', '/bin/bash');
+    const cmd = buildWorkerStartCommand({
+      teamName: 't',
+      workerName: 'w',
+      envVars: { OMC_TEAM_WORKER: 't/w' },
+      launchBinary: '/opt/codex/bin/codex',
+      launchArgs: ['--label', 'worker one'],
+      cwd: '/tmp/team workspace',
+      provider: 'codex',
+      launchAttempt: {
+        schema_version: 1,
+        attempt_id: '11111111-1111-4111-8111-111111111111',
+        nonce: '22222222-2222-4222-8222-222222222222',
+        team_name: 't',
+        worker_name: 'w',
+        pane_id: '%2',
+        provider: 'codex',
+        created_at: '2026-01-01T00:00:00.000Z',
+        currentPath: '/tmp/current.json',
+        expectedPath: '/tmp/expected.json',
+        ackPath: '/tmp/ack.json',
+        decisionPath: '/tmp/decision.json',
+        startedPath: '/tmp/provider-started.json',
+        transportOwnerPath: '/tmp/transport-owner.json',
+        bootstrapDescriptorPath: '/tmp/bootstrap.json',
+        wrapperPath: '/tmp/launch.cmd',
+        transportCleanupCompletePath: '/tmp/transport-cleanup-complete.json',
+        runtimeCliPath: '/opt/omc/runtime-cli.cjs',
+      },
+    });
+
+    // Supervised POSIX launches reference the attempt-owned descriptor by path
+    // (issue #3655); the bootstrap spec itself must never travel inline.
+    expect(cmd).toContain("OMC_WORKER_LAUNCH_SPEC_FILE='/tmp/bootstrap.json'");
+    expect(cmd).not.toContain('OMC_WORKER_LAUNCH_SPEC=');
+    expect(cmd).toContain("exec \"$@\"");
+    expect(cmd).toContain("'--worker-launch'");
+    expect(cmd).toContain("'/opt/omc/runtime-cli.cjs'");
+  });
+
+  it('keeps provider percent/quote metacharacters out of the native Windows cmd command', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
+    const cmd = buildWorkerStartCommand({
+      teamName: 't',
+      workerName: 'w',
+      envVars: { OMC_TEAM_WORKER: 't/w' },
+      launchBinary: 'C:\\Program Files\\Codex\\codex.exe',
+      launchArgs: ['--label', '100% ready %USERPROFILE%', '--title="quoted"'],
+      cwd: 'C:\\team workspace',
+      provider: 'codex',
+      launchAttempt: {
+        schema_version: 1,
+        attempt_id: '11111111-1111-4111-8111-111111111111',
+        nonce: '22222222-2222-4222-8222-222222222222',
+        team_name: 't',
+        worker_name: 'w',
+        pane_id: '%2',
+        provider: 'codex',
+        created_at: '2026-01-01T00:00:00.000Z',
+        currentPath: 'C:\\state\\current.json',
+        expectedPath: 'C:\\state\\expected.json',
+        ackPath: 'C:\\state\\ack.json',
+        decisionPath: 'C:\\state\\decision.json',
+        startedPath: 'C:\\state\\provider-started.json',
+        transportOwnerPath: 'C:\\state\\transport-owner.json',
+        bootstrapDescriptorPath: 'C:\\state\\bootstrap.json',
+        wrapperPath: 'C:\\state\\launch.cmd',
+        transportCleanupCompletePath: 'C:\\state\\transport-cleanup-complete.json',
+        runtimeCliPath: 'C:\\Program Files\\omc\\runtime-cli.cjs',
+      },
+    });
+
+    expect(cmd).toContain('C:\\Windows\\System32\\cmd.exe /d /s /c');
+    // Supervised launches deliver the attempt-owned descriptor by path; the
+    // bootstrap spec (and its percent/quote metacharacters) never travels in
+    // the command line or cmd environment (issue #3655).
+    expect(cmd).toContain('set "OMC_WORKER_LAUNCH_SPEC_FILE=C:\\state\\bootstrap.json"');
+    expect(cmd).not.toContain('OMC_WORKER_LAUNCH_SPEC_B64=');
+    expect(cmd).not.toContain('OMC_WORKER_LAUNCH_SPEC=');
+    expect(cmd).not.toContain('100% ready %USERPROFILE%');
+    expect(cmd).not.toContain('pane_id=%%2');
+  });
+
+  it('rejects CRLF injection in native Windows provider argv', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
+
+    expect(() => buildWorkerStartCommand({
+      teamName: 't', workerName: 'w', envVars: {},
+      launchBinary: 'C:\\Program Files\\Cursor\\cursor-agent.exe',
+      launchArgs: ['--model', 'safe\r\nset PWNED=1'], cwd: 'C:\\repo',
+    })).toThrow('contains CR, LF, or NUL');
   });
 
   it('escapes psmux cmd.exe env vars and quoted launch args without PowerShell syntax', () => {
@@ -202,6 +441,29 @@ describe('buildWorkerStartCommand', () => {
     expect(cmd).toContain('"--token=abc%%25"');
     expect(cmd).not.toContain('literal%USERPROFILE%token%25');
   });
+  it('base64-encodes recovery gate launch identities for native Windows cmd', () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
+    const gate = { recoveryId: 'recovery-1', launchAttempt: { attempt_id: 'attempt-1', nonce: 'nonce-1', pane_id: '%2' } };
+
+    const cmd = buildWorkerStartCommand({
+      teamName: 't',
+      workerName: 'w',
+      envVars: { OMC_RECOVERY_GATE_SPEC: JSON.stringify(gate) },
+      launchBinary: 'C:\\Program Files\\nodejs\\node.exe',
+      launchArgs: ['C:\\omc\\runtime-cli.cjs', '--recovery-gate'],
+      cwd: 'C:\\repo',
+    });
+
+    const marker = 'set "OMC_RECOVERY_GATE_SPEC_B64=';
+    const encodedStart = cmd.indexOf(marker) + marker.length;
+    const encodedEnd = cmd.indexOf('" &&', encodedStart);
+    expect(JSON.parse(Buffer.from(cmd.slice(encodedStart, encodedEnd), 'base64').toString('utf8')))
+      .toMatchObject({ launchAttempt: { pane_id: '%2' } });
+    expect(cmd).not.toContain('OMC_RECOVERY_GATE_SPEC=');
+    expect(cmd).not.toContain('pane_id=%%2');
+  });
+
 
   it('does not cmd-escape percent signs on MSYS Windows worker startup', () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
@@ -240,7 +502,7 @@ describe('buildWorkerStartCommand', () => {
 
     expect(cmd).toBe(
       'C:\\Windows\\System32\\cmd.exe /d /s /c "set "OMC_TEAM_WORKER=team/worker-1" && ' +
-      '"C:\\Program Files\\OpenAI\\Codex\\codex.exe" "--full-auto""'
+      '"C:\\Program Files\\OpenAI\\Codex\\codex.exe" "--full-auto"" & exit /b'
     );
   });
 
@@ -454,6 +716,18 @@ describe('pane readiness startup banners', () => {
     expect(paneLooksReady(capture)).toBe(false);
   });
 
+  it('treats an exact directory trust selector as ready for legacy delivery', () => {
+    const capture = [
+      'Do you trust the contents of this directory?',
+      '› 1. Yes, continue',
+      '  2. No, quit',
+    ].join('\n');
+
+    expect(paneHasTrustPrompt(capture)).toBe(true);
+    expect(paneLooksReady(capture)).toBe(true);
+    expect(paneHasActiveTask(capture)).toBe(false);
+  });
+
   it('detects Codex CLI hook-trust review screen as a trust prompt', () => {
     const capture = [
       '  Hooks need review',
@@ -470,6 +744,43 @@ describe('pane readiness startup banners', () => {
     expect(paneHasTrustPrompt(capture)).toBe(true);
     expect(paneLooksReady(capture)).toBe(true);
     expect(paneHasActiveTask(capture)).toBe(false);
+  });
+
+  it('detects the cursor-agent workspace-trust banner and refuses to call it ready', () => {
+    // Verbatim capture from `cursor-agent` launched in tmux on an untrusted
+    // directory. It offers no numbered choice and the process exits, unlike
+    // the dismissible Claude/Codex prompts above.
+    const capture = [
+      '⚠ Workspace Trust Required',
+      '',
+      '  Cursor Agent can execute code and access files in this directory.',
+      '  Do you trust the contents of this directory?',
+      '',
+      '    /private/tmp/ct-nf2',
+      '',
+      '  To proceed, you can either:',
+      "    • Run 'agent' interactively to decide",
+      '    • Pass --trust, --yolo, or -f if you trust this directory',
+    ].join('\n');
+
+    expect(paneHasTrustPrompt(capture)).toBe(true);
+    // The pane is dead: treating it as ready would hand work to a gone process.
+    expect(paneLooksReady(capture, 'cursor')).toBe(false);
+    expect(paneHasActiveTask(capture, 'cursor')).toBe(false);
+  });
+
+  it('gives the Cursor trust banner precedence and keeps it provider-scoped', () => {
+    const capture = [
+      '⚠ Workspace Trust Required',
+      'Do you trust the contents of this directory?',
+      '› 1. Yes, continue',
+      '  2. No, quit',
+      "  • Pass --trust, --yolo, or -f if you trust this directory",
+    ].join('\n');
+
+    expect(paneHasTrustPrompt(capture, 'cursor')).toBe(true);
+    expect(paneLooksReady(capture, 'cursor')).toBe(false);
+    expect(paneLooksReady(capture, 'claude')).toBe(true);
   });
 
   it('still treats actual prompt lines as ready', () => {

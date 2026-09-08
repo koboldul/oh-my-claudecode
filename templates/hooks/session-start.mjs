@@ -3,16 +3,22 @@
 // Restores persistent mode states when session starts
 // Cross-platform: Windows, macOS, Linux
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, rmSync, statSync } from 'fs';
 import { join, dirname, normalize, resolve } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { spawn } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const { getClaudeConfigDir, getUpdateCheckCachePath } = await import(pathToFileURL(join(__dirname, 'lib', 'config-dir.mjs')).href);
 const configDir = getClaudeConfigDir();
 const { resolveSessionStatePathsForHook, resolveOmcStateRoot } = await import(pathToFileURL(join(__dirname, 'lib', 'state-root.mjs')).href);
+const { publishCacheOccupancy } = await import(pathToFileURL(join(__dirname, 'lib', 'cache-occupancy.mjs')).href);
+
+// Detached update-cache refresh: argv flag and the child's overall deadline.
+const REFRESH_UPDATE_CACHE_FLAG = '--refresh-update-cache';
+const REFRESH_UPDATE_CACHE_DEADLINE_MS = 3000;
 
 // Import timeout-protected stdin reader (prevents hangs on Linux/Windows, see issue #240, #524)
 let readStdin;
@@ -79,6 +85,102 @@ async function shouldRestoreModeState(directory, mode, state, sessionId) {
   return true;
 }
 
+// Read version from OMC's own package.json, not the project's (fixes #516)
+function resolveOmcVersion() {
+  for (let i = 1; i <= 4; i++) {
+    const candidate = join(__dirname, ...Array(i).fill('..'), 'package.json');
+    const pkg = readJsonFile(candidate);
+    if ((pkg?.name === 'oh-my-claude-sisyphus' || pkg?.name === 'oh-my-claudecode') && pkg?.version) {
+      return pkg.version;
+    }
+  }
+  return null;
+}
+
+// Registry base override. Only honoured when set; tests point it at a closed
+// port to exercise the offline/timeout paths without touching the network.
+function registryLatestUrl(packageName) {
+  const base = process.env.OMC_UPDATE_REGISTRY_BASE;
+  const root = base ? base.replace(/\/+$/, '') : 'https://registry.npmjs.org';
+  return `${root}/${packageName}/latest`;
+}
+
+function readUpdateCheckCache() {
+  const cached = readJsonFile(getUpdateCheckCachePath());
+  return cached && typeof cached === 'object' && !Array.isArray(cached) ? cached : {};
+}
+
+// Merge into the existing cache so unrelated fields (e.g. the Claude Code
+// version tracked below) survive an OMC-only refresh. Refresh children from
+// concurrent sessions share this file, so serialize the read/modify/write and
+// publish a complete JSON document with a same-directory rename.
+function mergeUpdateCheckCache(fields) {
+  const cachePath = getUpdateCheckCachePath();
+  const cacheDir = dirname(cachePath);
+  const lockPath = `${cachePath}.lock`;
+  const deadline = Date.now() + 1000;
+  let locked = false;
+
+  try {
+    mkdirSync(cacheDir, { recursive: true });
+    while (!locked && Date.now() < deadline) {
+      try {
+        mkdirSync(lockPath);
+        locked = true;
+      } catch {
+        try {
+          if (Date.now() - statSync(lockPath).mtimeMs > 10_000) {
+            rmSync(lockPath, { recursive: true, force: true });
+          }
+        } catch {}
+        try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } catch {}
+      }
+    }
+    if (!locked) return;
+
+    const temporaryPath = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(temporaryPath, JSON.stringify({ ...readUpdateCheckCache(), ...fields }), 'utf-8');
+    try {
+      renameSync(temporaryPath, cachePath);
+    } catch {
+      // Windows cannot replace an existing file with rename. The lock keeps
+      // other writers out; readers already tolerate a missing cache briefly.
+      try { unlinkSync(cachePath); } catch {}
+      renameSync(temporaryPath, cachePath);
+    }
+  } catch {
+    // Cache refresh is best-effort and must never affect session startup.
+  } finally {
+    if (locked) {
+      try { rmSync(lockPath, { recursive: true, force: true }); } catch {}
+    }
+  }
+}
+
+// Refresh the cached latest Claude Code version (same 24h window and 2s timeout
+// as the OMC check) so the HUD can show a Claude Code update hint. The field is
+// simply absent on caches written before this check existed.
+async function checkClaudeCodeUpdate() {
+  const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
+  const cached = readUpdateCheckCache();
+  if (cached.claudeCodeCheckedAt && (Date.now() - cached.claudeCodeCheckedAt) < CACHE_DURATION) return;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 2000);
+  try {
+    const response = await fetch(registryLatestUrl('@anthropic-ai/claude-code'), {
+      signal: controller.signal
+    });
+    if (!response.ok) return;
+
+    const data = await response.json();
+    if (!data?.version) return;
+    mergeUpdateCheckCache({ claudeCodeLatestVersion: data.version, claudeCodeCheckedAt: Date.now() });
+  } catch {
+    // Silent fail - network unavailable or timeout
+  } finally { clearTimeout(timeoutId); }
+}
+
 async function checkForUpdates(currentVersion) {
   const cacheFile = getUpdateCheckCachePath();
   const now = Date.now();
@@ -94,7 +196,7 @@ async function checkForUpdates(currentVersion) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 2000);
   try {
-    const response = await fetch('https://registry.npmjs.org/oh-my-claude-sisyphus/latest', {
+    const response = await fetch(registryLatestUrl('oh-my-claude-sisyphus'), {
       signal: controller.signal
     });
 
@@ -111,16 +213,60 @@ async function checkForUpdates(currentVersion) {
       timestamp: now,
       latestVersion,
       currentVersion,
-      updateAvailable
+      updateAvailable,
+      // This hook only queries npm; pin the source so the merge does not
+      // preserve a stale marketplace value from an earlier plugin install.
+      source: 'npm'
     };
 
-    writeJsonFile(cacheFile, cacheData);
+    mergeUpdateCheckCache(cacheData);
 
     return updateAvailable ? cacheData : null;
   } catch (error) {
     // Silent fail - network unavailable or timeout
     return null;
   } finally { clearTimeout(timeoutId); }
+}
+
+// Concurrent: each fetch aborts after 2s, and SessionStart hooks have a 5s
+// budget, so running them in sequence would risk a cold-cache timeout.
+async function runUpdateChecks() {
+  const currentVersion = resolveOmcVersion();
+  const [updateInfo] = await Promise.all([
+    currentVersion ? checkForUpdates(currentVersion).catch(() => null) : null,
+    checkClaudeCodeUpdate().catch(() => {}),
+  ]);
+  return updateInfo;
+}
+
+// Refresh the update caches in a detached child so a slow or unreachable
+// registry cannot delay the SessionStart response (the hook budget is 5s).
+function refreshUpdateCacheInBackground() {
+  if (process.env.OMC_HOOK_BACKGROUND_CHILD === '1') return;
+  try {
+    const child = spawn(process.execPath, [__filename, REFRESH_UPDATE_CACHE_FLAG], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      env: { ...process.env, OMC_HOOK_BACKGROUND_CHILD: '1' },
+    });
+    // spawn reports most failures (EMFILE, EPERM, ENOMEM) via an async 'error'
+    // event, not a throw; swallow it so the hook never exits non-zero after answering.
+    child.on('error', () => {});
+    child.unref();
+  } catch {
+    // Cache refresh is best-effort and must never affect hook output.
+  }
+}
+
+// Detached child entrypoint: refresh the caches, then exit. The deadline keeps
+// the child from lingering if a fetch never settles.
+async function refreshUpdateCacheAndExit() {
+  const deadline = setTimeout(() => process.exit(0), REFRESH_UPDATE_CACHE_DEADLINE_MS);
+  deadline.unref();
+  try { await runUpdateChecks(); } catch {}
+  clearTimeout(deadline);
+  process.exit(0);
 }
 
 function compareVersions(v1, v2) {
@@ -266,7 +412,6 @@ function buildSessionStartAdditionalContext(messages) {
   const priorityOrder = [
     /\[MODEL ROUTING OVERRIDE/,
     /\[AUTOPILOT MODE RESTORED\]/,
-    /\[ULTRAWORK MODE RESTORED\]/,
     /\[RALPH LOOP RESTORED\]/,
     /\[PROJECT MEMORY\]/,
     /\[NOTEPAD PRIORITY CONTEXT LOADED\]/,
@@ -380,8 +525,6 @@ ${priorityContext}
 </notepad-priority>`;
 }
 
-const STALE_STATE_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
-
 /**
  * Validate that a candidate cwd is a real OMC workspace anchor.
  * Returns the candidate unchanged if it is non-empty AND contains a
@@ -429,100 +572,6 @@ function normalizePath(p) {
   return normalized;
 }
 
-function getStateRecencyMs(state) {
-  if (!state || typeof state !== 'object') return 0;
-  const startedAt = state.started_at ? new Date(state.started_at).getTime() : 0;
-  const lastCheckedAt = state.last_checked_at ? new Date(state.last_checked_at).getTime() : 0;
-  return Math.max(startedAt || 0, lastCheckedAt || 0);
-}
-
-function isFreshActiveState(state) {
-  if (!state?.active) return false;
-  const recencyMs = getStateRecencyMs(state);
-  if (!Number.isFinite(recencyMs) || recencyMs <= 0) return false;
-  return (Date.now() - recencyMs) <= STALE_STATE_THRESHOLD_MS;
-}
-
-function isOwnerProcessAlive(state) {
-  const pid = state && typeof state.owner_pid === 'number' ? state.owner_pid : null;
-  // Unknown PID → backwards-compat: assume alive (current behavior).
-  if (pid === null || pid <= 0) return true;
-  if (pid === process.pid) return true;
-  try {
-    // Signal 0 probes liveness without affecting the process.
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // ESRCH = no such process → owner is dead, safe to reclaim.
-    if (err && err.code === 'ESRCH') return false;
-    // EPERM = owned by a different user → can't tell, assume alive.
-    return true;
-  }
-}
-
-function hasConflictingUltraworkRestore(state, sessionId, directory, source) {
-  if (!sessionId || !isFreshActiveState(state)) return false;
-  if (typeof state.session_id !== 'string' || !state.session_id || state.session_id === sessionId) {
-    return false;
-  }
-  // Recorded owner PID is dead → the state file is orphaned, not a real
-  // parallel-session conflict. Allow the current session to reclaim it.
-  if (!isOwnerProcessAlive(state)) return false;
-
-  if (source === 'global') {
-    if (typeof state.project_path !== 'string' || !state.project_path) {
-      return false;
-    }
-    return normalizePath(state.project_path) === normalizePath(directory);
-  }
-
-  return true;
-}
-
-async function getUltraworkRestoreCandidate(directory, sessionId) {
-  const { readPath: localPath } = await resolveSessionStatePathsForHook(directory, 'ultrawork', sessionId || undefined);
-  const globalPath = join(homedir(), '.omc', 'state', 'ultrawork-state.json');
-
-  const localState = readJsonFile(localPath);
-  if (hasConflictingUltraworkRestore(localState, sessionId, directory, 'local')) {
-    return { restore: null, collision: { source: 'local', state: localState } };
-  }
-  if (localState?.active && (!localState.session_id || localState.session_id === sessionId)) {
-    return { restore: localState, collision: null };
-  }
-
-  const globalState = readJsonFile(globalPath);
-  if (hasConflictingUltraworkRestore(globalState, sessionId, directory, 'global')) {
-    return { restore: null, collision: { source: 'global', state: globalState } };
-  }
-  if (globalState?.active && (!globalState.session_id || globalState.session_id === sessionId)) {
-    return { restore: globalState, collision: null };
-  }
-
-  return { restore: null, collision: null };
-}
-
-function formatUltraworkCollisionWarning(source, state) {
-  const startedAt = state?.started_at || 'an unknown time';
-  const ownerSession = state?.session_id || 'another session';
-  const scope = source === 'global' ? 'matching project path in the shared global fallback state' : 'this repo root';
-  return `<session-restore>
-
-[PARALLEL SESSION WARNING]
-
-Detected an active ultrawork session for ${scope}.
-Owner session: ${ownerSession}
-Started: ${startedAt}
-
-To avoid shared \.omc/state bleed across parallel sessions, OMC suppressed the restore for this session.
-Continue normally in this session, or use a separate worktree / close the other same-root session before resuming the prior ultrawork state.
-
-</session-restore>
-
----
-`;
-}
-
 async function main() {
   try {
     const input = await readStdin();
@@ -532,24 +581,45 @@ async function main() {
     const rawDirectory = data.cwd || data.directory || process.cwd();
     const directory = validateCwd(rawDirectory);
     if (directory === null) {
+      // No workspace here, but the registry update checks do not need one, so
+      // the HUD update cache still refreshes for users who launch Claude Code
+      // outside a repo. It runs detached: this path must answer immediately and
+      // must not touch any workspace or session state.
+      refreshUpdateCacheInBackground();
       console.log(JSON.stringify({ continue: true }));
       return;
     }
     const sessionId = data.sessionId || data.session_id || data.sessionid || '';
-    const messages = [];
+    if (process.env.CLAUDE_PLUGIN_ROOT) {
+      publishCacheOccupancy(process.env.CLAUDE_PLUGIN_ROOT, configDir);
+    }
+    let messages = [];
     const userMessages = [];
+    let pendingRestore = null;
+    let pendingRestoreMessage = null;
 
-    // Check for updates (non-blocking)
-    // Read version from OMC's own package.json, not the project's (fixes #516)
-    let currentVersion = null;
-    for (let i = 1; i <= 4; i++) {
-      const candidate = join(__dirname, ...Array(i).fill('..'), 'package.json');
-      const pkg = readJsonFile(candidate);
-      if ((pkg?.name === 'oh-my-claude-sisyphus' || pkg?.name === 'oh-my-claudecode') && pkg?.version) {
-        currentVersion = pkg.version;
-        break;
+    // Restore the newest PreCompact checkpoint after compaction (issue #3730).
+    // Only fires when Claude Code signals the session resumed from compaction
+    // (source === 'compact'); never on startup, resume, or clear.
+    if (data.source === 'compact' && sessionId) {
+      try {
+        const { preparePreCompactCheckpointRestore, claimPreCompactCheckpointRestore } = await import(
+          pathToFileURL(join(__dirname, 'lib', 'precompact-restore.mjs')).href
+        );
+        const restoreRoot = await resolveOmcStateRoot(directory);
+        const prepared = preparePreCompactCheckpointRestore(restoreRoot, sessionId);
+        if (prepared) {
+          pendingRestore = { ...prepared, restoreRoot, preparePreCompactCheckpointRestore, claimPreCompactCheckpointRestore };
+          pendingRestoreMessage = `<session-restore>\n\n${prepared.text}\n\n</session-restore>\n\n---\n`;
+          messages.push(pendingRestoreMessage);
+        }
+      } catch {
+        // Restore is advisory: never break session start on a checkpoint error.
       }
     }
+
+    // Check for updates (non-blocking)
+    const currentVersion = resolveOmcVersion();
 
     // Template-version drift check: warn once per session if installed templates differ from plugin
     if (currentVersion) {
@@ -570,7 +640,7 @@ async function main() {
       } catch { /* non-fatal */ }
     }
 
-    const updateInfo = currentVersion ? await checkForUpdates(currentVersion) : null;
+    const updateInfo = await runUpdateChecks();
     if (updateInfo) {
       const configPath = join(getClaudeConfigDir(), '.omc-config.json');
       const omcConfig = readJsonFile(configPath) || {};
@@ -581,32 +651,6 @@ async function main() {
 
     if (await shouldEmitModelRoutingOverride(directory)) {
       messages.push(MODEL_ROUTING_OVERRIDE_MESSAGE);
-    }
-
-    // Check for ultrawork state - warn on conflicting same-path session, otherwise restore.
-    const ultraworkCandidate = await getUltraworkRestoreCandidate(directory, sessionId);
-    if (ultraworkCandidate.collision) {
-      messages.push(
-        formatUltraworkCollisionWarning(
-          ultraworkCandidate.collision.source,
-          ultraworkCandidate.collision.state,
-        ),
-      );
-    } else if (await shouldRestoreModeState(directory, 'ultrawork', ultraworkCandidate.restore, sessionId)) {
-      const ultraworkState = ultraworkCandidate.restore;
-      messages.push(`<session-restore>
-
-[ULTRAWORK MODE RESTORED]
-
-You have an active ultrawork session from ${ultraworkState.started_at}.
-Original task: ${ultraworkState.original_prompt}
-
-Continue working in ultrawork mode until all tasks are complete.
-
-</session-restore>
-
----
-`);
     }
 
     // Check for incomplete todos (project-local only, not global
@@ -685,6 +729,62 @@ ${agentsContent}
       }
     }
 
+    let additionalContext = '';
+    if (pendingRestore && pendingRestoreMessage) {
+      additionalContext = buildSessionStartAdditionalContext(messages);
+      if (additionalContext.includes(pendingRestoreMessage)) {
+        let markerStatus = null;
+        const waitCell = new Int32Array(new SharedArrayBuffer(4));
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          const status = pendingRestore.claimPreCompactCheckpointRestore(
+            pendingRestore.restoreRoot,
+            sessionId,
+            pendingRestore.path,
+            pendingRestore.created_at,
+            pendingRestore.mtime_ms,
+            pendingRestore.checkpoint_sha256,
+          );
+          if (status === 'written') {
+            markerStatus = status;
+            break;
+          }
+          if (status !== 'contended') break;
+          Atomics.wait(waitCell, 0, 0, 10);
+          const refreshed = pendingRestore.preparePreCompactCheckpointRestore(
+            pendingRestore.restoreRoot,
+            sessionId,
+          );
+          if (!refreshed) break;
+          const refreshedMessage = `<session-restore>\n\n${refreshed.text}\n\n</session-restore>\n\n---\n`;
+          const refreshedMessages = messages.map((message) => (
+            message === pendingRestoreMessage ? refreshedMessage : message
+          ));
+          const refreshedContext = buildSessionStartAdditionalContext(refreshedMessages);
+          if (!refreshedContext.includes(refreshedMessage)) break;
+          pendingRestore = {
+            ...refreshed,
+            restoreRoot: pendingRestore.restoreRoot,
+            preparePreCompactCheckpointRestore: pendingRestore.preparePreCompactCheckpointRestore,
+            claimPreCompactCheckpointRestore: pendingRestore.claimPreCompactCheckpointRestore,
+          };
+          pendingRestoreMessage = refreshedMessage;
+          messages = refreshedMessages;
+          additionalContext = refreshedContext;
+        }
+        if (!markerStatus) {
+          messages = messages.filter((message) => message !== pendingRestoreMessage);
+          additionalContext = buildSessionStartAdditionalContext(messages);
+        }
+      } else {
+        // The complete restore sentinel did not fit the aggregate budget;
+        // do not commit a replay marker for context that was not delivered.
+        messages = messages.filter((message) => message !== pendingRestoreMessage);
+        additionalContext = buildSessionStartAdditionalContext(messages);
+      }
+    } else if (messages.length > 0) {
+      additionalContext = buildSessionStartAdditionalContext(messages);
+    }
+
     if (messages.length > 0 || userMessages.length > 0) {
       const output = {
         continue: true,
@@ -695,7 +795,7 @@ ${agentsContent}
       if (messages.length > 0) {
         output.hookSpecificOutput = {
           hookEventName: 'SessionStart',
-          additionalContext: buildSessionStartAdditionalContext(messages)
+          additionalContext,
         };
       }
       console.log(JSON.stringify(output));
@@ -707,4 +807,8 @@ ${agentsContent}
   }
 }
 
-main();
+if (process.argv.includes(REFRESH_UPDATE_CACHE_FLAG)) {
+  refreshUpdateCacheAndExit();
+} else {
+  main();
+}

@@ -18,7 +18,6 @@ const HELP_TOKENS = new Set(['--help', '-h', 'help']);
 const MIN_WORKER_COUNT = 1;
 const MAX_WORKER_COUNT = 20;
 const VALID_TEAM_CLI_AGENT_TYPES = new Set(['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity', 'copilot']);
-const CURSOR_ALLOWED_TEAM_ROLES = new Set(['executor']);
 const DEFAULT_TEAM_CLI_AGENT_TYPE = 'claude';
 const TEAM_HELP = `
 Usage: omc team [N:agent-type[:role]] [--new-window] [--auto-merge] [--no-decompose] "<task description>"
@@ -52,8 +51,6 @@ Auto-merge (v2-only):
 
 Roles (optional): architect, executor, planner, analyst, critic, debugger, verifier,
   code-reviewer, security-reviewer, test-engineer, designer, writer, scientist
-
-Cursor workers are executor-style only; use 1:cursor or 1:cursor:executor, not reviewer/critic/security/verdict roles.
 `;
 const TEAM_API_HELP = `
 Usage: omc team api <operation> [--input <json>] [--json]
@@ -298,10 +295,6 @@ function normalizeWorkerSpecSegment(match) {
             throw new Error(`Invalid agent type "${token}" in worker spec "${match[0]}". ` +
                 `Expected one of: ${[...VALID_TEAM_CLI_AGENT_TYPES].join(', ')}. ` +
                 `For a role-only shorthand on the default agent, use "${count}:${explicitRole}".`);
-        }
-        if (token === 'cursor' && !CURSOR_ALLOWED_TEAM_ROLES.has(explicitRole)) {
-            throw new Error(`Invalid Cursor worker role "${explicitRole}" in worker spec "${match[0]}". ` +
-                `Cursor workers are executor-style only; use "${count}:cursor" or "${count}:cursor:executor".`);
         }
         return { count, agentType: token, role: explicitRole };
     }
@@ -748,13 +741,17 @@ async function handleTeamShutdown(teamName, cwd, force) {
     const { isRuntimeV2Enabled } = await import('../../team/runtime-v2.js');
     if (isRuntimeV2Enabled()) {
         const { shutdownTeamV2 } = await import('../../team/runtime-v2.js');
-        await shutdownTeamV2(teamName, cwd, { force });
+        const shutdown = await shutdownTeamV2(teamName, cwd, { force });
+        if (shutdown.outcome !== 'cleaned')
+            throw new Error(`Team shutdown ${shutdown.outcome}: ${shutdown.reason}`);
         console.log(`Team shutdown complete: ${teamName}`);
         return;
     }
     // v1 fallback
     const { shutdownTeam } = await import('../../team/runtime.js');
-    await shutdownTeam(teamName, `omc-team-${teamName}`, cwd);
+    const cleaned = await shutdownTeam(teamName, `omc-team-${teamName}`, cwd);
+    if (!cleaned)
+        throw new Error(`Team shutdown failed: cleanup unverified for ${teamName}`);
     console.log(`Team shutdown complete: ${teamName}`);
 }
 // ---------------------------------------------------------------------------

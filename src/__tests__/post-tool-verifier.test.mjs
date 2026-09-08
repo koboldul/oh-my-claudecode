@@ -4,12 +4,12 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { join } from 'path';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import process from 'process';
-import { detectBashFailure, detectWriteFailure, isClaudeCodeWriteSuccess, isNonZeroExitWithOutput, summarizeAgentResult } from '../../scripts/post-tool-verifier.mjs';
+import { detectAnnouncedBackgroundLaunch, detectBashFailure, detectWriteFailure, isBackgroundToolInvocation, isClaudeCodeWriteSuccess, isNonZeroExitWithOutput, summarizeAgentResult } from '../../scripts/post-tool-verifier.mjs';
 import { ensureHookRuntimeBundle } from './helpers/ensure-hook-runtime-bundle.js';
 
 const SCRIPT_PATH = join(process.cwd(), 'scripts', 'post-tool-verifier.mjs');
@@ -41,14 +41,50 @@ function runPostToolVerifier(input, env = {}) {
   return runHookScript(SCRIPT_PATH, input, env);
 }
 
+function scopedHookEnvironment(cwd, env) {
+  const homeDir = mkdtempSync(join(tmpdir(), 'post-tool-verifier-home-'));
+  if (cwd && cwd !== process.cwd() && !existsSync(join(cwd, '.git'))) {
+    execFileSync('git', ['init', '--quiet'], { cwd, stdio: 'pipe' });
+  }
+
+  const effectiveHome = env.HOME || homeDir;
+  const childEnv = {
+    ...process.env,
+    NODE_ENV: 'test',
+    DISABLE_OMC: '',
+    OMC_SKIP_HOOKS: '',
+    OMC_QUIET: '0',
+    OMC_STATE_DIR: '',
+    CLAUDE_PLUGIN_ROOT: '',
+    HOME: effectiveHome,
+    USERPROFILE: env.USERPROFILE || effectiveHome,
+    CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR || join(effectiveHome, '.claude'),
+    ...env,
+  };
+
+  return {
+    childEnv,
+    cleanup() {
+      rmSync(homeDir, { recursive: true, force: true });
+    },
+  };
+}
+
 function runHookScript(scriptPath, input, env = {}) {
-  const stdout = execSync(`node "${scriptPath}"`, {
-    input: JSON.stringify(input),
-    encoding: 'utf-8',
-    timeout: 5000,
-    env: { ...process.env, NODE_ENV: 'test', ...env },
-  });
-  return JSON.parse(stdout.trim());
+  const cwd = typeof input?.cwd === 'string' && input.cwd.length > 0 ? input.cwd : process.cwd();
+  const fixture = scopedHookEnvironment(cwd, env);
+  try {
+    const stdout = execSync(`node "${scriptPath}"`, {
+      cwd,
+      input: JSON.stringify(input),
+      encoding: 'utf-8',
+      timeout: 5000,
+      env: fixture.childEnv,
+    });
+    return JSON.parse(stdout.trim());
+  } finally {
+    fixture.cleanup();
+  }
 }
 
 function withTempDir(fn) {
@@ -110,6 +146,96 @@ function writeRalplanStateFixture(tempDir, sessionId, overrides = {}) {
     }),
   );
 }
+
+describe('session statistics retention', () => {
+  it('keeps the current session while pruning accumulated historical sessions', () => {
+    withTempDir((tempDir) => {
+      const configDir = join(tempDir, '.claude');
+      const statePath = join(configDir, '.session-stats.json');
+      mkdirSync(configDir, { recursive: true });
+      const sessions = Object.fromEntries(
+        Array.from({ length: 150 }, (_, index) => [
+          `historical-${index}`,
+          {
+            tool_counts: { Read: 1 },
+            last_tool: 'Read',
+            total_calls: 1,
+            started_at: index + 1,
+            updated_at: index + 1,
+          },
+        ]),
+      );
+      writeFileSync(statePath, JSON.stringify({ sessions }));
+
+      runPostToolVerifier(
+        {
+          session_id: 'current-session',
+          cwd: tempDir,
+          tool_name: 'Read',
+          tool_input: { file_path: join(tempDir, 'README.md') },
+          tool_response: 'ok',
+        },
+        {
+          HOME: tempDir,
+          USERPROFILE: tempDir,
+          CLAUDE_CONFIG_DIR: configDir,
+        },
+      );
+
+      const retained = JSON.parse(readFileSync(statePath, 'utf8')).sessions;
+      expect(Object.keys(retained)).toHaveLength(100);
+      expect(retained['current-session'].tool_counts.Read).toBe(1);
+      expect(retained['historical-149']).toBeDefined();
+      expect(retained['historical-0']).toBeUndefined();
+    });
+  });
+
+  it.each([
+    { DISABLE_OMC: 'true', OMC_SKIP_HOOKS: '' },
+    { DISABLE_OMC: '', OMC_SKIP_HOOKS: 'post-tool-use' },
+  ])('does not rewrite statistics when disabled by %j', (env) => {
+    withTempDir((tempDir) => {
+      const configDir = join(tempDir, '.claude');
+      const statePath = join(configDir, '.session-stats.json');
+      mkdirSync(configDir, { recursive: true });
+      const original = JSON.stringify({
+        sessions: {
+          existing: { tool_counts: { Read: 7 }, total_calls: 7, started_at: 1, updated_at: 2 },
+        },
+      });
+      writeFileSync(statePath, original);
+
+      expect(runPostToolVerifier(
+        {
+          session_id: 'current-session',
+          cwd: tempDir,
+          tool_name: 'Read',
+          tool_input: { file_path: join(tempDir, 'README.md') },
+          tool_response: 'ok',
+        },
+        {
+          HOME: tempDir,
+          USERPROFILE: tempDir,
+          CLAUDE_CONFIG_DIR: configDir,
+          ...env,
+        },
+      )).toEqual({ continue: true });
+      expect(readFileSync(statePath, 'utf8')).toBe(original);
+    });
+  });
+
+  it('does not initialize the state directory when disabled', () => {
+    withTempDir((tempDir) => {
+      const configDir = join(tempDir, 'missing-config');
+
+      expect(runPostToolVerifier(
+        { session_id: 'disabled-session', cwd: tempDir, tool_name: 'Read' },
+        { CLAUDE_CONFIG_DIR: configDir, DISABLE_OMC: 'true' },
+      )).toEqual({ continue: true });
+      expect(existsSync(configDir)).toBe(false);
+    });
+  });
+});
 
 describe('detectBashFailure', () => {
   describe('Claude Code temp CWD false positives (issue #696)', () => {
@@ -510,6 +636,7 @@ describe('agent output summarization / truncation (issue #1373)', () => {
     expect(out.continue).toBe(true);
     expect(out.hookSpecificOutput?.additionalContext).toContain('TaskOutput summary:');
     expect(out.hookSpecificOutput?.additionalContext).toContain('TaskOutput clipped');
+    expect(out).not.toHaveProperty('suppressOutput');
   });
 });
 
@@ -597,7 +724,7 @@ describe('post-tool hook regression coverage (issue #2615)', () => {
       cwd: process.cwd(),
     });
 
-    expect(out).toEqual({ continue: true, suppressOutput: true });
+    expect(out).toEqual({ continue: true });
   });
 });
 
@@ -856,7 +983,7 @@ describe('OMC_QUIET hook message suppression (issue #1646)', () => {
       { OMC_QUIET: '1' },
     );
 
-    expect(edit).toEqual({ continue: true, suppressOutput: true });
+    expect(edit).toEqual({ continue: true });
 
     const grep = runPostToolVerifier(
       {
@@ -868,7 +995,7 @@ describe('OMC_QUIET hook message suppression (issue #1646)', () => {
       { OMC_QUIET: '1' },
     );
 
-    expect(grep).toEqual({ continue: true, suppressOutput: true });
+    expect(grep).toEqual({ continue: true });
 
     const writeFailure = runPostToolVerifier(
       {
@@ -920,7 +1047,7 @@ describe('OMC_QUIET hook message suppression (issue #1646)', () => {
       );
     });
 
-    expect(taskSummary).toEqual({ continue: true, suppressOutput: true });
+    expect(taskSummary).toEqual({ continue: true });
   });
 });
 
@@ -938,7 +1065,7 @@ describe('Skill active state cleanup on PostToolUse (issue #2103)', () => {
         cwd: tempDir,
       });
 
-      expect(out).toEqual({ continue: true, suppressOutput: true });
+      expect(out).toEqual({ continue: true });
       expect(existsSync(skillStatePath(tempDir, sessionId))).toBe(false);
       expect(existsSync(legacySkillStatePath(tempDir))).toBe(false);
     });
@@ -957,7 +1084,7 @@ describe('Skill active state cleanup on PostToolUse (issue #2103)', () => {
         cwd: tempDir,
       });
 
-      expect(out).toEqual({ continue: true, suppressOutput: true });
+      expect(out).toEqual({ continue: true });
       expect(existsSync(skillStatePath(tempDir, sessionId))).toBe(true);
       expect(existsSync(legacySkillStatePath(tempDir))).toBe(true);
     });
@@ -982,6 +1109,30 @@ describe('Skill active state cleanup on PostToolUse (issue #2103)', () => {
     });
   });
 
+  it('activates only ralph state for the template post-tool hook path', () => {
+    withTempDir((tempDir) => {
+      const sessionId = 'ralph-template-no-ultrawork';
+      // Redirect HOME so the template hook's shared-home global fallback write
+      // (~/.omc/state/ralph-state.json) lands in the sandbox instead of the
+      // real home. Leaving it in the real home leaks active ralph state into
+      // other suites (e.g. cancel-integration's broad-clear location count).
+      const homeDir = join(tempDir, 'home');
+      mkdirSync(homeDir, { recursive: true });
+      const out = runHookScript(TEMPLATE_HOOK_PATH, {
+        tool_name: 'Skill',
+        tool_input: { skill: 'oh-my-claudecode:ralph' },
+        tool_response: { ok: true },
+        session_id: sessionId,
+        cwd: tempDir,
+      }, { HOME: homeDir });
+
+      expect(out).toEqual({ continue: true, suppressOutput: true });
+      const stateDir = join(tempDir, '.omc', 'state', 'sessions', sessionId);
+      expect(existsSync(join(stateDir, 'ralph-state.json'))).toBe(true);
+      expect(existsSync(join(stateDir, 'ultrawork-state.json'))).toBe(false);
+    });
+  });
+
   it('deactivates ralplan state when the ralplan skill completes in post-tool-verifier', () => {
     withTempDir((tempDir) => {
       const sessionId = 'ralplan-complete-script';
@@ -995,7 +1146,7 @@ describe('Skill active state cleanup on PostToolUse (issue #2103)', () => {
         cwd: tempDir,
       });
 
-      expect(out).toEqual({ continue: true, suppressOutput: true });
+      expect(out).toEqual({ continue: true });
 
       const state = JSON.parse(readFileSync(ralplanStatePath(tempDir, sessionId), 'utf-8'));
       expect(state.active).toBe(false);
@@ -1044,7 +1195,7 @@ describe('Skill active state cleanup on PostToolUse (issue #2103)', () => {
         cwd: tempDir,
       });
 
-      expect(out).toEqual({ continue: true, suppressOutput: true });
+      expect(out).toEqual({ continue: true });
       expect(existsSync(skillStatePath(tempDir, sessionId))).toBe(false);
       expect(existsSync(legacySkillStatePath(tempDir))).toBe(false);
     });
@@ -1063,9 +1214,159 @@ describe('Skill active state cleanup on PostToolUse (issue #2103)', () => {
         cwd: tempDir,
       });
 
-      expect(out).toEqual({ continue: true, suppressOutput: true });
+      expect(out).toEqual({ continue: true });
       expect(existsSync(skillStatePath(tempDir, sessionId))).toBe(false);
       expect(existsSync(legacySkillStatePath(tempDir))).toBe(false);
     });
+  });
+});
+
+describe('background operation detection (issue #3578)', () => {
+  const TRIGGER_WORDS = ['started', 'running', 'background', 'async', 'task_id', 'spawned'];
+
+  describe('isBackgroundToolInvocation', () => {
+    it('is true only when run_in_background is exactly true', () => {
+      expect(isBackgroundToolInvocation({ run_in_background: true })).toBe(true);
+      expect(isBackgroundToolInvocation({ run_in_background: false })).toBe(false);
+      expect(isBackgroundToolInvocation({ run_in_background: 'true' })).toBe(false);
+      expect(isBackgroundToolInvocation({ command: 'echo running' })).toBe(false);
+    });
+
+    it('fails safe on malformed or missing tool_input', () => {
+      expect(isBackgroundToolInvocation(undefined)).toBe(false);
+      expect(isBackgroundToolInvocation(null)).toBe(false);
+      expect(isBackgroundToolInvocation('run_in_background')).toBe(false);
+      expect(isBackgroundToolInvocation([{ run_in_background: true }])).toBe(false);
+      expect(isBackgroundToolInvocation(42)).toBe(false);
+    });
+  });
+
+  describe('detectAnnouncedBackgroundLaunch', () => {
+    it('matches the harness announcement only at the start of output', () => {
+      expect(detectAnnouncedBackgroundLaunch('Async agent launched successfully\nagentId: a8de3dd')).toBe(true);
+      expect(detectAnnouncedBackgroundLaunch('  Background task launched\n')).toBe(true);
+      expect(detectAnnouncedBackgroundLaunch('Background task resumed')).toBe(true);
+    });
+
+    it('does not match the phrase quoted elsewhere in the output', () => {
+      expect(
+        detectAnnouncedBackgroundLaunch('Report: the parser checks for Async agent launched strings.'),
+      ).toBe(false);
+    });
+
+    it('is case-sensitive by design', () => {
+      expect(detectAnnouncedBackgroundLaunch('async agent launched successfully')).toBe(false);
+    });
+
+    it('fails safe on non-string output', () => {
+      expect(detectAnnouncedBackgroundLaunch(undefined)).toBe(false);
+      expect(detectAnnouncedBackgroundLaunch(null)).toBe(false);
+      expect(detectAnnouncedBackgroundLaunch({ text: 'Async agent launched' })).toBe(false);
+    });
+  });
+
+  describe('foreground Bash never reports a background operation', () => {
+    for (const word of TRIGGER_WORDS) {
+      it(`does not fire when foreground output contains "${word}"`, () => {
+        const out = runPostToolVerifier({
+          tool_name: 'Bash',
+          tool_input: { command: 'echo demo' },
+          tool_response: `the service is ${word} normally`,
+          session_id: `bg-fp-${word}`,
+        });
+
+        expect(out).toEqual({ continue: true });
+      });
+    }
+
+    it('does not fire when foreground output contains every trigger word at once', () => {
+      const out = runPostToolVerifier({
+        tool_name: 'Bash',
+        tool_input: { command: 'cat notes.txt' },
+        tool_response: TRIGGER_WORDS.join(' '),
+        session_id: 'bg-fp-all',
+      });
+
+      expect(out).toEqual({ continue: true });
+    });
+
+    it('does not fire for the reported repro payload', () => {
+      const out = runPostToolVerifier({
+        tool_name: 'Bash',
+        tool_input: { command: 'echo "the service is running"' },
+        tool_response: 'the service is running',
+        session_id: 'bg-fp-repro',
+      });
+
+      expect(out).toEqual({ continue: true });
+    });
+  });
+
+  describe('genuine background invocations still fire', () => {
+    it('fires for Bash with run_in_background=true', () => {
+      const out = runPostToolVerifier({
+        tool_name: 'Bash',
+        tool_input: { command: 'sleep 100', run_in_background: true },
+        tool_response: 'ok',
+        session_id: 'bg-real-bash',
+      });
+
+      expect(out.hookSpecificOutput.additionalContext).toContain('Background operation detected');
+    });
+
+    it('fires for Task with run_in_background=true', () => {
+      const out = runPostToolVerifier({
+        tool_name: 'Task',
+        tool_input: { description: 'explore', run_in_background: true },
+        tool_response: 'ok',
+        session_id: 'bg-real-task',
+      });
+
+      expect(out.hookSpecificOutput.additionalContext).toContain('Background task launched');
+    });
+
+    it('fires for a Task output leading with the launch announcement', () => {
+      const out = runPostToolVerifier({
+        tool_name: 'Task',
+        tool_input: { description: 'explore' },
+        tool_response: 'Async agent launched successfully\nagentId: a8de3dd',
+        session_id: 'bg-real-announce',
+      });
+
+      expect(out.hookSpecificOutput.additionalContext).toContain('Background task launched');
+    });
+
+    it('does not fire for a foreground Task result that merely quotes the announcement', () => {
+      const out = runPostToolVerifier({
+        tool_name: 'Task',
+        tool_input: { description: 'investigate' },
+        tool_response: 'Investigation report: the parser matches "Async agent launched" text.',
+        session_id: 'bg-fg-task-quote',
+      });
+
+      expect(out).toEqual({ continue: true });
+    });
+  });
+
+  describe('malformed tool_input fails safely', () => {
+    for (const [label, toolInput] of [
+      ['missing', undefined],
+      ['null', null],
+      ['string', 'run_in_background=true'],
+      ['array', [{ run_in_background: true }]],
+    ]) {
+      it(`does not fire and still continues for ${label} tool_input`, () => {
+        const payload = {
+          tool_name: 'Bash',
+          tool_response: TRIGGER_WORDS.join(' '),
+          session_id: `bg-malformed-${label}`,
+        };
+        if (toolInput !== undefined) payload.tool_input = toolInput;
+
+        const out = runPostToolVerifier(payload);
+
+        expect(out).toEqual({ continue: true });
+      });
+    }
   });
 });

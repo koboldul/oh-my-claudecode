@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { isAbsolute, join } from 'path';
+import { getOmcRoot } from '../lib/worktree-paths.js';
 /**
  * Typed path builders for all team state files.
  * All paths are relative to cwd.
@@ -43,6 +44,16 @@ export const TeamPaths = {
     ready: (teamName, workerName) => `.omc/state/team/${teamName}/workers/${workerName}/.ready`,
     overlay: (teamName, workerName) => `.omc/state/team/${teamName}/workers/${workerName}/AGENTS.md`,
     shutdownAck: (teamName, workerName) => `.omc/state/team/${teamName}/workers/${workerName}/shutdown-ack.json`,
+    workerLaunchAttemptRoot: (teamName, workerName, attemptId) => `.omc/state/team/${teamName}/workers/${workerName}/launch-attempts/${attemptId}`,
+    workerLaunchCurrent: (teamName, workerName) => `.omc/state/team/${teamName}/workers/${workerName}/launch-attempts/current.json`,
+    workerLaunchExpected: (teamName, workerName, attemptId) => `.omc/state/team/${teamName}/workers/${workerName}/launch-attempts/${attemptId}/expected.json`,
+    workerLaunchAck: (teamName, workerName, attemptId) => `.omc/state/team/${teamName}/workers/${workerName}/launch-attempts/${attemptId}/ack.json`,
+    workerLaunchStarted: (teamName, workerName, attemptId) => `.omc/state/team/${teamName}/workers/${workerName}/launch-attempts/${attemptId}/provider-started.json`,
+    workerLaunchTransportOwner: (teamName, workerName, attemptId) => `.omc/state/team/${teamName}/workers/${workerName}/launch-attempts/${attemptId}/transport-owner.json`,
+    workerLaunchBootstrapDescriptor: (teamName, workerName, attemptId) => `.omc/state/team/${teamName}/workers/${workerName}/launch-attempts/${attemptId}/bootstrap.json`,
+    workerLaunchWrapper: (teamName, workerName, attemptId) => `.omc/state/team/${teamName}/workers/${workerName}/launch-attempts/${attemptId}/launch.cmd`,
+    workerLaunchTransportCleanupComplete: (teamName, workerName, attemptId) => `.omc/state/team/${teamName}/workers/${workerName}/launch-attempts/${attemptId}/transport-cleanup-complete.json`,
+    workerLaunchDecision: (teamName, workerName, attemptId) => `.omc/state/team/${teamName}/workers/${workerName}/launch-attempts/${attemptId}/decision.json`,
     mailbox: (teamName, workerName) => `.omc/state/team/${teamName}/mailbox/${workerName}.json`,
     mailboxLockDir: (teamName, workerName) => `.omc/state/team/${teamName}/mailbox/.lock-${workerName}`,
     dispatchRequests: (teamName) => `.omc/state/team/${teamName}/dispatch/requests.json`,
@@ -107,13 +118,18 @@ export const TeamPaths = {
  * Get absolute path for a team state file.
  */
 export function absPath(cwd, relativePath) {
-    return isAbsolute(relativePath) ? relativePath : join(cwd, relativePath);
+    if (isAbsolute(relativePath))
+        return relativePath;
+    if (relativePath === '.omc' || relativePath.startsWith('.omc/')) {
+        return join(getOmcRoot(cwd), relativePath.slice('.omc'.length).replace(/^\//, ''));
+    }
+    return join(cwd, relativePath);
 }
 /**
  * Get absolute root path for a team's state directory.
  */
 export function teamStateRoot(cwd, teamName) {
-    return join(cwd, TeamPaths.root(teamName));
+    return absPath(cwd, TeamPaths.root(teamName));
 }
 /**
  * Canonical task storage path builder.
@@ -128,10 +144,11 @@ export function teamStateRoot(cwd, teamName) {
  * New writes always use this canonical path.
  */
 export function getTaskStoragePath(cwd, teamName, taskId) {
+    const tasksRoot = join(getOmcRoot(cwd), 'state', 'team', teamName, 'tasks');
     if (taskId !== undefined) {
-        return join(cwd, TeamPaths.taskFile(teamName, taskId));
+        return join(tasksRoot, normalizeTaskFileStem(taskId) + '.json');
     }
-    return join(cwd, TeamPaths.tasks(teamName));
+    return tasksRoot;
 }
 /**
  * Legacy task storage path builder (deprecated).

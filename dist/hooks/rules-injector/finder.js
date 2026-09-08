@@ -152,6 +152,11 @@ export function findRuleFiles(projectRoot, currentFile) {
                 });
             }
         }
+        // Without a project root, only the current file's own directory is in
+        // scope. Ascending further would let unrelated ancestor .cursor/rules,
+        // .claude/rules, or .github/instructions masquerade as project rules.
+        if (!projectRoot)
+            break;
         // Stop at project root or filesystem root
         if (projectRoot && currentDir === projectRoot)
             break;

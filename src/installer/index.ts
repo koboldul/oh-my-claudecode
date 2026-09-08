@@ -8,7 +8,7 @@
  * Bash hook scripts were removed in v3.9.0.
  */
 
-import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, chmodSync, readdirSync, cpSync, unlinkSync, rmSync, realpathSync, statSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, chmodSync, readdirSync, cpSync, unlinkSync, rmSync, realpathSync, statSync, lstatSync } from 'fs';
 import { createHash } from 'crypto';
 import { join, dirname, resolve, isAbsolute, basename } from 'path';
 import { fileURLToPath } from 'url';
@@ -29,8 +29,11 @@ import { OMC_CONFIG_FILE_REL } from '../lib/paths.js';
 import { buildHudWrapper } from '../lib/hud-wrapper-template.js';
 import { getOmcRoot } from '../lib/worktree-paths.js';
 import { syncOmcLearnedUserSkillsForClaudeCode } from '../utils/user-skill-compat.js';
+import { OMC_PLUGIN_ROOT_ENV } from '../lib/env-vars.js';
 import { analyzeLegacyClaudeMd, OMC_END_MARKER, OMC_START_MARKER, parseClaudeMdMarkers, removeClaudeMdRanges } from './claude-md-analysis.js';
 import { executeClaudeMdTransaction } from './claude-md-transaction.js';
+import { HISTORICAL_AGENT_OWNERSHIP, type HistoricalAgentOwnership } from './historical-agent-ownership.js';
+import entitlementManifest from '../config/builtin-skill-entitlements.json' with { type: 'json' };
 
 /** Claude Code configuration directory */
 export const CLAUDE_CONFIG_DIR = getClaudeConfigDir();
@@ -70,11 +73,63 @@ const CC_NATIVE_COMMANDS = new Set([
   'memory',
 ]);
 
-const SKININTHEGAMEBROS_ONLY_SKILLS = new Set([
-  'remember',
-  'verify',
-  'debug',
-]);
+const SKININTHEGAMEBROS_ONLY_SKILLS = new Set<string>(
+  entitlementManifest.skininthegamebrosOnlySkills.map((skill: string) => skill.trim().toLowerCase()),
+);
+
+function isSafeAgentFilename(filename: string): boolean {
+  return /^[a-z0-9-]+\.md$/.test(filename);
+}
+
+function isValidHistoricalAgent(record: unknown): record is HistoricalAgentOwnership {
+  if (!record || typeof record !== 'object') return false;
+  const candidate = record as HistoricalAgentOwnership;
+  return typeof candidate.filename === 'string'
+    && isSafeAgentFilename(candidate.filename)
+    && Number.isSafeInteger(candidate.byteLength)
+    && candidate.byteLength > 0
+    && typeof candidate.sha256 === 'string'
+    && /^[a-f0-9]{64}$/.test(candidate.sha256)
+    && typeof candidate.gitBlob === 'string'
+    && /^[a-f0-9]{40}$/.test(candidate.gitBlob)
+    && typeof candidate.firstReleaseTag === 'string'
+    && /^v4\.\d+\.\d+$/.test(candidate.firstReleaseTag)
+    && typeof candidate.lastReleaseTag === 'string'
+    && /^v4\.\d+\.\d+$/.test(candidate.lastReleaseTag);
+}
+
+const HISTORICAL_AGENT_HASHES_BY_FILENAME = new Map<string, Set<string>>();
+for (const record of HISTORICAL_AGENT_OWNERSHIP) {
+  if (!isValidHistoricalAgent(record)) continue;
+  const hashes = HISTORICAL_AGENT_HASHES_BY_FILENAME.get(record.filename) ?? new Set<string>();
+  hashes.add(`${record.byteLength}:${record.sha256}`);
+  HISTORICAL_AGENT_HASHES_BY_FILENAME.set(record.filename, hashes);
+}
+
+function hasAuthenticatedHistoricalAgentBytes(filename: string, content: Buffer): boolean {
+  const hashes = HISTORICAL_AGENT_HASHES_BY_FILENAME.get(filename);
+  return hashes?.has(`${content.length}:${createHash('sha256').update(content).digest('hex')}`) ?? false;
+}
+
+function readRegularAgentFile(filepath: string): { content: Buffer; dev: number; ino: number; size: number; mtimeMs: number } | null {
+  try {
+    const stat = lstatSync(filepath);
+    if (!stat.isFile()) return null;
+    return { content: readFileSync(filepath), dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+function hasUnchangedRegularAgentFile(filepath: string, previous: { content: Buffer; dev: number; ino: number; size: number; mtimeMs: number }): boolean {
+  const current = readRegularAgentFile(filepath);
+  return current !== null
+    && current.dev === previous.dev
+    && current.ino === previous.ino
+    && current.size === previous.size
+    && current.mtimeMs === previous.mtimeMs
+    && current.content.equals(previous.content);
+}
 
 function currentAgentsDir(): string {
   return join(getClaudeConfigDir(), 'agents');
@@ -534,6 +589,68 @@ export function isProjectScopedPlugin(): boolean {
 type HookEntry = { type: string; command: string };
 type HookGroup = { hooks: HookEntry[] };
 
+type SettingsHookEntry = { type?: unknown; command?: unknown; [key: string]: unknown };
+type SettingsHookGroup = { hooks?: unknown; [key: string]: unknown };
+type PluginHookManifestSnapshot = {
+  valid: boolean;
+  commandsByEvent: Map<string, Set<string>>;
+  diagnostics: string[];
+};
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function filterSettingsPluginDuplicateHooks(
+  hooks: Record<string, unknown>,
+  commandsByEvent: Map<string, Set<string>>,
+): { hooks: Record<string, unknown>; removed: number; removedByEvent: Map<string, number> } {
+  const filteredHooks: Record<string, unknown> = Object.create(null);
+  const removedByEvent = new Map<string, number>();
+  let removed = 0;
+
+  for (const [eventType, groups] of Object.entries(hooks)) {
+    if (!Array.isArray(groups)) {
+      filteredHooks[eventType] = groups;
+      continue;
+    }
+
+    const eventCommands = commandsByEvent.get(eventType);
+    const filteredGroups: unknown[] = [];
+    for (const group of groups) {
+      if (!isObjectRecord(group) || !Array.isArray((group as SettingsHookGroup).hooks)) {
+        filteredGroups.push(group);
+        continue;
+      }
+
+      const groupHooks = (group as SettingsHookGroup).hooks as unknown[];
+      const survivingHooks = groupHooks.filter(entry => {
+        if (!eventCommands || !isObjectRecord(entry)) return true;
+        const hook = entry as SettingsHookEntry;
+        const isDuplicate = hook.type === 'command'
+          && typeof hook.command === 'string'
+          && eventCommands.has(hook.command);
+        if (isDuplicate) {
+          removed++;
+          removedByEvent.set(eventType, (removedByEvent.get(eventType) ?? 0) + 1);
+        }
+        return !isDuplicate;
+      });
+
+      if (survivingHooks.length === 0) continue;
+      filteredGroups.push(survivingHooks.length === groupHooks.length
+        ? group
+        : { ...group, hooks: survivingHooks });
+    }
+
+    if (filteredGroups.length > 0) {
+      filteredHooks[eventType] = filteredGroups;
+    }
+  }
+
+  return { hooks: filteredHooks, removed, removedByEvent };
+}
+
 function pruneLegacyStandaloneHookScripts(log: (msg: string) => void, activeStandaloneOmcHookFilenames = new Set<string>()): void {
   if (!existsSync(HOOKS_DIR)) {
     return;
@@ -610,9 +727,28 @@ function configureInstallerSettings(
   let settings = { ...baseSettings };
 
   {
-    const existingHooks = { ...((settings.hooks || {}) as Record<string, unknown>) };
-    let legacyRemoved = 0;
+    let existingHooks = { ...((settings.hooks || {}) as Record<string, unknown>) };
+    const enabledOmcPlugin = context.runningAsPlugin || isOmcPluginEnabledInSettings(settings);
+    const pluginHandlesHooks = context.pluginProvidesHookFiles && enabledOmcPlugin;
 
+    if (pluginHandlesHooks) {
+      const snapshot = collectPluginHookManifestSnapshot();
+      if (snapshot.valid) {
+        const filtered = filterSettingsPluginDuplicateHooks(existingHooks, snapshot.commandsByEvent);
+        existingHooks = filtered.hooks;
+        if (filtered.removed > 0) {
+          context.log(
+            `  Removed ${filtered.removed} stale plugin duplicate hook entr${filtered.removed === 1 ? 'y' : 'ies'} from settings.json (events: ${[...filtered.removedByEvent.keys()].sort().join(', ')})`,
+          );
+        }
+      } else {
+        for (const diagnostic of snapshot.diagnostics) {
+          context.log(`  Skipped plugin duplicate-hook cleanup: ${diagnostic}`);
+        }
+      }
+    }
+
+    let legacyRemoved = 0;
     for (const [eventType, groups] of Object.entries(existingHooks)) {
       const groupList = groups as HookGroup[];
       const filtered = groupList.filter(group => {
@@ -635,8 +771,6 @@ function configureInstallerSettings(
       context.log(`  Cleaned up ${legacyRemoved} legacy hook entries from settings.json`);
     }
 
-    const enabledOmcPlugin = context.runningAsPlugin || isOmcPluginEnabledInSettings(settings);
-    const pluginHandlesHooks = context.pluginProvidesHookFiles && enabledOmcPlugin;
     if (pluginHandlesHooks) {
       const activeStandaloneOmcHookFilenames = collectActiveStandaloneOmcHookFilenames(existingHooks);
       pruneLegacyStandaloneHookScripts(context.log, activeStandaloneOmcHookFilenames);
@@ -853,6 +987,15 @@ function mergeHookGroups(
     return [...nonOmcGroups, ...newOmcGroups];
   }
 
+  // Nothing is registered for this event yet, so this is a first-time install
+  // rather than an "already configured" state. Without this branch the empty
+  // array that was passed in is returned unchanged, which writes an empty hook
+  // list into settings.json while the log claims the event was already set up.
+  if (existingGroups.length === 0) {
+    log(`  Installed ${eventType} hook`);
+    return newOmcGroups;
+  }
+
   if (hasNonOmcHook) {
     log(`  Warning: ${eventType} hook has non-OMC hook. Skipping. Use --force-hooks to override.`);
     result.hookConflicts.push({ eventType, existingCommand: nonOmcCommand });
@@ -862,44 +1005,92 @@ function mergeHookGroups(
   return existingGroups;
 }
 
+function readActiveAgentWitnesses(agentsDir: string): Map<string, Buffer> | null {
+  let entries: import('fs').Dirent[];
+  try {
+    entries = readdirSync(agentsDir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  const witnesses = new Map<string, Buffer>();
+  for (const entry of entries) {
+    if (!isSafeAgentFilename(entry.name)) continue;
+    if (!entry.isFile()) return null;
+    const witness = readRegularAgentFile(join(agentsDir, entry.name));
+    if (!witness || witness.content.length === 0) return null;
+    witnesses.set(entry.name, witness.content);
+  }
+
+  return witnesses.size > 0 ? witnesses : null;
+}
+
+function equalAgentWitnesses(left: Map<string, Buffer>, right: Map<string, Buffer>): boolean {
+  return left.size === right.size
+    && [...left].every(([filename, content]) => right.get(filename)?.equals(content));
+}
+
+function getActiveAgentFiles(): Set<string> | null {
+  const pluginRootResolution = resolveInstalledOmcPluginRoots();
+  if (pluginRootResolution.mode === 'unknown' || !pluginRootResolution.cleanupAllowed) return null;
+
+  const roots = pluginRootResolution.mode === 'legacy'
+    ? [getPackageDir()]
+    : pluginRootResolution.roots;
+  let activeWitnesses: Map<string, Buffer> | null = null;
+
+  for (const root of roots) {
+    if (pluginRootResolution.mode === 'plugin' && !hasCompletePluginPayload(root)) return null;
+    const witnesses = readActiveAgentWitnesses(join(root, 'agents'));
+    if (!witnesses || (activeWitnesses && !equalAgentWitnesses(activeWitnesses, witnesses))) return null;
+    activeWitnesses = witnesses;
+  }
+
+  return activeWitnesses ? new Set(activeWitnesses.keys()) : null;
+}
+
+function listAgentDirectoryEntries(agentsDir: string) {
+  try {
+    return readdirSync(agentsDir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Remove stale OMC-created agent files from the config agents directory.
- *
- * When OMC drops an agent definition in a new version, the old .md file
- * lingers in ~/.claude/agents/. This function compares the installed files
- * against the current package's agent definitions and removes any that:
- *   1. Are .md files (OMC agent naming convention)
- *   2. Were previously shipped by OMC (match the frontmatter `name:` pattern)
- *   3. No longer exist in the current package's agents/ directory
- *
- * User-created files (those whose filename does not match any historically
- * known OMC agent) are preserved.
+ * Remove stale OMC agents only when their exact raw bytes match the bounded,
+ * release-authenticated historical inventory and their basename is absent from
+ * both the resolved active payload and the current package. All uncertain ownership
+ * and filesystem states preserve.
  */
 export function cleanupStaleAgents(log: (msg: string) => void): string[] {
   const agentsDir = currentAgentsDir();
   if (!existsSync(agentsDir)) return [];
 
-  const currentAgentFiles = new Set(
-    Object.keys(loadAgentDefinitions()),
-  );
+  const activeAgentFiles = getActiveAgentFiles();
+  if (!activeAgentFiles) return [];
+  const currentPackageAgentWitnesses = readActiveAgentWitnesses(join(getPackageDir(), 'agents'));
+  if (!currentPackageAgentWitnesses) return [];
+  const currentPackageAgentFiles = new Set(currentPackageAgentWitnesses.keys());
+  const agentEntries = listAgentDirectoryEntries(agentsDir);
+  if (!agentEntries) return [];
 
   const removed: string[] = [];
-  for (const file of readdirSync(agentsDir)) {
-    if (!file.endsWith('.md')) continue;
-    if (file === 'AGENTS.md') continue;
-    if (currentAgentFiles.has(file)) continue;
+  for (const entry of agentEntries) {
+    const file = entry.name;
+    if (!entry.isFile() || file === 'AGENTS.md' || !isSafeAgentFilename(file) || activeAgentFiles.has(file) || currentPackageAgentFiles.has(file)) continue;
 
-    // Check if this looks like an OMC-created agent (kebab-case .md with frontmatter)
     const filepath = join(agentsDir, file);
+    const candidate = readRegularAgentFile(filepath);
+    if (!candidate || !hasAuthenticatedHistoricalAgentBytes(file, candidate.content)) continue;
+
     try {
-      const content = readFileSync(filepath, 'utf-8');
-      if (content.startsWith('---\n') && /^name:\s+\S+/m.test(content)) {
-        unlinkSync(filepath);
-        removed.push(file);
-        log(`  Removed stale agent: ${file}`);
-      }
+      if (!hasUnchangedRegularAgentFile(filepath, candidate)) continue;
+      unlinkSync(filepath);
+      removed.push(file);
+      log(`  Removed stale agent: ${file}`);
     } catch {
-      // Skip files that can't be read
+      // Preserve candidates when they cannot be revalidated or removed.
     }
   }
 
@@ -907,38 +1098,34 @@ export function cleanupStaleAgents(log: (msg: string) => void): string[] {
 }
 
 /**
- * Remove standalone agent files that duplicate plugin-provided agents (#2252).
- *
- * When the plugin is the canonical agent source, standalone copies in
- * ~/.claude/agents/ from a prior `omc setup` cause agent definitions to
- * appear twice. Removes standalone copies with OMC frontmatter whose
- * filename matches a current package agent.
+ * Remove standalone plugin duplicates only when an active payload still exposes
+ * the basename and the standalone file exactly matches authenticated history.
  */
 export function prunePluginDuplicateAgents(log: (msg: string) => void): string[] {
   const agentsDir = currentAgentsDir();
   if (!existsSync(agentsDir)) return [];
 
-  const currentAgentFiles = new Set(
-    Object.keys(loadAgentDefinitions()),
-  );
+  const activeAgentFiles = getActiveAgentFiles();
+  if (!activeAgentFiles) return [];
+  const agentEntries = listAgentDirectoryEntries(agentsDir);
+  if (!agentEntries) return [];
 
   const removed: string[] = [];
-  for (const file of readdirSync(agentsDir)) {
-    if (!file.endsWith('.md')) continue;
-    if (file === 'AGENTS.md') continue;
-    // Only prune agents whose name matches a current package agent
-    if (!currentAgentFiles.has(file)) continue;
+  for (const entry of agentEntries) {
+    const file = entry.name;
+    if (!entry.isFile() || file === 'AGENTS.md' || !isSafeAgentFilename(file) || !activeAgentFiles.has(file)) continue;
 
     const filepath = join(agentsDir, file);
+    const candidate = readRegularAgentFile(filepath);
+    if (!candidate || !hasAuthenticatedHistoricalAgentBytes(file, candidate.content)) continue;
+
     try {
-      const content = readFileSync(filepath, 'utf-8');
-      if (content.startsWith('---\n') && /^name:\s+\S+/m.test(content)) {
-        unlinkSync(filepath);
-        removed.push(file);
-        log(`  Pruned plugin-duplicate agent: ${file}`);
-      }
+      if (!hasUnchangedRegularAgentFile(filepath, candidate)) continue;
+      unlinkSync(filepath);
+      removed.push(file);
+      log(`  Pruned plugin-duplicate agent: ${file}`);
     } catch {
-      // Skip files that can't be read
+      // Preserve candidates when they cannot be revalidated or removed.
     }
   }
 
@@ -952,26 +1139,39 @@ export function prunePluginDuplicateAgents(log: (msg: string) => void): string[]
  * that contain a SKILL.md with OMC frontmatter but are no longer shipped by
  * the current package version. User-created skills are preserved.
  */
-export function cleanupStaleSkills(log: (msg: string) => void): string[] {
+export function cleanupStaleSkills(
+  log: (msg: string) => void,
+  options?: { safeStandaloneNames?: boolean },
+): string[] {
   const skillsDir = currentSkillsDir();
   if (!existsSync(skillsDir)) return [];
 
   const packageSkillsDir = join(getPackageDir(), 'skills');
   const currentSkillNames = new Set<string>();
 
+  // The keep-set must contain only the directory names the *current* install
+  // mode actually writes. Holding both the raw and `omc-`prefixed variants
+  // stranded the pre-rename copy whenever a skill collided with a Claude Code
+  // native command (e.g. `plan` -> `omc-plan`), leaving both installed.
+  const usesSafeNames = options?.safeStandaloneNames === true;
+
   if (existsSync(packageSkillsDir)) {
     for (const entry of readdirSync(packageSkillsDir, { withFileTypes: true })) {
       if (entry.isDirectory()) {
-        currentSkillNames.add(entry.name);
-        // Also add the safe standalone name variant
+        if (!usesSafeNames) {
+          currentSkillNames.add(entry.name);
+          continue;
+        }
         const skillMdPath = join(packageSkillsDir, entry.name, 'SKILL.md');
+        let rawName = entry.name;
         if (existsSync(skillMdPath)) {
           const content = readFileSync(skillMdPath, 'utf-8');
           const { metadata } = parseFrontmatter(content);
           if (typeof metadata.name === 'string' && metadata.name.trim().length > 0) {
-            currentSkillNames.add(toSafeStandaloneSkillName(metadata.name));
+            rawName = metadata.name;
           }
         }
+        currentSkillNames.add(toSafeStandaloneSkillName(rawName));
       }
     }
   }
@@ -1111,41 +1311,95 @@ function directoryHasSkillDefinitions(directory: string): boolean {
   }
 }
 
-export function getInstalledOmcPluginRoots(): string[] {
-  const pluginRoots = new Set<string>();
-  const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT?.trim();
+type PluginRootResolution =
+  | { mode: 'legacy'; roots: []; cleanupAllowed: true }
+  | { mode: 'plugin'; roots: string[]; cleanupAllowed: boolean }
+  | { mode: 'unknown'; roots: []; cleanupAllowed: false };
 
-  if (pluginRoot) {
-    pluginRoots.add(pluginRoot);
+type PluginRegistry = Record<string, unknown>;
+
+const OMC_PLUGIN_IDS = new Set(['oh-my-claudecode', 'oh-my-claudecode@omc', 'oh-my-claudecode@oh-my-claudecode']);
+const OMC_PLUGIN_MANIFEST_NAME = 'oh-my-claudecode';
+
+function isOfficialOmcPluginId(pluginId: string): boolean {
+  return OMC_PLUGIN_IDS.has(pluginId.toLowerCase());
+}
+
+function isOmcPluginLookalike(pluginId: string): boolean {
+  return pluginId.toLowerCase().includes(OMC_PLUGIN_MANIFEST_NAME);
+}
+
+function resolveInstalledOmcPluginRoots(): PluginRootResolution {
+  // --plugin-dir is the lifecycle source of truth. Claude's hook context is
+  // equivalent when it is the only explicit root. An explicit root is never
+  // supplemented by registry candidates: validation failure must preserve.
+  const omcPluginRoot = process.env[OMC_PLUGIN_ROOT_ENV]?.trim();
+  const claudePluginRoot = process.env.CLAUDE_PLUGIN_ROOT?.trim();
+  if (omcPluginRoot && claudePluginRoot && resolve(omcPluginRoot) !== resolve(claudePluginRoot)) {
+    return { mode: 'unknown', roots: [], cleanupAllowed: false };
+  }
+  const explicitRoot = omcPluginRoot || claudePluginRoot;
+  if (explicitRoot) {
+    return { mode: 'plugin', roots: [explicitRoot], cleanupAllowed: true };
   }
 
   const installedPluginsPath = join(CLAUDE_CONFIG_DIR, 'plugins', 'installed_plugins.json');
   if (!existsSync(installedPluginsPath)) {
-    return Array.from(pluginRoots);
+    return { mode: 'legacy', roots: [], cleanupAllowed: true };
   }
 
   try {
-    const raw = JSON.parse(readFileSync(installedPluginsPath, 'utf-8')) as {
-      plugins?: Record<string, Array<{ installPath?: string }>>;
-    } | Record<string, Array<{ installPath?: string }>>;
-    const plugins = raw.plugins ?? raw;
+    const raw: unknown = JSON.parse(readFileSync(installedPluginsPath, 'utf-8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { mode: 'unknown', roots: [], cleanupAllowed: false };
+    }
+    const registry = raw as { plugins?: unknown };
+    const plugins = registry.plugins ?? raw;
+    if (!plugins || typeof plugins !== 'object' || Array.isArray(plugins)) {
+      return { mode: 'unknown', roots: [], cleanupAllowed: false };
+    }
 
-    for (const [pluginId, entries] of Object.entries(plugins)) {
-      if (!pluginId.toLowerCase().includes('oh-my-claudecode') || !Array.isArray(entries)) {
+    const pluginRoots = new Set<string>();
+    let ambiguous = false;
+    for (const [pluginId, entries] of Object.entries(plugins as PluginRegistry)) {
+      const official = isOfficialOmcPluginId(pluginId);
+      if (!Array.isArray(entries) || entries.length === 0) {
+        ambiguous = true;
+        continue;
+      }
+      if (!official) {
+        if (isOmcPluginLookalike(pluginId)) ambiguous = true;
         continue;
       }
 
       for (const entry of entries) {
-        if (typeof entry?.installPath === 'string' && entry.installPath.trim().length > 0) {
-          pluginRoots.add(entry.installPath.trim());
+        if (!entry || typeof entry !== 'object' || typeof (entry as { installPath?: unknown }).installPath !== 'string') {
+          ambiguous = true;
+          continue;
         }
+        const installPath = (entry as { installPath: string }).installPath.trim();
+        if (!installPath) {
+          ambiguous = true;
+          continue;
+        }
+        pluginRoots.add(installPath);
       }
     }
-  } catch {
-    // Ignore unreadable plugin registry and fall back to env-based detection.
-  }
 
-  return Array.from(pluginRoots);
+    if (pluginRoots.size === 0) {
+      return ambiguous
+        ? { mode: 'unknown', roots: [], cleanupAllowed: false }
+        : { mode: 'legacy', roots: [], cleanupAllowed: true };
+    }
+    return { mode: 'plugin', roots: [...pluginRoots], cleanupAllowed: !ambiguous };
+  } catch {
+    return { mode: 'unknown', roots: [], cleanupAllowed: false };
+  }
+}
+
+export function getInstalledOmcPluginRoots(): string[] {
+  const resolution = resolveInstalledOmcPluginRoots();
+  return resolution.mode === 'plugin' ? resolution.roots : [];
 }
 
 const PLUGIN_SYNC_PAYLOAD = [
@@ -1215,8 +1469,8 @@ function validatePluginManifestSchema(root: string, manifest: Record<string, unk
     return errors;
   }
 
-  if (typeof manifest.name !== 'string' || manifest.name.trim().length === 0) {
-    errors.push('Invalid plugin manifest: .claude-plugin/plugin.json name must be a non-empty string');
+  if (manifest.name !== OMC_PLUGIN_MANIFEST_NAME) {
+    errors.push(`Invalid plugin manifest: .claude-plugin/plugin.json name must be ${OMC_PLUGIN_MANIFEST_NAME}`);
   }
 
   if (typeof manifest.commands !== 'string' || manifest.commands.trim().length === 0) {
@@ -1301,6 +1555,111 @@ export function validatePluginCachePayload(root: string): { valid: boolean; erro
 
 function hasCompletePluginPayload(root: string): boolean {
   return validatePluginSyncPayload(root).length === 0;
+}
+
+function collectPluginHookManifestSnapshot(): PluginHookManifestSnapshot {
+  const resolution = resolveInstalledOmcPluginRoots();
+  if (resolution.mode !== 'plugin' || !resolution.cleanupAllowed) {
+    return {
+      valid: false,
+      commandsByEvent: new Map(),
+      diagnostics: [`plugin root resolution is ${resolution.mode} (cleanupAllowed=${resolution.cleanupAllowed}, roots=${resolution.mode === 'plugin' ? resolution.roots.join(',') : 'none'})`],
+    };
+  }
+
+  const snapshots: Array<Map<string, Set<string>>> = [];
+  for (const root of resolution.roots) {
+    if (!hasCompletePluginPayload(root)) {
+      return {
+        valid: false,
+        commandsByEvent: new Map(),
+        diagnostics: [`${root}: incomplete plugin payload`],
+      };
+    }
+
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(join(root, 'hooks', 'hooks.json'), 'utf-8'));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        valid: false,
+        commandsByEvent: new Map(),
+        diagnostics: [`${root}: invalid hooks/hooks.json: ${message}`],
+      };
+    }
+
+    if (!isObjectRecord(raw) || !isObjectRecord(raw.hooks)) {
+      return {
+        valid: false,
+        commandsByEvent: new Map(),
+        diagnostics: [`${root}: hooks/hooks.json must contain a hooks object`],
+      };
+    }
+
+    const commandsByEvent = new Map<string, Set<string>>();
+    for (const [eventType, groups] of Object.entries(raw.hooks)) {
+      if (!Array.isArray(groups)) {
+        return {
+          valid: false,
+          commandsByEvent: new Map(),
+          diagnostics: [`${root}: hooks.${eventType} must be an array`],
+        };
+      }
+
+      const commands = new Set<string>();
+      for (const group of groups) {
+        if (!isObjectRecord(group) || !Array.isArray(group.hooks)) {
+          return {
+            valid: false,
+            commandsByEvent: new Map(),
+            diagnostics: [`${root}: hooks.${eventType} contains an invalid hook group`],
+          };
+        }
+
+        for (const entry of group.hooks) {
+          if (!isObjectRecord(entry)) {
+            return {
+              valid: false,
+              commandsByEvent: new Map(),
+              diagnostics: [`${root}: hooks.${eventType} contains an invalid hook entry`],
+            };
+          }
+          if (entry.type !== 'command') continue;
+          if (typeof entry.command !== 'string') {
+            return {
+              valid: false,
+              commandsByEvent: new Map(),
+              diagnostics: [`${root}: hooks.${eventType} contains a command hook without a string command`],
+            };
+          }
+          commands.add(entry.command);
+        }
+      }
+      if (commands.size > 0) commandsByEvent.set(eventType, commands);
+    }
+    snapshots.push(commandsByEvent);
+  }
+
+  const normalizeSnapshot = (snapshot: Map<string, Set<string>>) => JSON.stringify(
+    [...snapshot.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([eventType, commands]) => [eventType, [...commands].sort()]),
+  );
+  const expected = snapshots[0];
+  if (!expected) {
+    return { valid: false, commandsByEvent: new Map(), diagnostics: ['no plugin roots resolved'] };
+  }
+  const expectedNormalized = normalizeSnapshot(expected);
+  if (snapshots.some(snapshot => normalizeSnapshot(snapshot) !== expectedNormalized)) {
+    return {
+      valid: false,
+      commandsByEvent: new Map(),
+      diagnostics: [`installed plugin hook manifests disagree: ${resolution.roots.join(', ')}`],
+    };
+  }
+
+  return { valid: true, commandsByEvent: expected, diagnostics: [] };
 }
 
 function countPluginSyncPayloadEntries(root: string): number {
@@ -1830,7 +2189,7 @@ function syncBundledSkillDefinitions(log: (msg: string) => void, options?: { saf
 
   for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
-    if (SKININTHEGAMEBROS_ONLY_SKILLS.has(entry.name) && !isSkininthegamebrosUser()) {
+    if (SKININTHEGAMEBROS_ONLY_SKILLS.has(entry.name.toLowerCase()) && !isSkininthegamebrosUser()) {
       continue;
     }
 
@@ -2210,6 +2569,11 @@ export function install(options: InstallOptions = {}): InstallResult {
       log('Skipping agent/command/hook files (managed by plugin system)');
     }
 
+    // Single source of truth for the installed-directory naming mode: stale
+    // cleanup must evaluate the same mode the sync used, or a renamed skill
+    // leaves its pre-rename directory behind.
+    const useSafeStandaloneSkillNames = !enabledOmcPlugin || options.noPlugin === true;
+
     if (shouldInstallBundledSkills) {
       log(options.noPlugin
         ? 'Installing bundled skills from local package (--no-plugin)...'
@@ -2217,7 +2581,7 @@ export function install(options: InstallOptions = {}): InstallResult {
           ? 'Installing bundled skills from local package (no enabled OMC plugin detected)...'
           : 'Installing bundled skills from local package (enabled plugin skill files not found)...');
       result.installedSkills.push(...syncBundledSkillDefinitions(log, {
-        safeStandaloneNames: !enabledOmcPlugin || options.noPlugin === true,
+        safeStandaloneNames: useSafeStandaloneSkillNames,
       }));
     } else if (pluginProvidesSkillFiles) {
       log('Skipping bundled skill installation (plugin-provided skills are available). Use --no-plugin to force local skill sync.');
@@ -2232,7 +2596,9 @@ export function install(options: InstallOptions = {}): InstallResult {
 
     // Clean up stale OMC-created skills from previous versions
     if (existsSync(SKILLS_DIR)) {
-      const removedSkills = cleanupStaleSkills(log);
+      const removedSkills = cleanupStaleSkills(log, {
+        safeStandaloneNames: useSafeStandaloneSkillNames,
+      });
       if (removedSkills.length > 0) {
         log(`Cleaned up ${removedSkills.length} stale skill(s)`);
       }
@@ -2248,7 +2614,6 @@ export function install(options: InstallOptions = {}): InstallResult {
     // Keep the public installer on the same raw-byte transaction path as setup.
     // The public string merger remains exported for callers that use it directly.
     if (!projectScoped) {
-      const claudeMdPath = join(CLAUDE_CONFIG_DIR, 'CLAUDE.md');
       const transaction = executeClaudeMdTransaction({
         mode: 'global-overwrite',
         root: CLAUDE_CONFIG_DIR,
@@ -2258,7 +2623,7 @@ export function install(options: InstallOptions = {}): InstallResult {
       });
       if (!transaction.ok) throw new Error(transaction.error ?? 'CLAUDE.md transaction failed');
       for (const backupPath of transaction.backups) log(`Backed up existing CLAUDE.md to ${backupPath}`);
-      log(transaction.operations.some(operation => operation.existedBefore && operation.path === claudeMdPath)
+      log(transaction.operations.some(operation => operation.type === 'write' && operation.existedBefore && basename(operation.path) === 'CLAUDE.md')
         ? 'Updated CLAUDE.md (merged with existing content)'
         : 'Created CLAUDE.md');
     }

@@ -440,7 +440,15 @@ function assertOwnerCommitSignature(commit, signature, headSha, owner) {
   }
   const graphSignature = requiredObject(graphCommit.signature, 'GitHub GraphQL commit signature.signature');
   if (graphSignature.isValid !== true) fail('GitHub GraphQL does not verify the exact head signature');
-  if (requiredObject(graphSignature.signer, 'GitHub GraphQL commit signature.signer').login !== owner) {
+  const signerLogin = requiredString(
+    requiredObject(graphSignature.signer, 'GitHub GraphQL commit signature.signer').login,
+    'GitHub GraphQL commit signature.signer.login',
+  );
+  if (signerLogin === 'web-flow') {
+    if (requiredObject(commitResponse.committer, 'head commit response.committer').login !== 'web-flow') {
+      fail('GitHub web-flow signature does not match the REST commit committer');
+    }
+  } else if (signerLogin !== owner) {
     fail('GitHub GraphQL signature signer is not the protected owner');
   }
 }
@@ -505,12 +513,10 @@ export function authorizeGeneratedArtifactPullRequest({
   if (Date.parse(authorization.expiresAt) <= now.getTime()) {
     fail('generated-artifact authorization has expired');
   }
-  if (
-    authorization.targetRef !== eventData.baseRef ||
-    authorization.targetRef !== liveData.baseRef ||
-    authorization.headSha !== eventData.headSha ||
-    authorization.headSha !== liveData.headSha
-  ) {
+  if (authorization.targetRef !== eventData.baseRef || authorization.targetRef !== liveData.baseRef) {
+    fail('generated changes do not match the authorized PR/target/head identity');
+  }
+  if (authorization.headSha !== liveData.headSha) {
     fail('generated changes do not match the authorized PR/target/head identity');
   }
   if (authorization.mergeBaseSha !== compareMergeBaseSha) {
@@ -651,6 +657,7 @@ export async function verifyLiveGeneratedArtifactAuthorization({
   token,
   fetchImpl,
   repositoryRoot = REPOSITORY_ROOT,
+  now = new Date(),
 }) {
   const trustedManifest = validateAuthorizationManifest(manifest);
   const eventData = eventIdentity(event, trustedManifest.repository, trustedManifest.owner);
@@ -710,6 +717,7 @@ export async function verifyLiveGeneratedArtifactAuthorization({
     commit,
     signature: graphResponse.data.repository.object,
     files,
+    now,
   });
 
   // Close the observable push-race window before reporting authorization.

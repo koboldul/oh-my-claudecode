@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, mkdirSync, mkdtempSync as createTempDir, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -11,9 +12,38 @@ import { absPath, TeamPaths } from '../state-paths.js';
 import { currentProcessStartIdentity, publishOwnerEpoch } from '../team-owner-epoch.js';
 import { executeRecoverDeadWorkerV2Owner, prepareRecoveryOwnerBootstrap } from '../runtime-v2.js';
 
+let previousHome: string | undefined;
+let previousUserProfile: string | undefined;
+let previousOmcStateDir: string | undefined;
+
+beforeEach(() => {
+  previousHome = process.env.HOME;
+  previousUserProfile = process.env.USERPROFILE;
+  previousOmcStateDir = process.env.OMC_STATE_DIR;
+});
+
+function setFixtureEnv(root: string): void {
+  process.env.HOME = root;
+  process.env.USERPROFILE = root;
+  delete process.env.OMC_STATE_DIR;
+}
+
+function mkdtempSync(prefix: string): string {
+  const root = createTempDir(prefix);
+  setFixtureEnv(root);
+  return root;
+}
+
 afterEach(() => {
   vi.useRealTimers();
   setRuntimeOwnerDispatch(undefined);
+  recoveryOwnerBootstrapTestHooks.spawn(undefined);
+  if (previousHome === undefined) delete process.env.HOME;
+  else process.env.HOME = previousHome;
+  if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = previousUserProfile;
+  if (previousOmcStateDir === undefined) delete process.env.OMC_STATE_DIR;
+  else process.env.OMC_STATE_DIR = previousOmcStateDir;
 });
 
 function publishSuccess(cwd: string, requestId: string): RecoverDeadWorkerV2Result {
@@ -389,6 +419,7 @@ describe('runtime owner durable request admission', () => {
     const legacyCwd = mkdtempSync(join(tmpdir(), 'runtime-owner-legacy-config-'));
     const absentCwd = mkdtempSync(join(tmpdir(), 'runtime-owner-absent-config-'));
     try {
+      setFixtureEnv(legacyCwd);
       const configPath = absPath(legacyCwd, TeamPaths.config('recovery-team'));
       mkdirSync(join(configPath, '..'), { recursive: true });
       const legacy = validV2Config('recovery-team');
@@ -398,6 +429,7 @@ describe('runtime owner durable request admission', () => {
         minTimeoutMs: 100, maxTimeoutMs: 100, pollIntervalMs: 10 });
       await expect(client.recoverDeadWorker({ teamName: 'recovery-team', cwd: legacyCwd, workerName: 'worker-1',
         requestId: 'legacy-config', timeoutMs: 100 })).resolves.toMatchObject({ error: 'runtime_v2_required' });
+      setFixtureEnv(absentCwd);
       await expect(client.recoverDeadWorker({ teamName: 'recovery-team', cwd: absentCwd, workerName: 'worker-1',
         requestId: 'absent-config', timeoutMs: 100 })).resolves.toMatchObject({ error: 'team_not_found' });
     } finally {
@@ -524,6 +556,80 @@ describe('recovery admission lock crash takeover', () => {
     expect(isExpectedRecoveryOwnerSuccessor(owner, 1, 123, 'linux:456', true, 'owner')).toBe(true);
   });
 
+});
+
+describe('runtime owner bootstrap spawn lifecycle regressions', () => {
+  function seed(cwd: string, requestId: string, recoveryId: string): void {
+    seedV2Team(cwd);
+    seedBootstrapRecoveryRequest(cwd, 'recovery-team', requestId, recoveryId);
+  }
+
+  it('keeps reservation and intent pending when spawn throws synchronously', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'runtime-owner-spawn-throw-'));
+    try {
+      const requestId = 'spawn-throw-request';
+      const recoveryId = 'spawn-throw-recovery';
+      seed(cwd, requestId, recoveryId);
+      recoveryOwnerBootstrapTestHooks.spawn((() => { throw new Error('spawn failed'); }) as any);
+      const client = createRecoveryOwnerClient(vi.fn(), { persistentOwnerBootstrap: true,
+        minTimeoutMs: 100, maxTimeoutMs: 100, pollIntervalMs: 10 });
+      await expect(client.recoverDeadWorker({ teamName: 'recovery-team', cwd, workerName: 'worker-1', requestId, timeoutMs: 100 }))
+        .resolves.toMatchObject({ outcome: 'failed', error: 'recovery_request_timeout' });
+      expect(readRecoveryRequestReservation(cwd, requestId)).toMatchObject({ recovery_id: recoveryId, kind: 'reservation' });
+      expect(readRecoveryOutcome(cwd, requestId)).not.toMatchObject({ kind: 'final' });
+      expect(existsSync(absPath(cwd, TeamPaths.recoveryIntent('recovery-team', recoveryId)))).toBe(true);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it.each(['error', 'exit', 'signal'])('does not report readiness after child %s before publication', async kind => {
+    const cwd = mkdtempSync(join(tmpdir(), `runtime-owner-child-${kind}-`));
+    try {
+      const requestId = `child-${kind}-request`;
+      const recoveryId = `child-${kind}-recovery`;
+      seed(cwd, requestId, recoveryId);
+      recoveryOwnerBootstrapTestHooks.spawn((() => {
+        const child = new EventEmitter() as EventEmitter & { pid?: number; exitCode?: number | null; signalCode?: NodeJS.Signals | null; unref: () => void };
+        child.pid = process.pid;
+        child.exitCode = null;
+        child.signalCode = null;
+        child.unref = () => {
+          if (kind === 'error') child.emit('error', new Error('child failed'));
+          else if (kind === 'signal') { child.signalCode = 'SIGTERM'; child.emit('exit', null, 'SIGTERM'); }
+          else { child.exitCode = 1; child.emit('exit', 1, null); }
+        };
+        return child;
+      }) as any);
+      const client = createRecoveryOwnerClient(vi.fn(), { persistentOwnerBootstrap: true,
+        minTimeoutMs: 100, maxTimeoutMs: 100, pollIntervalMs: 10 });
+      await expect(client.recoverDeadWorker({ teamName: 'recovery-team', cwd, workerName: 'worker-1', requestId, timeoutMs: 100 }))
+        .resolves.toMatchObject({ outcome: 'failed', error: 'recovery_request_timeout' });
+      expect(readRecoveryOutcome(cwd, requestId)).not.toMatchObject({ kind: 'final' });
+      expect(readRecoveryRequestReservation(cwd, requestId)).toMatchObject({ recovery_id: recoveryId });
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it('fails closed when the child identity is missing or reused', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'runtime-owner-child-identity-'));
+    try {
+      const requestId = 'child-identity-request';
+      const recoveryId = 'child-identity-recovery';
+      seed(cwd, requestId, recoveryId);
+      recoveryOwnerBootstrapTestHooks.spawn((() => {
+        const child = new EventEmitter() as EventEmitter & { pid?: number; exitCode?: number | null; signalCode?: NodeJS.Signals | null; unref: () => void };
+        child.pid = 2_147_483_647;
+        child.exitCode = null;
+        child.signalCode = null;
+        child.unref = () => undefined;
+        return child;
+      }) as any);
+      const client = createRecoveryOwnerClient(vi.fn(), { persistentOwnerBootstrap: true,
+        minTimeoutMs: 100, maxTimeoutMs: 100, pollIntervalMs: 10 });
+      await expect(client.recoverDeadWorker({ teamName: 'recovery-team', cwd, workerName: 'worker-1', requestId, timeoutMs: 100 }))
+        .resolves.toMatchObject({ outcome: 'failed', error: 'recovery_request_timeout' });
+      expect(readRecoveryOutcome(cwd, requestId)).not.toMatchObject({ kind: 'final' });
+      expect(existsSync(absPath(cwd, TeamPaths.recoveryIntent('recovery-team', recoveryId)))).toBe(true);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
 });
 
 describe('recovery owner bootstrap candidates', () => {

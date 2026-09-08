@@ -36,7 +36,8 @@ import {
   resolveSessionStatePath,
   getSessionStateDir,
   getOmcRoot,
-} from "../../lib/worktree-paths.js";
+} from '../../lib/worktree-paths.js';
+import { getStateSessionOwner } from '../../lib/mode-state-io.js';
 import { MODE_STATE_FILE_MAP, MODE_NAMES } from "../../lib/mode-names.js";
 import { clearAllSkillActiveStateLocked } from "../skill-state/index.js";
 
@@ -77,17 +78,6 @@ const MODE_CONFIGS: Record<ExecutionMode, ModeConfig> = {
     markerFile: "ralph-verification.json",
     activeProperty: "active",
     hasGlobalState: false,
-  },
-  [MODE_NAMES.ULTRAWORK]: {
-    name: "Ultrawork",
-    stateFile: MODE_STATE_FILE_MAP[MODE_NAMES.ULTRAWORK],
-    activeProperty: "active",
-    hasGlobalState: false,
-  },
-  [MODE_NAMES.ULTRAQA]: {
-    name: "UltraQA",
-    stateFile: MODE_STATE_FILE_MAP[MODE_NAMES.ULTRAQA],
-    activeProperty: "active",
   },
   [MODE_NAMES.DEEP_INTERVIEW]: {
     name: "Deep Interview",
@@ -277,7 +267,8 @@ function isJsonModeActive(
       const state = JSON.parse(content);
 
       // Validate session identity: state must belong to this session
-      if (state.session_id && state.session_id !== sessionId) {
+      const ownerSessionId = getStateSessionOwner(state);
+      if (ownerSessionId && ownerSessionId !== sessionId) {
         return false;
       }
 
@@ -299,6 +290,10 @@ function isJsonModeActive(
   try {
     const content = readFileSync(stateFile, "utf-8");
     const state = JSON.parse(content);
+
+    if (getStateSessionOwner(state)) {
+      return false;
+    }
 
     if (config.activeProperty) {
       return state[config.activeProperty] === true;
@@ -425,11 +420,19 @@ export function getAllModeStatuses(
   cwd: string,
   sessionId?: string,
 ): ModeStatus[] {
-  return (Object.keys(MODE_CONFIGS) as ExecutionMode[]).map((mode) => ({
-    mode,
-    active: isModeActive(mode, cwd, sessionId),
-    stateFilePath: getStateFilePath(cwd, mode, sessionId),
-  }));
+  return (Object.keys(MODE_CONFIGS) as ExecutionMode[]).map((mode) => {
+    const stateFilePath = getStateFilePath(cwd, mode, sessionId);
+    const raw = (() => {
+      try { return JSON.parse(readFileSync(stateFilePath, 'utf8')) as Record<string, unknown>; }
+      catch { return null; }
+    })();
+    const owner = raw ? getStateSessionOwner(raw) : undefined;
+    return {
+      mode,
+      active: isModeActive(mode, cwd, sessionId) && (sessionId ? (!owner || owner === sessionId) : !owner),
+      stateFilePath,
+    };
+  });
 }
 
 function clearObservedJsonFile(

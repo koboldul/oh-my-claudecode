@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, w
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { migrateTeamConfigRevision, readRevisionedTeamConfig, readTeamConfig, readTeamManifest, saveTeamConfig, saveTeamConfigAtRevision, withScalingLock } from '../monitor.js';
+import { migrateTeamConfigRevision, readRevisionedTeamConfig, readTeamConfig, readTeamManifest, saveTeamConfig, saveTeamConfigAtRevision,
+  assertActiveFenceOwnershipTransition, withScalingLock } from '../monitor.js';
 import { absPath, TeamPaths } from '../state-paths.js';
 import type { TeamConfig } from '../types.js';
 import { withProcessIdentityFileLock, withProcessIdentityFileLockSync } from '../process-identity-lock.js';
@@ -11,6 +12,9 @@ import { currentProcessStartIdentity } from '../team-owner-epoch.js';
 import { teamCreateTask, teamReadConfig, teamReadManifest, withTaskClaimLock } from '../team-ops.js';
 
 let cwd: string;
+let previousHome: string | undefined;
+let previousUserProfile: string | undefined;
+let previousStateDir: string | undefined;
 const teamName = 'config-lock-team';
 const deadProcessStart = process.platform === 'darwin' ? 'darwin:1:0' : process.platform === 'win32' ? 'win32:1' : 'linux:1';
 
@@ -45,8 +49,25 @@ function writeConfig(config: TeamConfig): void {
   writeFileSync(path, JSON.stringify(config));
 }
 
-beforeEach(() => { cwd = mkdtempSync(join(tmpdir(), 'team-config-lock-')); writeConfig(initialConfig()); });
-afterEach(() => rmSync(cwd, { recursive: true, force: true }));
+beforeEach(() => {
+  cwd = mkdtempSync(join(tmpdir(), 'team-config-lock-'));
+  previousHome = process.env.HOME;
+  previousUserProfile = process.env.USERPROFILE;
+  previousStateDir = process.env.OMC_STATE_DIR;
+  process.env.HOME = cwd;
+  process.env.USERPROFILE = cwd;
+  delete process.env.OMC_STATE_DIR;
+  writeConfig(initialConfig());
+});
+afterEach(() => {
+  if (previousHome === undefined) delete process.env.HOME;
+  else process.env.HOME = previousHome;
+  if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = previousUserProfile;
+  if (previousStateDir === undefined) delete process.env.OMC_STATE_DIR;
+  else process.env.OMC_STATE_DIR = previousStateDir;
+  rmSync(cwd, { recursive: true, force: true });
+});
 
 describe('team config revision transaction', () => {
   it('rejects recovery cleanup and publishes no final after a normal writer wins the revision', async () => {
@@ -141,7 +162,7 @@ describe('team config revision transaction', () => {
     const recoveryCommit = saveTeamConfigAtRevision(cleanup, 1, cwd, async () => {
       finalEntered();
       await finalRelease;
-    });
+    }, { release: { active_recovery: true } });
     await entered;
 
     const staleNormal = initialConfig();
@@ -175,7 +196,9 @@ describe('team config revision transaction', () => {
   it('rejects a stale pre-incremented writer that would restore cleared recovery state', async () => {
     const cleanup = { ...initialConfig(), state_revision: 2, active_recovery: undefined,
       last_recovery: { ...initialConfig().active_recovery!, phase: 'adopted' as const, state_revision: 2 } };
-    await expect(saveTeamConfigAtRevision(cleanup, 1, cwd)).resolves.toBe(true);
+    await expect(saveTeamConfigAtRevision(cleanup, 1, cwd, undefined, {
+      release: { active_recovery: true },
+    })).resolves.toBe(true);
     const stalePreincremented = initialConfig();
     stalePreincremented.state_revision = 2;
     stalePreincremented.active_recovery = { ...stalePreincremented.active_recovery!, state_revision: 2 };
@@ -199,6 +222,97 @@ describe('team config revision transaction', () => {
     await expect(migrateTeamConfigRevision(teamName, cwd)).resolves.toMatchObject({ stateRevision: 0, config: { next_task_id: 13 } });
     await expect(readRevisionedTeamConfig(teamName, cwd)).resolves.toMatchObject({
       stateRevision: 0, config: { next_task_id: 13 },
+    });
+  });
+
+  describe('legacy config/manifest max_workers merge (#3744)', () => {
+    function writeLegacyConfig(maxWorkers: number | undefined): void {
+      const { state_revision: _revision, active_recovery: _recovery, max_workers: _default, ...legacy } = initialConfig();
+      writeConfig({ ...legacy, ...(maxWorkers === undefined ? {} : { max_workers: maxWorkers }) } as TeamConfig);
+    }
+
+    function writeMergeManifest(): void {
+      writeFileSync(absPath(cwd, TeamPaths.manifest(teamName)), JSON.stringify({ schema_version: 2, name: teamName,
+        workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%manifest' }],
+        worker_count: 1, next_task_id: 1, created_at: new Date().toISOString(), tmux_session: `${teamName}:0` }));
+    }
+
+    it('honors an explicit configured cap below the legacy default of 20 in both read paths', async () => {
+      writeLegacyConfig(3);
+      writeMergeManifest();
+
+      await expect(readTeamConfig(teamName, cwd)).resolves.toMatchObject({ max_workers: 3 });
+      await expect(teamReadConfig(teamName, cwd)).resolves.toMatchObject({ max_workers: 3 });
+    });
+
+    it('keeps the default cap of 20 when the legacy config omits max_workers', async () => {
+      writeLegacyConfig(undefined);
+      writeMergeManifest();
+
+      await expect(readTeamConfig(teamName, cwd)).resolves.toMatchObject({ max_workers: 20 });
+      await expect(teamReadConfig(teamName, cwd)).resolves.toMatchObject({ max_workers: 20 });
+    });
+
+    it('clamps an oversized configured cap to the hard ceiling of 20 in both read paths', async () => {
+      writeLegacyConfig(50);
+      writeMergeManifest();
+
+      await expect(readTeamConfig(teamName, cwd)).resolves.toMatchObject({ max_workers: 20 });
+      await expect(teamReadConfig(teamName, cwd)).resolves.toMatchObject({ max_workers: 20 });
+    });
+
+    it('returns a revisioned sub-ceiling cap verbatim without consulting the manifest merge', async () => {
+      writeConfig({ ...initialConfig(), max_workers: 3 });
+      writeFileSync(absPath(cwd, TeamPaths.manifest(teamName)), JSON.stringify({ schema_version: 2,
+        state_revision: 99, name: teamName, next_task_id: 99,
+        workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%manifest' }],
+        worker_count: 1 }));
+
+      await expect(readTeamConfig(teamName, cwd)).resolves.toMatchObject({ max_workers: 3, next_task_id: 1 });
+      await expect(teamReadConfig(teamName, cwd)).resolves.toMatchObject({ max_workers: 3, next_task_id: 1 });
+      expect((await teamReadConfig(teamName, cwd))?.workers[0]?.pane_id).not.toBe('%manifest');
+      await expect(readRevisionedTeamConfig(teamName, cwd)).resolves.toMatchObject({ config: { max_workers: 3, next_task_id: 1 } });
+    });
+
+    it('migrates a manifest-only team at the legacy default cap', async () => {
+      unlinkSync(absPath(cwd, TeamPaths.config(teamName)));
+      writeMergeManifest();
+
+      await expect(migrateTeamConfigRevision(teamName, cwd)).resolves.toMatchObject({ config: { max_workers: 20 } });
+      await expect(readTeamConfig(teamName, cwd)).resolves.toMatchObject({ max_workers: 20 });
+    });
+
+    it.each([0, -1, 1.5])('rejects a legacy config carrying invalid cap %s through every reader and migration', async maxWorkers => {
+      writeLegacyConfig(maxWorkers);
+      writeMergeManifest();
+
+      await expect(readTeamConfig(teamName, cwd)).rejects.toThrow('invalid_persisted_state');
+      await expect(teamReadConfig(teamName, cwd)).rejects.toThrow('invalid_persisted_state');
+      await expect(readRevisionedTeamConfig(teamName, cwd)).rejects.toThrow('invalid_persisted_state');
+      await expect(migrateTeamConfigRevision(teamName, cwd)).rejects.toThrow('invalid_persisted_state');
+    });
+
+    it.each([0, -1, 1.5])('rejects a revisioned config carrying invalid cap %s through every reader and migration', async maxWorkers => {
+      writeConfig({ ...initialConfig(), max_workers: maxWorkers });
+
+      await expect(readTeamConfig(teamName, cwd)).rejects.toThrow('invalid_persisted_state');
+      await expect(teamReadConfig(teamName, cwd)).rejects.toThrow('invalid_persisted_state');
+      await expect(readRevisionedTeamConfig(teamName, cwd)).rejects.toThrow('invalid_persisted_state');
+      await expect(migrateTeamConfigRevision(teamName, cwd)).rejects.toThrow('invalid_persisted_state');
+    });
+
+    it.each([0, -1, 1.5])('refuses to persist invalid cap %s through both writers', async maxWorkers => {
+      await expect(saveTeamConfig({ ...initialConfig(), max_workers: maxWorkers }, cwd)).rejects.toThrow('invalid_persisted_state');
+      await expect(saveTeamConfigAtRevision({ ...initialConfig(), max_workers: maxWorkers, state_revision: 2 }, 1, cwd))
+        .rejects.toThrow('invalid_persisted_state');
+    });
+
+    it.each([1, 20])('keeps configured boundary cap %s valid through both readers', async maxWorkers => {
+      writeLegacyConfig(maxWorkers);
+      writeMergeManifest();
+
+      await expect(readTeamConfig(teamName, cwd)).resolves.toMatchObject({ max_workers: maxWorkers });
+      await expect(teamReadConfig(teamName, cwd)).resolves.toMatchObject({ max_workers: maxWorkers });
     });
   });
 
@@ -278,8 +392,8 @@ describe('team config revision transaction', () => {
     ['malformed configured routing roles', { ...initialConfig(), configured_routing_roles: ['reviewer'] }],
     ['malformed Copilot defaults', { ...initialConfig(), copilot_defaults: { model: 'gpt-5.6-sol', reasoning_effort: 'extreme' } }],
     ['mismatched active fence revision', { ...initialConfig(), active_recovery: { ...initialConfig().active_recovery!, state_revision: 2 } }],
-    ['mismatched active scale-up fence revision', { ...initialConfig(), active_scale_up: { operation_id: 'up', phase: 'reserved', pid: 1, process_started_at: 'linux:1', state_revision: 2, created_at: new Date().toISOString(), updated_at: new Date().toISOString() } }],
-    ['mismatched active scale-down fence revision', { ...initialConfig(), active_scale_down: { operation_id: 'down', phase: 'draining', pid: 1, process_started_at: 'linux:1', workers: [], state_revision: 2, created_at: new Date().toISOString(), updated_at: new Date().toISOString() } }],
+    ['mismatched active scale-up fence revision', { ...initialConfig(), active_scale_up: { operation_id: 'up', phase: 'reserved' as const, pid: 1, process_started_at: 'linux:1', state_revision: 2, created_at: new Date().toISOString(), updated_at: new Date().toISOString() } }],
+    ['mismatched active scale-down fence revision', { ...initialConfig(), active_scale_down: { operation_id: 'down', phase: 'draining' as const, pid: 1, process_started_at: 'linux:1', workers: [], state_revision: 2, created_at: new Date().toISOString(), updated_at: new Date().toISOString() } }],
     ['mismatched shutdown fence revision', { ...initialConfig(), shutdown_attempt: { nonce: 'shutdown', pid: 1, process_started_at: 'linux:1', state_revision: 2, created_at: new Date().toISOString() } }],
     ['mismatched all-dead fence revision', { ...initialConfig(), all_dead_recovery: { detected_at: new Date().toISOString(), deadline_at: new Date().toISOString(), state_revision: 2 } }],
     ['malformed owner', { ...initialConfig(), runtime_owner_epoch: { epoch: 1, nonce: 'owner' } }],
@@ -295,6 +409,62 @@ describe('team config revision transaction', () => {
     await expect(readTeamConfig(teamName, cwd)).rejects.toThrow('invalid_persisted_state');
     await expect(saveTeamConfig(initialConfig(), cwd)).rejects.toThrow('invalid_persisted_state');
     expect(readFileSync(configPath, 'utf8')).toBe(bytes);
+  });
+
+  it('accepts and round-trips a committed scale-up fence through real save/load', async () => {
+    const now = new Date().toISOString();
+    const base = initialConfig();
+    // Start from a clean revisioned config without recovery, with committed scale-up.
+    writeConfig({
+      ...base,
+      active_recovery: undefined,
+      active_scale_up: {
+        operation_id: 'scale-up-committed',
+        phase: 'committed',
+        pid: 42,
+        process_started_at: 'linux:1',
+        state_revision: 1,
+        created_at: now,
+        updated_at: now,
+      },
+    });
+    const loaded = await readRevisionedTeamConfig(teamName, cwd);
+    expect(loaded?.config.active_scale_up?.phase).toBe('committed');
+    expect(loaded?.config.active_scale_up?.state_revision).toBe(loaded?.config.state_revision);
+
+    // Advance revision while retaining committed fence with intentionally stale fence revision.
+    // saveTeamConfigAtRevision must align all active fences to config.state_revision.
+    const nextRevision = loaded!.stateRevision + 1;
+    const advanced = {
+      ...loaded!.config,
+      state_revision: nextRevision,
+      active_recovery: {
+        request_id: 'r1', recovery_id: 'rec1', worker_name: 'worker-1',
+        owner_epoch: 1, owner_nonce: 'n1', phase: 'reserved' as const,
+        state_revision: nextRevision, created_at: now, updated_at: now,
+      },
+      active_scale_up: { ...loaded!.config.active_scale_up!, state_revision: loaded!.stateRevision },
+    };
+    await expect(saveTeamConfigAtRevision(advanced, loaded!.stateRevision, cwd)).resolves.toBe(true);
+    const after = await readRevisionedTeamConfig(teamName, cwd);
+    expect(after?.config.active_scale_up?.phase).toBe('committed');
+    expect(after?.config.active_scale_up?.state_revision).toBe(after?.config.state_revision);
+    expect(after?.config.active_recovery?.state_revision).toBe(after?.config.state_revision);
+  });
+
+  it('rejects a malformed scale-up phase that is not in the canonical set', async () => {
+    const now = new Date().toISOString();
+    const bad = {
+      ...initialConfig(),
+      active_scale_up: {
+        operation_id: 'scale-up-bad', phase: 'finished', pid: 1,
+        process_started_at: 'linux:1', state_revision: 1,
+        created_at: now, updated_at: now,
+      },
+    };
+    const configPath = absPath(cwd, TeamPaths.config(teamName));
+    writeFileSync(configPath, JSON.stringify(bad));
+    await expect(readRevisionedTeamConfig(teamName, cwd)).rejects.toThrow('invalid_persisted_state');
   });
 
   it('rejects a path-mismatched persisted config before migration writes a projection', async () => {
@@ -437,4 +607,296 @@ describe('team config revision transaction', () => {
     expect(effect).toHaveBeenCalledTimes(1);
     expect(existsSync(lockPath)).toBe(false);
   });
+
+
+  // ── CAS fence ownership trust boundary (exact-head 70d5 P1) ──────────────
+
+  it('rejects foreign active_scale_up ownership substitution at matching revision', async () => {
+    const now = new Date().toISOString();
+    writeConfig({
+      ...initialConfig(),
+      active_recovery: undefined,
+      active_scale_up: {
+        operation_id: 'owner-A', phase: 'effects' as const, pid: 111, process_started_at: 'linux:owner-A',
+        state_revision: 1, created_at: now, updated_at: now,
+      },
+    });
+    const foreign = {
+      ...initialConfig(),
+      state_revision: 2,
+      active_recovery: undefined,
+      active_scale_up: {
+        operation_id: 'owner-B', phase: 'effects' as const, pid: 222, process_started_at: 'linux:owner-B',
+        state_revision: 2, created_at: now, updated_at: now,
+      },
+    };
+    await expect(saveTeamConfigAtRevision(foreign, 1, cwd)).rejects.toThrow('invalid_persisted_state');
+    const after = await readRevisionedTeamConfig(teamName, cwd);
+    expect(after?.config.active_scale_up?.operation_id).toBe('owner-A');
+    expect(after?.stateRevision).toBe(1);
+  });
+
+  it('accepts same-owner scale-up phase transition with revision rebase', async () => {
+    const now = new Date().toISOString();
+    writeConfig({
+      ...initialConfig(),
+      active_recovery: undefined,
+      active_scale_up: {
+        operation_id: 'owner-A', phase: 'reserved' as const, pid: 111, process_started_at: 'linux:owner-A',
+        state_revision: 1, created_at: now, updated_at: now,
+      },
+    });
+    const advanced = {
+      ...initialConfig(),
+      state_revision: 2,
+      active_recovery: undefined,
+      active_scale_up: {
+        operation_id: 'owner-A', phase: 'effects' as const, pid: 111, process_started_at: 'linux:owner-A',
+        state_revision: 2, created_at: now, updated_at: now,
+      },
+    };
+    await expect(saveTeamConfigAtRevision(advanced, 1, cwd)).resolves.toBe(true);
+    const after = await readRevisionedTeamConfig(teamName, cwd);
+    expect(after?.config.active_scale_up?.phase).toBe('effects');
+    expect(after?.config.active_scale_up?.operation_id).toBe('owner-A');
+    expect(after?.config.active_scale_up?.state_revision).toBe(2);
+  });
+
+  it('rejects clearing active_scale_up without release authorization', async () => {
+    const now = new Date().toISOString();
+    writeConfig({
+      ...initialConfig(),
+      active_recovery: undefined,
+      active_scale_up: {
+        operation_id: 'owner-A', phase: 'committed' as const, pid: 111, process_started_at: 'linux:owner-A',
+        state_revision: 1, created_at: now, updated_at: now,
+      },
+    });
+    const cleared = {
+      ...initialConfig(),
+      state_revision: 2,
+      active_recovery: undefined,
+      active_scale_up: undefined,
+    };
+    await expect(saveTeamConfigAtRevision(cleared, 1, cwd)).rejects.toThrow('invalid_persisted_state');
+    await expect(saveTeamConfigAtRevision(cleared, 1, cwd, undefined, {
+      release: { active_scale_up: true },
+    })).resolves.toBe(true);
+    const after = await readRevisionedTeamConfig(teamName, cwd);
+    expect(after?.config.active_scale_up).toBeUndefined();
+  });
+
+  it('rejects foreign active_recovery substitution', async () => {
+    const base = initialConfig(); // has active_recovery recovery-a
+    const foreign = {
+      ...base,
+      state_revision: 2,
+      active_recovery: {
+        ...base.active_recovery!,
+        recovery_id: 'foreign-recovery',
+        request_id: 'foreign-request',
+        owner_epoch: 99,
+        owner_nonce: 'foreign-nonce',
+        state_revision: 2,
+      },
+    };
+    await expect(saveTeamConfigAtRevision(foreign, 1, cwd)).rejects.toThrow('invalid_persisted_state');
+  });
+
+  it('rejects foreign active_scale_down ownership substitution and worker retarget', async () => {
+    const now = new Date().toISOString();
+    writeConfig({
+      ...initialConfig(),
+      active_recovery: undefined,
+      workers: [
+        { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
+        { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [] },
+      ],
+      worker_count: 2,
+      active_scale_down: {
+        operation_id: 'sd-A', phase: 'failed' as const, pid: 111, process_started_at: 'linux:A',
+        workers: [{ name: 'worker-2' }],
+        state_revision: 1, failure_reason: 'pane_cleanup_failed',
+        created_at: now, updated_at: now,
+      },
+    });
+    // Foreign owner + different target worker
+    const foreign = {
+      ...initialConfig(),
+      state_revision: 2,
+      active_recovery: undefined,
+      workers: [
+        { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
+        { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [] },
+      ],
+      worker_count: 2,
+      active_scale_down: {
+        operation_id: 'sd-B', phase: 'draining' as const, pid: 222, process_started_at: 'linux:B',
+        workers: [{ name: 'worker-1' }], // retarget!
+        state_revision: 2, created_at: now, updated_at: now,
+      },
+    };
+    await expect(saveTeamConfigAtRevision(foreign, 1, cwd)).rejects.toThrow('invalid_persisted_state');
+    const after = await readRevisionedTeamConfig(teamName, cwd);
+    expect(after?.config.active_scale_down?.operation_id).toBe('sd-A');
+    expect(after?.config.active_scale_down?.workers).toEqual([{ name: 'worker-2' }]);
+  });
+
+  it('rejects stale expected revision even for same-owner transition', async () => {
+    const now = new Date().toISOString();
+    writeConfig({
+      ...initialConfig(),
+      active_recovery: undefined,
+      active_scale_up: {
+        operation_id: 'owner-A', phase: 'reserved' as const, pid: 111, process_started_at: 'linux:A',
+        state_revision: 1, created_at: now, updated_at: now,
+      },
+    });
+    const advanced = {
+      ...initialConfig(),
+      state_revision: 2,
+      active_recovery: undefined,
+      active_scale_up: {
+        operation_id: 'owner-A', phase: 'effects' as const, pid: 111, process_started_at: 'linux:A',
+        state_revision: 2, created_at: now, updated_at: now,
+      },
+    };
+    await expect(saveTeamConfigAtRevision(advanced, 0, cwd)).resolves.toBe(false);
+  });
+
+  it('rejects empty/non-string launch_attempt_id on worker rows', async () => {
+    const base = initialConfig();
+    const badEmpty = {
+      ...base,
+      state_revision: 2,
+      active_recovery: { ...base.active_recovery!, state_revision: 2 },
+      workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], launch_attempt_id: '' }],
+    };
+    await expect(saveTeamConfigAtRevision(badEmpty as any, 1, cwd)).rejects.toThrow('invalid_persisted_state');
+    const badNull = {
+      ...base,
+      state_revision: 2,
+      active_recovery: { ...base.active_recovery!, state_revision: 2 },
+      workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], launch_attempt_id: null }],
+    };
+    await expect(saveTeamConfigAtRevision(badNull as any, 1, cwd)).rejects.toThrow('invalid_persisted_state');
+  });
+
+  it('accepts non-empty launch_attempt_id strings (UUID and attempt-scoped forms)', async () => {
+    const base = initialConfig();
+    for (const id of ['123e4567-e89b-12d3-a456-426614174000', 'attempt-worker-1']) {
+      const good = {
+        ...base,
+        state_revision: 2,
+        active_recovery: { ...base.active_recovery!, state_revision: 2 },
+        workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], launch_attempt_id: id }],
+      };
+      await expect(saveTeamConfigAtRevision(good, 1, cwd)).resolves.toBe(true);
+      // Reset for next iteration
+      writeConfig(base);
+    }
+  });
+
+
+
+  it('authorizes same-owner failed→draining scale-down resume with identical workers', () => {
+    const now = new Date().toISOString();
+    const workers = [{ name: 'worker-2', pane_id: '%2' }];
+    const current = {
+      ...initialConfig(),
+      active_recovery: undefined,
+      workers: [
+        { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
+        { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [] },
+      ],
+      worker_count: 2,
+      active_scale_down: {
+        operation_id: 'sd-resume', phase: 'failed' as const, pid: 111, process_started_at: 'linux:A',
+        workers, state_revision: 1, failure_reason: 'pane_cleanup_failed',
+        created_at: now, updated_at: now,
+      },
+    };
+    const proposed = {
+      ...current,
+      state_revision: 2,
+      active_scale_down: {
+        ...current.active_scale_down!,
+        phase: 'draining' as const,
+        state_revision: 2,
+        updated_at: now,
+        failure_reason: undefined,
+      },
+    };
+    expect(() => assertActiveFenceOwnershipTransition(current, proposed)).not.toThrow();
+  });
+
+  it('rejects failed→draining scale-down when workers are retargeted', () => {
+    const now = new Date().toISOString();
+    const current = {
+      ...initialConfig(),
+      active_recovery: undefined,
+      workers: [
+        { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
+        { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [] },
+      ],
+      worker_count: 2,
+      active_scale_down: {
+        operation_id: 'sd-resume', phase: 'failed' as const, pid: 111, process_started_at: 'linux:A',
+        workers: [{ name: 'worker-2' }], state_revision: 1, failure_reason: 'x',
+        created_at: now, updated_at: now,
+      },
+    };
+    const proposed = {
+      ...current,
+      state_revision: 2,
+      active_scale_down: {
+        ...current.active_scale_down!,
+        phase: 'draining' as const,
+        workers: [{ name: 'worker-1' }], // retarget forbidden
+        state_revision: 2,
+        updated_at: now,
+      },
+    };
+    expect(() => assertActiveFenceOwnershipTransition(current, proposed)).toThrow('invalid_persisted_state');
+  });
+
+  it('persists same-owner failed→draining scale-down resume through real CAS', async () => {
+    const now = new Date().toISOString();
+    writeConfig({
+      ...initialConfig(),
+      active_recovery: undefined,
+      workers: [
+        { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
+        { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [] },
+      ],
+      worker_count: 2,
+      active_scale_down: {
+        operation_id: 'sd-cas-resume', phase: 'failed', pid: 42, process_started_at: 'linux:owner',
+        workers: [{ name: 'worker-2', pane_id: '%2' }],
+        state_revision: 1, failure_reason: 'pane_cleanup_failed',
+        created_at: now, updated_at: now,
+      },
+    } as any);
+    const advanced = {
+      ...initialConfig(),
+      active_recovery: undefined,
+      state_revision: 2,
+      workers: [
+        { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
+        { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [] },
+      ],
+      worker_count: 2,
+      active_scale_down: {
+        operation_id: 'sd-cas-resume', phase: 'draining' as const, pid: 42, process_started_at: 'linux:owner',
+        workers: [{ name: 'worker-2', pane_id: '%2' }],
+        state_revision: 2, created_at: now, updated_at: now,
+      },
+    };
+    await expect(saveTeamConfigAtRevision(advanced, 1, cwd)).resolves.toBe(true);
+    const after = await readRevisionedTeamConfig(teamName, cwd);
+    expect(after?.config.active_scale_down?.phase).toBe('draining');
+    expect(after?.config.active_scale_down?.operation_id).toBe('sd-cas-resume');
+    expect(after?.config.active_scale_down?.workers).toEqual([{ name: 'worker-2', pane_id: '%2' }]);
+  });
+
 });

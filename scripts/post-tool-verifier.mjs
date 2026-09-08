@@ -9,7 +9,6 @@
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, renameSync, unlinkSync } from 'fs';
-import { closeSync, openSync, readSync, statSync } from 'fs';
 import { basename, join, dirname, resolve } from 'path';
 import { homedir, tmpdir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
@@ -17,18 +16,24 @@ import { getClaudeConfigDir } from './lib/config-dir.mjs';
 import { encodeProjectPath } from './lib/encode-project-path.mjs';
 import { resolveOmcStateRoot } from './lib/state-root.mjs';
 import { readStdin } from './lib/stdin.mjs';
+import { resolveContextPercent } from './lib/context-usage.mjs';
 import { BOUNDED_GIT_TIMEOUT_MS } from './lib/bounded-git-timeout.mjs';
 import {
   loadHookRuntime,
   surfaceOptionalHookFailure,
 } from './lib/hook-runtime-loader.mjs';
 
+const SKIP_HOOKS = (process.env.OMC_SKIP_HOOKS || '').split(',').map(s => s.trim());
+const HOOK_DISABLED =
+  process.env.DISABLE_OMC === '1' ||
+  process.env.DISABLE_OMC === 'true' ||
+  SKIP_HOOKS.includes('post-tool-use');
+
 const AGENT_OUTPUT_ANALYSIS_LIMIT = parseInt(process.env.OMC_AGENT_OUTPUT_ANALYSIS_LIMIT || '12000', 10);
 const AGENT_OUTPUT_SUMMARY_LIMIT = parseInt(process.env.OMC_AGENT_OUTPUT_SUMMARY_LIMIT || '360', 10);
 const PREEMPTIVE_WARNING_THRESHOLD_PERCENT = parseInt(process.env.OMC_PREEMPTIVE_COMPACTION_WARNING_PERCENT || '70', 10);
 const PREEMPTIVE_CRITICAL_THRESHOLD_PERCENT = parseInt(process.env.OMC_PREEMPTIVE_COMPACTION_CRITICAL_PERCENT || '90', 10);
 const PREEMPTIVE_COOLDOWN_MS = parseInt(process.env.OMC_PREEMPTIVE_COMPACTION_COOLDOWN_MS || '60000', 10);
-const PREEMPTIVE_TRANSCRIPT_TAIL_BYTES = 4096;
 const PREEMPTIVE_LARGE_OUTPUT_TOOLS = new Set(['read', 'grep', 'glob', 'bash', 'webfetch', 'task', 'taskcreate', 'taskupdate', 'taskoutput']);
 const QUIET_LEVEL = getQuietLevel();
 const SESSION_ID_ALLOWLIST = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/;
@@ -121,12 +126,14 @@ const distDir = join(__dirname, '..', 'dist', 'hooks', 'notepad');
 // Try to import notepad functions (may fail if not built)
 let setPriorityContext = null;
 let addWorkingMemoryEntry = null;
-try {
-  const notepadModule = await import(pathToFileURL(join(distDir, 'index.js')).href);
-  setPriorityContext = notepadModule.setPriorityContext;
-  addWorkingMemoryEntry = notepadModule.addWorkingMemoryEntry;
-} catch {
-  // Notepad module not available - remember tags will be silently ignored
+if (!HOOK_DISABLED) {
+  try {
+    const notepadModule = await import(pathToFileURL(join(distDir, 'index.js')).href);
+    setPriorityContext = notepadModule.setPriorityContext;
+    addWorkingMemoryEntry = notepadModule.addWorkingMemoryEntry;
+  } catch {
+    // Notepad module not available - remember tags will be silently ignored
+  }
 }
 
 // Debug logging helper - gated behind OMC_DEBUG env var
@@ -137,14 +144,17 @@ const debugLog = (...args) => {
 // State file for session tracking
 const cfgDir = getClaudeConfigDir();
 const STATE_FILE = join(cfgDir, '.session-stats.json');
+const MAX_SESSION_STATS = 100;
 
 // Ensure state directory exists
-try {
-  const stateDir = cfgDir;
-  if (!existsSync(stateDir)) {
-    mkdirSync(stateDir, { recursive: true });
-  }
-} catch {}
+if (!HOOK_DISABLED) {
+  try {
+    const stateDir = cfgDir;
+    if (!existsSync(stateDir)) {
+      mkdirSync(stateDir, { recursive: true });
+    }
+  } catch {}
+}
 
 // Load session statistics
 function loadStats() {
@@ -188,6 +198,17 @@ function updateStats(toolName, sessionId) {
   session.last_tool = toolName;
   session.total_calls = (session.total_calls || 0) + 1;
   session.updated_at = Math.floor(Date.now() / 1000);
+
+  const sessionEntries = Object.entries(stats.sessions);
+  if (sessionEntries.length > MAX_SESSION_STATS) {
+    sessionEntries
+      .filter(([id]) => id !== sessionId)
+      .sort(([, left], [, right]) =>
+        (right.updated_at || right.started_at || 0) - (left.updated_at || left.started_at || 0)
+      )
+      .slice(MAX_SESSION_STATS - 1)
+      .forEach(([id]) => delete stats.sessions[id]);
+  }
 
   saveStats(stats);
   return session.tool_counts[toolName];
@@ -355,18 +376,26 @@ export function detectBashFailure(output) {
     .some(line => linePatterns.some(pattern => pattern.test(line)));
 }
 
-// Detect background operation
-function detectBackgroundOperation(output) {
-  const bgPatterns = [
-    /started/i,
-    /running/i,
-    /background/i,
-    /async/i,
-    /task_id/i,
-    /spawned/i,
-  ];
+// Detect whether a tool call was actually backgrounded.
+//
+// The PostToolUse payload carries the tool's own `tool_input`, and Bash/Task
+// expose `run_in_background` — that flag, not the command output, is what
+// determines background execution. Substring-matching words like "running" or
+// "async" against arbitrary output misreports ordinary foreground calls
+// (issue #3578).
+export function isBackgroundToolInvocation(toolInput) {
+  if (!toolInput || typeof toolInput !== 'object' || Array.isArray(toolInput)) return false;
+  return toolInput.run_in_background === true;
+}
 
-  return bgPatterns.some(pattern => pattern.test(output));
+// Anchored fallback for the harness's own background-launch announcement.
+// Deliberately case-sensitive and anchored to the start of the output: text
+// that merely quotes the phrase elsewhere is not a launch (same rule as
+// src/hud/transcript.ts). Only the Task family gets this fallback — Bash has
+// no equivalent announcement, so it relies on the input flag alone.
+export function detectAnnouncedBackgroundLaunch(output) {
+  if (typeof output !== 'string') return false;
+  return /^(?:Async agent launched|Background task (?:launched|resumed))\b/.test(output.trimStart());
 }
 
 function resolveTranscriptPath(transcriptPath, cwd) {
@@ -419,80 +448,6 @@ function resolveTranscriptPath(transcriptPath, cwd) {
   return transcriptPath;
 }
 
-function readTranscriptUsage(transcriptPath) {
-  if (!transcriptPath) return null;
-
-  let fd = -1;
-  try {
-    const stat = statSync(transcriptPath);
-    if (stat.size === 0) return null;
-
-    fd = openSync(transcriptPath, 'r');
-    const readSize = Math.min(PREEMPTIVE_TRANSCRIPT_TAIL_BYTES, stat.size);
-    const buffer = Buffer.alloc(readSize);
-    readSync(fd, buffer, 0, readSize, stat.size - readSize);
-    closeSync(fd);
-    fd = -1;
-
-    const tail = buffer.toString('utf-8');
-    const windowMatches = tail.match(/"context_window"\s{0,5}:\s{0,5}(\d+)/g);
-    const inputMatches = tail.match(/"input_tokens"\s{0,5}:\s{0,5}(\d+)/g);
-    if (!windowMatches || !inputMatches) return null;
-
-    const lastWindow = Number.parseInt(
-      windowMatches[windowMatches.length - 1].match(/(\d+)/)?.[1] || '0',
-      10,
-    );
-    const lastInput = Number.parseInt(
-      inputMatches[inputMatches.length - 1].match(/(\d+)/)?.[1] || '0',
-      10,
-    );
-    if (!Number.isFinite(lastWindow) || lastWindow <= 0) return null;
-    if (!Number.isFinite(lastInput) || lastInput < 0) return null;
-
-    return Math.round((lastInput / lastWindow) * 100);
-  } catch {
-    return null;
-  } finally {
-    if (fd !== -1) {
-      try { closeSync(fd); } catch {}
-    }
-  }
-}
-
-function readContextUsageFromHookInput(data) {
-  const contextWindow = data?.contextWindow;
-  if (!contextWindow || typeof contextWindow !== 'object') {
-    return null;
-  }
-
-  const usedPercentage = contextWindow.used_percentage;
-  if (Number.isFinite(usedPercentage) && usedPercentage >= 0) {
-    return Math.min(100, Math.max(0, Math.round(usedPercentage)));
-  }
-
-  const size = contextWindow.context_window_size;
-  if (!Number.isFinite(size) || size <= 0) {
-    return null;
-  }
-
-  const usage = contextWindow.current_usage;
-  if (!usage || typeof usage !== 'object') {
-    return null;
-  }
-
-  const inputTokens = Number(usage.input_tokens || 0);
-  const cacheCreationTokens = Number(usage.cache_creation_input_tokens || 0);
-  const cacheReadTokens = Number(usage.cache_read_input_tokens || 0);
-
-  const totalTokens = inputTokens + cacheCreationTokens + cacheReadTokens;
-  if (!Number.isFinite(totalTokens) || totalTokens < 0) {
-    return null;
-  }
-
-  return Math.min(100, Math.max(0, Math.round((totalTokens / size) * 100)));
-}
-
 function getPreemptiveCooldownFilePath(directory, sessionId) {
   const cooldownScope =
     sessionId && sessionId !== 'unknown'
@@ -543,16 +498,17 @@ function buildPreemptiveContextMessage(percentUsed, severity) {
   return `[OMC WARNING] Context at ${percentUsed}% (warning threshold: ${getPreemptiveWarningThreshold()}%). Plan a /compact soon to preserve room for the next large tool output.`;
 }
 
-function maybeBuildPreemptiveCompactionMessage(toolName, data, directory) {
+async function maybeBuildPreemptiveCompactionMessage(toolName, data, directory) {
   if (!PREEMPTIVE_LARGE_OUTPUT_TOOLS.has(String(toolName || '').toLowerCase())) {
     return '';
   }
 
-  const percentFromTranscript = readTranscriptUsage(
-    resolveTranscriptPath(data.transcriptPath, directory),
+  const percentUsed = await resolveContextPercent(
+    data,
+    resolveTranscriptPath(data.transcript_path || data.transcriptPath, directory),
+    directory,
   );
-  const percentUsed =
-    percentFromTranscript ?? readContextUsageFromHookInput(data);
+
   const warningThreshold = getPreemptiveWarningThreshold();
   const criticalThreshold = getPreemptiveCriticalThreshold();
 
@@ -974,6 +930,7 @@ function generateMessage(toolName, toolOutput, sessionId, toolCount, directory, 
     rawLength = 0,
     structuredWriteSuccess = false,
     structuredWriteFailure = false,
+    toolInput = {},
   } = options;
   let message = '';
 
@@ -986,7 +943,7 @@ function generateMessage(toolName, toolOutput, sessionId, toolCount, directory, 
         message = `Command exited with code ${code} but produced valid output. This may be expected behavior.`;
       } else if (detectBashFailure(toolOutput)) {
         message = 'Command failed. Please investigate the error and fix before continuing.';
-      } else if (QUIET_LEVEL < 2 && detectBackgroundOperation(toolOutput)) {
+      } else if (QUIET_LEVEL < 2 && isBackgroundToolInvocation(toolInput)) {
         message = 'Background operation detected. Remember to verify results before proceeding.';
       }
       break;
@@ -997,7 +954,10 @@ function generateMessage(toolName, toolOutput, sessionId, toolCount, directory, 
       const agentSummary = getAgentCompletionSummary(directory, QUIET_LEVEL, sessionId);
       if (detectWriteFailure(toolOutput)) {
         message = 'Task delegation failed. Verify agent name and parameters.';
-      } else if (QUIET_LEVEL < 2 && detectBackgroundOperation(toolOutput)) {
+      } else if (
+        QUIET_LEVEL < 2 &&
+        (isBackgroundToolInvocation(toolInput) || detectAnnouncedBackgroundLaunch(toolOutput))
+      ) {
         message = 'Background task launched. Use TaskOutput to check results when needed.';
       } else if (QUIET_LEVEL < 2 && toolCount > 5) {
         message = `Multiple tasks delegated (${toolCount} total). Track their completion status.`;
@@ -1104,7 +1064,7 @@ function describeCanonicalFailure(result) {
   return failures.length > 0 ? [...new Set(failures)].join('; ') : undefined;
 }
 
-function processPostToolUse(data) {
+async function processPostToolUse(data) {
   const toolName = data.toolName || '';
   const rawResponse = data.toolOutput ?? '';
   const structuredWriteSuccess =
@@ -1158,8 +1118,9 @@ function processPostToolUse(data) {
       rawLength: toolOutput.length,
       structuredWriteSuccess,
       structuredWriteFailure,
+      toolInput: data.toolInput || {},
     }),
-    maybeBuildPreemptiveCompactionMessage(toolName, data, directory),
+    await maybeBuildPreemptiveCompactionMessage(toolName, data, directory),
   );
 
   // Build response - use hookSpecificOutput.additionalContext for PostToolUse
@@ -1177,9 +1138,7 @@ function processPostToolUse(data) {
 }
 
 async function main() {
-  // Skip guard: check OMC_SKIP_HOOKS env var (see issue #838)
-  const _skipHooks = (process.env.OMC_SKIP_HOOKS || '').split(',').map(s => s.trim());
-  if (process.env.DISABLE_OMC === '1' || _skipHooks.includes('post-tool-use')) {
+  if (HOOK_DISABLED) {
     console.log(JSON.stringify({ continue: true }));
     return;
   }

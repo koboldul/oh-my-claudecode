@@ -26,27 +26,27 @@ import {
   validateNamedWorkflowStateStructure,
 } from '../named-workflow-resume-validator.js';
 
-// Mock the ralph and ultraqa modules
+// Mock the ralph module (linked-state cleanup still routes through it)
 vi.mock('../../ralph/index.js', () => ({
   clearRalphState: vi.fn(() => true),
-  clearLinkedUltraworkState: vi.fn(() => true),
   readRalphState: vi.fn(() => null)
-}));
-
-vi.mock('../../ultraqa/index.js', () => ({
-  clearUltraQAState: vi.fn(() => true),
-  readUltraQAState: vi.fn(() => null)
 }));
 
 // Import mocked functions after vi.mock
 import * as ralphLoop from '../../ralph/index.js';
-import * as ultraqaLoop from '../../ultraqa/index.js';
+import { readModeState } from '../../../lib/mode-state-io.js';
 
 describe('AutopilotCancel', () => {
   let testDir: string;
+  let previousHome: string | undefined;
+  let previousUserProfile: string | undefined;
 
   beforeEach(() => {
     testDir = mkdtempSync(join(tmpdir(), 'autopilot-cancel-test-'));
+    previousHome = process.env.HOME;
+    previousUserProfile = process.env.USERPROFILE;
+    process.env.HOME = testDir;
+    process.env.USERPROFILE = testDir;
     const fs = require('fs');
     fs.mkdirSync(join(testDir, '.omc', 'state'), { recursive: true });
     vi.clearAllMocks();
@@ -54,6 +54,10 @@ describe('AutopilotCancel', () => {
 
   afterEach(() => {
     rmSync(testDir, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
     delete process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_PATH;
     delete process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_BASE64;
     delete process.env.OMC_TEST_CONDITIONAL_CLEAR_REPLACEMENT_PATH;
@@ -130,7 +134,7 @@ describe('AutopilotCancel', () => {
       expect(ralphLoop.clearRalphState).toHaveBeenCalledWith(testDir);
     });
 
-    it('should clean up ralph and ultrawork when linked', () => {
+    it('should ignore retired linkage metadata when cleaning up ralph', () => {
       initAutopilot(testDir, 'test idea');
 
       // Mock active ralph state with linked ultrawork
@@ -142,45 +146,47 @@ describe('AutopilotCancel', () => {
       const result = cancelAutopilot(testDir);
 
       expect(result.success).toBe(true);
-      expect(result.message).toContain('Cleaned up: ultrawork, ralph');
-      expect(ralphLoop.clearLinkedUltraworkState).toHaveBeenCalledWith(testDir);
+      expect(result.message).toContain('Cleaned up: ralph');
+      expect(result.message).not.toContain('ultrawork');
       expect(ralphLoop.clearRalphState).toHaveBeenCalledWith(testDir);
     });
 
-    it('should clean up ultraqa state when active', () => {
+    it('should clean up pre-existing retired ultraqa state when active', () => {
       initAutopilot(testDir, 'test idea');
 
-      // Mock active ultraqa state
-      vi.mocked(ultraqaLoop.readUltraQAState).mockReturnValueOnce({
-        active: true
-      } as any);
+      // Simulate a pre-existing retired ultraqa state file
+      writeFileSync(
+        join(testDir, '.omc', 'state', 'ultraqa-state.json'),
+        JSON.stringify({ active: true, cycle: 2 })
+      );
 
       const result = cancelAutopilot(testDir);
 
       expect(result.success).toBe(true);
       expect(result.message).toContain('Cleaned up: ultraqa');
-      expect(ultraqaLoop.clearUltraQAState).toHaveBeenCalledWith(testDir);
+      expect(readModeState('ultraqa', testDir)).toBeNull();
     });
 
     it('should clean up all states when all are active', () => {
       initAutopilot(testDir, 'test idea');
 
-      // Mock all states active
+      // Mock ralph active; write a real retired ultraqa state file
       vi.mocked(ralphLoop.readRalphState).mockReturnValueOnce({
         active: true,
         linked_ultrawork: true
       } as any);
-      vi.mocked(ultraqaLoop.readUltraQAState).mockReturnValueOnce({
-        active: true
-      } as any);
+      writeFileSync(
+        join(testDir, '.omc', 'state', 'ultraqa-state.json'),
+        JSON.stringify({ active: true, cycle: 1 })
+      );
 
       const result = cancelAutopilot(testDir);
 
       expect(result.success).toBe(true);
-      expect(result.message).toContain('Cleaned up: ultrawork, ralph, ultraqa');
-      expect(ralphLoop.clearLinkedUltraworkState).toHaveBeenCalledWith(testDir);
+      expect(result.message).toContain('Cleaned up: ralph, ultraqa');
+      expect(result.message).not.toContain('ultrawork');
       expect(ralphLoop.clearRalphState).toHaveBeenCalledWith(testDir);
-      expect(ultraqaLoop.clearUltraQAState).toHaveBeenCalledWith(testDir);
+      expect(readModeState('ultraqa', testDir)).toBeNull();
     });
 
     it('should mark autopilot as inactive but keep state on disk', () => {
@@ -220,8 +226,7 @@ describe('AutopilotCancel', () => {
       expect(cancelAutopilot(testDir, sessionId)).toMatchObject({ success: false, message: 'workflow_descriptor_integrity_failed' });
       expect(require('fs').readFileSync(statePath)).toEqual(before);
       expect(ralphLoop.clearRalphState).not.toHaveBeenCalled();
-      expect(ralphLoop.clearLinkedUltraworkState).not.toHaveBeenCalled();
-      expect(ultraqaLoop.clearUltraQAState).not.toHaveBeenCalled();
+      expect(readModeState('ultraqa', testDir)).toBeNull();
     });
 
     it('cancels a structurally valid exact named run', () => {
@@ -282,7 +287,7 @@ describe('AutopilotCancel', () => {
       expect(cancelAutopilot(testDir, sessionId)).toMatchObject({ success: false, message: 'Autopilot run changed before cancellation; retry /cancel.' });
       expect(readAutopilotState(testDir, sessionId)).toMatchObject({ active: true, originalIdea: 'replacement run' });
       expect(ralphLoop.clearRalphState).not.toHaveBeenCalled();
-      expect(ultraqaLoop.clearUltraQAState).not.toHaveBeenCalled();
+      expect(readModeState('ultraqa', testDir)).toBeNull();
     });
 
     it('does not clean linked state when the primary named mutation lock is held', () => {
@@ -299,8 +304,7 @@ describe('AutopilotCancel', () => {
       expect(cancelAutopilot(testDir, sessionId).success).toBe(false);
       expect(clearAutopilot(testDir, sessionId).success).toBe(false);
       expect(ralphLoop.clearRalphState).not.toHaveBeenCalled();
-      expect(ralphLoop.clearLinkedUltraworkState).not.toHaveBeenCalled();
-      expect(ultraqaLoop.clearUltraQAState).not.toHaveBeenCalled();
+      expect(readModeState('ultraqa', testDir)).toBeNull();
       expect(readAutopilotState(testDir, sessionId)).toMatchObject({ active: true, workflowRunId: state.workflowRunId });
     });
 
@@ -324,17 +328,16 @@ describe('AutopilotCancel', () => {
       });
       writeAutopilotState(testDir, state, sessionId);
       vi.mocked(ralphLoop.readRalphState).mockReturnValue({ active: true, linked_ultrawork: true } as any);
-      vi.mocked(ralphLoop.clearLinkedUltraworkState).mockReturnValueOnce(false);
+      vi.mocked(ralphLoop.clearRalphState).mockReturnValueOnce(false);
 
       const cancelled = cancelAutopilot(testDir, sessionId);
       expect(cancelled).toMatchObject({ success: false, preservedState: { active: false, workflowRunId: state.workflowRunId } });
-      expect(cancelled.message).toContain('ultrawork');
-      expect(ralphLoop.clearRalphState).not.toHaveBeenCalled();
+      expect(cancelled.message).toContain('ralph');
 
       const retried = cancelAutopilot(testDir, sessionId);
       expect(retried).toMatchObject({ success: true, preservedState: { active: false, workflowRunId: state.workflowRunId } });
       expect(readAutopilotState(testDir, sessionId)).toMatchObject({ active: false, workflowRunId: state.workflowRunId });
-      expect(ralphLoop.clearLinkedUltraworkState).toHaveBeenCalledTimes(2);
+      expect(ralphLoop.clearRalphState).toHaveBeenCalledTimes(2);
       expect(ralphLoop.clearRalphState).toHaveBeenCalledWith(testDir, sessionId);
     });
 
@@ -343,15 +346,13 @@ describe('AutopilotCancel', () => {
       initAutopilot(testDir, 'test idea', sessionId);
 
       vi.mocked(ralphLoop.readRalphState).mockReturnValueOnce(null as any);
-      vi.mocked(ultraqaLoop.readUltraQAState).mockReturnValueOnce(null as any);
 
       cancelAutopilot(testDir, sessionId);
 
       expect(ralphLoop.readRalphState).toHaveBeenCalledWith(testDir, sessionId);
-      expect(ultraqaLoop.readUltraQAState).toHaveBeenCalledWith(testDir, sessionId);
+      expect(readModeState('ultraqa', testDir, sessionId)).toBeNull();
       expect(ralphLoop.clearRalphState).not.toHaveBeenCalled();
-      expect(ralphLoop.clearLinkedUltraworkState).not.toHaveBeenCalled();
-      expect(ultraqaLoop.clearUltraQAState).not.toHaveBeenCalled();
+      expect(readModeState('ultraqa', testDir)).toBeNull();
     });
   });
 
@@ -389,7 +390,7 @@ describe('AutopilotCancel', () => {
       expect(ralphLoop.clearRalphState).toHaveBeenCalledWith(testDir);
     });
 
-    it('should clear ralph and linked ultrawork state when present', () => {
+    it('should ignore retired linkage metadata when clearing ralph state', () => {
       initAutopilot(testDir, 'test idea');
 
       // Mock ralph state with linked ultrawork
@@ -400,21 +401,21 @@ describe('AutopilotCancel', () => {
 
       clearAutopilot(testDir);
 
-      expect(ralphLoop.clearLinkedUltraworkState).toHaveBeenCalledWith(testDir);
       expect(ralphLoop.clearRalphState).toHaveBeenCalledWith(testDir);
     });
 
     it('should clear ultraqa state when present', () => {
       initAutopilot(testDir, 'test idea');
 
-      // Mock ultraqa state exists
-      vi.mocked(ultraqaLoop.readUltraQAState).mockReturnValueOnce({
-        active: false
-      } as any);
+      // Pre-existing retired ultraqa state (inactive) still gets cleared
+      writeFileSync(
+        join(testDir, '.omc', 'state', 'ultraqa-state.json'),
+        JSON.stringify({ active: false, cycle: 3 })
+      );
 
       clearAutopilot(testDir);
 
-      expect(ultraqaLoop.clearUltraQAState).toHaveBeenCalledWith(testDir);
+      expect(readModeState('ultraqa', testDir)).toBeNull();
     });
 
     it('should clear all states when all are present', () => {
@@ -425,15 +426,15 @@ describe('AutopilotCancel', () => {
         active: true,
         linked_ultrawork: true
       } as any);
-      vi.mocked(ultraqaLoop.readUltraQAState).mockReturnValueOnce({
-        active: true
-      } as any);
+      writeFileSync(
+        join(testDir, '.omc', 'state', 'ultraqa-state.json'),
+        JSON.stringify({ active: true, cycle: 1 })
+      );
 
       clearAutopilot(testDir);
 
-      expect(ralphLoop.clearLinkedUltraworkState).toHaveBeenCalledWith(testDir);
       expect(ralphLoop.clearRalphState).toHaveBeenCalledWith(testDir);
-      expect(ultraqaLoop.clearUltraQAState).toHaveBeenCalledWith(testDir);
+      expect(readModeState('ultraqa', testDir)).toBeNull();
 
       const state = readAutopilotState(testDir);
       expect(state).toBeNull();
@@ -444,15 +445,13 @@ describe('AutopilotCancel', () => {
       initAutopilot(testDir, 'test idea', sessionId);
 
       vi.mocked(ralphLoop.readRalphState).mockReturnValueOnce(null as any);
-      vi.mocked(ultraqaLoop.readUltraQAState).mockReturnValueOnce(null as any);
 
       clearAutopilot(testDir, sessionId);
 
       expect(ralphLoop.readRalphState).toHaveBeenCalledWith(testDir, sessionId);
-      expect(ultraqaLoop.readUltraQAState).toHaveBeenCalledWith(testDir, sessionId);
+      expect(readModeState('ultraqa', testDir, sessionId)).toBeNull();
       expect(ralphLoop.clearRalphState).not.toHaveBeenCalled();
-      expect(ralphLoop.clearLinkedUltraworkState).not.toHaveBeenCalled();
-      expect(ultraqaLoop.clearUltraQAState).not.toHaveBeenCalled();
+      expect(readModeState('ultraqa', testDir)).toBeNull();
     });
   });
 

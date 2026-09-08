@@ -6,8 +6,8 @@
  * The autopilot feature orchestrates a complete development lifecycle:
  * 1. Expansion: Analyst + Architect expand the idea into detailed requirements
  * 2. Planning: Architect creates comprehensive execution plan
- * 3. Execution: Ralph + Ultrawork implement the plan
- * 4. QA: UltraQA ensures build/lint/tests pass
+ * 3. Execution: executor agents implement the plan with Ralph persistence
+ * 4. QA: build/lint/test cycling ensures the build passes
  * 5. Validation: Multiple specialized architects verify the implementation
  */
 import type { PipelineTracking, WorkflowDescriptor } from "./pipeline-types.js";
@@ -70,8 +70,6 @@ export interface AutopilotPlanning {
 export interface AutopilotExecution {
     /** Number of ralph persistence iterations */
     ralph_iterations: number;
-    /** Whether ultrawork parallel execution is active */
-    ultrawork_active: boolean;
     /** Number of tasks completed from the plan */
     tasks_completed: number;
     /** Total number of tasks in the plan */
@@ -87,8 +85,6 @@ export interface AutopilotExecution {
  * State tracking for the QA phase
  */
 export interface AutopilotQA {
-    /** Number of UltraQA test-fix cycles performed */
-    ultraqa_cycles: number;
     /** Current build status */
     build_status: QAStatus;
     /** Current lint status */
@@ -186,7 +182,7 @@ export interface AutopilotConfig {
      * Pipeline configuration for the unified orchestrator.
      * When set, autopilot uses the pipeline orchestrator instead of the legacy
      * hard-coded phase sequence. This is the path forward for unifying
-     * autopilot/ultrawork/ultrapilot.
+     * autopilot and ultrapilot.
      *
      * @see https://github.com/Yeachan-Heo/oh-my-claudecode/issues/1130
      */

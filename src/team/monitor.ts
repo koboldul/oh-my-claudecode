@@ -33,7 +33,7 @@ import type {
   TeamSummaryPerformance,
 } from './types.js';
 import type { TeamPhase } from './phase-controller.js';
-import { normalizeTeamManifest } from './governance.js';
+import { normalizeTeamManifest, resolveMaxWorkers } from './governance.js';
 import { canonicalizeTeamConfigWorkers } from './worker-canonicalization.js';
 
 // ---------------------------------------------------------------------------
@@ -96,6 +96,9 @@ function configFromManifest(manifest: TeamManifestV2): TeamConfig {
     resize_hook_name: manifest.resize_hook_name,
     resize_hook_target: manifest.resize_hook_target,
     next_worker_index: manifest.next_worker_index,
+    resolved_routing: manifest.resolved_routing,
+    resolved_routing_roles: manifest.resolved_routing_roles,
+    external_models_defaults: manifest.external_models_defaults,
     service_descriptor: manifest.service_descriptor,
   };
 }
@@ -108,8 +111,27 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+function isOptionalExternalModelsDefaults(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecord(value)) return false;
+  const allowed = new Set(['provider', 'codexModel', 'geminiModel', 'grokModel', 'antigravityModel', 'cursorModel']);
+  if (Object.keys(value).some(key => !allowed.has(key))) return false;
+  if (value.provider !== undefined && !['codex', 'gemini', 'antigravity'].includes(value.provider as string)) return false;
+  return ['codexModel', 'geminiModel', 'grokModel', 'antigravityModel', 'cursorModel']
+    .every(key => value[key] === undefined || value[key] === '' || isNonEmptyString(value[key]));
+}
+
+function isOptionalRoutingRoles(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value)
+    && value.every(role => (CANONICAL_TEAM_ROLES as readonly string[]).includes(role as string)));
+}
+
 function isSafeCounter(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function isValidPersistedMaxWorkers(value: unknown): value is number | undefined {
+  return value === undefined || (isSafeCounter(value) && value >= 1);
 }
 
 function isTimestamp(value: unknown): value is string {
@@ -119,6 +141,7 @@ function isTimestamp(value: unknown): value is string {
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every(item => typeof item === 'string');
 }
+
 
 function isWorkerInfo(value: unknown): boolean {
   if (!isRecord(value) || typeof value.name !== 'string' || !WORKER_NAME_SAFE_PATTERN.test(value.name) || !isSafeCounter(value.index) || value.index < 1) return false;
@@ -139,6 +162,7 @@ function isWorkerInfo(value: unknown): boolean {
     && (value.replacement_generation === undefined || isSafeCounter(value.replacement_generation))
     && (value.pane_attempt_id === undefined || isNonEmptyString(value.pane_attempt_id))
     && (value.operational_state === undefined || ['starting', 'active', 'dead', 'stopped'].includes(value.operational_state as string))
+    && (value.launch_attempt_id === undefined || isNonEmptyString(value.launch_attempt_id))
     && (value.launch_descriptor === undefined || isLaunchDescriptor(value.launch_descriptor));
 }
 
@@ -163,7 +187,7 @@ function isRecoveryAttempt(value: unknown): boolean {
 }
 
 function isScaleUpAttempt(value: unknown): boolean {
-  return isRecord(value) && isNonEmptyString(value.operation_id) && ['reserved', 'effects', 'failed'].includes(value.phase as string)
+  return isRecord(value) && isNonEmptyString(value.operation_id) && ['reserved', 'effects', 'committed', 'failed'].includes(value.phase as string)
     && isSafeCounter(value.pid) && value.pid > 0 && isNonEmptyString(value.process_started_at) && isSafeCounter(value.state_revision)
     && isTimestamp(value.created_at) && isTimestamp(value.updated_at)
     && (value.failure_reason === undefined || typeof value.failure_reason === 'string');
@@ -219,7 +243,7 @@ function isTeamConfig(value: unknown, requireRevision: boolean, expectedTeamName
     || (value.task !== undefined && typeof value.task !== 'string')
     || (value.worker_launch_mode !== undefined && !['interactive', 'prompt'].includes(value.worker_launch_mode as string))
     || !isSafeCounter(value.worker_count)
-    || (value.max_workers !== undefined && !isSafeCounter(value.max_workers))
+    || !isValidPersistedMaxWorkers(value.max_workers)
     || !Array.isArray(value.workers) || value.worker_count !== value.workers.length
     || !value.workers.every(isWorkerInfo) || !hasUniqueWorkerIdentity(value.workers)
     || !isTimestamp(value.created_at) || !isNonEmptyString(value.tmux_session)
@@ -227,7 +251,9 @@ function isTeamConfig(value: unknown, requireRevision: boolean, expectedTeamName
     || !isOptionalPolicy(value.policy) || !isOptionalGovernance(value.governance)
     || !isOptionalWorkspaceShape(value) || !isOptionalPaneShape(value)
     || !isOptionalRouting(value.resolved_routing)
+    || !isOptionalRoutingRoles(value.resolved_routing_roles)
     || !isOptionalConfiguredRoutingRoles(value.configured_routing_roles)
+    || !isOptionalExternalModelsDefaults(value.external_models_defaults)
     || !isOptionalCopilotDefaults(value.copilot_defaults)) return false;
   if (requireRevision ? !isSafeCounter(value.state_revision) : value.state_revision !== undefined && !isSafeCounter(value.state_revision)) return false;
   if (!requireRevision && Object.hasOwn(value, 'state_revision')) return false;
@@ -295,13 +321,14 @@ function isOptionalRouting(value: unknown): boolean {
 }
 
 function isResolvedRoleRoute(value: unknown): value is { primary: RoleAssignment; fallback: RoleAssignment } {
-  return isRecord(value) && isRoleAssignment(value.primary) && isRoleAssignment(value.fallback);
+  return isRecord(value) && isRoleAssignment(value.primary, true) && isRoleAssignment(value.fallback);
 }
 
-function isRoleAssignment(value: unknown): value is RoleAssignment {
+function isRoleAssignment(value: unknown, allowEmptyExternalModel = false): value is RoleAssignment {
+  const provider = isRecord(value) ? value.provider as string : undefined;
   return isRecord(value)
-    && ['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity', 'copilot'].includes(value.provider as string)
-    && isNonEmptyString(value.model)
+    && ['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity', 'copilot'].includes(provider as string)
+    && (isNonEmptyString(value.model) || (allowEmptyExternalModel && provider !== 'claude' && value.model === ''))
     && (value.reasoningEffort === undefined
       || ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value.reasoningEffort as string))
     && KNOWN_AGENT_NAMES.some(agent => agent === value.agent);
@@ -314,7 +341,7 @@ function hasMatchingActiveFenceRevisions(value: Record<string, unknown>): boolea
     .every(fence => fence === undefined || (isRecord(fence) && fence.state_revision === revision));
 }
 
-function alignActiveFenceRevisions(config: TeamConfig, revision: number): TeamConfig {
+export function alignActiveFenceRevisions(config: TeamConfig, revision: number): TeamConfig {
   return {
     ...config,
     ...(config.active_recovery ? { active_recovery: { ...config.active_recovery, state_revision: revision } } : {}),
@@ -377,7 +404,7 @@ export async function readTeamConfig(teamName: string, cwd: string): Promise<Tea
     workers: [...(config.workers ?? []), ...(manifest.workers ?? [])],
     worker_count: Math.max(config.worker_count ?? 0, manifest.worker_count ?? 0),
     next_task_id: Math.max(config.next_task_id ?? 1, manifest.next_task_id ?? 1),
-    max_workers: Math.max(config.max_workers ?? 0, 20),
+    max_workers: resolveMaxWorkers(config.max_workers),
   });
 }
 
@@ -431,22 +458,193 @@ export async function migrateTeamConfigRevision(teamName: string, cwd: string): 
   });
 }
 
+
+/** Fence families protected by the CAS ownership trust boundary. */
+export type ActiveFenceFamily =
+  | 'active_scale_up'
+  | 'active_scale_down'
+  | 'active_recovery'
+  | 'shutdown_attempt'
+  | 'all_dead_recovery';
+
+export type FenceReclaimAuthorization = Partial<Record<ActiveFenceFamily, true>>;
+
+export interface SaveTeamConfigAtRevisionOptions {
+  /**
+   * Authorizes foreign-owner replacement for specific fence families after the
+   * caller has verified reclaim eligibility (e.g. dead owner). Without this,
+   * only same-owner phase transitions / revision rebases are permitted.
+   */
+  reclaim?: FenceReclaimAuthorization;
+  /**
+   * Authorizes clearing a fence. Release is never implied by numeric revision CAS alone.
+   */
+  release?: FenceReclaimAuthorization;
+}
+
+const SCALE_UP_PHASES = ['reserved', 'effects', 'committed', 'failed'] as const;
+const SCALE_DOWN_PHASES = ['draining', 'effects', 'failed'] as const;
+const RECOVERY_PHASES = ['reserved', 'requeued', 'ready', 'active', 'services_pending', 'adopted', 'failed'] as const;
+
+function phaseIndex(phases: readonly string[], phase: unknown): number {
+  return typeof phase === 'string' ? phases.indexOf(phase) : -1;
+}
+
+function sameScaleOwner(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  return a.operation_id === b.operation_id && a.pid === b.pid && a.process_started_at === b.process_started_at;
+}
+
+function sameRecoveryAttempt(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  // Stable attempt identity. owner_epoch/nonce may rebind when the runtime owner
+  // rebinds; that is not foreign recovery substitution.
+  return a.recovery_id === b.recovery_id && a.request_id === b.request_id
+    && a.worker_name === b.worker_name;
+}
+
+function sameShutdownOwner(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  return a.nonce === b.nonce && a.pid === b.pid && a.process_started_at === b.process_started_at;
+}
+
+function sameAllDead(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  // Grace deadline is the durable identity; detected_at may refresh on reload.
+  return a.deadline_at === b.deadline_at;
+}
+
+/**
+ * Trust boundary: a proposed config may only retain/replace active fences when
+ * ownership identity matches the authoritative fence and the phase transition is
+ * allowed, or when an explicit reclaim/release authorization is supplied.
+ * Revision rebasing alone must never launder foreign ownership.
+ */
+export function assertActiveFenceOwnershipTransition(
+  current: TeamConfig,
+  proposed: TeamConfig,
+  options: SaveTeamConfigAtRevisionOptions = {},
+): void {
+  const reclaim = options.reclaim ?? {};
+  const release = options.release ?? {};
+
+  const checkScaleLike = (
+    family: 'active_scale_up' | 'active_scale_down',
+    cur: (Record<string, unknown> & { phase?: string }) | undefined,
+    next: (Record<string, unknown> & { phase?: string }) | undefined,
+    phases: readonly string[],
+    preserveWorkers: boolean,
+  ): void => {
+    if (cur && !next) {
+      if (!release[family]) throw new Error('invalid_persisted_state');
+      return;
+    }
+    if (!cur && next) return; // fresh install on empty slot
+    if (cur && next) {
+      if (sameScaleOwner(cur, next)) {
+        const from = phaseIndex(phases, cur.phase);
+        const to = phaseIndex(phases, next.phase);
+        if (from < 0 || to < 0) throw new Error('invalid_persisted_state');
+        // Same-owner scale-down resume: failed → draining re-enters cleanup for the
+        // exact operation/workers. This is the only authorized backward phase move.
+        const scaleDownFailedResume = family === 'active_scale_down'
+          && cur.phase === 'failed'
+          && next.phase === 'draining';
+        if (!scaleDownFailedResume && to < from) throw new Error('invalid_persisted_state');
+        if (family === 'active_scale_up' && cur.phase === 'committed' && next.phase !== 'committed') {
+          throw new Error('invalid_persisted_state');
+        }
+        if (preserveWorkers && JSON.stringify(cur.workers) !== JSON.stringify(next.workers)) {
+          throw new Error('invalid_persisted_state');
+        }
+        return;
+      }
+      if (!reclaim[family]) throw new Error('invalid_persisted_state');
+    }
+  };
+
+  checkScaleLike(
+    'active_scale_up',
+    current.active_scale_up as (Record<string, unknown> & { phase?: string }) | undefined,
+    proposed.active_scale_up as (Record<string, unknown> & { phase?: string }) | undefined,
+    SCALE_UP_PHASES,
+    false,
+  );
+  checkScaleLike(
+    'active_scale_down',
+    current.active_scale_down as (Record<string, unknown> & { phase?: string }) | undefined,
+    proposed.active_scale_down as (Record<string, unknown> & { phase?: string }) | undefined,
+    SCALE_DOWN_PHASES,
+    true,
+  );
+
+  {
+    const cur = current.active_recovery as Record<string, unknown> | undefined;
+    const next = proposed.active_recovery as Record<string, unknown> | undefined;
+    if (cur && !next) {
+      if (!release.active_recovery) throw new Error('invalid_persisted_state');
+    } else if (cur && next) {
+      if (sameRecoveryAttempt(cur, next)) {
+        const from = phaseIndex(RECOVERY_PHASES, cur.phase);
+        const to = phaseIndex(RECOVERY_PHASES, next.phase);
+        if (from < 0 || to < 0 || to < from) throw new Error('invalid_persisted_state');
+      } else if (!reclaim.active_recovery) {
+        throw new Error('invalid_persisted_state');
+      }
+    }
+  }
+
+  {
+    const cur = current.shutdown_attempt as Record<string, unknown> | undefined;
+    const next = proposed.shutdown_attempt as Record<string, unknown> | undefined;
+    if (cur && !next) {
+      if (!release.shutdown_attempt) throw new Error('invalid_persisted_state');
+    } else if (cur && next) {
+      if (!sameShutdownOwner(cur, next) && !reclaim.shutdown_attempt) {
+        throw new Error('invalid_persisted_state');
+      }
+    }
+  }
+
+  {
+    const cur = current.all_dead_recovery as Record<string, unknown> | undefined;
+    const next = proposed.all_dead_recovery as Record<string, unknown> | undefined;
+    if (cur && !next) {
+      if (!release.all_dead_recovery) throw new Error('invalid_persisted_state');
+    } else if (cur && next) {
+      if (!sameAllDead(cur, next) && !reclaim.all_dead_recovery) {
+        throw new Error('invalid_persisted_state');
+      }
+    }
+  }
+}
+
 export async function saveTeamConfigAtRevision(
   config: TeamConfig,
   expectedRevision: number,
   cwd: string,
   afterCommit?: () => Promise<void> | void,
+  options: SaveTeamConfigAtRevisionOptions = {},
 ): Promise<boolean> {
-  if (!validateRevisionedTeamConfig(config, config.name)) throw new Error('invalid_persisted_state');
+  if (typeof config.state_revision !== 'number' || !Number.isSafeInteger(config.state_revision)) {
+    throw new Error('invalid_persisted_state');
+  }
+  // Shape-validate the proposed config with fences already carrying their intended revision
+  // numbers (callers set state_revision on fences). Do NOT align yet — alignment before
+  // ownership comparison would launder foreign fences onto a matching revision.
+  if (!validateRevisionedTeamConfig(alignActiveFenceRevisions(config, config.state_revision), config.name)) {
+    throw new Error('invalid_persisted_state');
+  }
   await assertPersistedConfigPathBinding(config.name, cwd);
   return withTeamConfigMutationLock(config.name, cwd, async () => {
-
     const current = await readRevisionedTeamConfig(config.name, cwd);
     if (!current || current.stateRevision !== expectedRevision) return false;
-    if (!validateRevisionedTeamConfig(config, config.name)) throw new Error('invalid_persisted_state');
-    await saveTeamConfigUnlocked(config, cwd);
-    const verified = await readRevisionedTeamConfig(config.name, cwd);
-    if (verified?.stateRevision !== config.state_revision) return false;
+
+    // Trust boundary: compare ownership/phase against authoritative fences BEFORE rebasing.
+    assertActiveFenceOwnershipTransition(current.config, config, options);
+
+    const locked = alignActiveFenceRevisions(config, config.state_revision!);
+    if (!validateRevisionedTeamConfig(locked, locked.name)) throw new Error('invalid_persisted_state');
+    await saveTeamConfigUnlocked(locked, cwd);
+    const verified = await readRevisionedTeamConfig(locked.name, cwd);
+    if (verified?.stateRevision !== locked.state_revision) return false;
+    Object.assign(config, locked);
     await afterCommit?.();
     return true;
   });
@@ -477,7 +675,11 @@ export async function writeWorkerStatus(
   status: WorkerStatus,
   cwd: string,
 ): Promise<void> {
-  await writeAtomic(absPath(cwd, TeamPaths.workerStatus(teamName, workerName)), JSON.stringify(status, null, 2));
+  const launchAttemptId = process.env.OMC_WORKER_LAUNCH_ATTEMPT_ID;
+  const persisted = launchAttemptId && !status.launch_attempt_id
+    ? { ...status, launch_attempt_id: launchAttemptId }
+    : status;
+  await writeAtomic(absPath(cwd, TeamPaths.workerStatus(teamName, workerName)), JSON.stringify(persisted, null, 2));
 }
 
 export async function readWorkerHeartbeat(
@@ -765,6 +967,9 @@ async function saveTeamConfigUnlocked(config: TeamConfig, cwd: string): Promise<
       resize_hook_name: config.resize_hook_name,
       resize_hook_target: config.resize_hook_target,
       next_worker_index: config.next_worker_index,
+      resolved_routing: config.resolved_routing ?? existingManifest.resolved_routing,
+      resolved_routing_roles: config.resolved_routing_roles ?? existingManifest.resolved_routing_roles,
+      external_models_defaults: config.external_models_defaults ?? existingManifest.external_models_defaults,
       policy: config.policy ?? existingManifest.policy,
       governance: config.governance ?? existingManifest.governance,
       state_revision: config.state_revision,
@@ -896,12 +1101,13 @@ export function diffSnapshots(
 // State cleanup
 // ---------------------------------------------------------------------------
 
-export async function cleanupTeamState(teamName: string, cwd: string): Promise<void> {
+export async function cleanupTeamState(teamName: string, cwd: string): Promise<boolean> {
   const root = absPath(cwd, TeamPaths.root(teamName));
   const { rm } = await import('fs/promises');
   try {
     await rm(root, { recursive: true, force: true });
+    return true;
   } catch {
-    // Ignore cleanup errors
+    return false;
   }
 }

@@ -8,6 +8,7 @@
 
 import { colors } from '../utils/formatting.js';
 import { loadConfig } from '../../config/loader.js';
+import { probeCli } from '../../team/cli-detection.js';
 import type { TeamRoleProvider } from '../../shared/types.js';
 import { detectCli } from '../../team/cli-detection.js';
 
@@ -15,7 +16,7 @@ interface ProviderProbe {
   provider: TeamRoleProvider;
   binary: string;
   found: boolean;
-  runnable: boolean;
+  runnable?: boolean;
   path?: string;
   version?: string;
   error?: string;
@@ -33,15 +34,10 @@ const PROVIDER_BINARY: Record<TeamRoleProvider, string> = {
 
 function probeProvider(provider: TeamRoleProvider): ProviderProbe {
   const binary = PROVIDER_BINARY[provider];
-  const detected = detectCli(binary);
   return {
     provider,
     binary,
-    found: detected.available,
-    runnable: detected.runnable,
-    ...(detected.path ? { path: detected.path.split(/\r?\n/)[0] } : {}),
-    ...(detected.version ? { version: detected.version.split(/\r?\n/)[0] } : {}),
-    ...(detected.error ? { error: detected.error } : {}),
+    ...probeCli(binary),
   };
 }
 
@@ -87,24 +83,34 @@ export async function doctorTeamRoutingCommand(options: { json?: boolean }): Pro
       ),
     );
   } else {
+    const claudeFound = probes.some((probe) => probe.provider === 'claude' && probe.found);
     console.log(colors.bold('Team role routing — provider CLI probe'));
     for (const p of probes) {
-      if (p.runnable) {
-        const version = p.version ? ` (${p.version})` : '';
-        console.log(`  ${colors.green('✓')} ${p.provider}: ${p.path}${version}`);
-      } else if (p.found) {
-        const detail = p.error ? `: ${p.error}` : '';
-        console.log(`  ${colors.yellow('⚠')} ${p.provider}: resolved at ${p.path}, but the version probe failed${detail} — fix the provider before routing /team tasks to it`);
+      if (p.found) {
+        const resolvedPath = p.path ? `: ${p.path}` : '';
+        const version = p.version ? ` (${p.version})` : p.error ? ' (version unavailable)' : '';
+        console.log(`  ${colors.green('✓')} ${p.provider}${resolvedPath}${version}`);
       } else {
-        console.log(`  ${colors.yellow('⚠')} ${p.provider}: not found on PATH — /team tasks routed to it cannot start`);
+        const fallback = p.provider === 'claude'
+          ? 'orchestrator/fallback unavailable'
+          : claudeFound
+            ? `/team tasks routed to ${p.provider} can fall back to Claude`
+            : 'no available Claude fallback';
+        console.log(`  ${colors.yellow('⚠')} ${p.provider}: not found on PATH — ${fallback}`);
       }
     }
-    if (unusable.length === 0) {
-      console.log(colors.green('\nAll configured providers are available and runnable.'));
+    if (missing.length === 0) {
+      console.log(colors.green('\nAll configured providers are available.'));
+    } else if (!claudeFound) {
+      console.log(
+        colors.yellow(
+          `\n${missing.length} provider${missing.length === 1 ? '' : 's'} missing (warn only — no available Claude fallback; orchestrator/fallback unavailable).`,
+        ),
+      );
     } else {
       console.log(
         colors.yellow(
-          `\n${unusable.length} provider${unusable.length === 1 ? '' : 's'} unavailable or failed its version probe; affected /team routes are not ready.`,
+          `\n${missing.length} provider${missing.length === 1 ? '' : 's'} missing (warn only — /team can fall back to Claude).`,
         ),
       );
     }
