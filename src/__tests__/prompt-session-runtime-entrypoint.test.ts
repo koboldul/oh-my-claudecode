@@ -255,7 +255,11 @@ function stagePlugin(runtime: 'valid' | 'missing' = 'valid'): StagedPlugin {
 function makeWorktree(label: string): string {
   const root = mkdtempSync(join(tmpdir(), `omc-prompt-session-${label}-`));
   tempRoots.push(root);
-  mkdirSync(join(root, '.git'));
+  execFileSync('git', ['init', '--quiet'], {
+    cwd: root,
+    stdio: 'pipe',
+    windowsHide: true,
+  });
   return root;
 }
 

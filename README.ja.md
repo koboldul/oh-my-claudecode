@@ -79,12 +79,12 @@ Team はステージ型パイプラインで実行されます:
 
 ### tmux CLI ワーカー — Codex & Gemini (v4.4.0+)
 
-**v4.4.0 で Codex/Gemini MCP サーバー**（`x`、`g` プロバイダー）が**削除されます**。代わりに `/omc-teams` を使って tmux 分割ペインで実際の CLI プロセスを起動してください:
+**v4.4.0 で Codex/Gemini MCP サーバー**（`x`、`g` プロバイダー）が**削除されます**。代わりに `omc team` を使って tmux 分割ペインで実際の CLI プロセスを起動してください:
 
 ```bash
-/omc-teams 2:codex   "review auth module for security issues"
-/omc-teams 2:gemini  "redesign UI components for accessibility"
-/omc-teams 1:claude  "implement the payment flow"
+omc team 2:codex   "review auth module for security issues"
+omc team 2:gemini  "redesign UI components for accessibility"
+omc team 1:claude  "implement the payment flow"
 ```
 
 Codex と Gemini の助言を一緒に確認するには、`/ask codex` と `/ask gemini` を使い、Claude に結果を統合させます:
@@ -96,9 +96,9 @@ Codex と Gemini の助言を一緒に確認するには、`/ask codex` と `/as
 
 | スキル | ワーカー | 最適用途 |
 |-------|---------|----------|
-| `/omc-teams N:codex` | N 個の Codex CLI ペイン | コードレビュー、セキュリティ解析、アーキテクチャ |
-| `/omc-teams N:gemini` | N 個の Gemini CLI ペイン | UI/UX デザイン、ドキュメント、大規模コンテキスト |
-| `/omc-teams N:claude` | N 個の Claude CLI ペイン | tmux で Claude CLI を使う汎用タスク |
+| `omc team N:codex` | N 個の Codex CLI ペイン | コードレビュー、セキュリティ解析、アーキテクチャ |
+| `omc team N:gemini` | N 個の Gemini CLI ペイン | UI/UX デザイン、ドキュメント、大規模コンテキスト |
+| `omc team N:claude` | N 個の Claude CLI ペイン | tmux で Claude CLI を使う汎用タスク |
 
 ワーカーはオンデマンドで起動し、タスク完了後に終了します — アイドルリソースの無駄なし。`codex` / `gemini` CLI のインストールとアクティブな tmux セッションが必要です。
 
@@ -215,7 +215,6 @@ server.py:42 のハンドラーを try/except ClientDisconnectedError で囲ん�
 | キーワード | 効果 | 例 |
 |---------|-----|-----|
 | `team` | 標準 Team オーケストレーション | `/team 3:executor "fix all TypeScript errors"` |
-| `omc-teams` | tmux CLI ワーカー (codex/gemini/claude) | `/omc-teams 2:codex "security review"` |
 | `autopilot` | 完全自律実行 | `autopilot: build a todo app` |
 | `ralph` | 粘り強いモード | `ralph: refactor auth` |
 | `plan` | 計画インタビュー | `plan the API` |

@@ -315,6 +315,80 @@ describe('scaleUp launch config', () => {
     );
   });
 
+  it('passes the persisted routed Copilot reasoning effort instead of current process defaults', async () => {
+    const previousReasoningEffort = process.env.OMC_COPILOT_REASONING_EFFORT;
+    process.env.OMC_COPILOT_REASONING_EFFORT = 'low';
+    modelContractMocks.buildWorkerArgv.mockImplementation(
+      (_agentType: CliAgentType, launchConfig: { model?: string; reasoningEffort?: string }) => [
+        '/usr/bin/copilot',
+        '--model',
+        launchConfig.model ?? 'gpt-5.6-sol',
+        '--effort',
+        launchConfig.reasoningEffort
+          ?? process.env.OMC_COPILOT_REASONING_EFFORT
+          ?? 'max',
+      ],
+    );
+    config = makeConfig({
+      resolved_routing: {
+        executor: {
+          primary: {
+            provider: 'copilot',
+            model: 'gpt-5.6-sol',
+            reasoningEffort: 'high',
+            agent: 'executor',
+          },
+          fallback: {
+            provider: 'claude',
+            model: 'claude-sonnet-5',
+            agent: 'executor',
+          },
+        },
+      } as TeamConfig['resolved_routing'],
+      resolved_routing_roles: ['executor'],
+    });
+
+    try {
+      const result = await scaleUp(
+        'demo-team',
+        1,
+        'codex',
+        [{
+          subject: 'implement the executor task',
+          description: 'write code',
+          owner: 'worker-1',
+          role: 'executor',
+        }],
+        cwd,
+        { OMC_TEAM_SCALING_ENABLED: '1' } as NodeJS.ProcessEnv,
+      );
+
+      expect(result).toMatchObject({ ok: true });
+      expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith(
+        'copilot',
+        expect.objectContaining({
+          model: 'gpt-5.6-sol',
+          reasoningEffort: 'high',
+        }),
+      );
+      expect(
+        (result as Extract<typeof result, { ok: true }>).addedWorkers[0]
+          ?.launch_descriptor?.args,
+      ).toEqual([
+        '--model',
+        'gpt-5.6-sol',
+        '--effort',
+        'high',
+      ]);
+    } finally {
+      if (previousReasoningEffort === undefined) {
+        delete process.env.OMC_COPILOT_REASONING_EFFORT;
+      } else {
+        process.env.OMC_COPILOT_REASONING_EFFORT = previousReasoningEffort;
+      }
+    }
+  });
+
   it('preserves Claude model environment when external defaults are empty', async () => {
     modelContractMocks.resolveDefaultWorkerModel.mockReturnValue('claude-env-model');
     modelContractMocks.buildWorkerArgv.mockReturnValue(['/usr/bin/claude', '--model', 'claude-env-model']);

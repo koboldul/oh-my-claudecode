@@ -89,7 +89,7 @@ omc team status auth-review
 omc team shutdown auth-review
 ```
 
-`/omc-teams`는 레거시 호환 스킬로 유지되며, 현재는 내부적으로 `omc team ...`으로 라우팅됩니다.
+`omc-teams`는 v5에서 제거되었고 더 이상 별칭으로 제공되지 않습니다. CLI 워커에는 `omc team ...`을 사용하세요.
 
 Codex와 Gemini의 조언을 함께 검토하려면 `/ask codex`와 `/ask gemini`를 사용하고 Claude가 결과를 통합하도록 하세요:
 
@@ -230,7 +230,7 @@ server.py:42의 핸들러를 try/except ClientDisconnectedError로 감싸세요.
 
 **참고:**
 - **병렬 작업은 Team 또는 executor 위임을 사용하세요:** 여러 작업을 조율하려면 `/team`을 사용하고, 단일 구현 작업은 executor에게 위임하세요. 완전한 검증까지 지속해야 할 때는 Ralph를 사용합니다.
-- `/omc-teams`는 레거시 호환 경로로 남아 있으며 내부적으로 `omc team ...`으로 라우팅됩니다.
+- `omc-teams`는 v5에서 제거되었고 더 이상 별칭으로 제공되지 않습니다. CLI 워커에는 `omc team ...`을 사용하세요.
 - `swarm N agents` 구문은 에이전트 수 추출을 위해 여전히 인식되지만, v4.1.7+에서 런타임은 Team 기반입니다.
 
 ---

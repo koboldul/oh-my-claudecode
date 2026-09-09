@@ -79,12 +79,12 @@ Habilita los equipos nativos de Claude Code en `~/.claude/settings.json`:
 
 ### Trabajadores CLI tmux — Codex & Gemini (v4.4.0+)
 
-**v4.4.0 elimina los servidores MCP de Codex/Gemini** (proveedores `x`, `g`). Usa `/omc-teams` para lanzar procesos CLI reales en paneles divididos de tmux:
+**v4.4.0 elimina los servidores MCP de Codex/Gemini** (proveedores `x`, `g`). Usa `omc team` para lanzar procesos CLI reales en paneles divididos de tmux:
 
 ```bash
-/omc-teams 2:codex   "review auth module for security issues"
-/omc-teams 2:gemini  "redesign UI components for accessibility"
-/omc-teams 1:claude  "implement the payment flow"
+omc team 2:codex   "review auth module for security issues"
+omc team 2:gemini  "redesign UI components for accessibility"
+omc team 1:claude  "implement the payment flow"
 ```
 
 Para trabajo mixto de Codex + Gemini en un solo comando, usa la habilidad **`/ccg`**:
@@ -95,9 +95,9 @@ Para trabajo mixto de Codex + Gemini en un solo comando, usa la habilidad **`/cc
 
 | Habilidad | Trabajadores | Mejor Para |
 |-------|---------|----------|
-| `/omc-teams N:codex` | N paneles Codex CLI | Revisión de código, análisis de seguridad, arquitectura |
-| `/omc-teams N:gemini` | N paneles Gemini CLI | Diseño UI/UX, docs, tareas de gran contexto |
-| `/omc-teams N:claude` | N paneles Claude CLI | Tareas generales via Claude CLI en tmux |
+| `omc team N:codex` | N paneles Codex CLI | Revisión de código, análisis de seguridad, arquitectura |
+| `omc team N:gemini` | N paneles Gemini CLI | Diseño UI/UX, docs, tareas de gran contexto |
+| `omc team N:claude` | N paneles Claude CLI | Tareas generales via Claude CLI en tmux |
 | `/ccg` | 1 Codex + 1 Gemini | Orquestación tri-modelo en paralelo |
 
 Los trabajadores se inician bajo demanda y terminan cuando su tarea se completa — sin uso de recursos en espera. Requiere las CLIs `codex` / `gemini` instaladas y una sesión tmux activa.
@@ -208,7 +208,6 @@ Atajos opcionales para usuarios avanzados. El lenguaje natural funciona bien sin
 | Palabra Clave | Efecto | Ejemplo |
 |---------|--------|---------|
 | `team` | Orquestación canónica con Team | `/team 3:executor "fix all TypeScript errors"` |
-| `omc-teams` | Trabajadores CLI tmux (codex/gemini/claude) | `/omc-teams 2:codex "security review"` |
 | `ccg` | Orquestación tri-modelo Codex+Gemini | `/ccg review this PR` |
 | `autopilot` | Ejecución completamente autónoma | `autopilot: build a todo app` |
 | `ralph` | Modo persistencia | `ralph: refactor auth` |

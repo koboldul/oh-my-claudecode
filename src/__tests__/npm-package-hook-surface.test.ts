@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
@@ -16,7 +17,29 @@ import {
   type PluginJson,
 } from './npm-package-surface-helpers.js';
 
+const COMMITTED_HOOK_ENTRYPOINTS = [
+  'context-guard-stop.mjs',
+  'session-end.mjs',
+  'wiki-session-end.mjs',
+] as const;
+
 describe('npm package hook surface regression', () => {
+  it.each(COMMITTED_HOOK_ENTRYPOINTS)(
+    'keeps the committed %s entrypoint valid Node syntax',
+    (entrypoint) => {
+      const result = spawnSync(
+        process.execPath,
+        ['--check', join(PACKAGE_ROOT, 'scripts', entrypoint)],
+        {
+          encoding: 'utf-8',
+          windowsHide: true,
+        },
+      );
+
+      expect(result.status, result.stderr || result.error?.message).toBe(0);
+    },
+  );
+
   it('builds generated hook runtimes for packaging without mutating ordinary test entrypoints', () => {
     const packageJson = JSON.parse(
       readFileSync(join(PACKAGE_ROOT, 'package.json'), 'utf-8'),

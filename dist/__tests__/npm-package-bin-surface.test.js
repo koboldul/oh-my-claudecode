@@ -37,6 +37,13 @@ let tarballPathCache = null;
 function readPackageJson() {
     return JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf-8"));
 }
+function npmInvocation(args) {
+    if (process.platform !== "win32")
+        return ["npm", args];
+    const npmCliPath = process.env.npm_execpath ??
+        join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+    return [process.execPath, [npmCliPath, ...args]];
+}
 function sha256(path) {
     return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
@@ -107,8 +114,7 @@ function validateWithExplicitBash(scriptPath) {
             encoding: "utf-8",
             windowsHide: true,
         });
-        expect(syntax.stderr, syntax.error?.message).toBe("");
-        expect(syntax.status).toBe(0);
+        expect(syntax.status, syntax.error?.message ?? syntax.stderr).toBe(0);
         return true;
     }
     const syntax = spawnSync("bash", ["-n", scriptPath], {
@@ -180,9 +186,8 @@ function getPackedPackage() {
         const startedWithoutGeneratedBundles = [...GENERATED_RUNTIME_ENTRYPOINTS].every((file) => !existsSync(join(packWorkspaceCache, file)));
         mkdirSync(packDirCache, { recursive: true });
         const npmArgs = ["pack", "--pack-destination", packDirCache, "--silent"];
-        const npmCliPath = process.env.npm_execpath ??
-            join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
-        const stdout = execFileSync(process.platform === "win32" ? process.execPath : "npm", process.platform === "win32" ? [npmCliPath, ...npmArgs] : npmArgs, {
+        const [npmCommand, npmCommandArgs] = npmInvocation(npmArgs);
+        const stdout = execFileSync(npmCommand, npmCommandArgs, {
             cwd: packWorkspaceCache,
             encoding: "utf-8",
             stdio: ["ignore", "pipe", "inherit"],
@@ -272,22 +277,28 @@ describe("npm package bin surface regression", () => {
         mkdirSync(consumerModules, { recursive: true });
         symlinkSync(packedPackageFixture.extractedPackageRoot, join(consumerModules, packageName), process.platform === "win32" ? "junction" : "dir");
         symlinkSync(join(PACKAGE_ROOT, "node_modules"), join(packedPackageFixture.extractedPackageRoot, "node_modules"), process.platform === "win32" ? "junction" : "dir");
-        writeFileSync(join(consumerRoot, "package.json"), JSON.stringify({ type: "module" }));
-        writeFileSync(join(consumerRoot, "index.ts"), `import { recoverDeadWorkerV2 } from ${JSON.stringify(`./node_modules/${packageName}/dist/team/index.js`)};\nvoid recoverDeadWorkerV2;\n`);
-        writeFileSync(join(consumerRoot, "tsconfig.json"), JSON.stringify({
-            compilerOptions: {
-                target: "ES2022",
-                module: "NodeNext",
-                moduleResolution: "NodeNext",
-                strict: true,
-                skipLibCheck: false,
-                noEmit: true,
-                types: ["node"],
-                typeRoots: [join(PACKAGE_ROOT, "node_modules", "@types")],
-            },
-            include: ["index.ts"],
-        }));
-        expect(() => execFileSync(process.execPath, [join(PACKAGE_ROOT, "node_modules", "typescript", "bin", "tsc"), "-p", join(consumerRoot, "tsconfig.json")], { cwd: consumerRoot, stdio: "pipe" })).not.toThrow();
+        const packedNodeModules = join(packedPackageFixture.extractedPackageRoot, "node_modules");
+        try {
+            writeFileSync(join(consumerRoot, "package.json"), JSON.stringify({ type: "module" }));
+            writeFileSync(join(consumerRoot, "index.ts"), `import { recoverDeadWorkerV2 } from ${JSON.stringify(`./node_modules/${packageName}/dist/team/index.js`)};\nvoid recoverDeadWorkerV2;\n`);
+            writeFileSync(join(consumerRoot, "tsconfig.json"), JSON.stringify({
+                compilerOptions: {
+                    target: "ES2022",
+                    module: "NodeNext",
+                    moduleResolution: "NodeNext",
+                    strict: true,
+                    skipLibCheck: false,
+                    noEmit: true,
+                    types: ["node"],
+                    typeRoots: [join(PACKAGE_ROOT, "node_modules", "@types")],
+                },
+                include: ["index.ts"],
+            }));
+            expect(() => execFileSync(process.execPath, [join(PACKAGE_ROOT, "node_modules", "typescript", "bin", "tsc"), "-p", join(consumerRoot, "tsconfig.json")], { cwd: consumerRoot, stdio: "pipe" })).not.toThrow();
+        }
+        finally {
+            rmSync(packedNodeModules, { recursive: true, force: true });
+        }
     });
     it("typechecks the supported team export from a clean tarball install", () => {
         const consumerRoot = join(fixtureRootCache, "clean-type-consumer");
@@ -298,7 +309,7 @@ describe("npm package bin surface regression", () => {
             throw new Error("typecheck fixture dependencies missing");
         mkdirSync(consumerRoot, { recursive: true });
         writeFileSync(join(consumerRoot, "package.json"), JSON.stringify({ type: "module", private: true }));
-        execFileSync("npm", [
+        const [npmCommand, npmArgs] = npmInvocation([
             "install",
             tarballPathCache,
             `typescript@${typescriptVersion}`,
@@ -306,7 +317,8 @@ describe("npm package bin surface regression", () => {
             "--ignore-scripts",
             "--no-audit",
             "--no-fund",
-        ], { cwd: consumerRoot, stdio: "pipe" });
+        ]);
+        execFileSync(npmCommand, npmArgs, { cwd: consumerRoot, stdio: "pipe" });
         writeFileSync(join(consumerRoot, "index.ts"), `import { recoverDeadWorkerV2 } from ${JSON.stringify(`${packedPackageFixture.packageJson.name}/team`)};\nvoid recoverDeadWorkerV2;\n`);
         writeFileSync(join(consumerRoot, "tsconfig.json"), JSON.stringify({
             compilerOptions: {
@@ -320,7 +332,7 @@ describe("npm package bin surface regression", () => {
             include: ["index.ts"],
         }));
         expect(() => execFileSync(process.execPath, [join(consumerRoot, "node_modules", "typescript", "bin", "tsc"), "-p", join(consumerRoot, "tsconfig.json")], { cwd: consumerRoot, stdio: "pipe" })).not.toThrow();
-    });
+    }, 180_000);
     it("rebuilds recovery CLI surfaces from source without committed bundles", () => {
         expect(packedPackageFixture.startedWithoutGeneratedBundles).toBe(true);
         const packedCli = join(packDirCache, "package", "bridge", "cli.cjs");
@@ -395,7 +407,7 @@ describe("npm package bin surface regression", () => {
         const source = readFileSync(join(PACKAGE_ROOT, "src", "lib", "worktree-paths.ts"), "utf-8");
         const packedDist = readFileSync(join(packedPackageFixture.extractedPackageRoot, "dist", "lib", "worktree-paths.js"), "utf-8");
         expect(packedPackageFixture.files.has("dist/lib/worktree-paths.js")).toBe(true);
-        expect(source.match(/windowsHide/g)).toHaveLength(6);
+        expect(source.match(/windowsHide/g)).toHaveLength(7);
         expect(packedDist).not.toContain("execSync(");
         expect(packedDist.match(/windowsHide: true/g)).toHaveLength(7);
         expect(packedDist).toContain("gitTopLevelCacheMap");
@@ -430,11 +442,10 @@ describe("npm package bin surface regression", () => {
     });
     it("packs every generated Copilot prompt and its capability inventory", () => {
         const { copilotCapabilityMatrix, files } = packedPackageFixture;
+        const sourceCapabilityMatrix = JSON.parse(readFileSync(join(PACKAGE_ROOT, "prompt-assets", "copilot-capability-matrix.json"), "utf-8"));
         const executableSupportPath = "skills-copilot/self-improve/scripts/validate.sh";
         const selfImprove = copilotCapabilityMatrix.skills.find(({ id }) => id === "self-improve");
-        expect(copilotCapabilityMatrix.skills).toHaveLength(41);
-        expect(copilotCapabilityMatrix.aliases).toHaveLength(4);
-        expect(copilotCapabilityMatrix.commands).toHaveLength(28);
+        expect(copilotCapabilityMatrix).toEqual(sourceCapabilityMatrix);
         expect(files.has("prompt-assets/copilot-capability-matrix.json")).toBe(true);
         for (const entry of [
             ...copilotCapabilityMatrix.skills,

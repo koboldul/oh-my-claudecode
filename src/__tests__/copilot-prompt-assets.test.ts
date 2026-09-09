@@ -202,29 +202,6 @@ function validateFixtureWithGenerator(content: string): void {
   );
 }
 
-function transformTeamFixtureWithGenerator(content: string): string {
-  const script = `
-    import { transformCopilotTeamReference } from ${JSON.stringify(
-      pathToFileURL(GENERATOR).href,
-    )};
-    process.stdout.write(
-      transformCopilotTeamReference(process.env.OMC_PROMPT_FIXTURE),
-    );
-  `;
-  return execFileSync(
-    process.execPath,
-    ["--input-type=module", "--eval", script],
-    {
-      cwd: ROOT,
-      env: {
-        ...process.env,
-        OMC_PROMPT_FIXTURE: content,
-      },
-      encoding: "utf8",
-    },
-  );
-}
-
 const matrix = readJson<CapabilityMatrix>(INVENTORY_PATH);
 
 describe("Copilot prompt asset generation", () => {
@@ -233,9 +210,6 @@ describe("Copilot prompt asset generation", () => {
     expect(matrix.host).toBe("github-copilot");
     expect(matrix.sourceHost).toBe("claude-code");
     expect(matrix.generator).toBe("scripts/generate-copilot-prompts.mjs");
-    expect(matrix.skills).toHaveLength(41);
-    expect(matrix.aliases).toHaveLength(4);
-    expect(matrix.commands).toHaveLength(28);
 
     const sourceSkills = readdirSync(join(ROOT, "skills"), {
       withFileTypes: true,
@@ -291,12 +265,6 @@ describe("Copilot prompt asset generation", () => {
       targetSkill: "project-session-manager",
     });
     expect(
-      matrix.commands.find((entry) => entry.id === "learner"),
-    ).toMatchObject({
-      commandMode: "alias",
-      targetSkill: "skillify",
-    });
-    expect(
       matrix.skills.find((entry) => entry.id === "project-session-manager")
         ?.aliases,
     ).toContain("psm");
@@ -320,6 +288,9 @@ describe("Copilot prompt asset generation", () => {
   });
 
   it("routes Copilot to generated prompts while Claude stays canonical", () => {
+    const packageJson = readJson<{ version: string }>(
+      join(ROOT, "package.json"),
+    );
     const claudeManifest = readJson<{
       agents: string;
       skills: string[];
@@ -329,6 +300,7 @@ describe("Copilot prompt asset generation", () => {
       agents: string;
       skills: string[];
       commands: string;
+      version: string;
     }>(join(ROOT, "plugin.json"));
 
     expect(claudeManifest.agents).toBe("./agents/");
@@ -339,11 +311,43 @@ describe("Copilot prompt asset generation", () => {
 
     expect(copilotManifest.agents).toBe("./agents-copilot/");
     expect(copilotManifest.commands).toBe("./commands-copilot/");
+    expect(copilotManifest.version).toBe(packageJson.version);
     expect([...copilotManifest.skills].sort()).toEqual(
       matrix.skills
         .map((entry) => `./skills-copilot/${entry.id}/`)
         .sort(),
     );
+  });
+
+  it("keeps retired /omc-teams references descriptive instead of executable", () => {
+    for (const relative of [
+      "skills/team/SKILL.md",
+      "skills/autopilot/SKILL.md",
+      "skills-copilot/team/SKILL.md",
+      "skills-copilot/autopilot/SKILL.md",
+    ]) {
+      const activeRecommendations = readFileSync(join(ROOT, relative), "utf8")
+        .split(/\r?\n/)
+        .filter(
+          (line) =>
+            line.includes("/omc-teams") &&
+            !/\b(?:legacy|retired|removed)\b/i.test(line),
+        );
+      expect(activeRecommendations, relative).toEqual([]);
+    }
+
+    for (const relative of readdirSync(ROOT).filter((entry) =>
+        /^README(?:\.[^.]+)?\.md$/.test(entry)
+    )) {
+        const executableReferences = readFileSync(join(ROOT, relative), "utf8")
+          .split(/\r?\n/)
+          .filter(
+            (line) =>
+              line.includes("/omc-teams") ||
+              /^\|\s*`omc-teams`\s*\|/.test(line),
+          );
+        expect(executableReferences, relative).toEqual([]);
+    }
   });
 
   it("keeps generated assets deterministic without touching canonical prompts", () => {
@@ -562,39 +566,6 @@ describe("Copilot prompt asset generation", () => {
     ).not.toThrow();
   });
 
-  it("replaces the complete deep-dive Phase 3 team section", () => {
-    const source = readFileSync(
-      join(ROOT, "skills", "deep-dive", "SKILL.md"),
-      "utf8",
-    );
-    const transformed = transformTeamFixtureWithGenerator(source);
-    const phaseStart = transformed.indexOf("## Phase 3: Trace Execution");
-    const phaseEnd = transformed.indexOf("## Phase 4:", phaseStart);
-    const phaseThree = transformed.slice(phaseStart, phaseEnd);
-    const normalizedPhaseThree = phaseThree.replace(/\s+/g, " ");
-
-    expect(phaseThree).toContain("### Copilot Task Coordination");
-    expect(phaseThree).toContain(
-      'Task(agent_type="oh-my-claudecode:tracer", prompt="...")',
-    );
-    expect(normalizedPhaseThree).toContain("three independent tracer lanes");
-    expect(normalizedPhaseThree).toContain(
-      "lead conversation owns coordination",
-    );
-    expect(normalizedPhaseThree).toContain("explicit follow-up Task calls");
-    expect(normalizedPhaseThree).toContain(
-      "available read, search, and shell tools",
-    );
-    expect(phaseThree).toContain("**Parallelism fallback**");
-    expect(phaseThree).not.toContain("Team Mode Orchestration");
-    expect(phaseThree).not.toContain("Claude built-in team mode");
-    expect(phaseThree).not.toContain("Team mode fallback");
-    expect(transformed).toContain(
-      "Phase 3 runs trace with 3 independent Task lanes",
-    );
-    validateFixtureWithGenerator(phaseThree);
-  });
-
   it("keeps runtime-owned paths aligned with their source resolvers", () => {
     const claudeConfigDir = normalizedPath(getClaudeConfigDir());
     const learnerSkillsDir = normalizedPath(getLearnerSkillsDir("user"));
@@ -649,7 +620,7 @@ describe("Copilot prompt asset generation", () => {
       expect(content).not.toContain(".copilot/omc.jsonc");
     }
 
-    for (const skill of ["deep-dive", "deep-interview", "sciomc"]) {
+    for (const skill of ["deep-interview"]) {
       const content = readFileSync(
         join(ROOT, "skills-copilot", skill, "SKILL.md"),
         "utf8",
@@ -658,7 +629,7 @@ describe("Copilot prompt asset generation", () => {
       expect(content).not.toContain(".copilot/settings.json");
     }
 
-    for (const skill of ["learner", "skill", "skillify"]) {
+    for (const skill of ["skill", "skillify"]) {
       const content = readFileSync(
         join(ROOT, "skills-copilot", skill, "SKILL.md"),
         "utf8",

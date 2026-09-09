@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-#!/usr/bin/env node
 import { runSessionEndEntrypoint } from './lib/session-end-runner.mjs';
 import { isMainThread } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';

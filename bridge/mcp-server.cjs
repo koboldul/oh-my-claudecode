@@ -23137,15 +23137,28 @@ function validateWorkingDirectory(workingDirectory) {
   return resolvedReal;
 }
 function resolveStateWorkingDirectory(workingDirectory) {
-  const currentProbe = probeGitTopLevel(process.cwd());
+  const currentContext = getProcessCwdValidationContext();
+  const currentProbe = probeGitTopLevel(currentContext.cwd);
   if (currentProbe.status === "probe_failed" || currentProbe.status === "git_missing") {
-    throw new Error(formatGitProbeFailedMessage(process.cwd()));
+    throw new Error(formatGitProbeFailedMessage(currentContext.cwd));
   }
   if (currentProbe.status === "ok") {
     if (!workingDirectory) return validateWorkingDirectoryOrLinkedWorktree();
     return validateWorkingDirectoryOrLinkedWorktree(workingDirectory);
   }
   if (!workingDirectory) return process.cwd();
+  if (currentContext.pluginRuntime) {
+    const validated2 = validateWorkingDirectory(workingDirectory);
+    const requestedRoot = getGitTopLevel((0, import_path12.resolve)(workingDirectory));
+    if (requestedRoot && canonicalizeForCompare(requestedRoot) !== canonicalizeForCompare(validated2)) {
+      throw new ForeignWorkingDirectoryError(
+        canonicalizePathForRuntime(requestedRoot),
+        canonicalizePathForRuntime(validated2),
+        workingDirectory
+      );
+    }
+    return validated2;
+  }
   validateWorkingDirectoryOrLinkedWorktree(workingDirectory);
   const validated = validateWorkingDirectory(workingDirectory);
   return validated;

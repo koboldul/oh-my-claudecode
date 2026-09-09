@@ -8,7 +8,7 @@ level: 4
 
 # Team Skill
 
-Spawn N coordinated agents working on a shared task list using Claude Code's implicit agent team. Claude Code 2.1.178+ removed native `TeamCreate`/`TeamDelete`; with `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, each session has one implicit team and teammates are spawned directly with the Agent/Task tool using distinct `name` values. This skill still preserves OMC's legacy tmux/CLI worker orchestration where documented (`omc team` / `/omc-teams`).
+Spawn N coordinated agents working on a shared task list using Claude Code's implicit agent team. Claude Code 2.1.178+ removed native `TeamCreate`/`TeamDelete`; with `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, each session has one implicit team and teammates are spawned directly with the Agent/Task tool using distinct `name` values. This skill still preserves OMC's legacy tmux/CLI worker orchestration where documented (`omc team`).
 
 The `swarm` compatibility alias was removed in #1131.
 
@@ -46,8 +46,8 @@ The `swarm` compatibility alias was removed in #1131.
 # Mixed: Codex for backend analysis, Gemini/Antigravity for frontend (delegate per-task with /oh-my-claudecode:ask)
 ```
 
-**External routing rule:** `N:copilot` MUST invoke `omc team N:copilot "<task>"` (or the
-equivalent `/omc-teams` surface). Never pass `copilot` as an Agent/Task `subagent_type`;
+**External routing rule:** `N:copilot` MUST invoke `omc team N:copilot "<task>"`.
+Never pass `copilot` as an Agent/Task `subagent_type`;
 no native Copilot teammate type exists.
 
 ## Architecture

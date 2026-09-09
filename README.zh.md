@@ -79,12 +79,12 @@ Team 按阶段化流水线运行：
 
 ### tmux CLI 工作者 — Codex & Gemini (v4.4.0+)
 
-**v4.4.0 移除了 Codex/Gemini MCP 服务器**（`x`、`g` 提供商）。请改用 `/omc-teams` 在 tmux 分屏中启动真实的 CLI 进程：
+**v4.4.0 移除了 Codex/Gemini MCP 服务器**（`x`、`g` 提供商）。请改用 `omc team` 在 tmux 分屏中启动真实的 CLI 进程：
 
 ```bash
-/omc-teams 2:codex   "review auth module for security issues"
-/omc-teams 2:gemini  "redesign UI components for accessibility"
-/omc-teams 1:claude  "implement the payment flow"
+omc team 2:codex   "review auth module for security issues"
+omc team 2:gemini  "redesign UI components for accessibility"
+omc team 1:claude  "implement the payment flow"
 ```
 
 如需同时参考 Codex 和 Gemini 的建议，请使用 `/ask codex` 和 `/ask gemini`，再由 Claude 汇总结果：
@@ -96,9 +96,9 @@ Team 按阶段化流水线运行：
 
 | 技能 | 工作者 | 最适合 |
 |-------|---------|----------|
-| `/omc-teams N:codex` | N 个 Codex CLI 窗格 | 代码审查、安全分析、架构 |
-| `/omc-teams N:gemini` | N 个 Gemini CLI 窗格 | UI/UX 设计、文档、大上下文任务 |
-| `/omc-teams N:claude` | N 个 Claude CLI 窗格 | 通过 tmux 中的 Claude CLI 处理通用任务 |
+| `omc team N:codex` | N 个 Codex CLI 窗格 | 代码审查、安全分析、架构 |
+| `omc team N:gemini` | N 个 Gemini CLI 窗格 | UI/UX 设计、文档、大上下文任务 |
+| `omc team N:claude` | N 个 Claude CLI 窗格 | 通过 tmux 中的 Claude CLI 处理通用任务 |
 
 工作者按需生成，任务完成后自动退出 — 无空闲资源浪费。需要安装 `codex` / `gemini` CLI 并有活跃的 tmux 会话。
 
@@ -215,7 +215,6 @@ source: extracted
 | 关键词 | 效果 | 示例 |
 |---------|--------|---------|
 | `team` | 标准 Team 编排 | `/team 3:executor "fix all TypeScript errors"` |
-| `omc-teams` | tmux CLI 工作者 (codex/gemini/claude) | `/omc-teams 2:codex "security review"` |
 | `autopilot` | 全自动执行 | `autopilot: build a todo app` |
 | `ralph` | 持久模式 | `ralph: refactor auth` |
 | `plan` | 规划访谈 | `plan the API` |

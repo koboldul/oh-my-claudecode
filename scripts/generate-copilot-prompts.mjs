@@ -21,6 +21,8 @@ const INVENTORY_PATH = join(
   'prompt-assets',
   'copilot-capability-matrix.json',
 );
+const PACKAGE_JSON_PATH = join(ROOT, 'package.json');
+const COPILOT_PLUGIN_MANIFEST_PATH = join(ROOT, 'plugin.json');
 const SOURCE_SKILLS_DIR = join(ROOT, 'skills');
 const SOURCE_COMMANDS_DIR = join(ROOT, 'commands');
 const OUTPUT_SKILLS_DIR = join(ROOT, 'skills-copilot');
@@ -1986,7 +1988,32 @@ export function loadCopilotPromptInventory() {
 export function generateCopilotPrompts({ check = false } = {}) {
   const inventory = loadCopilotPromptInventory();
   const expected = buildExpectedFiles(inventory);
+  const packageJson = readJson(PACKAGE_JSON_PATH, repoPath(PACKAGE_JSON_PATH));
+  const manifest = readJson(
+    COPILOT_PLUGIN_MANIFEST_PATH,
+    repoPath(COPILOT_PLUGIN_MANIFEST_PATH),
+  );
+  if (typeof packageJson.version !== 'string' || packageJson.version.trim() === '') {
+    throw new Error('package.json must define a version');
+  }
+  const expectedManifest = Buffer.from(
+    `${JSON.stringify(
+      {
+        ...manifest,
+        version: packageJson.version,
+        skills: inventory.skills.map(
+          (entry) => `./skills-copilot/${entry.id}/`,
+        ),
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
   const drift = compareGeneratedFiles(expected);
+  if (!readFileSync(COPILOT_PLUGIN_MANIFEST_PATH).equals(expectedManifest)) {
+    drift.push(`stale ${repoPath(COPILOT_PLUGIN_MANIFEST_PATH)}`);
+  }
 
   if (check) {
     if (drift.length > 0) {
@@ -1996,6 +2023,9 @@ export function generateCopilotPrompts({ check = false } = {}) {
   }
 
   writeGeneratedFiles(expected);
+  if (!readFileSync(COPILOT_PLUGIN_MANIFEST_PATH).equals(expectedManifest)) {
+    writeFileSync(COPILOT_PLUGIN_MANIFEST_PATH, expectedManifest);
+  }
   return { files: expected.size, drift };
 }
 

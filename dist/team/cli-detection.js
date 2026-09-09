@@ -204,18 +204,15 @@ export function probeCli(binary, platform = process.platform) {
         ...(result.error === undefined ? {} : { error: result.error }),
     };
 }
-/**
- * Legacy detector projection. `available` intentionally remains tied to a
- * status-zero version process rather than to successful path resolution.
- */
+/** Project the canonical probe into the richer legacy detector contract. */
 export function detectCli(binary) {
     const result = executeCliProbe(binary, process.platform);
-    if (!result.versionExitedZero)
-        return { available: false };
     return {
-        available: true,
-        version: result.version ?? '',
-        path: result.path,
+        available: result.found,
+        runnable: result.versionExitedZero,
+        ...(result.path === undefined ? {} : { path: result.path }),
+        ...(result.version === undefined ? {} : { version: result.version }),
+        ...(result.error === undefined ? {} : { error: result.error }),
     };
 }
 export function detectAllClis() {

@@ -2002,9 +2002,10 @@ export function validateWorkingDirectory(workingDirectory) {
  * paths outside the trusted non-git context.
  */
 export function resolveStateWorkingDirectory(workingDirectory) {
-    const currentProbe = probeGitTopLevel(process.cwd());
+    const currentContext = getProcessCwdValidationContext();
+    const currentProbe = probeGitTopLevel(currentContext.cwd);
     if (currentProbe.status === 'probe_failed' || currentProbe.status === 'git_missing') {
-        throw new Error(formatGitProbeFailedMessage(process.cwd()));
+        throw new Error(formatGitProbeFailedMessage(currentContext.cwd));
     }
     if (currentProbe.status === 'ok') {
         if (!workingDirectory)
@@ -2013,6 +2014,15 @@ export function resolveStateWorkingDirectory(workingDirectory) {
     }
     if (!workingDirectory)
         return process.cwd();
+    if (currentContext.pluginRuntime) {
+        const validated = validateWorkingDirectory(workingDirectory);
+        const requestedRoot = getGitTopLevel(resolve(workingDirectory));
+        if (requestedRoot &&
+            canonicalizeForCompare(requestedRoot) !== canonicalizeForCompare(validated)) {
+            throw new ForeignWorkingDirectoryError(canonicalizePathForRuntime(requestedRoot), canonicalizePathForRuntime(validated), workingDirectory);
+        }
+        return validated;
+    }
     // Run the strict resolver first so a mixed git/non-git or foreign-repository
     // request cannot be silently substituted with the startup cwd.
     validateWorkingDirectoryOrLinkedWorktree(workingDirectory);

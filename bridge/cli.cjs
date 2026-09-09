@@ -32296,15 +32296,28 @@ function validateWorkingDirectory(workingDirectory) {
   return resolvedReal;
 }
 function resolveStateWorkingDirectory(workingDirectory) {
-  const currentProbe = probeGitTopLevel(process.cwd());
+  const currentContext = getProcessCwdValidationContext();
+  const currentProbe = probeGitTopLevel(currentContext.cwd);
   if (currentProbe.status === "probe_failed" || currentProbe.status === "git_missing") {
-    throw new Error(formatGitProbeFailedMessage(process.cwd()));
+    throw new Error(formatGitProbeFailedMessage(currentContext.cwd));
   }
   if (currentProbe.status === "ok") {
     if (!workingDirectory) return validateWorkingDirectoryOrLinkedWorktree();
     return validateWorkingDirectoryOrLinkedWorktree(workingDirectory);
   }
   if (!workingDirectory) return process.cwd();
+  if (currentContext.pluginRuntime) {
+    const validated2 = validateWorkingDirectory(workingDirectory);
+    const requestedRoot = getGitTopLevel((0, import_path18.resolve)(workingDirectory));
+    if (requestedRoot && canonicalizeForCompare(requestedRoot) !== canonicalizeForCompare(validated2)) {
+      throw new ForeignWorkingDirectoryError(
+        canonicalizePathForRuntime(requestedRoot),
+        canonicalizePathForRuntime(validated2),
+        workingDirectory
+      );
+    }
+    return validated2;
+  }
   validateWorkingDirectoryOrLinkedWorktree(workingDirectory);
   const validated = validateWorkingDirectory(workingDirectory);
   return validated;
@@ -41494,16 +41507,10 @@ Before launching Cursor workers, verify \`cursor-agent\` is installed and authen
 
 Configured autopilot team worker types include CLI-backed workers: ${requested}. For executor-style implementation work, use the tmux CLI team runtime instead of in-process Claude-only Task subagents.
 
-Use one of these equivalent surfaces from the lead session:
+Use this surface from the lead session:
 
 \`\`\`sh
 omc team ${agentSpec} "<implementation task from ${planPath}>"
-\`\`\`
-
-Or from Claude Code slash commands:
-
-\`\`\`text
-/omc-teams ${agentSpec} "<implementation task from ${planPath}>"
 \`\`\`
 
 Requested worker types: ${requested}. CLI workers may receive their assigned team roles, including reviewer-style roles. Prompt-mode external providers, including Copilot, may serve reviewer roles when team role routing selects them. The roles \`critic\`, \`code-reviewer\`, \`security-reviewer\`, and \`test-engineer\` use the structured verdict-output contract, with the team leader owning the terminal task transition. Final approval remains a lead-session responsibility.${cursorGuidance}`;
@@ -41543,7 +41550,7 @@ Read the implementation plan at: \`${planPath}\`
 
 ${teamRuntimeGuidance}
 
-${useCliTeamRuntime ? `1. **Launch CLI executor workers** with \`omc team\` or \`/omc-teams\` using the requested agent types.
+${useCliTeamRuntime ? `1. **Launch CLI executor workers** with \`omc team\` using the requested agent types.
 2. **Decompose executor-style implementation tasks** from the implementation plan and pass them to CLI workers.
 3. **Monitor tmux/team output** and integrate completed implementation changes.
 4. **Route review roles deliberately**; Copilot and other prompt-mode providers use the structured verdict-file contract, while Cursor remains executor-only.
@@ -116245,22 +116252,14 @@ function executeCliProbe(binary, platform) {
   }
   return failedVersionResult(resolvedPath);
 }
-function probeCli(binary, platform = process.platform) {
-  const result = executeCliProbe(binary, platform);
+function detectCli(binary) {
+  const result = executeCliProbe(binary, process.platform);
   return {
-    found: result.found,
+    available: result.found,
+    runnable: result.versionExitedZero,
     ...result.path === void 0 ? {} : { path: result.path },
     ...result.version === void 0 ? {} : { version: result.version },
     ...result.error === void 0 ? {} : { error: result.error }
-  };
-}
-function detectCli(binary) {
-  const result = executeCliProbe(binary, process.platform);
-  if (!result.versionExitedZero) return { available: false };
-  return {
-    available: true,
-    version: result.version ?? "",
-    path: result.path
   };
 }
 
@@ -116344,7 +116343,7 @@ function detectCopilotCliCompatibility() {
   if (!detectedVersion) {
     return {
       available: true,
-      runnable: detected.runnable ?? false,
+      runnable: detected.runnable,
       status: "unverified",
       verifiedVersion: VERIFIED_COPILOT_CLI_VERSION,
       ...versionOutput ? { versionOutput } : {},
@@ -116356,7 +116355,7 @@ function detectCopilotCliCompatibility() {
   }
   return {
     available: true,
-    runnable: detected.runnable ?? false,
+    runnable: detected.runnable,
     ...assessCopilotCliVersion(detectedVersion),
     versionOutput,
     ...detected.path ? { path: detected.path.split(/\r?\n/)[0] } : {}
@@ -119457,10 +119456,15 @@ var PROVIDER_BINARY = {
 };
 function probeProvider(provider) {
   const binary = PROVIDER_BINARY[provider];
+  const detected = detectCli(binary);
   return {
     provider,
     binary,
-    ...probeCli(binary)
+    found: detected.available,
+    runnable: detected.runnable,
+    ...detected.path ? { path: detected.path.split(/\r?\n/)[0] } : {},
+    ...detected.version ? { version: detected.version.split(/\r?\n/)[0] } : {},
+    ...detected.error ? { error: detected.error } : {}
   };
 }
 function collectConfiguredProviders() {
@@ -119500,21 +119504,34 @@ async function doctorTeamRoutingCommand(options) {
       )
     );
   } else {
-    const claudeFound = probes.some((probe) => probe.provider === "claude" && probe.found);
+    const claudeRunnable = probes.some((probe) => probe.provider === "claude" && probe.runnable);
     console.log(colors.bold("Team role routing \u2014 provider CLI probe"));
     for (const p of probes) {
-      if (p.found) {
+      if (p.runnable) {
         const resolvedPath = p.path ? `: ${p.path}` : "";
-        const version3 = p.version ? ` (${p.version})` : p.error ? " (version unavailable)" : "";
+        const version3 = p.version ? ` (${p.version})` : "";
         console.log(`  ${colors.green("\u2713")} ${p.provider}${resolvedPath}${version3}`);
+      } else if (p.found) {
+        const resolvedPath = p.path ? ` at ${p.path}` : "";
+        const detail = p.error ? `: ${p.error}` : "";
+        console.log(
+          `  ${colors.yellow("\u26A0")} ${p.provider}: resolved${resolvedPath}, but the version probe failed (version unavailable)${detail} \u2014 fix the provider before routing /team tasks to it`
+        );
       } else {
-        const fallback = p.provider === "claude" ? "orchestrator/fallback unavailable" : claudeFound ? `/team tasks routed to ${p.provider} can fall back to Claude` : "no available Claude fallback";
+        const fallback = p.provider === "claude" ? "orchestrator/fallback unavailable" : claudeRunnable ? `/team tasks routed to ${p.provider} can fall back to Claude` : "no available Claude fallback";
         console.log(`  ${colors.yellow("\u26A0")} ${p.provider}: not found on PATH \u2014 ${fallback}`);
       }
     }
-    if (missing.length === 0) {
+    if (unusable.length === 0) {
       console.log(colors.green("\nAll configured providers are available."));
-    } else if (!claudeFound) {
+    } else if (missing.length === 0) {
+      console.log(
+        colors.yellow(
+          `
+${unusable.length} provider${unusable.length === 1 ? "" : "s"} failed its version probe; affected /team routes are not ready.`
+        )
+      );
+    } else if (!claudeRunnable) {
       console.log(
         colors.yellow(
           `

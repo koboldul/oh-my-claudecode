@@ -92,7 +92,7 @@ export function detectCopilotCliCompatibility() {
     if (!detectedVersion) {
         return {
             available: true,
-            runnable: detected.runnable ?? false,
+            runnable: detected.runnable,
             status: 'unverified',
             verifiedVersion: VERIFIED_COPILOT_CLI_VERSION,
             ...(versionOutput ? { versionOutput } : {}),
@@ -104,7 +104,7 @@ export function detectCopilotCliCompatibility() {
     }
     return {
         available: true,
-        runnable: detected.runnable ?? false,
+        runnable: detected.runnable,
         ...assessCopilotCliVersion(detectedVersion),
         versionOutput,
         ...(detected.path ? { path: detected.path.split(/\r?\n/)[0] } : {}),

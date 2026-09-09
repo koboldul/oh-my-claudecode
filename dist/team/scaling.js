@@ -538,6 +538,7 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                         cwd: workerCwd,
                         resolvedBinaryPath: launchBinary,
                         ...(workerModel ? { model: workerModel } : {}),
+                        ...(workerReasoningEffort ? { reasoningEffort: workerReasoningEffort } : {}),
                     });
                     launchArgs = args;
                 }

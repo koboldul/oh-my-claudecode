@@ -205,11 +205,8 @@ function reportCopilotContextUnavailable() {
     // Diagnostics must not turn this explicit fail-open path into a hook failure.
   }
 }
-    // Diagnostics must not turn this explicit fail-open path into a hook failure.
-  }
-}
 
-function processContextGuardStop(data) {
+async function processContextGuardStop(data) {
   // CRITICAL: Never block context-limit stops (compaction deadlock)
   if (isContextLimitStop(data)) {
     return { continue: true, suppressOutput: true };
@@ -228,7 +225,11 @@ function processContextGuardStop(data) {
   const sessionId = data.session_id || data.sessionId || '';
   const rawTranscriptPath = data.transcript_path || data.transcriptPath || '';
   const transcriptPath = resolveTranscriptPath(rawTranscriptPath, data.cwd);
-  const pct = estimateContextPercent(transcriptPath);
+  const pct = (await resolveContextPercent(
+    data,
+    transcriptPath,
+    data.cwd,
+  )) ?? 0;
 
   if (pct >= CRITICAL_THRESHOLD) {
     return { continue: true, suppressOutput: true };
@@ -288,8 +289,8 @@ async function main() {
     const result = await runtime.runHookJson(
       'stop',
       input,
-      (unit, envelope) => {
-        legacyOutput = processContextGuardStop(
+      async (unit, envelope) => {
+        legacyOutput = await processContextGuardStop(
           runtime.buildLegacyProcessorInput(envelope, unit),
         );
         return legacyOutput;

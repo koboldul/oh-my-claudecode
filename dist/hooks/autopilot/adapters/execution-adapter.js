@@ -34,16 +34,10 @@ Before launching Cursor workers, verify \`cursor-agent\` is installed and authen
 
 Configured autopilot team worker types include CLI-backed workers: ${requested}. For executor-style implementation work, use the tmux CLI team runtime instead of in-process Claude-only Task subagents.
 
-Use one of these equivalent surfaces from the lead session:
+Use this surface from the lead session:
 
 \`\`\`sh
 omc team ${agentSpec} "<implementation task from ${planPath}>"
-\`\`\`
-
-Or from Claude Code slash commands:
-
-\`\`\`text
-/omc-teams ${agentSpec} "<implementation task from ${planPath}>"
 \`\`\`
 
 Requested worker types: ${requested}. CLI workers may receive their assigned team roles, including reviewer-style roles. Prompt-mode external providers, including Copilot, may serve reviewer roles when team role routing selects them. The roles \`critic\`, \`code-reviewer\`, \`security-reviewer\`, and \`test-engineer\` use the structured verdict-output contract, with the team leader owning the terminal task transition. Final approval remains a lead-session responsibility.${cursorGuidance}`;
@@ -77,7 +71,7 @@ Read the implementation plan at: \`${planPath}\`
 
 ${teamRuntimeGuidance}
 
-${useCliTeamRuntime ? `1. **Launch CLI executor workers** with \`omc team\` or \`/omc-teams\` using the requested agent types.
+${useCliTeamRuntime ? `1. **Launch CLI executor workers** with \`omc team\` using the requested agent types.
 2. **Decompose executor-style implementation tasks** from the implementation plan and pass them to CLI workers.
 3. **Monitor tmux/team output** and integrate completed implementation changes.
 4. **Route review roles deliberately**; Copilot and other prompt-mode providers use the structured verdict-file contract, while Cursor remains executor-only.

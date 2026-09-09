@@ -614,6 +614,7 @@ export async function scaleUpOwned(
           cwd: workerCwd,
           resolvedBinaryPath: launchBinary,
           ...(workerModel ? { model: workerModel } : {}),
+          ...(workerReasoningEffort ? { reasoningEffort: workerReasoningEffort } : {}),
         });
         launchArgs = args;
       } catch (error) {

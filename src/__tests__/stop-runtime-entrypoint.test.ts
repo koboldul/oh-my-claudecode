@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
   copyFileSync,
   mkdirSync,
@@ -77,6 +77,11 @@ afterAll(() => {
 function makeProject(prefix: string): string {
   const project = mkdtempSync(join(tmpdir(), prefix));
   tempRoots.push(project);
+  execFileSync('git', ['init', '--quiet'], {
+    cwd: project,
+    stdio: 'pipe',
+    windowsHide: true,
+  });
   return project;
 }
 
@@ -334,6 +339,39 @@ describe('canonical Stop shipped entrypoints', () => {
         );
       }
     }
+  });
+
+  it('blocks high-context Claude stops and passes low-context Claude stops', () => {
+    const highProject = makeProject('omc-stop-context-high-');
+    writeTranscript(highProject, 1000, 850);
+    const high = runHook(
+      staged,
+      'context-guard-stop.mjs',
+      stopInput('claude', highProject, 'claude-context-high'),
+      highProject,
+    );
+
+    expect(high.signal).toBeNull();
+    expect(high.status, high.stderr).toBe(0);
+    expect(JSON.parse(high.stdout)).toEqual({
+      continue: false,
+      decision: 'block',
+      reason: expect.stringContaining(
+        '[OMC HIGH] Context at 85% (threshold: 75%)',
+      ),
+    });
+
+    const lowProject = makeProject('omc-stop-context-low-');
+    writeTranscript(lowProject, 1000, 250);
+    expectExactOutput(
+      runHook(
+        staged,
+        'context-guard-stop.mjs',
+        stopInput('claude', lowProject, 'claude-context-low'),
+        lowProject,
+      ),
+      goldens.claude.contextGuardPass,
+    );
   });
 
   it('preserves exact workflow block output for Claude and Copilot', () => {

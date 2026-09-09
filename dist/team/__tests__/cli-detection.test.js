@@ -135,7 +135,12 @@ describe('cli-detection', () => {
         mockSpawnSync
             .mockReturnValueOnce(spawnResult({ status: 0, stdout: '/usr/bin/codex\n' }))
             .mockReturnValueOnce(spawnResult({ status: 0, stdout: 'codex 5.0.0\n' }));
-        expect(detectCli('codex')).toEqual({ available: true, version: 'codex 5.0.0', path: '/usr/bin/codex' });
+        expect(detectCli('codex')).toEqual({
+            available: true,
+            runnable: true,
+            version: 'codex 5.0.0',
+            path: '/usr/bin/codex',
+        });
     });
     it('keeps a zero-exit blank version available to legacy callers', () => {
         restorePlatform = setProcessPlatform('linux');
@@ -150,7 +155,12 @@ describe('cli-detection', () => {
         mockSpawnSync
             .mockReturnValueOnce(spawnResult({ status: 0, stdout: '/usr/bin/codex\n' }))
             .mockReturnValueOnce(spawnResult({ status: 0, stdout: '  \n' }));
-        expect(detectCli('codex')).toEqual({ available: true, version: '', path: '/usr/bin/codex' });
+        expect(detectCli('codex')).toEqual({
+            available: true,
+            runnable: true,
+            path: '/usr/bin/codex',
+            error: 'version probe returned no output',
+        });
     });
     it('retains found but maps a failed direct version probe to legacy unavailable', () => {
         restorePlatform = setProcessPlatform('linux');
@@ -161,7 +171,12 @@ describe('cli-detection', () => {
         mockSpawnSync
             .mockReturnValueOnce(spawnResult({ status: 0, stdout: '/usr/bin/codex\n' }))
             .mockReturnValueOnce(spawnResult({ status: 1 }));
-        expect(detectCli('codex')).toEqual({ available: false });
+        expect(detectCli('codex')).toEqual({
+            available: true,
+            runnable: false,
+            path: '/usr/bin/codex',
+            error: 'version probe failed',
+        });
     });
     it.each(['ENOENT', 'UNKNOWN', 'EINVAL'])('uses the closed batch fallback for direct %s', (code) => {
         restorePlatform = setProcessPlatform('win32');

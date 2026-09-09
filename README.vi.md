@@ -79,12 +79,12 @@ Bật Claude Code native teams trong `~/.claude/settings.json`:
 
 ### Công nhân CLI tmux — Codex & Gemini (v4.4.0+)
 
-**v4.4.0 xóa các máy chủ MCP Codex/Gemini** (nhà cung cấp `x`, `g`). Dùng `/omc-teams` để khởi động tiến trình CLI thực sự trong các pane tmux phân chia:
+**v4.4.0 xóa các máy chủ MCP Codex/Gemini** (nhà cung cấp `x`, `g`). Dùng `omc team` để khởi động tiến trình CLI thực sự trong các pane tmux phân chia:
 
 ```bash
-/omc-teams 2:codex   "review auth module for security issues"
-/omc-teams 2:gemini  "redesign UI components for accessibility"
-/omc-teams 1:claude  "implement the payment flow"
+omc team 2:codex   "review auth module for security issues"
+omc team 2:gemini  "redesign UI components for accessibility"
+omc team 1:claude  "implement the payment flow"
 ```
 
 Để xử lý công việc Codex + Gemini trong một lệnh, dùng skill **`/ccg`**:
@@ -95,9 +95,9 @@ Bật Claude Code native teams trong `~/.claude/settings.json`:
 
 | Skill | Công nhân | Tốt nhất cho |
 |-------|---------|----------|
-| `/omc-teams N:codex` | N pane Codex CLI | Xem xét code, phân tích bảo mật, kiến trúc |
-| `/omc-teams N:gemini` | N pane Gemini CLI | Thiết kế UI/UX, tài liệu, tác vụ ngữ cảnh lớn |
-| `/omc-teams N:claude` | N pane Claude CLI | Tác vụ chung qua Claude CLI trong tmux |
+| `omc team N:codex` | N pane Codex CLI | Xem xét code, phân tích bảo mật, kiến trúc |
+| `omc team N:gemini` | N pane Gemini CLI | Thiết kế UI/UX, tài liệu, tác vụ ngữ cảnh lớn |
+| `omc team N:claude` | N pane Claude CLI | Tác vụ chung qua Claude CLI trong tmux |
 | `/ccg` | 1 Codex + 1 Gemini | Điều phối ba mô hình song song |
 
 Công nhân được tạo theo yêu cầu và tắt khi hoàn thành tác vụ — không lãng phí tài nguyên. Cần cài `codex` / `gemini` CLI và có phiên tmux đang hoạt động.
@@ -217,7 +217,6 @@ Các phím tắt tùy chọn cho người dùng nâng cao. Không dùng chúng t
 | Keyword | Hiệu ứng | Ví dụ |
 |---------|--------|---------|
 | `team` | Điều phối Team chuẩn | `/team 3:executor "fix all TypeScript errors"` |
-| `omc-teams` | Công nhân CLI tmux (codex/gemini/claude) | `/omc-teams 2:codex "security review"` |
 | `ccg` | Điều phối tri-model Codex+Gemini | `/ccg review this PR` |
 | `autopilot` | Thực thi tự động toàn phần | `autopilot: build a todo app` |
 | `ralph` | Chế độ bền bỉ | `ralph: refactor auth` |
