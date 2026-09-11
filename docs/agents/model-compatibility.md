@@ -11,11 +11,11 @@ are deliberately out of scope.
 
 | Agent | Role | Recommended (premium) | Recommended (cost-effective) | Avoid | Notes |
 |---|---|---|---|---|---|
-| Prometheus | Planning | Claude Opus 4.8, GPT-5.5 high | Sonnet 4.6 | — | Heavy reasoning; runs 1–2x per session |
-| Hyperplan | Planning | Claude Opus 4.8, GPT-5.5 high | Sonnet 4.6 | — | Same as Prometheus |
+| Prometheus | Planning | GPT-6 Astra, Claude Opus 4.8 | Sonnet 4.6 | — | Heavy reasoning; runs 1–2x per session |
+| Hyperplan | Planning | GPT-6 Astra, Claude Opus 4.8 | Sonnet 4.6 | — | Same as Prometheus |
 | Sisyphus | Implementation | Sonnet 4.6 | DeepSeek V4 Pro, Kimi K2.5 | — | Token-heavy; cost matters most here |
 | Hephaestus | Implementation | Sonnet 4.6, Kimi K2.5 | DeepSeek V4 Pro | **GPT-\* (tool-calling/format breakage)** | Tuned for non-GPT |
-| Oracle | Review | Claude Opus 4.8, GPT-5.5 high | Sonnet 4.6 | — | Quality > cost; called sparingly |
+| Oracle | Review | GPT-6 Astra, Claude Opus 4.8 | Sonnet 4.6 | — | Quality > cost; called sparingly |
 | Aletheia | Review | Sonnet 4.6 | DeepSeek V4 Pro | — | |
 | Hermes | Coordination | Sonnet 4.6 | DeepSeek V4 Flash | — | Coordinator only, not direct executor |
 
@@ -27,7 +27,8 @@ thing, remember rule 3.
 1. **Planning/Review = expensive; Implementation = cheap.**
    Token weight typically differs 5–20× between a single Prometheus/Oracle pass
    and a full Sisyphus implementation loop. Spend on the rare, decisive calls;
-   economize on the high-volume ones.
+   economize on the high-volume ones. Use `gpt-6-astra` when selecting the
+   top-of-the-line GPT option for these decisive calls.
 2. **Hephaestus should not be paired with GPT-family models.**
    Tool-calling and structured-output formats break. Use Sonnet 4.6 / Kimi K2.5
    for premium and DeepSeek V4 Pro for cost-effective. This is the "Hephaestus
