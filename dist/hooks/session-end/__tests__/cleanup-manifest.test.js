@@ -1,10 +1,14 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { claimSessionEndAction, claimSessionEndJob, finishSessionEndAction, isManifestTerminal, markSessionEndActionRunner, mutateSessionEndJob, prepareCoreManifest, readSessionEndJob, reapStaleSessionEndOwner, releaseSessionEndJob, renewSessionEndLease, sealCoreManifest, sealWikiManifest, sessionEndJobPath, sessionEndJobsDirectory, sessionEndScopeKey, takeSessionEndDiscoveryPage, } from '../cleanup-manifest.js';
+import { claimSessionEndAction, claimSessionEndJob, finishSessionEndAction, isManifestTerminal, markSessionEndActionRunner, mutateSessionEndJob, prepareCoreManifest, readSessionEndJob, reapStaleSessionEndOwner, releaseSessionEndJob, renewSessionEndLease, sealCoreManifest, sealWikiManifest, sessionEndJobsDirectory, takeSessionEndDiscoveryPage, updateSessionEndActionPayload, } from '../cleanup-manifest.js';
 const directories = [];
+beforeEach(() => {
+    const stateRoot = mkdtempSync(join(tmpdir(), 'omc-cleanup-state-'));
+    directories.push(stateRoot);
+    vi.stubEnv('OMC_STATE_DIR', stateRoot);
+});
 function project() {
     const directory = mkdtempSync(join(tmpdir(), 'omc-cleanup-manifest-'));
     directories.push(directory);
@@ -19,84 +23,9 @@ function preparedAndSealed(directory, sessionId = 'session-a') {
 afterEach(() => {
     for (const directory of directories.splice(0))
         rmSync(directory, { recursive: true, force: true });
+    vi.unstubAllEnvs();
 });
 describe('durable SessionEnd cleanup manifest', () => {
-    it('isolates identical session ids under scoped v2 manifest paths', () => {
-        const first = project();
-        const second = project();
-        const sessionId = 'same-session';
-        expect(prepareCoreManifest(first, sessionId, { scope: 'first' })).not.toBeNull();
-        expect(prepareCoreManifest(second, sessionId, { scope: 'second' })).not.toBeNull();
-        expect(sessionEndJobPath(first, sessionId)).not.toBe(sessionEndJobPath(second, sessionId));
-        expect(readSessionEndJob(first, sessionId)?.scopeKey).toBe(sessionEndScopeKey(first));
-        expect(readSessionEndJob(second, sessionId)?.scopeKey).toBe(sessionEndScopeKey(second));
-        expect(readSessionEndJob(first, sessionId)?.actions.callback.payload).toMatchObject({
-            scope: 'first',
-        });
-        expect(readSessionEndJob(second, sessionId)?.actions.callback.payload).toMatchObject({
-            scope: 'second',
-        });
-    });
-    it('migrates only a v1 manifest whose legacy scope matches the worktree', () => {
-        const directory = project();
-        const sessionId = 'matching-v1';
-        expect(prepareCoreManifest(directory, sessionId, { legacy: true })).not.toBeNull();
-        const created = readSessionEndJob(directory, sessionId);
-        const legacyRoot = join(directory, '.omc', 'state', 'session-end-jobs');
-        const legacyPath = join(legacyRoot, `${sessionId}.json`);
-        const legacyScopeKey = createHash('sha256')
-            .update(JSON.stringify(directory))
-            .digest('hex');
-        mkdirSync(legacyRoot, { recursive: true });
-        writeFileSync(legacyPath, JSON.stringify({
-            ...created,
-            scopeKey: legacyScopeKey,
-        }));
-        rmSync(join(legacyRoot, 'v2'), { recursive: true, force: true });
-        const migrated = readSessionEndJob(directory, sessionId);
-        expect(migrated?.scopeKey).toBe(sessionEndScopeKey(directory));
-        expect(migrated?.revision).toBe(created.revision + 1);
-        expect(readFileSync(sessionEndJobPath(directory, sessionId), 'utf8')).toContain(sessionEndScopeKey(directory));
-    });
-    it('leaves a mismatched v1 manifest untouched', () => {
-        const directory = project();
-        const sessionId = 'foreign-v1';
-        expect(prepareCoreManifest(directory, sessionId, { legacy: true })).not.toBeNull();
-        const created = readSessionEndJob(directory, sessionId);
-        const legacyRoot = join(directory, '.omc', 'state', 'session-end-jobs');
-        const legacyPath = join(legacyRoot, `${sessionId}.json`);
-        mkdirSync(legacyRoot, { recursive: true });
-        writeFileSync(legacyPath, JSON.stringify({
-            ...created,
-            scopeKey: '00'.repeat(32),
-        }));
-        rmSync(join(legacyRoot, 'v2'), { recursive: true, force: true });
-        expect(readSessionEndJob(directory, sessionId)).toBeNull();
-        expect(readFileSync(legacyPath, 'utf8')).toContain('00'.repeat(32));
-    });
-    it('keeps the first producer eventId/rawDigest authoritative across replay', () => {
-        const directory = project();
-        const sessionId = 'producer-idempotency';
-        const first = {
-            eventId: '11'.repeat(32),
-            rawDigest: '22'.repeat(32),
-        };
-        const replay = {
-            eventId: '33'.repeat(32),
-            rawDigest: '44'.repeat(32),
-        };
-        expect(prepareCoreManifest(directory, sessionId, { source: 'first' }, first)).not.toBeNull();
-        expect(prepareCoreManifest(directory, sessionId, { source: 'replay' }, replay)).not.toBeNull();
-        expect(sealWikiManifest(directory, sessionId, { source: 'wiki-first' }, first)).not.toBeNull();
-        expect(sealWikiManifest(directory, sessionId, { source: 'wiki-replay' }, replay)).not.toBeNull();
-        const manifest = readSessionEndJob(directory, sessionId);
-        expect(manifest.producers.core).toMatchObject(first);
-        expect(manifest.producers.wiki).toMatchObject(first);
-        expect(manifest.actions.callback.payload).toMatchObject({ source: 'first' });
-        expect(manifest.actions['wiki-capture'].payload).toMatchObject({
-            source: 'wiki-first',
-        });
-    });
     it('serializes concurrent core/wiki producers and rejects a second worker claim', async () => {
         const directory = project();
         const sessionId = 'concurrent-producers';
@@ -153,6 +82,21 @@ describe('durable SessionEnd cleanup manifest', () => {
         writeFileSync(path, JSON.stringify(expiresAgain));
         expect(again?.owner).toBeTruthy();
         expect(reapStaleSessionEndOwner(directory, sessionId, 'reused-owner', 1, 'mismatch')?.owner).toBeNull();
+    });
+    it('binds payload enrichment to the captured armed runner rather than the current owner', () => {
+        const directory = project();
+        const sessionId = preparedAndSealed(directory, 'payload-authority');
+        const owner = claimSessionEndJob(directory, sessionId, 'owner', 'identity', Date.now() + 5_000);
+        const claimed = claimSessionEndAction(directory, sessionId, 'owner', 'foreground-cleanup', Date.now() + 5_000);
+        const action = claimed.actions['foreground-cleanup'];
+        const authority = { jobId: owner.jobId, actionName: 'foreground-cleanup', attempt: action.attempts, ownerNonce: 'owner', runnerNonce: action.runner.runnerNonce };
+        expect(updateSessionEndActionPayload(directory, sessionId, authority, ['callback'], { proof: 'early' })).toBeNull();
+        markSessionEndActionRunner(directory, sessionId, 'owner', 'foreground-cleanup', authority.runnerNonce, 'armed');
+        expect(updateSessionEndActionPayload(directory, sessionId, authority, ['callback'], { proof: 'valid' })).not.toBeNull();
+        for (const invalid of [{ ...authority, ownerNonce: 'stale-owner' }, { ...authority, runnerNonce: 'stale-runner' }, { ...authority, attempt: authority.attempt + 1 }, { ...authority, jobId: 'foreign-job' }]) {
+            expect(updateSessionEndActionPayload(directory, sessionId, invalid, ['callback'], { proof: 'forged' })).toBeNull();
+            expect(readSessionEndJob(directory, sessionId)?.actions.callback.payload.proof).toBe('valid');
+        }
     });
     it('persists action claim, runner arm, result, and terminality separately from discovery tickets', () => {
         const directory = project();

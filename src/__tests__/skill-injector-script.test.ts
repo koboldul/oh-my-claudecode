@@ -3,12 +3,14 @@ import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, write
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { provisionStandaloneStateLockBridge } from '../installer/index.js';
 import {
   stageHookRuntime,
   type StagedHookRuntime,
 } from './helpers/staged-hook-runtime.js';
 
 const REPO_ROOT = process.cwd();
+const PACKAGE_ROOT = process.cwd();
 const NODE = process.execPath;
 const tempDirs: string[] = [];
 let stagedRuntime: StagedHookRuntime;
@@ -149,6 +151,9 @@ Write concise release notes.`);
     mkdirSync(join(pluginRoot, 'bridge'), { recursive: true });
     mkdirSync(join(pluginRoot, 'hooks'), { recursive: true });
     cpSync(join(process.cwd(), 'scripts', 'lib'), libDir, { recursive: true });
+    // The copied state-lock.mjs resolves better-sqlite3 relative to the temp
+    // plugin root, so replace it with a bridge pinned to the package root.
+    provisionStandaloneStateLockBridge(PACKAGE_ROOT, join(libDir, 'state-lock.mjs'));
     writeFileSync(join(scriptsDir, 'run.cjs'), readFileSync(join(process.cwd(), 'scripts', 'run.cjs')));
     writeFileSync(join(scriptsDir, 'skill-injector.mjs'), readFileSync(scriptPath));
     execFileSync(

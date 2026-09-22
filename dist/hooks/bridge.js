@@ -16,11 +16,11 @@ import { pathToFileURL } from "url";
 import { existsSync, readFileSync, readdirSync, rmdirSync, } from "fs";
 import { dirname, join } from "path";
 import { resolveToWorktreeRoot, getOmcRoot, getSessionStateDir as resolveSessionStateDir, listSessionIds, resolveStatePath, resolveSessionStatePath, } from "../lib/worktree-paths.js";
-import { canClearStateForSession, clearStateFileLockedIf, confirmSkillModeStatesLocked, readModeState, readModeStateWithMeta, writeModeState, writeStateFileLockedCreateIf, writeStateFileLockedIf, } from "../lib/mode-state-io.js";
+import { canClearStateForSession, clearStateFileLockedIf, readModeState, readModeStateWithMeta, writeModeState, writeStateFileLockedCreateIf, writeStateFileLockedIf, } from "../lib/mode-state-io.js";
 import { SESSION_END_MODE_STATE_FILES } from "../lib/mode-names.js";
 import { formatOmcCliInvocation } from "../utils/omc-cli-rendering.js";
 import { createSwallowedErrorLogger } from "../lib/swallowed-error.js";
-import { dispatchDetachedNotificationInBackground } from "./background-notifications.js";
+import { dispatchNotificationInBackground } from "./background-notifications.js";
 import { readCanonicalTeamStateCandidate } from "./team-canonical-state.js";
 // Hot-path imports: needed on every/most hook invocations (keyword-detector, pre/post-tool-use)
 import { removeCodeBlocks, getAllKeywordsWithSizeCheck, applyRalplanGate, sanitizeForKeywordDetection, NON_LATIN_SCRIPT_PATTERN, parseExplicitWorkflowSlashInvocation, isRetiredWorkflowSlashInvocation, } from "./keyword-detector/index.js";
@@ -32,7 +32,7 @@ import { compactOmcStartupGuidance, loadConfig } from "../config/loader.js";
 import { activatePromptPrerequisiteState, buildPromptPrerequisiteDenyReason, buildPromptPrerequisiteReminder, clearPromptPrerequisiteState, getPromptPrerequisiteConfig, isPromptPrerequisiteBlockingTool, parsePromptPrerequisiteSections, readPromptPrerequisiteState, recordPromptPrerequisiteProgress, shouldEnforcePromptPrerequisites, } from "./prompt-prerequisites/index.js";
 import { resolveAutopilotPlanPath, resolveOpenQuestionsPlanPath, } from "../config/plan-output.js";
 import { formatAutopilotRuntimeInsight } from "./autopilot/runtime-insight.js";
-import { writeSkillActiveState, isCanonicalWorkflowSkill, isWorkflowSkillCompleted, upsertWorkflowSkillSlot, markWorkflowSkillCompleted, pruneExpiredWorkflowSkillTombstones, mutateSkillActiveStateLocked, } from "./skill-state/index.js";
+import { writeSkillActiveState, isCanonicalWorkflowSkill, upsertWorkflowSkillSlot, markWorkflowSkillCompleted, pruneExpiredWorkflowSkillTombstones, readSkillActiveStateNormalized, writeSkillActiveStateCopies, } from "./skill-state/index.js";
 import { resolveWorkflowInputWithWarning } from "../workflow/alias-resolver.js";
 import { ULTRATHINK_MESSAGE, SEARCH_MESSAGE, ANALYZE_MESSAGE, TDD_MESSAGE, CODE_REVIEW_MESSAGE, SECURITY_REVIEW_MESSAGE, RALPH_MESSAGE, PROMPT_TRANSLATION_MESSAGE, } from "../installer/hooks.js";
 // Agent dashboard is used in pre/post-tool-use hot path
@@ -84,8 +84,27 @@ const BACKGROUND_BASH_ID_PATTERN = /(?:background (?:bash )?(?:command|process|t
 const TASK_OUTPUT_ID_PATTERN = /<task_id>([^<]+)<\/task_id>/i;
 const TASK_OUTPUT_STATUS_PATTERN = /<status>([^<]+)<\/status>/i;
 const SAFE_SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/;
-const SESSION_START_CONTEXT_BUDGET = 6000;
-const SESSION_START_OMISSION_NOTICE = '[Additional SessionStart context omitted to preserve the 6000-character aggregate budget.]';
+const MODE_CONFIRMATION_SKILL_MAP = {
+    ralph: ["ralph"],
+    autopilot: ["autopilot"],
+    ralplan: ["ralplan"],
+};
+const DEFAULT_SESSION_START_CONTEXT_BUDGET = 6000;
+/**
+ * Aggregate character budget shared by everything SessionStart injects.
+ * Override with OMC_SESSION_START_CONTEXT_BUDGET (positive integer). Any other
+ * value falls back to the default so a bad setting can never blank the context.
+ */
+function resolveSessionStartContextBudget() {
+    const raw = process.env.OMC_SESSION_START_CONTEXT_BUDGET?.trim();
+    if (!raw)
+        return DEFAULT_SESSION_START_CONTEXT_BUDGET;
+    const parsed = Number(raw);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_SESSION_START_CONTEXT_BUDGET;
+}
+function sessionStartOmissionNotice(budget) {
+    return `[Additional SessionStart context omitted to preserve the ${budget}-character aggregate budget.]`;
+}
 const SESSION_STARTED_MARKER_FILE = "session-started.json";
 const LINUX_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
 function compactBudgetedText(text, maxChars) {
@@ -114,16 +133,17 @@ function buildSessionStartAdditionalContext(messages) {
     })
         .sort((a, b) => a.priority - b.priority || a.index - b.index)
         .map((entry) => entry.message);
+    const budget = resolveSessionStartContextBudget();
     let used = 0;
     const selected = [];
     for (const message of ordered) {
         const separatorLength = selected.length > 0 ? 1 : 0;
-        if (used + separatorLength + message.length > SESSION_START_CONTEXT_BUDGET) {
-            const remainingBudget = SESSION_START_CONTEXT_BUDGET - used - separatorLength;
+        if (used + separatorLength + message.length > budget) {
+            const remainingBudget = budget - used - separatorLength;
             if (remainingBudget > 0) {
                 selected.push(remainingBudget > 120
                     ? compactBudgetedText(message, remainingBudget)
-                    : compactBudgetedText(SESSION_START_OMISSION_NOTICE, remainingBudget));
+                    : compactBudgetedText(sessionStartOmissionNotice(budget), remainingBudget));
             }
             break;
         }
@@ -458,7 +478,9 @@ function markModeAwaitingConfirmation(directory, sessionId, ...modeNames) {
     }
 }
 function confirmSkillModeStates(directory, skillName, sessionId) {
-    confirmSkillModeStatesLocked(directory, skillName, sessionId);
+    for (const modeName of MODE_CONFIRMATION_SKILL_MAP[skillName] ?? []) {
+        updateModeAwaitingConfirmation(directory, modeName, sessionId, false);
+    }
 }
 function getSkillInvocationArgs(toolInput) {
     if (!toolInput || typeof toolInput !== "object") {
@@ -511,7 +533,6 @@ function deactivateRalplanState(directory, sessionId) {
         "done",
     ]);
     const completedAt = typeof state.completed_at === "string"
-        && state.completed_at.trim().length > 0
         ? state.completed_at
         : new Date().toISOString();
     writeModeState("ralplan", {
@@ -867,7 +888,7 @@ function getPromptText(input) {
     return "";
 }
 function isExplicitAskSlashInvocation(promptText) {
-    return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini|antigravity|agy|grok|cursor|copilot)\b/i.test(promptText);
+    return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini|antigravity|agy|grok|cursor)\b/i.test(promptText);
 }
 function activateRalplanStartupState(directory, sessionId) {
     const now = new Date().toISOString();
@@ -892,14 +913,17 @@ function resolveWorkflowSlotModeStatePath(directory, skillName, sessionId) {
     return paths[0] ?? "";
 }
 /**
- * Seed (or refresh) a canonical workflow-slot entry through the skill-state
- * owner. Returns `false` on best-effort failure.
+ * Seed (or refresh) a canonical workflow-slot entry in the dual-copy ledger
+ * via the only sanctioned helper, `writeSkillActiveStateCopies()`. Returns
+ * `true` when at least one copy was written, `false` on best-effort failure.
  */
 function seedWorkflowSlotForSkill(directory, skillName, sessionId, source, parentSkill) {
     if (!isCanonicalWorkflowSkill(skillName))
         return false;
     const normalized = skillName.toLowerCase().replace(/^oh-my-claudecode:/, "");
     try {
+        const current = readSkillActiveStateNormalized(directory, sessionId);
+        const pruned = pruneExpiredWorkflowSkillTombstones(current);
         // Resolve mode-state file pointers eagerly so downstream readers can
         // locate the mode payload without re-deriving the path.
         const rootStatePath = resolveStatePathSafe("skill-active", directory);
@@ -918,8 +942,8 @@ function seedWorkflowSlotForSkill(directory, skillName, sessionId, source, paren
         if (parentSkill !== undefined) {
             slotData.parent_skill = parentSkill;
         }
-        const result = mutateSkillActiveStateLocked(directory, sessionId, (current) => upsertWorkflowSkillSlot(pruneExpiredWorkflowSkillTombstones(current), normalized, slotData));
-        return result.status !== "failed";
+        const next = upsertWorkflowSkillSlot(pruned, normalized, slotData);
+        return writeSkillActiveStateCopies(directory, next, sessionId);
     }
     catch {
         return false;
@@ -934,15 +958,14 @@ function confirmWorkflowSlot(directory, skillName, sessionId) {
         return false;
     const normalized = skillName.toLowerCase().replace(/^oh-my-claudecode:/, "");
     try {
-        const result = mutateSkillActiveStateLocked(directory, sessionId, (current) => {
-            const slot = current.active_skills[normalized];
-            if (!slot || isWorkflowSkillCompleted(slot))
-                return current;
-            return upsertWorkflowSkillSlot(current, normalized, {
-                last_confirmed_at: new Date().toISOString(),
-            });
+        const current = readSkillActiveStateNormalized(directory, sessionId);
+        const slot = current.active_skills[normalized];
+        if (!slot || slot.completed_at)
+            return false;
+        const next = upsertWorkflowSkillSlot(current, normalized, {
+            last_confirmed_at: new Date().toISOString(),
         });
-        return result.status === "written";
+        return writeSkillActiveStateCopies(directory, next, sessionId);
     }
     catch {
         return false;
@@ -958,10 +981,11 @@ function tombstoneWorkflowSlot(directory, skillName, sessionId) {
         return false;
     const normalized = skillName.toLowerCase().replace(/^oh-my-claudecode:/, "");
     try {
-        const result = mutateSkillActiveStateLocked(directory, sessionId, (current) => current.active_skills[normalized]
-            ? markWorkflowSkillCompleted(current, normalized)
-            : current);
-        return result.status === "written";
+        const current = readSkillActiveStateNormalized(directory, sessionId);
+        if (!current.active_skills[normalized])
+            return false;
+        const next = markWorkflowSkillCompleted(current, normalized);
+        return writeSkillActiveStateCopies(directory, next, sessionId);
     }
     catch {
         return false;
@@ -1340,7 +1364,7 @@ async function processPersistentMode(input) {
                 }
                 if (shouldSendIdleNotification(stateDir, sessionId, idleRepoState)) {
                     recordIdleNotificationSent(stateDir, sessionId, idleRepoState);
-                    dispatchDetachedNotificationInBackground("session-idle", {
+                    dispatchNotificationInBackground("session-idle", {
                         sessionId,
                         projectPath: directory,
                         profileName: process.env.OMC_NOTIFY_PROFILE,
@@ -1421,7 +1445,7 @@ async function processSessionStart(input) {
     initSilentAutoUpdate();
     // Send session-start notification (non-blocking, swallows errors)
     if (sessionId) {
-        dispatchDetachedNotificationInBackground("session-start", {
+        dispatchNotificationInBackground("session-start", {
             sessionId,
             projectPath: directory,
             profileName: process.env.OMC_NOTIFY_PROFILE,
@@ -1680,7 +1704,7 @@ export function dispatchAskUserQuestionNotification(sessionId, directory, toolIn
         .map((q) => q.question)
         .filter(Boolean)
         .join("; ") || "User input requested";
-    dispatchDetachedNotificationInBackground("ask-user-question", {
+    dispatchNotificationInBackground("ask-user-question", {
         sessionId,
         projectPath: directory,
         question: questionText,
@@ -1939,7 +1963,7 @@ function processPreToolUse(input) {
         const agentName = agentType?.includes(":")
             ? agentType.split(":").pop()
             : agentType;
-        dispatchDetachedNotificationInBackground("agent-call", {
+        dispatchNotificationInBackground("agent-call", {
             sessionId: input.sessionId,
             projectPath: directory,
             agentName,

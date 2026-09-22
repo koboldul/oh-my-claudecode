@@ -214,7 +214,8 @@ describe("Persistent Mode Session Isolation (Issue #311)", () => {
         expires_at: new Date(now + 30_000).toISOString(),
         target_state_sha256: createHash("sha256").update(JSON.stringify(state)).digest("hex"),
       }));
-      writeFileSync(`${statePath}.mutation.lock`, "held");
+      // Corrupt owner metadata must fail closed without executing the cancellation callback.
+      writeFileSync(join(sessionDir, 'autopilot-state.json.mutation.lock'), '{invalid owner');
 
       await expect(checkPersistentModes(sessionId, tempDir)).resolves.toMatchObject({
         shouldBlock: true,

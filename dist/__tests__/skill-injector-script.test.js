@@ -1,21 +1,13 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { stageHookRuntime, } from './helpers/staged-hook-runtime.js';
-const REPO_ROOT = process.cwd();
+import { provisionStandaloneStateLockBridge } from '../installer/index.js';
+import { afterEach, describe, expect, it } from 'vitest';
+const SCRIPT_PATH = join(process.cwd(), 'scripts', 'skill-injector.mjs');
+const PACKAGE_ROOT = process.cwd();
 const NODE = process.execPath;
 const tempDirs = [];
-let stagedRuntime;
-let scriptPath;
-beforeAll(() => {
-    stagedRuntime = stageHookRuntime(['skill-injector.mjs'], REPO_ROOT);
-    scriptPath = stagedRuntime.scriptPath('skill-injector.mjs');
-});
-afterAll(() => {
-    stagedRuntime.cleanup();
-});
 function makeTempDir(prefix) {
     const directory = mkdtempSync(join(tmpdir(), prefix));
     tempDirs.push(directory);
@@ -23,7 +15,7 @@ function makeTempDir(prefix) {
 }
 function runSkillInjector(env = {}, payload = {}) {
     const cwd = typeof payload.cwd === 'string' ? payload.cwd : makeTempDir('skill-injector-guard-');
-    const raw = execFileSync(NODE, [scriptPath], {
+    const raw = execFileSync(NODE, [SCRIPT_PATH], {
         cwd,
         encoding: 'utf-8',
         input: JSON.stringify({
@@ -127,17 +119,14 @@ Write concise release notes.`);
         const pluginRoot = makeTempDir('skill-injector-worker-plugin-');
         const scriptsDir = join(pluginRoot, 'scripts');
         const libDir = join(scriptsDir, 'lib');
-        const runtimePath = join(pluginRoot, 'bridge', 'hook-runtime.cjs');
-        mkdirSync(join(pluginRoot, 'bridge'), { recursive: true });
+        mkdirSync(libDir, { recursive: true });
         mkdirSync(join(pluginRoot, 'hooks'), { recursive: true });
-        cpSync(join(process.cwd(), 'scripts', 'lib'), libDir, { recursive: true });
+        provisionStandaloneStateLockBridge(PACKAGE_ROOT, join(libDir, 'state-lock.mjs'));
+        for (const file of ['config-dir.mjs', 'stdin.mjs', 'atomic-write.mjs']) {
+            writeFileSync(join(libDir, file), readFileSync(join(process.cwd(), 'scripts', 'lib', file)));
+        }
         writeFileSync(join(scriptsDir, 'run.cjs'), readFileSync(join(process.cwd(), 'scripts', 'run.cjs')));
-        writeFileSync(join(scriptsDir, 'skill-injector.mjs'), readFileSync(scriptPath));
-        execFileSync(NODE, [
-            join(process.cwd(), 'scripts', 'build-hook-runtime.mjs'),
-            '--outfile',
-            runtimePath,
-        ], { cwd: process.cwd(), stdio: 'pipe' });
+        writeFileSync(join(scriptsDir, 'skill-injector.mjs'), readFileSync(SCRIPT_PATH));
         writeFileSync(join(pluginRoot, 'hooks', 'hooks.json'), JSON.stringify({
             hooks: {
                 UserPromptSubmit: [{ matcher: '', hooks: [{

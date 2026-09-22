@@ -2,16 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import { resolveTaskAssignment } from '../runtime-v2.js';
 import { buildResolvedRoutingSnapshot } from '../stage-router.js';
-import type { CliAgentType } from '../model-contract.js';
 
 const resolvedRouting = buildResolvedRoutingSnapshot({});
-const binaries: Partial<Record<CliAgentType, string>> = {
-  claude: '/usr/bin/claude',
-  gemini: '/usr/bin/gemini',
-  codex: '/usr/bin/codex',
-  antigravity: '/usr/bin/agy',
-  copilot: '/usr/bin/copilot',
-};
 
 describe('runtime-v2 explicit provider + role preservation', () => {
   // Regression: `1:antigravity:executor` must launch antigravity, not silently fall
@@ -21,7 +13,6 @@ describe('runtime-v2 explicit provider + role preservation', () => {
       { subject: 'Executor task', description: 'apply the implementation', role: 'executor' },
       resolvedRouting,
       undefined,
-      binaries,
       'antigravity',
     );
     expect(assignment).toEqual({ agentType: 'antigravity', model: '', role: 'executor' });
@@ -32,7 +23,6 @@ describe('runtime-v2 explicit provider + role preservation', () => {
       { subject: 'Review', description: 'review the change', role: 'reviewer' },
       resolvedRouting,
       undefined,
-      binaries,
       'gemini',
     );
     expect(assignment.agentType).toBe('gemini');
@@ -45,7 +35,6 @@ describe('runtime-v2 explicit provider + role preservation', () => {
       { subject: 'Executor task', description: 'apply the implementation', role: 'executor' },
       resolvedRouting,
       undefined,
-      binaries,
       'claude',
     );
     expect(assignment.agentType).toBe('claude');
@@ -57,7 +46,6 @@ describe('runtime-v2 explicit provider + role preservation', () => {
       { subject: 'Review', description: 'review the change', role: 'code-reviewer' },
       resolvedRouting,
       undefined,
-      binaries,
       'copilot',
     );
     expect(assignment).toEqual({
@@ -67,32 +55,23 @@ describe('runtime-v2 explicit provider + role preservation', () => {
     });
   });
 
-  it('propagates routed Copilot effort and falls back to the immutable Claude tuple when unavailable', () => {
+  // A routed provider is authoritative: binary availability is validated later,
+  // before any worker launch, instead of silently rewriting provider identity.
+  it('propagates routed Copilot model and effort regardless of binary availability', () => {
     const routed = buildResolvedRoutingSnapshot({
       team: { roleRouting: { critic: { provider: 'copilot' } } },
     });
-    const available = resolveTaskAssignment(
+    const assignment = resolveTaskAssignment(
       { subject: 'Critique', description: 'challenge the plan', role: 'critic' },
       routed,
       { critic: { provider: 'copilot' } },
-      binaries,
       'claude',
     );
-    expect(available).toMatchObject({
+    expect(assignment).toMatchObject({
       agentType: 'copilot',
       model: 'gpt-5.6-sol',
       reasoningEffort: 'max',
       role: 'critic',
     });
-
-    const unavailable = resolveTaskAssignment(
-      { subject: 'Critique', description: 'challenge the plan', role: 'critic' },
-      routed,
-      { critic: { provider: 'copilot' } },
-      { claude: '/usr/bin/claude' },
-      'claude',
-    );
-    expect(unavailable.agentType).toBe('claude');
-    expect(unavailable.reasoningEffort).toBeUndefined();
   });
 });

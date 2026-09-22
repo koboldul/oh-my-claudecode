@@ -161,150 +161,6 @@ export function isProcessAlive(pid) {
         return false;
     }
 }
-let currentProcessStartIdentitySync;
-function parseWindowsDmtfTimestamp(value) {
-    const match = value.match(/(\d{14})\.(\d{6})([+-])(\d{3})/);
-    if (!match)
-        return undefined;
-    const compact = match[1];
-    const year = Number(compact.slice(0, 4));
-    const month = Number(compact.slice(4, 6));
-    const day = Number(compact.slice(6, 8));
-    const hour = Number(compact.slice(8, 10));
-    const minute = Number(compact.slice(10, 12));
-    const second = Number(compact.slice(12, 14));
-    const microseconds = Number(match[2]);
-    const offsetMinutes = Number(match[4]) * (match[3] === '-' ? -1 : 1);
-    if (year < 1601
-        || month < 1
-        || month > 12
-        || day < 1
-        || day > 31
-        || hour > 23
-        || minute > 59
-        || second > 59
-        || !Number.isSafeInteger(microseconds)
-        || !Number.isSafeInteger(offsetMinutes)) {
-        return undefined;
-    }
-    const wallClockMs = Date.UTC(year, month - 1, day, hour, minute, second);
-    const verified = new Date(wallClockMs);
-    if (verified.getUTCFullYear() !== year
-        || verified.getUTCMonth() !== month - 1
-        || verified.getUTCDate() !== day
-        || verified.getUTCHours() !== hour
-        || verified.getUTCMinutes() !== minute
-        || verified.getUTCSeconds() !== second) {
-        return undefined;
-    }
-    const epochMilliseconds = wallClockMs - offsetMinutes * 60_000;
-    return {
-        epochMilliseconds,
-        epochMicroseconds: BigInt(epochMilliseconds) * 1000n + BigInt(microseconds),
-    };
-}
-export function parseWindowsProcessStartIdentity(value) {
-    const parsed = parseWindowsDmtfTimestamp(value);
-    return parsed
-        ? `windows-dmtf-us:${parsed.epochMicroseconds.toString()}`
-        : undefined;
-}
-/**
- * Synchronous process-start identity for exclusive file-lock ownership.
- * `absent` proves the PID is not live; `null` means identity is unavailable.
- */
-export function getProcessStartIdentitySync(pid) {
-    if (!Number.isInteger(pid) || pid <= 0)
-        return null;
-    if (process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(pid)
-        || process.env.OMC_TEST_FILE_LOCK_PROCESS_START_UNKNOWN_PID === String(pid)) {
-        return null;
-    }
-    if (pid === process.pid && currentProcessStartIdentitySync !== undefined) {
-        return currentProcessStartIdentitySync;
-    }
-    let identity = null;
-    if (process.platform === 'linux') {
-        try {
-            const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-            const closeParen = stat.lastIndexOf(')');
-            if (closeParen >= 0) {
-                const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
-                identity =
-                    fields[19] && /^\d+$/.test(fields[19])
-                        ? fields[19]
-                        : null;
-            }
-        }
-        catch (error) {
-            identity =
-                error.code === 'ENOENT'
-                    ? 'absent'
-                    : null;
-        }
-    }
-    else if (process.platform === 'darwin') {
-        try {
-            const stdout = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
-                encoding: 'utf8',
-                env: { ...process.env, LC_ALL: 'C' },
-                stdio: ['ignore', 'pipe', 'ignore'],
-                timeout: 1000,
-                windowsHide: true,
-            });
-            const value = new Date(stdout.trim()).getTime();
-            identity = Number.isFinite(value) ? String(value) : null;
-        }
-        catch {
-            identity = isProcessAlive(pid) ? null : 'absent';
-        }
-    }
-    else if (process.platform === 'win32') {
-        try {
-            const stdout = execFileSync('powershell', [
-                '-NoProfile',
-                '-NonInteractive',
-                '-Command',
-                `$p = [System.Diagnostics.Process]::GetProcessById(${pid}); `
-                    + '[System.Management.ManagementDateTimeConverter]'
-                    + '::ToDmtfDateTime([datetime]$p.StartTime)',
-            ], {
-                encoding: 'utf8',
-                stdio: ['ignore', 'pipe', 'ignore'],
-                timeout: 5000,
-                windowsHide: true,
-            });
-            identity = parseWindowsProcessStartIdentity(stdout) ?? null;
-        }
-        catch {
-            try {
-                const stdout = execFileSync('wmic', [
-                    'process',
-                    'where',
-                    `ProcessId=${pid}`,
-                    'get',
-                    'CreationDate',
-                    '/format:csv',
-                ], {
-                    encoding: 'utf8',
-                    stdio: ['ignore', 'pipe', 'ignore'],
-                    timeout: 1000,
-                    windowsHide: true,
-                });
-                identity = parseWindowsProcessStartIdentity(stdout) ?? null;
-            }
-            catch {
-                identity = isProcessAlive(pid) ? null : 'absent';
-            }
-        }
-    }
-    if (pid === process.pid
-        && identity !== null
-        && identity !== 'absent') {
-        currentProcessStartIdentitySync = identity;
-    }
-    return identity;
-}
 /**
  * Get process start time for PID reuse detection.
  * Returns milliseconds timestamp on macOS/Windows, jiffies on Linux.
@@ -346,7 +202,24 @@ async function getProcessStartTimeWindows(pid, deadlineAt) {
         : getProcessStartTimeWindowsPowerShellProcess(pid, deadlineAt);
 }
 function parseWmicCreationDate(stdout) {
-    return parseWindowsDmtfTimestamp(stdout)?.epochMilliseconds;
+    const lines = stdout.trim().split(/\r?\n/).filter(l => l.trim());
+    if (lines.length < 2)
+        return undefined;
+    const candidate = lines.find(line => /,\d{14}/.test(line)) ?? lines[1];
+    const match = candidate.match(/,(\d{14})/);
+    if (!match)
+        return undefined;
+    const d = match[1];
+    const date = new Date(parseInt(d.slice(0, 4), 10), parseInt(d.slice(4, 6), 10) - 1, parseInt(d.slice(6, 8), 10), parseInt(d.slice(8, 10), 10), parseInt(d.slice(10, 12), 10), parseInt(d.slice(12, 14), 10));
+    const value = date.getTime();
+    return Number.isNaN(value) ? undefined : value;
+}
+function parseWindowsEpochMilliseconds(stdout) {
+    const match = stdout.trim().match(/-?\d+/);
+    if (!match)
+        return undefined;
+    const value = parseInt(match[0], 10);
+    return Number.isFinite(value) ? value : undefined;
 }
 async function getProcessStartTimeWindowsPowerShellCim(pid, deadlineAt) {
     try {
@@ -354,11 +227,9 @@ async function getProcessStartTimeWindowsPowerShellCim(pid, deadlineAt) {
             '-NoProfile',
             '-NonInteractive',
             '-Command',
-            `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction Stop; `
-                + 'if ($p -and $p.CreationDate) { '
-                + '[System.Management.ManagementDateTimeConverter]::ToDmtfDateTime([datetime]$p.CreationDate) }'
+            `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction Stop; if ($p -and $p.CreationDate) { [DateTimeOffset]$p.CreationDate | ForEach-Object { $_.ToUnixTimeMilliseconds() } }`
         ], { timeout: Math.max(1, Math.min(5000, remainingDeadlineMs(deadlineAt) ?? 5000)), windowsHide: true });
-        return parseWmicCreationDate(stdout);
+        return parseWindowsEpochMilliseconds(stdout);
     }
     catch {
         return undefined;
@@ -370,11 +241,9 @@ async function getProcessStartTimeWindowsPowerShellProcess(pid, deadlineAt) {
             '-NoProfile',
             '-NonInteractive',
             '-Command',
-            `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; `
-                + 'if ($p -and $p.StartTime) { '
-                + '[System.Management.ManagementDateTimeConverter]::ToDmtfDateTime([datetime]$p.StartTime) }'
+            `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($p -and $p.StartTime) { [DateTimeOffset]$p.StartTime | ForEach-Object { $_.ToUnixTimeMilliseconds() } }`
         ], { timeout: Math.max(1, Math.min(5000, remainingDeadlineMs(deadlineAt) ?? 5000)), windowsHide: true });
-        return parseWmicCreationDate(stdout);
+        return parseWindowsEpochMilliseconds(stdout);
     }
     catch {
         return undefined;
@@ -409,6 +278,62 @@ async function getProcessStartTimeLinux(pid, deadlineAt) {
     catch {
         return undefined;
     }
+}
+/**
+ * Synchronous process start identity capture for use immediately after spawn,
+ * before the event loop turns. Closes the PID-reuse window that an async
+ * getProcessStartIdentity call would leave open.
+ *
+ * - Linux: reads /proc/<pid>/stat synchronously (microseconds).
+ * - macOS: spawnSync('ps', ...) to get the process start time.
+ * - Windows: spawnSync('powershell', ...) to get StartTime ticks.
+ *
+ * Returns null if the identity cannot be captured synchronously. The caller
+ * must fail closed (no signal) when this returns null.
+ */
+export function getProcessStartIdentitySync(pid) {
+    if (!Number.isInteger(pid) || pid <= 0)
+        return null;
+    if (process.platform === 'linux') {
+        try {
+            const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+            const closeParen = stat.lastIndexOf(')');
+            if (closeParen === -1)
+                return null;
+            const fields = stat.substring(closeParen + 2).split(' ');
+            const startTime = parseInt(fields[19] ?? '', 10);
+            return Number.isNaN(startTime) ? null : String(startTime);
+        }
+        catch {
+            return null;
+        }
+    }
+    if (process.platform === 'darwin') {
+        try {
+            const result = spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8', timeout: 2000, windowsHide: true, env: { ...process.env, LC_ALL: 'C' } });
+            if (result.status !== 0 || !result.stdout)
+                return null;
+            const time = new Date(result.stdout.trim()).getTime();
+            return Number.isNaN(time) ? null : String(time);
+        }
+        catch {
+            return null;
+        }
+    }
+    if (process.platform === 'win32') {
+        try {
+            const cmd = `$p = Get-Process -Id ${pid} -ErrorAction Stop; if ($p -and $p.StartTime) { $p.StartTime.ToUniversalTime().Ticks }`;
+            const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', cmd], { encoding: 'utf8', timeout: 3000, windowsHide: true });
+            if (result.status !== 0 || !result.stdout)
+                return null;
+            const ticks = result.stdout.trim().match(/^\d+$/)?.[0];
+            return ticks ? `ticks:${ticks}` : null;
+        }
+        catch {
+            return null;
+        }
+    }
+    return null;
 }
 /**
  * Gracefully terminate a process with escalation.
@@ -496,11 +421,6 @@ async function getProcessStartIdentityWindows(pid, deadlineAt) {
 export async function getProcessStartIdentity(pid, deadlineAt) {
     if (!Number.isInteger(pid) || pid <= 0 || isDeadlineExceeded(deadlineAt))
         return null;
-    const synchronousIdentity = getProcessStartIdentitySync(pid);
-    if (synchronousIdentity === 'absent')
-        return null;
-    if (synchronousIdentity !== null)
-        return synchronousIdentity;
     if (process.platform === 'win32')
         return getProcessStartIdentityWindows(pid, deadlineAt);
     const startTime = await getProcessStartTime(pid, deadlineAt);

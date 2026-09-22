@@ -1,4 +1,4 @@
-import { type SessionEndActionName } from './cleanup-manifest.js';
+import { type SessionEndActionName, type SessionEndActionAuthority } from './cleanup-manifest.js';
 export interface SessionEndWorkerPayload {
     directory: string;
     sessionId: string;
@@ -7,7 +7,7 @@ export interface SessionEndWorkerPayload {
 /** Durable OpenClaw routing is supplied from the manifest to the action runner, never from worker ambient state. */
 export declare function workerEnvironment(): NodeJS.ProcessEnv;
 export declare function spawnSessionEndWorker(payload: SessionEndWorkerPayload): boolean;
-export declare function executeSessionEndAction(name: SessionEndActionName, payload: SessionEndWorkerPayload, deadlineAt: number): Promise<void>;
+export declare function executeSessionEndAction(name: SessionEndActionName, payload: SessionEndWorkerPayload, deadlineAt: number, authority?: SessionEndActionAuthority): Promise<void>;
 export declare function processSessionEndWorker(payload: SessionEndWorkerPayload): Promise<void>;
 /** Resident recovery path: claims the same bounded tickets but reconciles them without spawning. */
 export declare function reconcileSessionEndJobsInProcess(directory: string, sessionIds?: readonly string[], processStartIdentity?: string): Promise<void>;

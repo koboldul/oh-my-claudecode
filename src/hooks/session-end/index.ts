@@ -2,7 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
 import type { NotificationPlatform } from '../../notifications/types.js';
-import { resolveToWorktreeRoot, getOmcRoot, validateSessionId, isValidTranscriptPath, resolveSessionStatePath } from '../../lib/worktree-paths.js';
+import { cleanupBridgeSessions } from '../../tools/python-repl/bridge-manager.js';
+import { resolveToWorktreeRoot, getOmcRoot, validateSessionId, isValidTranscriptPath, resolveSessionStatePath, withProjectIdentifierScope } from '../../lib/worktree-paths.js';
 import { SESSION_END_MODE_STATE_FILES, SESSION_METRICS_MODE_FILES } from '../../lib/mode-names.js';
 import {
   canClearStateForSession,
@@ -680,7 +681,7 @@ function extractTeamNameFromState(state: Record<string, unknown> | null): string
   return normalizeSessionEndTeamName(state.team_name ?? state.teamName);
 }
 
-async function findSessionOwnedTeams(directory: string, sessionId: string): Promise<string[]> {
+export async function findSessionOwnedTeams(directory: string, sessionId: string): Promise<string[]> {
   const teamNames = new Set<string>();
   const teamState = readModeStateWithMeta<Record<string, unknown>>('team', directory, sessionId);
   const stateTeamName = canClearStateForSession(teamState, sessionId)
@@ -919,6 +920,12 @@ export async function runForegroundSessionEndCleanup(directory: string, sessionI
   return outcome;
 }
 
+export async function prepareSessionEndWorkerInput(directory: string, input: SessionEndInput): Promise<Record<string, unknown>> {
+  const metrics = recordSessionMetrics(directory, input);
+  const teamNames = await findSessionOwnedTeams(directory, input.session_id);
+  return { transcriptPath: input.transcript_path, cwd: input.cwd, reason: input.reason, input, metrics, initialTeamNames: teamNames };
+}
+
 /** Foreground path: only durable local state and worker launch; deferred adapters are worker-owned. */
 function buildDurableSessionEndPayload(directory: string, input: SessionEndInput, metrics: SessionMetrics): Record<string, unknown> {
   const teamState = readModeStateWithMeta<Record<string, unknown>>('team', directory, input.session_id);
@@ -942,61 +949,63 @@ export async function admitSessionEnd(
   input: SessionEndInput,
   event?: SessionEndProducerAdmission,
 ): Promise<SessionEndAdmissionResult> {
-  const directory = resolveToWorktreeRoot(input.cwd);
-  const existing = event ? readSessionEndJob(directory, input.session_id) : null;
-  if (event && existing && existing.producers.core.state !== 'absent') {
-    const matches = existing.producers.core.eventId === event.eventId
-      && existing.producers.core.rawDigest === event.rawDigest;
-    return {
-      output: { continue: true },
-      directory,
-      sessionId: input.session_id,
-      admitted: true,
-      deduplicated: matches,
-    };
-  }
+  return withProjectIdentifierScope(async () => {
+    const directory = resolveToWorktreeRoot(input.cwd);
+    const existing = event ? readSessionEndJob(directory, input.session_id) : null;
+    if (event && existing && existing.producers.core.state !== 'absent') {
+      const matches = existing.producers.core.eventId === event.eventId
+        && existing.producers.core.rawDigest === event.rawDigest;
+      return {
+        output: { continue: true },
+        directory,
+        sessionId: input.session_id,
+        admitted: true,
+        deduplicated: matches,
+      };
+    }
 
-  // Stale-unfinished-PRD warning (#3669): surface the divergence at session end
-  // BEFORE mode-state cleanup removes the ralph state (the abnormal-exit
-  // signal). Never blocks session end.
-  const stalePrdWarning = getSessionEndStalePrdWarning(directory, input.session_id);
-  if (stalePrdWarning) {
-    console.warn(stalePrdWarning);
-  }
-  const metrics = recordSessionMetrics(directory, input);
-  const payload = buildDurableSessionEndPayload(directory, input, metrics);
-  const manifest = prepareCoreManifest(directory, input.session_id, payload, event);
-  if (!manifest) {
+    // Stale-unfinished-PRD warning (#3669): surface the divergence at session end
+    // BEFORE mode-state cleanup removes the ralph state (the abnormal-exit
+    // signal). Never blocks session end.
+    const stalePrdWarning = getSessionEndStalePrdWarning(directory, input.session_id);
+    if (stalePrdWarning) {
+      console.warn(stalePrdWarning);
+    }
+    const metrics = recordSessionMetrics(directory, input);
+    const payload = buildDurableSessionEndPayload(directory, input, metrics);
+    const manifest = prepareCoreManifest(directory, input.session_id, payload, event);
+    if (!manifest) {
+      return {
+        output: { continue: true },
+        directory,
+        sessionId: input.session_id,
+        admitted: false,
+      };
+    }
+    exportSessionSummary(directory, metrics);
+    let foregroundOutcome: Record<string, unknown>;
+    try {
+      foregroundOutcome = await runForegroundSessionEndCleanup(
+        directory,
+        input.session_id,
+        false,
+      );
+    } catch {
+      return {
+        output: { continue: true },
+        directory,
+        sessionId: input.session_id,
+        admitted: false,
+      };
+    }
+    const sealed = completeForegroundCleanupAndSealCore(directory, input.session_id, foregroundOutcome);
     return {
       output: { continue: true },
       directory,
       sessionId: input.session_id,
-      admitted: false,
+      admitted: Boolean(sealed),
     };
-  }
-  exportSessionSummary(directory, metrics);
-  let foregroundOutcome: Record<string, unknown>;
-  try {
-    foregroundOutcome = await runForegroundSessionEndCleanup(
-      directory,
-      input.session_id,
-      false,
-    );
-  } catch {
-    return {
-      output: { continue: true },
-      directory,
-      sessionId: input.session_id,
-      admitted: false,
-    };
-  }
-  const sealed = completeForegroundCleanupAndSealCore(directory, input.session_id, foregroundOutcome);
-  return {
-    output: { continue: true },
-    directory,
-    sessionId: input.session_id,
-    admitted: Boolean(sealed),
-  };
+  });
 }
 
 export async function processSessionEnd(input: SessionEndInput): Promise<HookOutput> {
@@ -1009,6 +1018,7 @@ export async function processSessionEnd(input: SessionEndInput): Promise<HookOut
     });
   }
   return admission.output;
+}
 }
 
 /** Wiki producer has no foreground lock or write; it only seals a durable capture/no-op intent. */

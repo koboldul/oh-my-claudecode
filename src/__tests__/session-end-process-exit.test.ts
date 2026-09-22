@@ -13,6 +13,7 @@ import {
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
+import { getOmcRoot } from '../lib/worktree-paths.js';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import {
@@ -22,6 +23,7 @@ import {
   describe,
   expect,
   it,
+  vi,
 } from 'vitest';
 import { sessionEndJobPath } from '../hooks/session-end/cleanup-manifest.js';
 
@@ -536,13 +538,18 @@ describe('SessionEnd run.cjs runner/admission latency and detached completion', 
         // reaches its terminal receipt; successful tests clean synchronously.
       }
     }
+    vi.unstubAllEnvs();
   });
 
   function createProject(label = 'project'): string {
     const cwd = mkdtempSync(join(tmpdir(), `omc-session-end-${label}-`));
     tempDirs.push(cwd);
     mkdirSync(join(cwd, '.git'));
+    vi.stubEnv('HOME', cwd);
+    vi.stubEnv('USERPROFILE', cwd);
+    vi.stubEnv('OMC_STATE_DIR', '');
     writeFileSync(join(cwd, 'transcript.jsonl'), '');
+    mkdirSync(getOmcRoot(cwd), { recursive: true });
     return cwd;
   }
 
@@ -863,12 +870,12 @@ describe('SessionEnd run.cjs runner/admission latency and detached completion', 
   it('lets wiki-session-end return without waiting for a live wiki lock', async () => {
     const cwd = createProject('wiki-lock');
     configureDeferredAdapters(cwd);
-    const wikiDir = join(cwd, '.omc', 'wiki');
+    const wikiDir = join(getOmcRoot(cwd), 'wiki');
     const sessionId = 'wiki-live-lock';
     const tracking = workerTracking(cwd, 'wiki-lock');
     mkdirSync(wikiDir, { recursive: true });
     writeFileSync(
-      join(cwd, '.omc', '.omc-config.json'),
+      join(getOmcRoot(cwd), '.omc-config.json'),
       JSON.stringify({ wiki: { autoCapture: true } }),
     );
     writeFileSync(

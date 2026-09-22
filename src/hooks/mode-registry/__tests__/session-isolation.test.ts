@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { getProcessStartIdentitySync } from '../../../platform/process-utils.js';
 import { spawn } from 'child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync, unlinkSync } from 'fs';
@@ -54,20 +55,9 @@ describe('Session-Scoped State Isolation', () => {
   });
 
   function liveLockOwner() {
-    const processStartIdentity = getProcessStartIdentitySync(process.pid);
-    if (
-      processStartIdentity === null
-      || processStartIdentity === 'absent'
-    ) {
-      throw new Error('current process identity unavailable');
-    }
-    return JSON.stringify({
-      version: 2,
-      pid: process.pid,
-      processStartIdentity,
-      nonce: randomUUID(),
-      timestamp: Date.now(),
-    });
+    const processStart = getProcessStartIdentitySync(process.pid);
+    if (processStart === null) throw new Error('current process identity unavailable');
+    return JSON.stringify({ version: 1, pid: process.pid, processStart, createdAt: new Date().toISOString(), nonce: randomUUID() });
   }
 
   // Helper to create state file at session-scoped path

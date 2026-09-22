@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'crypto';
+import { getProcessStartIdentitySync } from '../../platform/process-utils.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync, existsSync, lstatSync } from 'fs';
 import { homedir, tmpdir } from 'os';
@@ -34,20 +35,9 @@ vi.mock('../../lib/worktree-paths.js', async () => {
 });
 
 function liveLockOwner() {
-  const processStartIdentity = getProcessStartIdentitySync(process.pid);
-  if (
-    processStartIdentity === null
-    || processStartIdentity === 'absent'
-  ) {
-    throw new Error('current process identity unavailable');
-  }
-  return JSON.stringify({
-    version: 2,
-    pid: process.pid,
-    processStartIdentity,
-    nonce: randomUUID(),
-    timestamp: Date.now(),
-  });
+  const processStart = getProcessStartIdentitySync(process.pid);
+  if (processStart === null) throw new Error('current process identity unavailable');
+  return JSON.stringify({ version: 1, pid: process.pid, processStart, createdAt: new Date().toISOString(), nonce: randomUUID() });
 }
 
 function portableWorkflowState(sessionId: string): Record<string, unknown> {

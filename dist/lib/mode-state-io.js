@@ -5,44 +5,325 @@
  * Centralises path resolution, ghost-legacy cleanup, directory creation,
  * and file permissions so that individual mode modules don't duplicate this logic.
  */
-import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync, writeSync } from 'fs';
+import { closeSync, existsSync, fstatSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync, writeSync } from 'fs';
 import { basename, dirname, join, resolve } from 'path';
 import { createHash, randomUUID } from 'crypto';
-import { spawnSync } from 'child_process';
-import { getOmcRoot, probeGitTopLevel, resolveStatePath, resolveSessionStatePath, resolveSessionStatePaths, ensureSessionStateDir, ensureOmcDir, listSessionIds, } from './worktree-paths.js';
+import Database from 'better-sqlite3';
+import { getOmcRoot, probeGitTopLevel, resolveStatePath, resolveSessionStatePath, ensureSessionStateDir, ensureOmcDir, listSessionIds, } from './worktree-paths.js';
+import { getProcessStartIdentitySync } from '../platform/process-utils.js';
 import { atomicWriteJsonSync } from './atomic-write.js';
-import { acquireFileLockSync, releaseFileLockSync, } from './file-lock.js';
-import { MODE_CONFIRMATION_SKILL_MAP } from './mode-names.js';
-import { getProcessStartIdentitySync, } from '../platform/process-utils.js';
-function flockPath() { return process.env.NODE_ENV === 'test' && process.env.OMC_TEST_FLOCK_AVAILABLE === '0' ? null : existsSync('/usr/bin/flock') ? '/usr/bin/flock' : existsSync('/bin/flock') ? '/bin/flock' : null; }
-function processStartIdentity(pid) {
-    const identity = getProcessStartIdentitySync(pid);
-    if (identity === null || identity === 'absent')
-        return identity;
-    return identity.match(/\d+$/)?.[0] ?? null;
+const localLocks = new Map();
+// The current process's own start identity is immutable for the process
+// lifetime once successfully captured. acquireLockAt spawns a real
+// subprocess (ps on Darwin, powershell on Windows) to compute it; caching
+// a successful result avoids paying that subprocess cost on every single
+// lock acquisition. A transient probe failure (subprocess timeout/spawn
+// hiccup under load) is deliberately NOT cached, so the next call retries
+// the real probe instead of permanently fail-closing every subsequent
+// lock acquisition for the rest of the process lifetime.
+let ownProcessStartIdentityCache = null;
+function ownProcessStartIdentity() {
+    if (ownProcessStartIdentityCache === null) {
+        ownProcessStartIdentityCache = getProcessStartIdentitySync(process.pid);
+    }
+    return ownProcessStartIdentityCache;
 }
-function acquireLockAt(path, _requireExclusive = false) {
+function sqliteConstructor() {
+    return Database;
+}
+function mutationDbPath(lockPath) {
+    let current = dirname(lockPath);
+    while (basename(current) !== 'state') {
+        const parent = dirname(current);
+        if (parent === current)
+            return join(dirname(lockPath), '.state-mutation-locks.db');
+        current = parent;
+    }
+    return join(current, '.state-mutation-locks.db');
+}
+function ownerFromRow(row) {
+    if (!row || row.version !== 1 || !Number.isSafeInteger(row.pid) || row.pid <= 0 || typeof row.process_start !== 'string' || typeof row.created_at !== 'string' || typeof row.nonce !== 'string')
+        return null;
+    return { version: 1, pid: row.pid, processStart: row.process_start, createdAt: row.created_at, nonce: row.nonce };
+}
+function writeAllSync(fd, content, label) {
+    const bytes = Buffer.from(content, 'utf8');
+    let offset = 0;
+    while (offset < bytes.length) {
+        const written = writeSync(fd, bytes, offset, bytes.length - offset);
+        if (!Number.isInteger(written) || written <= 0)
+            throw new Error(`${label} made no progress`);
+        offset += written;
+    }
+    if (fstatSync(fd).size !== bytes.length)
+        throw new Error(`${label} size verification failed`);
+}
+function readLockOwner(path) {
     try {
-        return acquireFileLockSync(path, {
-            timeoutMs: 500,
-            retryDelayMs: 10,
-            staleLockMs: 30_000,
-        });
+        const value = JSON.parse(readFileSync(path, 'utf8'));
+        const pid = value.pid;
+        if (value.version !== 1 || !Number.isSafeInteger(pid) || pid <= 0 || typeof value.processStart !== 'string' || !/^\S+$/.test(value.processStart) || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt)) || typeof value.nonce !== 'string' || !/^[0-9a-f-]{36}$/i.test(value.nonce))
+            return null;
+        return value;
+    }
+    catch (error) {
+        return error.code === 'ENOENT' ? 'absent' : null;
+    }
+}
+function sameOwner(left, right) {
+    return left !== null && left.pid === right.pid && left.processStart === right.processStart && left.nonce === right.nonce;
+}
+function ownerLive(owner) {
+    if (process.env.NODE_ENV === 'test' && process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(owner.pid))
+        return null;
+    const current = processStartIdentity(owner.pid);
+    if (current === null)
+        return null;
+    return current === 'absent' ? false : current === owner.processStart;
+}
+function publishLockOwner(path, owner) {
+    const tempPath = `${path}.${owner.pid}.${owner.nonce}.tmp`;
+    let fd;
+    try {
+        fd = openSync(tempPath, 'wx', 0o600);
+        writeAllSync(fd, JSON.stringify(owner), 'lock owner publication');
+        fsyncSync(fd);
+        closeSync(fd);
+        fd = undefined;
+        linkSync(tempPath, path);
+        unlinkSync(tempPath);
+        return true;
     }
     catch {
+        try {
+            if (fd !== undefined)
+                closeSync(fd);
+        }
+        catch { /* best effort */ }
+        try {
+            unlinkSync(tempPath);
+        }
+        catch { /* best effort */ }
+        return false;
+    }
+}
+function openMutationDb(lockPath) {
+    const Database = sqliteConstructor();
+    if (!Database)
+        return null;
+    let db = null;
+    try {
+        const dbPath = mutationDbPath(lockPath);
+        for (const sidecar of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`]) {
+            try {
+                const stat = statSync(sidecar);
+                if (!stat.isFile() || stat.nlink !== 1) {
+                    if (process.env.OMC_LOCK_DEBUG)
+                        console.error(`[lock-debug] openMutationDb sidecar-reject ${sidecar} isFile=${stat.isFile()} nlink=${stat.nlink}`);
+                    return null;
+                }
+            }
+            catch (error) {
+                if (error.code !== 'ENOENT') {
+                    if (process.env.OMC_LOCK_DEBUG)
+                        console.error(`[lock-debug] openMutationDb sidecar-stat-error ${sidecar} ${error.code}`);
+                    return null;
+                }
+            }
+        }
+        db = new Database(dbPath);
+        db.pragma('journal_mode = WAL');
+        db.pragma('busy_timeout = 2000');
+        db.exec('CREATE TABLE IF NOT EXISTS state_mutation_locks (lock_key TEXT PRIMARY KEY, version INTEGER NOT NULL, pid INTEGER NOT NULL, process_start TEXT NOT NULL, created_at TEXT NOT NULL, nonce TEXT NOT NULL)');
+        return db;
+    }
+    catch (error) {
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] openMutationDb open/exec failed for ${lockPath}: ${error?.message}`);
+        try {
+            db?.close();
+        }
+        catch { /* best effort */ }
         return null;
     }
 }
-function acquireMutationLock(filePath, requireExclusive = false) {
-    return acquireLockAt(`${filePath}.mutation.lock`, requireExclusive);
+function acquireLockAt(path, attempts = 50) {
+    mkdirSync(dirname(path), { recursive: true });
+    const key = (() => { try {
+        return resolve(realpathSync(dirname(path)), basename(path));
+    }
+    catch {
+        return resolve(path);
+    } })();
+    const held = localLocks.get(key);
+    if (held && !('unlocked' in held)) {
+        held.depth += 1;
+        return held;
+    }
+    const db = openMutationDb(path);
+    if (!db) {
+        // Transient: sidecar validation can observe a mid-write WAL/SHM state
+        // from a concurrent owner. Retry with the same backoff as contention,
+        // rather than failing closed on a race that isn't a real integrity issue.
+        if (attempts <= 1)
+            return null;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        return acquireLockAt(path, attempts - 1);
+    }
+    const processStart = ownProcessStartIdentity();
+    if (!processStart) {
+        try {
+            db.close();
+        }
+        catch { /* best effort */ }
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] acquireLockAt processStart-null ${path}`);
+        // Transient: the identity probe (spawnSync ps/powershell) can time out
+        // under CI/system load without the process itself being unavailable.
+        // Retry within budget instead of failing closed on the first probe miss.
+        if (attempts <= 1)
+            return null;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        return acquireLockAt(path, attempts - 1);
+    }
+    const owner = { version: 1, pid: process.pid, processStart, createdAt: new Date().toISOString(), nonce: randomUUID() };
+    try {
+        db.exec('BEGIN IMMEDIATE');
+        const rawRow = db.prepare('SELECT version, pid, process_start, created_at, nonce FROM state_mutation_locks WHERE lock_key = ?').get(key);
+        if (rawRow) {
+            const row = ownerFromRow(rawRow);
+            if (!row) {
+                db.exec('ROLLBACK');
+                db.close();
+                if (process.env.OMC_LOCK_DEBUG)
+                    console.error(`[lock-debug] acquireLockAt row-invalid ${path}`);
+                return null;
+            }
+            const live = ownerLive(row);
+            if (live === null || live) {
+                db.exec('ROLLBACK');
+                db.close();
+                if (process.env.OMC_LOCK_DEBUG)
+                    console.error(`[lock-debug] acquireLockAt row-live=${live} ${path}`);
+                if (live === null || attempts <= 1)
+                    return null;
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+                return acquireLockAt(path, attempts - 1);
+            }
+            db.prepare('DELETE FROM state_mutation_locks WHERE lock_key = ?').run(key);
+        }
+        const artifact = readLockOwner(path);
+        if (artifact !== 'absent') {
+            if (!artifact) {
+                db.exec('ROLLBACK');
+                db.close();
+                console.error(`[omc-lock] state_mutation_lock_unverifiable: ${path}`);
+                return null;
+            }
+            const live = ownerLive(artifact);
+            if (live === null || live) {
+                db.exec('ROLLBACK');
+                db.close();
+                if (process.env.OMC_LOCK_DEBUG)
+                    console.error(`[lock-debug] acquireLockAt artifact-live=${live} ${path}`);
+                if (live === null || attempts <= 1)
+                    return null;
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+                return acquireLockAt(path, attempts - 1);
+            }
+            try {
+                unlinkSync(path);
+            }
+            catch (error) {
+                db.exec('ROLLBACK');
+                db.close();
+                if (process.env.OMC_LOCK_DEBUG)
+                    console.error(`[lock-debug] acquireLockAt artifact-unlink-failed ${path} ${error.code}`);
+                return null;
+            }
+        }
+        db.prepare('INSERT INTO state_mutation_locks (lock_key, version, pid, process_start, created_at, nonce) VALUES (?, 1, ?, ?, ?, ?)').run(key, owner.pid, owner.processStart, owner.createdAt, owner.nonce);
+        if (!publishLockOwner(path, owner)) {
+            db.exec('ROLLBACK');
+            db.close();
+            if (process.env.OMC_LOCK_DEBUG)
+                console.error(`[lock-debug] acquireLockAt publish-failed ${path}`);
+            // The lock artifact may have been (re)written by a concurrent owner
+            // between our absent/dead check and this publish (e.g. linkSync sees
+            // EEXIST). This is contention, not corruption; retry within budget
+            // instead of failing closed on the first race.
+            if (attempts <= 1)
+                return null;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+            return acquireLockAt(path, attempts - 1);
+        }
+        db.exec('COMMIT');
+        const lock = { db, key, path, owner, depth: 1 };
+        localLocks.set(key, lock);
+        return lock;
+    }
+    catch (error) {
+        try {
+            db.exec('ROLLBACK');
+        }
+        catch { /* best effort */ }
+        try {
+            db.close();
+        }
+        catch { /* best effort */ }
+        // SQLITE_BUSY/SQLITE_LOCKED are transient contention from a concurrent
+        // owner mid-transaction, not an integrity failure; retry within budget
+        // the same way row/artifact contention does. Any other error still
+        // fails closed immediately.
+        const code = error?.code;
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] acquireLockAt caught-error ${path} code=${code} msg=${error?.message}`);
+        if ((code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED') && attempts > 1) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+            return acquireLockAt(path, attempts - 1);
+        }
+        return null;
+    }
+}
+function acquireMutationLock(filePath) {
+    return acquireLockAt(`${filePath}.mutation.lock`);
 }
 function releaseMutationLock(lock) {
-    if (!lock)
+    if (!lock || 'unlocked' in lock)
         return;
-    releaseFileLockSync(lock);
+    if (lock.depth > 1) {
+        lock.depth -= 1;
+        return;
+    }
+    localLocks.delete(lock.key);
+    try {
+        lock.db.exec('BEGIN IMMEDIATE');
+        const row = ownerFromRow(lock.db.prepare('SELECT version, pid, process_start, created_at, nonce FROM state_mutation_locks WHERE lock_key = ?').get(lock.key));
+        const artifact = readLockOwner(lock.path);
+        if (!sameOwner(row, lock.owner) || !sameOwner(artifact === 'absent' ? null : artifact, lock.owner)) {
+            lock.db.exec('ROLLBACK');
+            return;
+        }
+        unlinkSync(lock.path);
+        lock.db.prepare('DELETE FROM state_mutation_locks WHERE lock_key = ?').run(lock.key);
+        lock.db.exec('COMMIT');
+    }
+    catch {
+        try {
+            lock.db.exec('ROLLBACK');
+        }
+        catch { /* best effort */ }
+    }
+    finally {
+        try {
+            lock.db.close();
+        }
+        catch { /* best effort */ }
+    }
 }
 /** Executes a read or mutation against a state file under its mutation lock. */
-export function withStateFileMutationLock(filePath, callback, _requireExclusive = true) {
+export function withStateFileMutationLock(filePath, callback, requireExclusive = false) {
+    void requireExclusive;
     const lock = acquireLockAt(`${filePath}.mutation.lock`);
     if (!lock)
         return { acquired: false, value: undefined };
@@ -51,6 +332,23 @@ export function withStateFileMutationLock(filePath, callback, _requireExclusive 
     }
     finally {
         releaseMutationLock(lock);
+    }
+}
+function processStartIdentity(pid) {
+    if (!Number.isSafeInteger(pid) || pid <= 0)
+        return null;
+    if (process.env.NODE_ENV === 'test' && process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(pid))
+        return null;
+    const identity = getProcessStartIdentitySync(pid);
+    if (identity !== null)
+        return identity;
+    try {
+        process.kill(pid, 0);
+        return null;
+    }
+    catch (error) {
+        const code = error.code;
+        return code === 'ESRCH' ? 'absent' : null;
     }
 }
 export function writeStateFileLocked(filePath, state) {
@@ -182,11 +480,17 @@ export function writeStateFileLockedIf(filePath, predicate, transform) {
     }
 }
 export function writeStateFileLockedCreateIf(filePath, predicate, transform) {
-    if (!recoverEmergencyStateFile(filePath))
+    if (!recoverEmergencyStateFile(filePath)) {
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] CreateIf recoverEmergency failed ${filePath}`);
         return 'failed';
+    }
     const lock = acquireMutationLock(filePath);
-    if (!lock)
+    if (!lock) {
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] CreateIf acquireMutationLock failed ${filePath}`);
         return 'failed';
+    }
     try {
         if (process.env.NODE_ENV === 'test' && process.env.OMC_TEST_CONDITIONAL_CREATE_REPLACEMENT_PATH === filePath && process.env.OMC_TEST_CONDITIONAL_CREATE_REPLACEMENT_BASE64) {
             try {
@@ -203,7 +507,9 @@ export function writeStateFileLockedCreateIf(filePath, predicate, transform) {
             try {
                 current = JSON.parse(readFileSync(filePath, 'utf8'));
             }
-            catch {
+            catch (error) {
+                if (process.env.OMC_LOCK_DEBUG)
+                    console.error(`[lock-debug] CreateIf JSON-parse-failed ${filePath} ${error?.message}`);
                 return 'failed';
             }
         }
@@ -212,7 +518,9 @@ export function writeStateFileLockedCreateIf(filePath, predicate, transform) {
         atomicWriteJsonSync(filePath, transform(current));
         return 'written';
     }
-    catch {
+    catch (error) {
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] CreateIf caught-error ${filePath} ${error?.message}`);
         return 'failed';
     }
     finally {
@@ -230,8 +538,8 @@ function sessionOwnerFromStatePath(filePath) {
     return match?.[1];
 }
 function emergencyOwner() {
-    const processStart = processStartIdentity(process.pid);
-    return typeof processStart === 'string' ? { pid: process.pid, processStart, nonce: randomUUID() } : null;
+    const processStart = ownProcessStartIdentity();
+    return processStart !== null ? { pid: process.pid, processStart, nonce: randomUUID() } : null;
 }
 function sameEmergencyOwner(left, right) {
     return left.pid === right.pid && left.processStart === right.processStart && left.nonce === right.nonce;
@@ -256,11 +564,25 @@ function writeEmergencyJournal(path, journal, requireOwnership = true) {
         return false;
     }
 }
+// Windows processStart is formatted as `ticks:<n>` (see
+// getProcessStartIdentitySync); the literal colon is illegal in NTFS
+// filenames and made every linkSync() in publishEmergencyFileExclusive fail
+// with EINVAL. Filename-embedded process-start identities are sanitized
+// through these two functions (encode when building a temp name, decode
+// when parsing one back out of a directory listing) so the pid-reuse
+// staleness check in reconcileEmergencyPublicationTemps keeps working
+// unchanged cross-platform.
+function encodeProcessStartForFilename(processStart) {
+    return processStart.replace(/:/g, '_c_');
+}
+function decodeProcessStartFromFilename(encoded) {
+    return encoded.replace(/_c_/g, ':');
+}
 function emergencyPublicationTempPath(path) {
-    const processStart = processStartIdentity(process.pid);
-    if (!processStart || processStart === 'absent')
+    const processStart = ownProcessStartIdentity();
+    if (!processStart)
         return null;
-    return `${path}.${process.pid}.${processStart}.${randomUUID()}.tmp`;
+    return `${path}.${process.pid}.${encodeProcessStartForFilename(processStart)}.${randomUUID()}.tmp`;
 }
 /** Publishes a complete, durable transaction file without exposing a partial final path. */
 function publishEmergencyFileExclusive(path, content) {
@@ -288,7 +610,9 @@ function publishEmergencyFileExclusive(path, content) {
         unlinkSync(tempPath);
         return true;
     }
-    catch {
+    catch (error) {
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] publishEmergencyFileExclusive failed path=${path} tempPath=${tempPath} pathExists=${existsSync(path)} err=${error?.code} ${error?.message}`);
         return false;
     }
     finally {
@@ -308,81 +632,52 @@ function publishEmergencyFileExclusive(path, content) {
         }
     }
 }
-const RECOVERY_CLAIM_SCRIPT = String.raw `
-const fs = require('fs');
-const [operation, claimPath, expectedRaw] = process.argv.slice(1);
-const keys = ['createdAt', 'nonce', 'pid', 'processStart', 'version'];
-function readOwner() {
-  try {
-    const value = JSON.parse(fs.readFileSync(claimPath, 'utf8'));
-    const actual = Object.keys(value).sort();
-    if (actual.length !== keys.length || !actual.every((key, index) => key === keys[index]) || value.version !== 1 || !Number.isSafeInteger(value.pid) || value.pid <= 0 || typeof value.processStart !== 'string' || !/^\d+$/.test(value.processStart) || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt)) || typeof value.nonce !== 'string' || !/^[0-9a-f-]{36}$/i.test(value.nonce)) return null;
-    return value;
-  } catch (error) { return error && error.code === 'ENOENT' ? 'absent' : null; }
-}
-function exact(left, right) { return left.pid === right.pid && left.processStart === right.processStart && left.nonce === right.nonce; }
-function stale(owner) {
-  if (process.platform !== 'linux') return null;
-  try {
-    const stat = fs.readFileSync('/proc/' + owner.pid + '/stat', 'utf8');
-    const end = stat.lastIndexOf(')');
-    const fields = end >= 0 ? stat.slice(end + 2).trim().split(/\s+/) : [];
-    const start = fields[19] && /^\d+$/.test(fields[19]) ? fields[19] : null;
-    return start === null ? null : start !== owner.processStart;
-  } catch (error) { return error && error.code === 'ENOENT' ? true : null; }
-}
-let expected;
-try { expected = JSON.parse(expectedRaw); } catch { process.exit(3); }
-if (operation === 'release') {
-  const current = readOwner();
-  if (current === 'absent') process.exit(0);
-  if (!current || !exact(current, expected)) process.exit(4);
-  try { fs.unlinkSync(claimPath); process.exit(0); } catch { process.exit(3); }
-}
-const current = readOwner();
-if (current !== 'absent') {
-  if (!current) process.exit(3);
-  const isStale = stale(current);
-  if (isStale !== true) process.exit(isStale === false ? 2 : 3);
-  try { fs.unlinkSync(claimPath); } catch { process.exit(3); }
-}
-let fd;
-try {
-  fd = fs.openSync(claimPath, 'wx', 0o600);
-  const bytes = Buffer.from(JSON.stringify(expected));
-  let offset = 0;
-  while (offset < bytes.length) {
-    const written = fs.writeSync(fd, bytes, offset, bytes.length - offset);
-    if (written <= 0) throw new Error('recovery claim made no progress');
-    offset += written;
-  }
-  fs.fsyncSync(fd);
-  if (fs.statSync(claimPath).size !== bytes.length) throw new Error('recovery claim truncated');
-  fs.closeSync(fd);
-  process.exit(0);
-} catch { try { if (fd !== undefined) fs.closeSync(fd); } catch {} try { fs.unlinkSync(claimPath); } catch {} process.exit(3); }
-`;
-function guardedRecoveryClaim(path, operation, owner) {
-    const flock = flockPath();
-    if (!flock)
-        return 'unverifiable';
-    const result = spawnSync(flock, ['-x', `${path}.recovery.guard`, process.execPath, '-e', RECOVERY_CLAIM_SCRIPT, operation, path, JSON.stringify(owner)], { stdio: 'ignore', timeout: 2000 });
-    if (result.status === 0)
-        return 'claimed';
-    if (result.status === 2)
-        return 'live';
-    if (result.status === 4)
-        return 'replaced';
-    return 'unverifiable';
-}
-function acquireRecoveryClaim(path) {
-    const processStart = processStartIdentity(process.pid);
-    if (!processStart || processStart === 'absent')
+function acquireRecoveryClaim(path, attempts = 50) {
+    const processStart = ownProcessStartIdentity();
+    if (!processStart) {
+        // Transient: the identity probe can fail under the same load that
+        // causes SQLite lock contention. Retry within budget rather than
+        // failing closed on the first transient probe failure.
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] acquireRecoveryClaim processStart-null ${path}`);
+        if (attempts <= 1)
+            return null;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        return acquireRecoveryClaim(path, attempts - 1);
+    }
+    const lock = acquireLockAt(`${path}.recovery.guard`, attempts);
+    if (!lock || 'unlocked' in lock) {
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] acquireRecoveryClaim guard-lock-null ${path}`);
         return null;
+    }
+    const existing = readRecoveryClaim(path);
+    if (existing) {
+        const live = ownerLive(existing);
+        if (live === null || live) {
+            releaseMutationLock(lock);
+            if (process.env.OMC_LOCK_DEBUG)
+                console.error(`[lock-debug] acquireRecoveryClaim existing-live=${live} ${path}`);
+            return null;
+        }
+        try {
+            unlinkSync(path);
+        }
+        catch (error) {
+            releaseMutationLock(lock);
+            if (process.env.OMC_LOCK_DEBUG)
+                console.error(`[lock-debug] acquireRecoveryClaim existing-unlink-failed ${path} ${error.code}`);
+            return null;
+        }
+    }
     const owner = { version: 1, pid: process.pid, processStart, createdAt: new Date().toISOString(), nonce: randomUUID() };
-    if (!flockPath())
-        return publishEmergencyFileExclusive(path, JSON.stringify(owner)) ? owner : null;
-    return guardedRecoveryClaim(path, 'acquire', owner) === 'claimed' ? owner : null;
+    if (!publishEmergencyFileExclusive(path, JSON.stringify(owner))) {
+        releaseMutationLock(lock);
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] acquireRecoveryClaim publish-failed ${path}`);
+        return null;
+    }
+    return owner;
 }
 function readRecoveryClaim(path) {
     try {
@@ -397,16 +692,45 @@ function sameRecoveryClaim(left, right) {
     return left.pid === right.pid && left.processStart === right.processStart && left.nonce === right.nonce;
 }
 function releaseRecoveryClaim(path, owner) {
-    if (!flockPath()) {
-        try {
-            const current = readRecoveryClaim(path);
-            if (current && sameRecoveryClaim(current, owner))
-                unlinkSync(path);
-        }
-        catch { /* best-effort exact-owner release */ }
-        return;
+    const guardPath = `${path}.recovery.guard`;
+    const key = (() => { try {
+        return resolve(realpathSync(dirname(guardPath)), basename(guardPath));
     }
-    guardedRecoveryClaim(path, 'release', owner);
+    catch {
+        return resolve(guardPath);
+    } })();
+    const lock = localLocks.get(key);
+    if (!lock)
+        return;
+    try {
+        const current = readRecoveryClaim(path);
+        if (current && sameRecoveryClaim(current, owner)) {
+            // A failed unlink here (Windows: transient EBUSY/EPERM from a
+            // lingering handle or AV scan) leaves the claim artifact on disk
+            // permanently, poisoning every future recoverEmergencyStateFile call
+            // for this path as "unattributable" (fail-closed). Retry within a
+            // short budget before giving up, matching the retry discipline used
+            // for lock/identity-probe contention elsewhere in this file.
+            for (let attempt = 0; attempt < 10; attempt += 1) {
+                try {
+                    unlinkSync(path);
+                    break;
+                }
+                catch (error) {
+                    if (error.code === 'ENOENT')
+                        break;
+                    if (attempt === 9) {
+                        if (process.env.OMC_LOCK_DEBUG)
+                            console.error(`[lock-debug] releaseRecoveryClaim unlink-failed-after-retries ${path} ${error.code}`);
+                        break;
+                    }
+                    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+                }
+            }
+        }
+    }
+    catch { /* best-effort exact-owner release */ }
+    releaseMutationLock(lock);
 }
 /** Claims a transaction journal without replacing a concurrent transaction. */
 function createEmergencyJournal(path, journal) {
@@ -503,7 +827,7 @@ function sameFile(path, expected) {
 function reconcileEmergencyPublicationTemps(filePath, authorizeState) {
     const directory = dirname(filePath);
     const base = filePath.slice(directory.length + 1).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`^${base}\\.emergency-(journal\\.json|recovery\\.claim|quarantine\\.[0-9a-f-]{36}\\.payload)\\.(\\d+)\\.(\\d+)\\.([0-9a-f-]{36})\\.tmp$`, 'i');
+    const pattern = new RegExp(`^${base}\\.emergency-(journal\\.json|recovery\\.claim|quarantine\\.[0-9a-f-]{36}\\.payload)\\.(\\d+)\\.([^.]+)\\.([0-9a-f-]{36})\\.tmp$`, 'i');
     let names;
     try {
         names = readdirSync(directory);
@@ -516,8 +840,9 @@ function reconcileEmergencyPublicationTemps(filePath, authorizeState) {
         if (!match)
             continue;
         const path = join(directory, name);
+        const matchedProcessStart = decodeProcessStartFromFilename(match[3]);
         const currentStart = processStartIdentity(Number(match[2]));
-        if (currentStart === null || currentStart === match[3])
+        if (currentStart === null || currentStart === matchedProcessStart)
             return false;
         const generation = fileIdentity(path);
         try {
@@ -537,7 +862,7 @@ function reconcileEmergencyPublicationTemps(filePath, authorizeState) {
                 }
                 else {
                     const claim = readRecoveryClaim(path);
-                    if (!claim || claim.pid !== Number(match[2]) || claim.processStart !== match[3] || claim.nonce !== match[4])
+                    if (!claim || claim.pid !== Number(match[2]) || claim.processStart !== matchedProcessStart || claim.nonce !== match[4])
                         return false;
                 }
             }
@@ -627,19 +952,34 @@ function recoveryGenerationsAuthorized(filePath, journal, authorizeState) {
 function hasUnattributableRecoveryClaimArtifact(filePath, recoveryClaim) {
     const directory = dirname(filePath);
     const base = filePath.slice(directory.length + 1).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const tempPattern = new RegExp(`^${base}\\.emergency-recovery\\.claim\\.\\d+\\.\\d+\\.[0-9a-f-]{36}\\.tmp$`, 'i');
+    const tempPattern = new RegExp(`^${base}\\.emergency-recovery\\.claim\\.\\d+\\.[^.]+\\.[0-9a-f-]{36}\\.tmp$`, 'i');
     try {
-        if (readdirSync(directory).some((name) => tempPattern.test(name)))
+        if (readdirSync(directory).some((name) => tempPattern.test(name))) {
+            if (process.env.OMC_LOCK_DEBUG)
+                console.error(`[lock-debug] hasUnattributable temp-match ${filePath}`);
             return true;
+        }
         const claimPath = `${filePath}.emergency-recovery.claim`;
-        if (!existsSync(claimPath))
-            return recoveryClaim !== undefined;
-        if (!recoveryClaim)
+        if (!existsSync(claimPath)) {
+            const result = recoveryClaim !== undefined;
+            if (result && process.env.OMC_LOCK_DEBUG)
+                console.error(`[lock-debug] hasUnattributable no-claim-file-but-recoveryClaim-set ${filePath}`);
+            return result;
+        }
+        if (!recoveryClaim) {
+            if (process.env.OMC_LOCK_DEBUG)
+                console.error(`[lock-debug] hasUnattributable claim-file-exists-no-recoveryClaim ${filePath}`);
             return true;
+        }
         const current = readRecoveryClaim(claimPath);
-        return !current || !sameRecoveryClaim(current, recoveryClaim);
+        const result = !current || !sameRecoveryClaim(current, recoveryClaim);
+        if (result && process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] hasUnattributable claim-mismatch ${filePath} current=${JSON.stringify(current)} recoveryClaim=${JSON.stringify(recoveryClaim)}`);
+        return result;
     }
-    catch {
+    catch (error) {
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] hasUnattributable caught-error ${filePath} ${error?.message}`);
         return true;
     }
 }
@@ -699,18 +1039,27 @@ export function recoverEmergencyStateFile(filePath, options) {
     // Prefilter before taking a claim so stale shared-home artifacts cannot be
     // reclaimed solely because their process owner is dead. Revalidate while
     // holding our own claim below.
-    if (!sharedRecoveryArtifactsAuthorized(filePath, authorizeState))
+    if (!sharedRecoveryArtifactsAuthorized(filePath, authorizeState)) {
+        if (process.env.OMC_LOCK_DEBUG)
+            console.error(`[lock-debug] recoverEmergency prefilter-false ${filePath}`);
         return false;
+    }
     if (!existsSync(journalPath)) {
         if (!authorizeState)
             return reconcileEmergencyPublicationTemps(filePath);
         const claimPath = `${filePath}.emergency-recovery.claim`;
         const claim = acquireRecoveryClaim(claimPath);
-        if (!claim)
+        if (!claim) {
+            if (process.env.OMC_LOCK_DEBUG)
+                console.error(`[lock-debug] recoverEmergency no-journal-claim-null ${filePath}`);
             return false;
+        }
         try {
-            if (existsSync(journalPath) || !sharedRecoveryArtifactsAuthorized(filePath, authorizeState, claim))
+            if (existsSync(journalPath) || !sharedRecoveryArtifactsAuthorized(filePath, authorizeState, claim)) {
+                if (process.env.OMC_LOCK_DEBUG)
+                    console.error(`[lock-debug] recoverEmergency no-journal-revalidate-false ${filePath}`);
                 return false;
+            }
             return reconcileEmergencyPublicationTemps(filePath, authorizeState);
         }
         finally {
@@ -1019,173 +1368,6 @@ export function getStateSessionOwner(state) {
 export function canClearStateForSession(state, sessionId) {
     const ownerSessionId = getStateSessionOwner(state);
     return !ownerSessionId || ownerSessionId === sessionId;
-}
-function modeConfirmationGeneration(state) {
-    const meta = state._meta
-        && typeof state._meta === 'object'
-        && !Array.isArray(state._meta)
-        ? state._meta
-        : null;
-    const value = state.generation ?? meta?.generation;
-    return typeof value === 'number'
-        && Number.isSafeInteger(value)
-        && value >= 0
-        ? value
-        : null;
-}
-function modeConfirmationTimestamp(state) {
-    const value = typeof state.awaiting_confirmation_set_at === 'string'
-        && state.awaiting_confirmation_set_at.trim()
-        ? state.awaiting_confirmation_set_at.trim()
-        : typeof state.started_at === 'string'
-            ? state.started_at.trim()
-            : '';
-    return value;
-}
-function modeConfirmationDigest(state) {
-    return createHash('sha256')
-        .update(JSON.stringify(state))
-        .digest('hex');
-}
-/**
- * Clear confirmation fields through the mode-state owner lock. Transactional
- * effects target one exact observed generation; legacy callers retain the
- * historical root-plus-session behavior.
- */
-export function confirmModeAwaitingConfirmationLocked(directory, modeName, sessionId, observation) {
-    let paths;
-    try {
-        const resolved = resolveSessionStatePaths(modeName, sessionId || undefined, directory);
-        if (observation) {
-            const allowedPaths = sessionId
-                ? [resolved.sessionScoped, resolved.legacy]
-                : [resolved.legacy];
-            const allowedPath = allowedPaths.find((candidate) => resolve(observation.path) === resolve(candidate));
-            if (!observation.path
-                || !sessionId
-                || !allowedPath
-                || (observation.ownerSessionId
-                    && observation.ownerSessionId !== sessionId)) {
-                return { modeName, status: 'failed', paths: [] };
-            }
-            paths = [allowedPath];
-        }
-        else {
-            paths = sessionId
-                ? [resolved.sessionScoped, resolved.legacy]
-                : [resolved.legacy];
-        }
-    }
-    catch {
-        return { modeName, status: 'failed', paths: [] };
-    }
-    if (observation) {
-        const path = paths[0];
-        if (!recoverEmergencyStateFile(path)) {
-            return { modeName, status: 'failed', paths };
-        }
-        if (process.env.NODE_ENV === 'test'
-            && process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_PATH === path
-            && process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_BASE64) {
-            try {
-                const replacement = JSON.parse(Buffer.from(process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_BASE64, 'base64').toString('utf8'));
-                atomicWriteJsonSync(path, replacement);
-            }
-            finally {
-                delete process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_PATH;
-                delete process.env.OMC_TEST_CONDITIONAL_WRITE_REPLACEMENT_BASE64;
-            }
-        }
-        const lock = acquireMutationLock(path);
-        if (!lock)
-            return { modeName, status: 'failed', paths };
-        try {
-            if (!existsSync(path)) {
-                return { modeName, status: 'not-applicable', paths };
-            }
-            let current;
-            try {
-                const parsed = JSON.parse(readFileSync(path, 'utf8'));
-                if (parsed === null
-                    || typeof parsed !== 'object'
-                    || Array.isArray(parsed)) {
-                    return { modeName, status: 'failed', paths };
-                }
-                current = parsed;
-            }
-            catch {
-                return { modeName, status: 'failed', paths };
-            }
-            if (current.awaiting_confirmation !== true) {
-                return { modeName, status: 'not-applicable', paths };
-            }
-            if (!observation.ownerSessionId) {
-                return { modeName, status: 'failed', paths };
-            }
-            if (getStateSessionOwner(current) !== observation.ownerSessionId
-                || modeConfirmationGeneration(current) !== observation.generation
-                || modeConfirmationTimestamp(current)
-                    !== observation.confirmationTimestamp
-                || modeConfirmationDigest(current) !== observation.digest) {
-                return { modeName, status: 'changed', paths };
-            }
-            const next = { ...current };
-            delete next.awaiting_confirmation;
-            delete next.awaiting_confirmation_set_at;
-            atomicWriteJsonSync(path, next);
-            if (!existsSync(path)) {
-                return { modeName, status: 'written', paths };
-            }
-            try {
-                const verified = JSON.parse(readFileSync(path, 'utf8'));
-                if (verified === null
-                    || typeof verified !== 'object'
-                    || Array.isArray(verified)
-                    || verified.awaiting_confirmation === true) {
-                    return { modeName, status: 'failed', paths };
-                }
-            }
-            catch {
-                return { modeName, status: 'failed', paths };
-            }
-            return { modeName, status: 'written', paths };
-        }
-        catch {
-            return { modeName, status: 'failed', paths };
-        }
-        finally {
-            releaseMutationLock(lock);
-        }
-    }
-    let wrote = false;
-    let failed = false;
-    for (const path of [...new Set(paths.filter(Boolean))]) {
-        try {
-            const result = writeStateFileLockedIf(path, (current) => current.awaiting_confirmation === true
-                && (!sessionId || canClearStateForSession(current, sessionId)), (current) => {
-                const next = { ...current };
-                delete next.awaiting_confirmation;
-                delete next.awaiting_confirmation_set_at;
-                return next;
-            });
-            wrote ||= result === 'written';
-            failed ||= result === 'failed';
-        }
-        catch {
-            failed = true;
-        }
-    }
-    return {
-        modeName,
-        status: failed ? 'failed' : wrote ? 'written' : 'skipped',
-        paths,
-    };
-}
-/**
- * Confirm every mode owned by a Skill invocation using the shared map.
- */
-export function confirmSkillModeStatesLocked(directory, skillName, sessionId) {
-    return (MODE_CONFIRMATION_SKILL_MAP[skillName] ?? []).map((modeName) => confirmModeAwaitingConfirmationLocked(directory, modeName, sessionId));
 }
 // ---------------------------------------------------------------------------
 // Internal helpers
