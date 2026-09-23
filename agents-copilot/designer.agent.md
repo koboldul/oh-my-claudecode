@@ -1,7 +1,7 @@
 ---
 name: designer
 description: UI/UX Designer-Developer for stunning interfaces
-model: claude-opus-5
+model: gpt-6-luna
 reasoning-effort: max
 target: github-copilot
 level: 2

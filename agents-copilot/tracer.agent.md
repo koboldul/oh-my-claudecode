@@ -1,7 +1,7 @@
 ---
 name: tracer
 description: Evidence-driven causal tracing with competing hypotheses, evidence for/against, uncertainty tracking, and next-probe recommendations
-model: claude-opus-5
+model: gpt-6-luna
 reasoning-effort: max
 target: github-copilot
 level: 3

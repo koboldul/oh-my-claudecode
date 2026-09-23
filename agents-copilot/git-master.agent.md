@@ -1,7 +1,7 @@
 ---
 name: git-master
 description: Git expert for atomic commits, rebasing, and history management with style detection
-model: claude-opus-5
+model: gpt-6-luna
 reasoning-effort: max
 target: github-copilot
 level: 3

@@ -1,7 +1,7 @@
 ---
 name: verifier
 description: Verification strategy, evidence-based completion checks, test adequacy
-model: claude-opus-5
+model: gpt-6-luna
 reasoning-effort: max
 target: github-copilot
 tools: [execute, read, search, agent, web, todo]

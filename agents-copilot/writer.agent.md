@@ -1,7 +1,7 @@
 ---
 name: writer
 description: Technical documentation writer for README, API docs, and comments
-model: claude-opus-5
+model: gpt-6-sol
 reasoning-effort: max
 target: github-copilot
 level: 2

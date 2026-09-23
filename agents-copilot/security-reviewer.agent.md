@@ -1,7 +1,7 @@
 ---
 name: security-reviewer
 description: Security vulnerability detection specialist (OWASP Top 10, secrets, unsafe patterns)
-model: claude-opus-5
+model: gpt-6-sol
 reasoning-effort: max
 target: github-copilot
 tools: [execute, read, search, agent, web, todo]

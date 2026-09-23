@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Strategic planning consultant with interview workflow
-model: claude-opus-5
+model: gpt-6-sol
 reasoning-effort: max
 target: github-copilot
 level: 4

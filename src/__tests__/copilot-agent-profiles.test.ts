@@ -45,12 +45,16 @@ describe('Copilot-specific agent profiles', () => {
       const source = readFileSync(join(SOURCE_DIR, sourceFile), 'utf8');
       const outputFile = sourceFile.replace(/\.md$/, '.agent.md');
       const generated = readFileSync(join(COPILOT_DIR, outputFile), 'utf8');
+      const sourceModel = source.match(/^model:\s*(\S+)/m)?.[1] ?? '';
+      const expectedModel = sourceModel.toLowerCase().includes('sonnet')
+        ? 'gpt-6-luna'
+        : 'gpt-6-sol';
 
       expect(generated).toBe(beforeGeneration[outputFile]);
-      expect(generated).toMatch(/^model: claude-opus-5$/m);
+      expect(generated).toMatch(new RegExp(`^model: ${expectedModel}$`, 'm'));
       expect(generated).toMatch(/^reasoning-effort: max$/m);
       expect(generated).toMatch(/^target: github-copilot$/m);
-      expect(generated).not.toMatch(/^model: (?:haiku|sonnet|opus|fable)$/m);
+      expect(generated).not.toMatch(/^model: (?:haiku|sonnet|opus|fable|claude-opus-5)$/m);
       expect(generated).not.toContain('Runtime effort inherits from the parent Claude Code session');
       expect(generated).not.toContain('subagent_type');
       expect(generated).not.toContain('model=haiku');

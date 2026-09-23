@@ -14,8 +14,16 @@ import { fileURLToPath } from 'node:url';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SOURCE_DIR = join(ROOT, 'agents');
 const OUTPUT_DIR = join(ROOT, 'agents-copilot');
-const COPILOT_MODEL = 'claude-opus-5';
+const COPILOT_SOL_MODEL = 'gpt-6-sol';
+const COPILOT_LUNA_MODEL = 'gpt-6-luna';
 const COPILOT_REASONING_EFFORT = 'max';
+
+function getCopilotModel(frontmatter) {
+  const sourceModel = frontmatter.match(/^model:\s*(\S+)/m)?.[1] ?? '';
+  return sourceModel.toLowerCase().includes('sonnet')
+    ? COPILOT_LUNA_MODEL
+    : COPILOT_SOL_MODEL;
+}
 
 function rewriteDescription(frontmatter) {
   return frontmatter.replace(
@@ -60,8 +68,9 @@ export function transformCopilotAgent(source, sourceName = 'agent.md') {
     throw new Error(`Agent ${sourceName} has no model field`);
   }
 
+  const copilotModel = getCopilotModel(frontmatter);
   frontmatter = frontmatter
-    .replace(/^model:\s*\S+.*$/m, `model: ${COPILOT_MODEL}`)
+    .replace(/^model:\s*\S+.*$/m, `model: ${copilotModel}`)
     .replace(/^reasoning-effort:\s*\S+.*\r?\n?/m, '')
     .replace(/^target:\s*\S+.*\r?\n?/m, '');
 
@@ -78,7 +87,7 @@ export function transformCopilotAgent(source, sourceName = 'agent.md') {
     frontmatter = frontmatter.replace(/^disallowedTools:\s*.*\r?\n?/m, '');
   }
 
-  const modelLine = `model: ${COPILOT_MODEL}`;
+  const modelLine = `model: ${copilotModel}`;
   const toolsLine = disallowedToolsMatch
     ? '\ntools: [execute, read, search, agent, web, todo]'
     : '';
