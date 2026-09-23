@@ -251,6 +251,11 @@ World`);
       it('should return null for model ending in -high', () => {
         expect(getHighVariant('some-model-high')).toBeNull();
       });
+
+      it('should return null for GPT-6 Astra, which is already high-end', () => {
+        expect(getHighVariant('gpt-6-astra')).toBeNull();
+        expect(getHighVariant('openai/gpt-6-astra')).toBeNull();
+      });
     });
 
     describe('Prefixed models', () => {
@@ -275,6 +280,11 @@ World`);
 
     it('should return true for any model ending in -high', () => {
       expect(isAlreadyHighVariant('custom-model-high')).toBe(true);
+    });
+
+    it('should return true for GPT-6 Astra', () => {
+      expect(isAlreadyHighVariant('gpt-6-astra')).toBe(true);
+      expect(isAlreadyHighVariant('openai/gpt-6-astra')).toBe(true);
     });
 
     it('should return false for non-high variant', () => {

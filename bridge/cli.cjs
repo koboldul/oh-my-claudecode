@@ -122344,7 +122344,13 @@ var HIGH_VARIANT_MAP = {
   "gemini-3-pro": "gemini-3-pro-high",
   "gemini-3-flash": "gemini-3-flash-high"
 };
-var ALREADY_HIGH = new Set(Object.values(HIGH_VARIANT_MAP));
+var GPT_HIGH_END_MODELS = /* @__PURE__ */ new Set([
+  "gpt-6-astra"
+]);
+var ALREADY_HIGH = /* @__PURE__ */ new Set([
+  ...Object.values(HIGH_VARIANT_MAP),
+  ...GPT_HIGH_END_MODELS
+]);
 
 // src/hooks/rules-injector/index.ts
 var import_fs97 = require("fs");
