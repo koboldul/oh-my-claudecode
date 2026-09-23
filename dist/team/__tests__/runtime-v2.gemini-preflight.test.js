@@ -7,6 +7,11 @@ const mocks = vi.hoisted(() => ({
     createTeamSession: vi.fn(),
     spawnWorkerInPane: vi.fn(),
     spawnOwnedWorkerInPane: vi.fn(),
+    splitTeamWorkerPaneWithEvidence: vi.fn(),
+    workerPaneBelongsToOwnedProviderTarget: vi.fn(async () => true),
+    observeTmuxServerIdentity: vi.fn(async () => 'matching'),
+    getOwnedWorkerLiveness: vi.fn(async () => 'dead'),
+    adoptWorkerPaneOwnership: vi.fn(),
     deliverStartupInbox: vi.fn(),
     sendToWorker: vi.fn(),
     waitForPaneReady: vi.fn(),
@@ -28,8 +33,8 @@ const modelContractMocks = vi.hoisted(() => ({
     clearResolvedPathCache: vi.fn(),
     getContract: vi.fn((agentType) => ({ binary: agentType ?? 'claude' })),
     getWorkerEnv: vi.fn(() => ({ OMC_TEAM_WORKER: 'issue2675-team/worker-1' })),
-    isPromptModeAgent: vi.fn(() => false),
-    getPromptModeArgs: vi.fn(() => []),
+    isPromptModeAgent: vi.fn((_agentType) => false),
+    getPromptModeArgs: vi.fn((_agentType, _instruction) => []),
     resolveClaudeWorkerModel: vi.fn(() => undefined),
     normalizeExternalModelsDefaults: vi.fn((defaults) => defaults),
     resolveExternalModelsDefaults: vi.fn((defaults) => defaults),
@@ -40,6 +45,13 @@ const modelContractMocks = vi.hoisted(() => ({
     }),
     validateWorkerLaunchDescriptor: vi.fn((value) => value),
 }));
+const FIXTURE_TMUX_SERVER_IDENTITY = {
+    socket_path: '/tmp/omc-test-tmux.sock',
+    server_pid: 4242,
+    process_started_at: process.platform === 'darwin'
+        ? 'darwin:1700000000:123456'
+        : 'linux:01234567-89ab-cdef-0123-456789abcdef:424242',
+};
 vi.mock('../worker-launch-ack.js', async (importOriginal) => {
     const actual = await importOriginal();
     return { ...actual, withWorkerLaunchAttemptFence: launchMocks.withWorkerLaunchAttemptFence };
@@ -52,6 +64,11 @@ vi.mock('../tmux-session.js', async (importOriginal) => ({
     createTeamSession: mocks.createTeamSession,
     spawnWorkerInPane: mocks.spawnWorkerInPane,
     spawnOwnedWorkerInPane: mocks.spawnOwnedWorkerInPane,
+    splitTeamWorkerPaneWithEvidence: mocks.splitTeamWorkerPaneWithEvidence,
+    workerPaneBelongsToOwnedProviderTarget: mocks.workerPaneBelongsToOwnedProviderTarget,
+    observeTmuxServerIdentity: mocks.observeTmuxServerIdentity,
+    getOwnedWorkerLiveness: mocks.getOwnedWorkerLiveness,
+    adoptWorkerPaneOwnership: mocks.adoptWorkerPaneOwnership,
     deliverStartupInbox: mocks.deliverStartupInbox,
     sendToWorker: mocks.sendToWorker,
     waitForPaneReady: mocks.waitForPaneReady,
@@ -108,7 +125,36 @@ describe('runtime-v2 Gemini preflight routing', () => {
             leaderPaneId: '%1',
             workerPaneIds: [],
             sessionMode: 'split-pane',
+            tmuxServerIdentity: FIXTURE_TMUX_SERVER_IDENTITY,
         });
+        mocks.splitTeamWorkerPaneWithEvidence.mockImplementation(async (splitTarget, direction, _cwd, provider = 'tmux', identity) => ({
+            commandSucceeded: true,
+            provider,
+            splitTarget,
+            direction,
+            rawOutput: '%2\n',
+            stderr: '',
+            paneId: '%2',
+            ...(provider === 'tmux' ? { tmuxServerIdentity: identity ?? FIXTURE_TMUX_SERVER_IDENTITY } : {}),
+        }));
+        mocks.workerPaneBelongsToOwnedProviderTarget.mockResolvedValue(true);
+        mocks.observeTmuxServerIdentity.mockResolvedValue('matching');
+        mocks.getOwnedWorkerLiveness.mockResolvedValue('dead');
+        mocks.adoptWorkerPaneOwnership.mockImplementation(async (input) => ({
+            ok: true,
+            ownership: {
+                provider: input.provider ?? 'tmux',
+                providerTarget: input.providerTarget,
+                paneId: input.paneId,
+                splitTarget: '',
+                leaderPaneId: input.leaderPaneId,
+                reservedPaneIds: [],
+                source: 'adopted',
+                ...(input.provider !== 'cmux'
+                    ? { tmuxServerIdentity: input.tmuxServerIdentity ?? FIXTURE_TMUX_SERVER_IDENTITY }
+                    : {}),
+            },
+        }));
         mocks.spawnWorkerInPane.mockResolvedValue(undefined);
         mocks.spawnOwnedWorkerInPane.mockImplementation(async (sessionName, ownership, config) => {
             await mocks.spawnWorkerInPane(sessionName, ownership.paneId, config);
@@ -377,6 +423,50 @@ describe('runtime-v2 Gemini preflight routing', () => {
         expect(modelContractMocks.buildWorkerArgv).not.toHaveBeenCalled();
         await expect(import('node:fs/promises').then(fs => fs.access(join(cwd, '.omc', 'state', 'team', 'issue2675-team'))))
             .rejects.toMatchObject({ code: 'ENOENT' });
+    });
+    it('persists routed Copilot prompt descriptors and writes Copilot-specific worker guidance', async () => {
+        cwd = await mkdtemp(join(tmpdir(), 'copilot-routing-'));
+        modelContractMocks.isPromptModeAgent.mockImplementation(agentType => agentType === 'copilot');
+        modelContractMocks.getPromptModeArgs.mockImplementation((_agentType, instruction) => ['-p', instruction ?? '']);
+        const { startTeamV2 } = await import('../runtime-v2.js');
+        const runtime = await startTeamV2({
+            teamName: 'copilot-routing-team',
+            workerCount: 1,
+            agentTypes: ['claude'],
+            tasks: [{
+                    subject: 'Review code',
+                    description: 'Review code and write a verdict',
+                    role: 'code-reviewer',
+                }],
+            cwd,
+            pluginConfig: {
+                externalModels: {
+                    defaults: {
+                        copilotModel: 'gpt-5.5',
+                        copilotReasoningEffort: 'high',
+                    },
+                },
+                team: { roleRouting: { 'code-reviewer': { provider: 'copilot' } } },
+            },
+        });
+        const worker = runtime.config.workers[0];
+        expect(worker.worker_cli).toBe('copilot');
+        expect(worker.launch_descriptor).toMatchObject({
+            provider: 'copilot',
+            model: 'gpt-5.5',
+            args: expect.arrayContaining(['-p']),
+        });
+        expect(modelContractMocks.buildWorkerArgv).toHaveBeenCalledWith('copilot', expect.objectContaining({
+            model: 'gpt-5.5',
+            reasoningEffort: 'high',
+        }));
+        expect(runtime.config.configured_routing_roles).toContain('code-reviewer');
+        expect(runtime.config.copilot_defaults).toEqual({
+            model: 'gpt-5.5',
+            reasoning_effort: 'high',
+        });
+        const overlay = await readFile(join(cwd, '.omc', 'state', 'team', 'copilot-routing-team', 'workers', 'worker-1', 'AGENTS.md'), 'utf-8');
+        expect(overlay).toContain('Agent-Type Guidance (copilot)');
     });
     it('fails a routed-only provider before state or session side effects', async () => {
         cwd = await mkdtemp(join(tmpdir(), 'routed-provider-preflight-'));

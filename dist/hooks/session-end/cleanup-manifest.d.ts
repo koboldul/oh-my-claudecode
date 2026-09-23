@@ -21,10 +21,16 @@ export interface SessionEndActionState {
 }
 export interface ProducerSlot {
     state: 'absent' | 'prepared' | 'sealed' | 'no-op';
+    eventId?: string;
+    rawDigest?: string;
     intentKey?: string;
     payloadDigest?: string;
     sealedAt?: string;
     sealedBy?: 'foreground' | 'recovery' | 'wiki-producer';
+}
+export interface SessionEndProducerAdmission {
+    eventId: string;
+    rawDigest: string;
 }
 export interface WorkerOwner {
     nonce: string;
@@ -59,6 +65,16 @@ export interface SessionEndJobV1 {
         terminalDigest: string;
         terminalRevision: number;
     };
+    /**
+     * Why the job last landed in `recoverable-failure` (issue #4076). Without
+     * this a CI-only failure reports `phase=recoverable-failure error=none` and
+     * the cause is unrecoverable from the artifact.
+     */
+    recoverableFailure?: {
+        reason: string;
+        releasedAt: string;
+        ownerNonce?: string;
+    };
 }
 export interface OpenClawRoutingSnapshot {
     openClawConfig?: string;
@@ -76,8 +92,9 @@ export interface DiscoveryTicket {
     retryAt: string;
     acknowledgedAt?: string;
 }
-export declare function sessionEndJobPath(directory: string, sessionId: string): string;
+export declare function sessionEndScopeKey(directory: string): string;
 export declare function sessionEndJobsDirectory(directory: string): string;
+export declare function sessionEndJobPath(directory: string, sessionId: string): string;
 /** Terminality is solely a manifest property. Discovery tickets are deliberately excluded. */
 export declare function isManifestTerminal(job: SessionEndJobV1): boolean;
 export declare function readSessionEndJob(directory: string, sessionId: string): SessionEndJobV1 | null;
@@ -91,17 +108,21 @@ export interface SessionEndActionAuthority {
     runnerNonce: string;
 }
 export declare function updateSessionEndActionPayload(directory: string, sessionId: string, authority: SessionEndActionAuthority, actionNames: readonly SessionEndActionName[], payload: Record<string, unknown>): SessionEndJobV1 | null;
-export declare function prepareCoreManifest(directory: string, sessionId: string, payload: Record<string, unknown>): SessionEndJobV1 | null;
+export declare function prepareCoreManifest(directory: string, sessionId: string, payload: Record<string, unknown>, admission?: SessionEndProducerAdmission): SessionEndJobV1 | null;
 /** Foreground cleanup is idempotent local work; its durable result is the prerequisite for producer-grace sealing. */
 export declare function completeForegroundCleanup(directory: string, sessionId: string, outcome: Record<string, unknown>): SessionEndJobV1 | null;
 export declare function completeForegroundCleanupAndSealCore(directory: string, sessionId: string, outcome: Record<string, unknown>): SessionEndJobV1 | null;
 export declare function sealCoreManifest(directory: string, sessionId: string): SessionEndJobV1 | null;
-export declare function sealWikiManifest(directory: string, sessionId: string, payload?: Record<string, unknown>): SessionEndJobV1 | null;
+export declare function sealWikiManifest(directory: string, sessionId: string, payload?: Record<string, unknown>, admission?: SessionEndProducerAdmission): SessionEndJobV1 | null;
 export declare function claimSessionEndJob(directory: string, sessionId: string, nonce: string, identity: string, deadlineAt: number): SessionEndJobV1 | null;
 export declare function renewSessionEndLease(directory: string, sessionId: string, nonce: string, generation: number, deadlineAt: number): SessionEndJobV1 | null;
 /** Reaping is intentionally separate from a new claim. Caller must establish dead or PID-reused identity. */
 export declare function reapStaleSessionEndOwner(directory: string, sessionId: string, expectedNonce: string, expectedGeneration: number, liveness: 'dead' | 'mismatch'): SessionEndJobV1 | null;
-export declare function releaseSessionEndJob(directory: string, sessionId: string, nonce: string, generation: number): SessionEndJobV1 | null;
+/**
+ * Releasing ownership without reaching `complete` is the one path that leaves a
+ * job non-terminal, so the caller's reason is persisted with it (issue #4076).
+ */
+export declare function releaseSessionEndJob(directory: string, sessionId: string, nonce: string, generation: number, reason?: string): SessionEndJobV1 | null;
 export declare function updateSessionEndJob(directory: string, sessionId: string, expectedOwner: string, mutate: (job: SessionEndJobV1) => void): SessionEndJobV1 | null;
 export declare function claimSessionEndAction(directory: string, sessionId: string, ownerNonce: string, name: SessionEndActionName, deadlineAt: number): SessionEndJobV1 | null;
 export declare function markSessionEndActionRunner(directory: string, sessionId: string, ownerNonce: string, name: SessionEndActionName, runnerNonce: string, phase: 'started' | 'armed' | 'result-recorded'): SessionEndJobV1 | null;

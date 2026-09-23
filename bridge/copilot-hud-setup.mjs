@@ -1,7 +1,7 @@
 // src/hud/copilot-setup.ts
 import { chmodSync as chmodSync2, existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
-import { dirname as dirname7, join as join10, normalize as normalize3, parse as parsePath, resolve as resolve3, sep as sep3 } from "node:path";
+import { dirname as dirname7, join as join10, normalize as normalize3, parse as parsePath, resolve as resolve3, sep as sep4 } from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
 
 // node_modules/jsonc-parser/lib/esm/impl/scanner.js
@@ -780,11 +780,11 @@ function parseTree(text, errors = [], options = ParseOptions.DEFAULT) {
       onValue({ type: getNodeType(value), offset, length, parent: currentParent, value });
       ensurePropertyComplete(offset + length);
     },
-    onSeparator: (sep4, offset, length) => {
+    onSeparator: (sep5, offset, length) => {
       if (currentParent.type === "property") {
-        if (sep4 === ":") {
+        if (sep5 === ":") {
           currentParent.colonOffset = offset;
-        } else if (sep4 === ",") {
+        } else if (sep5 === ",") {
           ensurePropertyComplete(offset);
         }
       }
@@ -1414,7 +1414,7 @@ function applyEdits(text, edits) {
 }
 
 // src/installer/index.ts
-import { join as join8, dirname as dirname5, resolve as resolve2, isAbsolute as isAbsolute2, basename as basename3 } from "path";
+import { join as join8, dirname as dirname5, resolve as resolve2, isAbsolute as isAbsolute2, basename as basename3, relative as relative2, sep as sep3 } from "path";
 
 // src/installer/hooks.ts
 import { join as join2, dirname } from "path";
@@ -1637,6 +1637,7 @@ import { resolve, normalize as normalize2, relative, sep as sep2, join as join6,
 import { pathToFileURL } from "url";
 var canonicalWorkingDirectoryRoots = /* @__PURE__ */ new WeakMap();
 var worktreePathRenderScope = new AsyncLocalStorage();
+var projectIdentifierOperationScope = new AsyncLocalStorage();
 function callerVisibleTrustedRootLabel(trustedRoot) {
   const label = basename(trustedRoot);
   return label.length > 0 ? label : "current repository";
@@ -2006,11 +2007,11 @@ function writeAllSync(fd, content, label) {
     throw new Error(`${label} size verification failed`);
   }
 }
-function verifyPrivateTempFile(fd, tempPath, label) {
+function verifyPrivateTempFile(fd, tempPath, label, operations) {
   const fdStats = fsSync.fstatSync(fd);
   let pathStats;
   try {
-    pathStats = fsSync.lstatSync(tempPath);
+    pathStats = (operations?.lstat ?? fsSync.lstatSync)(tempPath);
   } catch {
     throw new Error(`${label} temporary file was replaced before rename`);
   }
@@ -2025,11 +2026,11 @@ function verifyPrivateTempFile(fd, tempPath, label) {
     throw new Error(`${label} temporary file was replaced before rename`);
   }
 }
-function verifyPublishedFile(fd, filePath, label) {
+function verifyPublishedFile(fd, filePath, label, operations) {
   const fdStats = fsSync.fstatSync(fd);
   let pathStats;
   try {
-    pathStats = fsSync.lstatSync(filePath);
+    pathStats = (operations?.lstat ?? fsSync.lstatSync)(filePath);
   } catch {
     throw new Error(`${label} target was replaced at publication`);
   }
@@ -2037,29 +2038,29 @@ function verifyPublishedFile(fd, filePath, label) {
     throw new Error(`${label} target was replaced at publication`);
   }
 }
-function preservePriorTarget(filePath) {
+function preservePriorTarget(filePath, operations) {
   const backupPath = `${filePath}.rollback.${crypto.randomUUID()}`;
   try {
-    const stats = fsSync.lstatSync(filePath);
+    const stats = (operations?.lstat ?? fsSync.lstatSync)(filePath);
     const isWindows2 = process.platform === "win32";
     if (!stats.isFile() || (isWindows2 ? stats.nlink > 1 : stats.nlink !== 1)) {
       return null;
     }
-    fsSync.linkSync(filePath, backupPath);
+    (operations?.link ?? fsSync.linkSync)(filePath, backupPath);
     return backupPath;
   } catch (error) {
     if (error.code !== "ENOENT") {
       try {
-        fsSync.unlinkSync(backupPath);
+        (operations?.unlink ?? fsSync.unlinkSync)(backupPath);
       } catch {
       }
     }
     return null;
   }
 }
-function currentFileIdentity(filePath) {
+function currentFileIdentity(filePath, operations) {
   try {
-    const stats = fsSync.lstatSync(filePath);
+    const stats = (operations?.lstat ?? fsSync.lstatSync)(filePath);
     return { dev: stats.dev, ino: stats.ino };
   } catch {
     return null;
@@ -2073,30 +2074,31 @@ function descriptorIdentity(fd) {
     return null;
   }
 }
-function rollbackPriorTarget(filePath, backupPath, expectedIdentity) {
+function rollbackPriorTarget(filePath, backupPath, expectedIdentity, operations) {
   if (expectedIdentity === null) return;
-  const current = currentFileIdentity(filePath);
+  const current = currentFileIdentity(filePath, operations);
   if (current === null) return;
   if (expectedIdentity !== null && (current.dev !== expectedIdentity.dev || current.ino !== expectedIdentity.ino)) {
     return;
   }
   try {
     if (backupPath === null) {
-      fsSync.unlinkSync(filePath);
+      (operations?.unlink ?? fsSync.unlinkSync)(filePath);
     } else {
-      fsSync.renameSync(backupPath, filePath);
+      (operations?.rename ?? fsSync.renameSync)(backupPath, filePath);
     }
   } catch {
   }
 }
-function removeBackup(backupPath) {
+function removeBackup(backupPath, operations) {
   if (backupPath === null) return;
   try {
-    fsSync.unlinkSync(backupPath);
+    (operations?.unlink ?? fsSync.unlinkSync)(backupPath);
   } catch {
   }
 }
-function atomicWriteFileSync(filePath, content, hooks) {
+function atomicWriteFileSync(filePath, content, hooks, operations) {
+  if (operations && (!filePath || path.basename(filePath) !== filePath || filePath === "." || filePath === "..")) throw new RangeError("contained atomic write requires a basename");
   const dir = path.dirname(filePath);
   const base = path.basename(filePath);
   const tempPath = path.join(dir, `.${base}.tmp.${crypto.randomUUID()}`);
@@ -2104,38 +2106,43 @@ function atomicWriteFileSync(filePath, content, hooks) {
   let success = false;
   let backupPath = null;
   try {
-    ensureDirSync(dir);
-    fd = fsSync.openSync(tempPath, "wx", 384);
+    if (!operations) ensureDirSync(dir);
+    fd = operations ? operations.open(tempPath, fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY, 384) : fsSync.openSync(tempPath, "wx", 384);
     writeAllSync(fd, content, "atomic write");
     fsSync.fsyncSync(fd);
-    verifyPrivateTempFile(fd, tempPath, "atomic write");
-    backupPath = preservePriorTarget(filePath);
+    verifyPrivateTempFile(fd, tempPath, "atomic write", operations);
+    backupPath = preservePriorTarget(filePath, operations);
     hooks?.beforeRename?.();
-    fsSync.renameSync(tempPath, filePath);
+    (operations?.rename ?? fsSync.renameSync)(tempPath, filePath);
     let publishedIdentity = null;
     try {
-      verifyPublishedFile(fd, filePath, "atomic write");
+      verifyPublishedFile(fd, filePath, "atomic write", operations);
       publishedIdentity = descriptorIdentity(fd);
       hooks?.afterRename?.();
-      verifyPublishedFile(fd, filePath, "atomic write");
+      verifyPublishedFile(fd, filePath, "atomic write", operations);
     } catch (error) {
       rollbackPriorTarget(
         filePath,
         backupPath,
-        publishedIdentity
+        publishedIdentity,
+        operations
       );
       throw error;
     }
     fsSync.closeSync(fd);
     fd = null;
     success = true;
-    removeBackup(backupPath);
+    removeBackup(backupPath, operations);
     try {
-      const dirFd = fsSync.openSync(dir, "r");
-      try {
-        fsSync.fsyncSync(dirFd);
-      } finally {
-        fsSync.closeSync(dirFd);
+      if (operations) {
+        operations.sync();
+      } else {
+        const dirFd = fsSync.openSync(dir, "r");
+        try {
+          fsSync.fsyncSync(dirFd);
+        } finally {
+          fsSync.closeSync(dirFd);
+        }
       }
     } catch {
     }
@@ -2148,10 +2155,10 @@ function atomicWriteFileSync(filePath, content, hooks) {
     }
     if (!success) {
       try {
-        fsSync.unlinkSync(tempPath);
+        (operations?.unlink ?? fsSync.unlinkSync)(tempPath);
       } catch {
       }
-      removeBackup(backupPath);
+      removeBackup(backupPath, operations);
     }
   }
 }
@@ -2159,7 +2166,7 @@ var ATOMIC_BATCH_MAX_CONTENT_BYTES = 1024 * 1024;
 
 // src/hud/copilot-setup.ts
 function stripTrailingSeparator(value) {
-  if (!value.endsWith(sep3)) return value;
+  if (!value.endsWith(sep4)) return value;
   return value === parsePath(value).root ? value : value.slice(0, -1);
 }
 function resolveHomeSetting(configured, home, fallbackDirectory) {

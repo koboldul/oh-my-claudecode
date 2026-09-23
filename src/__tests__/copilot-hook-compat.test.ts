@@ -67,6 +67,7 @@ const EXPECTED_SCRIPTS_BY_EVENT: Readonly<
     'post-tool-verifier.mjs',
     'project-memory-posttool.mjs',
     'post-tool-rules-injector.mjs',
+    'post-tool-directory-context-injector.mjs',
   ],
   postToolUseFailure: ['post-tool-use-failure.mjs'],
   subagentStart: ['subagent-tracker.mjs'],

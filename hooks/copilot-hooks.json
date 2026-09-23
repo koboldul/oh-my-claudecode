@@ -4,185 +4,192 @@
     "userPromptSubmitted": [
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/keyword-detector.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/keyword-detector.mjs",
+        "timeout": 30,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/keyword-detector.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/keyword-detector.mjs\"",
-        "timeout": 10
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/keyword-detector.mjs\""
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/skill-injector.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/skill-injector.mjs",
+        "timeout": 30,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/skill-injector.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/skill-injector.mjs\"",
-        "timeout": 15
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/skill-injector.mjs\""
       }
     ],
     "sessionStart": [
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/session-start.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/session-start.mjs",
+        "timeout": 10,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs\"",
-        "timeout": 5
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.mjs\""
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/project-memory-session.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/project-memory-session.mjs",
+        "timeout": 5,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/project-memory-session.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/project-memory-session.mjs\"",
-        "timeout": 5
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/project-memory-session.mjs\""
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/wiki-session-start.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/wiki-session-start.mjs",
+        "timeout": 5,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/wiki-session-start.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/wiki-session-start.mjs\"",
-        "timeout": 5
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/wiki-session-start.mjs\""
       }
     ],
     "preToolUse": [
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/pre-tool-enforcer.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/pre-tool-enforcer.mjs",
+        "timeout": 10,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-tool-enforcer.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-tool-enforcer.mjs\"",
-        "timeout": 10
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-tool-enforcer.mjs\""
       }
     ],
     "permissionRequest": [
       {
         "type": "command",
-        "matcher": "bash|powershell",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/permission-handler.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/permission-handler.mjs",
+        "timeout": 5,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/permission-handler.mjs\"",
         "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/permission-handler.mjs\"",
-        "timeout": 5
+        "matcher": "bash|powershell"
       }
     ],
     "postToolUse": [
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/post-tool-verifier.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/post-tool-verifier.mjs",
+        "timeout": 5,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-verifier.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-verifier.mjs\"",
-        "timeout": 3
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-verifier.mjs\""
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/project-memory-posttool.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/project-memory-posttool.mjs",
+        "timeout": 3,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/project-memory-posttool.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/project-memory-posttool.mjs\"",
-        "timeout": 3
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/project-memory-posttool.mjs\""
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/post-tool-rules-injector.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/post-tool-rules-injector.mjs",
+        "timeout": 3,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-rules-injector.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-rules-injector.mjs\"",
-        "timeout": 3
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-rules-injector.mjs\""
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/post-tool-directory-context-injector.mjs",
+        "timeout": 3,
+        "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-directory-context-injector.mjs\"",
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-directory-context-injector.mjs\""
       }
     ],
     "postToolUseFailure": [
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/post-tool-use-failure.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/post-tool-use-failure.mjs",
+        "timeout": 3,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-use-failure.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-use-failure.mjs\"",
-        "timeout": 3
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-use-failure.mjs\""
       }
     ],
     "subagentStart": [
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/subagent-tracker.mjs start",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/subagent-tracker.mjs start",
+        "timeout": 3,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/subagent-tracker.mjs\" start",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/subagent-tracker.mjs\" start",
-        "timeout": 3
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/subagent-tracker.mjs\" start"
       }
     ],
     "subagentStop": [
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/subagent-tracker.mjs stop",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/subagent-tracker.mjs stop",
+        "timeout": 5,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/subagent-tracker.mjs\" stop",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/subagent-tracker.mjs\" stop",
-        "timeout": 5
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/subagent-tracker.mjs\" stop"
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/verify-deliverables.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/verify-deliverables.mjs",
+        "timeout": 5,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/verify-deliverables.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/verify-deliverables.mjs\"",
-        "timeout": 5
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/verify-deliverables.mjs\""
       }
     ],
     "preCompact": [
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/pre-compact.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/pre-compact.mjs",
+        "timeout": 10,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-compact.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-compact.mjs\"",
-        "timeout": 10
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-compact.mjs\""
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/project-memory-precompact.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/project-memory-precompact.mjs",
+        "timeout": 5,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/project-memory-precompact.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/project-memory-precompact.mjs\"",
-        "timeout": 5
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/project-memory-precompact.mjs\""
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/wiki-pre-compact.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/wiki-pre-compact.mjs",
+        "timeout": 3,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/wiki-pre-compact.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/wiki-pre-compact.mjs\"",
-        "timeout": 3
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/wiki-pre-compact.mjs\""
       }
     ],
     "agentStop": [
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/context-guard-stop.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/context-guard-stop.mjs",
+        "timeout": 5,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/context-guard-stop.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/context-guard-stop.mjs\"",
-        "timeout": 5
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/context-guard-stop.mjs\""
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/workflow-drift-guard.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/workflow-drift-guard.mjs",
+        "timeout": 3,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/workflow-drift-guard.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/workflow-drift-guard.mjs\"",
-        "timeout": 3
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/workflow-drift-guard.mjs\""
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/persistent-mode.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/persistent-mode.mjs",
+        "timeout": 10,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/persistent-mode.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/persistent-mode.mjs\"",
-        "timeout": 10
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/persistent-mode.mjs\""
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/code-simplifier.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/code-simplifier.mjs",
+        "timeout": 5,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/code-simplifier.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/code-simplifier.mjs\"",
-        "timeout": 5
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/code-simplifier.mjs\""
       }
     ],
     "sessionEnd": [
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/session-end.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/session-end.mjs",
+        "timeout": 30,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end.mjs\"",
-        "timeout": 30
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end.mjs\""
       },
       {
         "type": "command",
-        "command": "node \"$CLAUDE_PLUGIN_ROOT\"/scripts/run.cjs \"$CLAUDE_PLUGIN_ROOT\"/scripts/wiki-session-end.mjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/wiki-session-end.mjs",
+        "timeout": 30,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/wiki-session-end.mjs\"",
-        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/wiki-session-end.mjs\"",
-        "timeout": 30
+        "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/wiki-session-end.mjs\""
       }
     ]
   }

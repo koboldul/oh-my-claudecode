@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'crypto';
 import { execFileSync, execSync, spawn } from 'child_process';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { cpSync, mkdirSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdtempSync, unlinkSync } from 'fs';
+import { cpSync, mkdirSync, rmSync, existsSync, readFileSync, readdirSync, writeFileSync, mkdtempSync, unlinkSync, utimesSync } from 'fs';
 import { basename, dirname, join } from 'path';
 import { tmpdir } from 'os';
-import { emergencyMutateStateFileIf, recoverEmergencyStateFile, captureModeStateCleanup, findSessionOwnedStateCandidates, writeModeState, readModeState, readModeStateWithMeta, clearModeStateFile, withStateFileMutationLock } from '../mode-state-io.js';
+import { emergencyMutateStateFileIf, recoverEmergencyStateFile, captureModeStateCleanup, findSessionOwnedStateCandidates, getStateMutationLockDiagnostic, writeModeState, readModeState, readModeStateWithMeta, clearModeStateFile, withStateFileMutationLock } from '../mode-state-io.js';
 import { atomicWriteJsonSync } from '../atomic-write.js';
 import { clearWorktreeCache, getOmcRoot, getProjectIdentifier } from '../worktree-paths.js';
 import { getProcessStartIdentitySync } from '../../platform/process-utils.js';
@@ -115,8 +115,8 @@ describe('mode-state-io', () => {
             writeModeState('ralph', { active: true }, tempDir);
             const filePath = join(tempDir, '.omc', 'state', 'ralph-state.json');
             const { mode } = require('fs').statSync(filePath);
-            // 0o600 = owner read+write only (on Linux the file mode bits are in the lower 12 bits)
-            expect(mode & 0o777).toBe(0o600);
+            // Windows reports its emulated writable-file mode; POSIX preserves 0o600.
+            expect(mode & 0o777).toBe(process.platform === 'win32' ? 0o666 : 0o600);
         });
         it('should not leave shared .tmp file after successful write (uses atomic write with unique temp)', () => {
             writeModeState('ralph', { active: true }, tempDir);
@@ -142,11 +142,16 @@ describe('mode-state-io', () => {
             });
             expect(existsSync(`${statePath}.mutation.lock`)).toBe(false);
         });
-        it('uses one state-root SQLite lock database for nested session paths', () => {
+        it('uses one state-root SQLite lock database for nested session paths when available', () => {
             const statePath = join(tempDir, '.omc', 'state', 'sessions', 'session-a', 'autopilot-state.json');
             mkdirSync(dirname(statePath), { recursive: true });
             expect(withStateFileMutationLock(statePath, () => true)).toMatchObject({ acquired: true, value: true });
-            expect(existsSync(join(tempDir, '.omc', 'state', '.state-mutation-locks.db'))).toBe(true);
+            if (getStateMutationLockDiagnostic()) {
+                expect(existsSync(join(tempDir, '.omc', 'state', '.state-mutation-locks.db'))).toBe(false);
+            }
+            else {
+                expect(existsSync(join(tempDir, '.omc', 'state', '.state-mutation-locks.db'))).toBe(true);
+            }
             expect(existsSync(join(dirname(statePath), '.state-mutation-locks.db'))).toBe(false);
         });
         it('reclaims abandoned lock metadata under the SQLite guard', () => {
@@ -155,6 +160,8 @@ describe('mode-state-io', () => {
             const statePath = join(tempDir, '.omc', 'state', 'autopilot-state.json');
             mkdirSync(dirname(statePath), { recursive: true });
             writeFileSync(`${statePath}.mutation.lock`, JSON.stringify({ version: 1, pid: 999999999, processStart: '1', createdAt: new Date().toISOString(), nonce: randomUUID() }));
+            const staleTime = new Date(Date.now() - 60_000);
+            utimesSync(`${statePath}.mutation.lock`, staleTime, staleTime);
             expect(writeModeState('autopilot', { active: true }, tempDir)).toBe(true);
             expect(existsSync(`${statePath}.mutation.lock`)).toBe(false);
         });
@@ -352,6 +359,8 @@ describe('mode-state-io', () => {
                 createdAt: new Date().toISOString(),
                 nonce: randomUUID(),
             }));
+            const staleTime = new Date(Date.now() - 60_000);
+            utimesSync(lockPath, staleTime, staleTime);
             expect(clearModeStateFile('autopilot', tempDir, sessionId)).toBe(true);
             expect(existsSync(statePath)).toBe(false);
             expect(existsSync(lockPath)).toBe(false);
@@ -432,7 +441,10 @@ describe('mode-state-io', () => {
             mkdirSync(dirname(statePath), { recursive: true });
             const processStart = currentProcessStart();
             const lockPath = `${statePath}.mutation.lock`;
-            writeFileSync(lockPath, JSON.stringify({ version: 1, pid: process.pid, processStart, createdAt: new Date().toISOString(), nonce: randomUUID() }));
+            writeFileSync(lockPath, JSON.stringify({
+                pid: process.pid,
+                timestamp: Date.now(),
+            }));
             const childScript = String.raw `
         const fs = require('fs');
         const [statePath, lockPath] = process.argv.slice(1);
@@ -862,7 +874,7 @@ describe('mode-state-io', () => {
             expect(existsSync(claimPath)).toBe(false);
             expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ active: false, run: 'portable-stale-claim' });
         });
-        it('reclaims a stale recovery claim under the state guard and releases it for a second recovery', () => {
+        it('reclaims a stale recovery claim under the state guard and fails closed without one', () => {
             const path = join(tempDir, '.omc', 'state', 'autopilot-guarded-stale-claim.json');
             const raw = JSON.stringify({ active: true, run: 'guarded-stale-claim' });
             const writeDeadJournal = () => {

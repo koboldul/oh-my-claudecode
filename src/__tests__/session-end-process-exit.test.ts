@@ -113,6 +113,7 @@ function emitSessionEndClosure(outDir: string): void {
       join(sessionEndRoot, 'index.ts'),
       join(sessionEndRoot, 'worker.ts'),
       join(sessionEndRoot, 'action-runner.ts'),
+      join(REPO_ROOT, 'src', 'hooks', 'wiki', 'session-hooks.ts'),
     ],
     options: parsed.options,
   });
@@ -204,7 +205,7 @@ beforeAll(() => {
       throw new Error(`fresh SessionEnd closure did not emit ${filename}`);
     }
   }
-  stagedSessionEnd = join(scriptsDir, 'session-end.mjs');
+  stagedSessionEnd = join(stagedPluginRoot, 'scripts', 'session-end.mjs');
   timingPluginRoot = stagedPluginRoot;
   timingSessionEnd = join(timingPluginRoot, 'scripts', 'session-end.mjs');
   timingWikiSessionEnd = join(timingPluginRoot, 'scripts', 'wiki-session-end.mjs');
@@ -466,9 +467,18 @@ async function waitForTerminalCallback(
     }
     await new Promise<void>(resolve => setTimeout(resolve, 10));
   }
-  throw new Error(
-    `detached SessionEnd worker did not complete its callback; last manifest: ${JSON.stringify(lastManifest)}`,
-  );
+  let manifest: { phase?: string; owner?: unknown; recoverableFailure?: { reason?: string }; actions?: Record<string, { status?: string; error?: string }> } | null = null;
+  try {
+    if (existsSync(manifestPath)) {
+      manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+    }
+  } catch {
+    manifest = null;
+  }
+  const callback = manifest?.actions?.callback;
+  // recoverableFailure.reason is the only record of why a non-terminal release
+  // happened, so a CI-only failure must print it (issue #4076).
+  throw new Error(`detached SessionEnd worker did not complete its callback: phase=${manifest?.phase ?? 'missing'} owner=${manifest?.owner === null ? 'none' : typeof manifest?.owner} callback=${callback?.status ?? 'missing'} error=${callback?.error ?? 'none'} release=${manifest?.recoverableFailure?.reason ?? 'unrecorded'} file=${existsSync(callbackPath)}`);
 }
 
 async function waitForDeath(pid: number): Promise<void> {
@@ -544,7 +554,10 @@ describe('SessionEnd run.cjs runner/admission latency and detached completion', 
   function createProject(label = 'project'): string {
     const cwd = mkdtempSync(join(tmpdir(), `omc-session-end-${label}-`));
     tempDirs.push(cwd);
-    mkdirSync(join(cwd, '.git'));
+    execFileSync('git', ['init', '--quiet'], {
+      cwd,
+      stdio: 'pipe',
+    });
     vi.stubEnv('HOME', cwd);
     vi.stubEnv('USERPROFILE', cwd);
     vi.stubEnv('OMC_STATE_DIR', '');

@@ -17,7 +17,6 @@ import {
   isModeActiveInAnySession,
   getActiveSessionsForMode,
   clearStaleSessionDirs,
-  clearAllModeStates,
 } from '../index.js';
 
 import {
@@ -25,11 +24,10 @@ import {
   resolveSessionStatePath,
   listSessionIds,
 } from '../../../lib/worktree-paths.js';
-import { getProcessStartIdentitySync } from '../../../platform/process-utils.js';
-import {
-  acquireFileLockSync,
-  releaseFileLockSync,
-} from '../../../lib/file-lock.js';
+
+function toPosixPath(path: string): string {
+  return path.replaceAll('\\', '/');
+}
 
 describe('Session-Scoped State Isolation', () => {
   let tempDir: string;
@@ -99,10 +97,8 @@ describe('Session-Scoped State Isolation', () => {
 
   describe('resolveSessionStatePath', () => {
     it('should return session-scoped path', () => {
-    it('should return session-scoped path', () => {
       const path = resolveSessionStatePath('ralph', 'session-123', tempDir);
-      expect(path).toContain(join('.omc', 'state', 'sessions', 'session-123', 'ralph-state.json'));
-    });
+      expect(toPosixPath(path)).toContain('.omc/state/sessions/session-123/ralph-state.json');
     });
 
     it('should normalize state name', () => {
@@ -136,15 +132,13 @@ describe('Session-Scoped State Isolation', () => {
   describe('Session-scoped path resolution', () => {
     it('should return session-scoped path when sessionId provided for autoresearch', () => {
       const path = getStateFilePath(tempDir, 'autoresearch', 'session-123');
-      expect(path).toContain(join('sessions', 'session-123'));
+      expect(toPosixPath(path)).toContain('sessions/session-123');
       expect(path).toContain('autoresearch-state.json');
     });
 
     it('should return session-scoped path when sessionId provided', () => {
-    it('should return session-scoped path when sessionId provided', () => {
       const path = getStateFilePath(tempDir, 'ralph', 'session-123');
-      expect(path).toContain(join('sessions', 'session-123'));
-    });
+      expect(toPosixPath(path)).toContain('sessions/session-123');
     });
 
     it('should return legacy path when no sessionId', () => {
@@ -342,115 +336,6 @@ describe('Session-Scoped State Isolation', () => {
     });
   });
 
-  describe('full registry clear', () => {
-      it('removes only known owner-mediated files and keeps unknown files', () => {
-        const sessionId = 'full-clear-unknown';
-        createSessionState(sessionId, 'ralph', {
-          active: true,
-          session_id: sessionId,
-        });
-        const sessionDir = join(
-          tempDir,
-          '.omc',
-          'state',
-          'sessions',
-          sessionId,
-        );
-        const unknownPath = join(sessionDir, 'user-owned.txt');
-        writeFileSync(unknownPath, 'preserve me');
-
-        expect(clearAllModeStates(tempDir)).toBe(true);
-
-        expect(existsSync(join(sessionDir, 'ralph-state.json'))).toBe(false);
-        expect(readFileSync(unknownPath, 'utf8')).toBe('preserve me');
-        expect(existsSync(sessionDir)).toBe(true);
-      });
-
-      it('removes a session directory only after it is empty', () => {
-        const sessionId = 'full-clear-empty';
-        createSessionState(sessionId, 'ultrawork', {
-          active: true,
-          session_id: sessionId,
-        });
-        const sessionDir = join(
-          tempDir,
-          '.omc',
-          'state',
-          'sessions',
-          sessionId,
-        );
-
-        expect(clearAllModeStates(tempDir)).toBe(true);
-        expect(existsSync(sessionDir)).toBe(false);
-      });
-
-      it('preflights all known JSON before deleting any mode state', () => {
-        createLegacyState('ultrawork', { active: true });
-        const corruptPath = join(
-          tempDir,
-          '.omc',
-          'state',
-          'ralph-state.json',
-        );
-        writeFileSync(corruptPath, '{corrupt');
-        const validPath = join(
-          tempDir,
-          '.omc',
-          'state',
-          'ultrawork-state.json',
-        );
-
-        expect(clearAllModeStates(tempDir)).toBe(false);
-        expect(existsSync(validPath)).toBe(true);
-        expect(readFileSync(corruptPath, 'utf8')).toBe('{corrupt');
-      });
-
-      it('fails closed when the sessions directory cannot be enumerated', () => {
-        createLegacyState('ultrawork', { active: true });
-        const sessionsPath = join(
-          tempDir,
-          '.omc',
-          'state',
-          'sessions',
-        );
-        writeFileSync(sessionsPath, 'not a directory');
-        const validPath = join(
-          tempDir,
-          '.omc',
-          'state',
-          'ultrawork-state.json',
-        );
-
-        expect(clearAllModeStates(tempDir)).toBe(false);
-        expect(existsSync(validPath)).toBe(true);
-      });
-
-      it('uses one global barrier for marker writers and full clears', () => {
-        createLegacyState('ultrawork', { active: true });
-        const barrier = acquireFileLockSync(join(
-          tempDir,
-          '.omc',
-          'state',
-          '.mode-registry-clear.mutation.lock',
-        ));
-        expect(barrier).not.toBeNull();
-        try {
-          expect(createModeMarker('ralph', tempDir, {
-            session_id: 'barrier-session',
-          })).toBe(false);
-          expect(clearAllModeStates(tempDir)).toBe(false);
-          expect(existsSync(join(
-            tempDir,
-            '.omc',
-            'state',
-            'ultrawork-state.json',
-          ))).toBe(true);
-        } finally {
-          releaseFileLockSync(barrier!);
-        }
-    });
-  });
-
   describe('Backward compat with legacy state files', () => {
     it('should detect mode in legacy path', () => {
       createLegacyState('ralph', { active: true });
@@ -525,7 +410,7 @@ describe('Session-Scoped State Isolation', () => {
 
     it('should return correct state file path for team mode', () => {
       const path = getStateFilePath(tempDir, 'team', 'session-team-123');
-      expect(path).toContain(join('sessions', 'session-team-123'));
+      expect(toPosixPath(path)).toContain('sessions/session-team-123');
       expect(path).toContain('team-state.json');
     });
 

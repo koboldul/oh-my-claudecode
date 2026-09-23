@@ -1,3 +1,4 @@
+import { type SessionEndProducerAdmission } from './cleanup-manifest.js';
 export interface SessionEndInput {
     session_id: string;
     transcript_path: string;
@@ -18,6 +19,13 @@ export interface SessionMetrics {
 }
 export interface HookOutput {
     continue: boolean;
+}
+export interface SessionEndAdmissionResult {
+    output: HookOutput;
+    directory: string;
+    sessionId: string;
+    admitted: boolean;
+    deduplicated?: boolean;
 }
 interface SessionOwnedTeamCleanupResult {
     attempted: string[];
@@ -111,8 +119,10 @@ export declare function runSessionEndOpenClaw(directory: string, sessionId: stri
 /** Foreground cleanup has no network/process waits and records its result before the core producer is sealed. */
 export declare function runForegroundSessionEndCleanup(directory: string, sessionId: string, persistResult?: boolean): Promise<Record<string, unknown>>;
 export declare function prepareSessionEndWorkerInput(directory: string, input: SessionEndInput): Promise<Record<string, unknown>>;
+export declare function admitSessionEnd(input: SessionEndInput, event?: SessionEndProducerAdmission): Promise<SessionEndAdmissionResult>;
 export declare function processSessionEnd(input: SessionEndInput): Promise<HookOutput>;
 /** Wiki producer has no foreground lock or write; it only seals a durable capture/no-op intent. */
+export declare function admitWikiSessionEnd(input: SessionEndInput, event?: SessionEndProducerAdmission): Promise<SessionEndAdmissionResult>;
 export declare function processWikiSessionEnd(input: SessionEndInput): Promise<HookOutput>;
 export declare function handleSessionEnd(input: SessionEndInput): Promise<HookOutput>;
 export {};

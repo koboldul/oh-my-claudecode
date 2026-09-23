@@ -146,7 +146,7 @@ describe('workflow-drift-guard Stop hook', () => {
     expect(registrations).toEqual([{
       event: 'Stop',
       type: 'command',
-      command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/run.cjs "$CLAUDE_PLUGIN_ROOT"/scripts/workflow-drift-guard.mjs',
+      command: 'node "${CLAUDE_PLUGIN_ROOT}"/scripts/run.cjs "${CLAUDE_PLUGIN_ROOT}"/scripts/workflow-drift-guard.mjs',
       timeout: 3,
     }]);
   });

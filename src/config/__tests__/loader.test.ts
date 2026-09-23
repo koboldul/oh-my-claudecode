@@ -7,6 +7,7 @@ import {
   generateConfigSchema,
   loadConfig,
   loadContextFromFiles,
+  loadEnvConfig,
 } from "../loader.js";
 import { saveAndClear, restore } from "./test-helpers.js";
 
@@ -34,10 +35,26 @@ const ALL_KEYS = [
   "OMC_MODEL_ALIAS_FABLE",
   "OMC_DELEGATION_ROUTING_ENABLED",
   "OMC_DELEGATION_ROUTING_DEFAULT_PROVIDER",
+  "OMC_MAX_BACKGROUND_TASKS",
   "OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL",
   "OMC_COPILOT_DEFAULT_MODEL",
   "OMC_COPILOT_REASONING_EFFORT",
 ] as const;
+
+const TEST_FILE_CWD = process.cwd();
+
+function removeTempDir(tempDir: string): void {
+  const current = process.cwd().toLowerCase();
+  const target = tempDir.toLowerCase();
+  if (
+    current === target
+    || current.startsWith(`${target}\\`)
+    || current.startsWith(`${target}/`)
+  ) {
+    process.chdir(TEST_FILE_CWD);
+  }
+  rmSync(tempDir, { recursive: true, force: true });
+}
 
 describe("loadConfig() — GitHub Copilot external defaults", () => {
   let saved: Record<string, string | undefined>;
@@ -230,6 +247,36 @@ describe("loadConfig() — auto-forceInherit for non-standard providers", () => 
 });
 
 // ---------------------------------------------------------------------------
+// Background task limit environment override
+// ---------------------------------------------------------------------------
+describe("loadEnvConfig() — background task limit", () => {
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    saved = saveAndClear(ALL_KEYS);
+  });
+  afterEach(() => {
+    restore(saved);
+  });
+
+  it.each(["1", "5", "50"])(
+    "accepts an in-range positive decimal integer (%s)",
+    (value) => {
+      process.env.OMC_MAX_BACKGROUND_TASKS = value;
+      expect(loadEnvConfig().permissions?.maxBackgroundTasks).toBe(Number(value));
+    },
+  );
+
+  it.each(["0", "-1", "51", "1000", "3junk", "1.5", "1e2", "01", " 5 ", "abc"])(
+    "ignores malformed or out-of-range values (%s)",
+    (value) => {
+      process.env.OMC_MAX_BACKGROUND_TASKS = value;
+      expect(loadEnvConfig().permissions?.maxBackgroundTasks).toBeUndefined();
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
 // Model alias env overrides (issue #1211, issue #3726)
 // ---------------------------------------------------------------------------
 describe("loadConfig() — model alias env overrides", () => {
@@ -314,7 +361,7 @@ schema
         omcGuidance.length + `## Context from ${omcAgentsPath}\n\n`.length - 40,
       );
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -345,7 +392,7 @@ ${"- keep this\n".repeat(900)}
       expect(loaded).toContain(`## Context from ${fileA}`);
       expect(loaded).toContain('startup context budget');
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -440,7 +487,7 @@ describe("plan output configuration", () => {
         filenameTemplate: "plan-{{name}}.md",
       });
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 });
@@ -490,7 +537,7 @@ describe("company context configuration", () => {
         onError: "fail",
       });
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -552,7 +599,7 @@ describe("team.roleRouting (Option E)", () => {
         provider: "gemini",
       });
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -577,7 +624,7 @@ describe("team.roleRouting (Option E)", () => {
       expect(config.team?.ops?.defaultAgentType).toBe("cursor");
       expect(config.team?.roleRouting?.executor).toEqual({ provider: "cursor" });
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -604,7 +651,7 @@ describe("team.roleRouting (Option E)", () => {
       expect(config.team?.roleRouting?.["code-reviewer"]).toEqual({ provider: "copilot" });
     } finally {
       process.chdir(originalCwd);
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -626,7 +673,7 @@ describe("team.roleRouting (Option E)", () => {
         "cursor-grok-4.6-high",
       );
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -654,7 +701,7 @@ describe("team.roleRouting (Option E)", () => {
       });
       expect(config.team?.roleRouting?.critic).toEqual({ provider: "cursor" });
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -676,7 +723,7 @@ describe("team.roleRouting (Option E)", () => {
       const config = loadConfig();
       expect(config.team?.roleRouting?.critic?.provider).toBe("codex");
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -708,7 +755,7 @@ describe("team.roleRouting (Option E)", () => {
       process.chdir(tempDir);
       expect(() => loadConfig()).toThrow(/team\.roleRouting\.critic\.provider/);
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -728,7 +775,7 @@ describe("team.roleRouting (Option E)", () => {
       process.chdir(tempDir);
       expect(() => loadConfig()).toThrow(/orchestrator: key "provider" is not allowed/);
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -746,7 +793,7 @@ describe("team.roleRouting (Option E)", () => {
       process.chdir(tempDir);
       expect(() => loadConfig()).toThrow(/team\.roleRouting\.executor\.agent/);
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -770,7 +817,7 @@ describe("team.roleRouting (Option E)", () => {
       const r = config.team?.roleRouting as Record<string, unknown>;
       expect(r["reviewer"]).toEqual({ provider: "codex" });
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -788,7 +835,7 @@ describe("team.roleRouting (Option E)", () => {
       process.chdir(tempDir);
       expect(() => loadConfig()).toThrow(/team\.ops\.defaultAgentType/);
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 
@@ -806,7 +853,7 @@ describe("team.roleRouting (Option E)", () => {
       process.chdir(tempDir);
       expect(() => loadConfig()).toThrow(/unknown role "totally-fake-role"/);
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 });
@@ -869,7 +916,7 @@ describe("delegation routing deprecation warnings", () => {
         expect.stringContaining("delegationRouting to Codex/Gemini is deprecated"),
       );
     } finally {
-      rmSync(tempDir, { recursive: true, force: true });
+      removeTempDir(tempDir);
     }
   });
 });
@@ -885,7 +932,7 @@ describe("loadConfig() — autopilot team worker config", () => {
 
   afterEach(() => {
     process.chdir(originalCwd);
-    rmSync(tempDir, { recursive: true, force: true });
+    removeTempDir(tempDir);
   });
 
   it("loads autopilot.execution=team with Cursor team agentTypes", () => {
@@ -960,7 +1007,7 @@ describe("loadConfig() — autopilot.workflows", () => {
     process.chdir(originalCwd);
     if (originalConfigHome === undefined) delete process.env[configHomeEnv];
     else process.env[configHomeEnv] = originalConfigHome;
-    rmSync(tempDir, { recursive: true, force: true });
+    removeTempDir(tempDir);
   });
 
   it.each([

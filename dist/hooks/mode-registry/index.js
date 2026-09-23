@@ -9,12 +9,11 @@
  * All modes store state in `.omc/state/` subdirectory for consistency.
  */
 import { existsSync, readFileSync, mkdirSync, readdirSync, statSync, rmdirSync, rmSync, } from "fs";
-import { canClearStateForSession, clearStateFileLockedIf, withStateFileMutationLock, writeStateFileLocked, } from "../../lib/mode-state-io.js";
+import { canClearStateForSession, clearStateFileLockedIf, getStateMutationLockFailureMessage, writeStateFileLocked } from "../../lib/mode-state-io.js";
 import { join, dirname } from "path";
 import { listSessionIds, resolveSessionStatePath, getSessionStateDir, getOmcRoot, } from '../../lib/worktree-paths.js';
 import { getStateSessionOwner } from '../../lib/mode-state-io.js';
 import { MODE_STATE_FILE_MAP, MODE_NAMES } from "../../lib/mode-names.js";
-import { clearAllSkillActiveStateLocked } from "../skill-state/index.js";
 /**
  * Mode configuration registry
  *
@@ -68,30 +67,11 @@ export { MODE_CONFIGS };
  * Modes that are mutually exclusive (cannot run concurrently)
  */
 const EXCLUSIVE_MODES = [MODE_NAMES.AUTOPILOT, MODE_NAMES.AUTORESEARCH];
-const SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/;
-const MODE_REGISTRY_BARRIER_FILE = ".mode-registry-clear";
 /**
  * Get the state directory path
  */
 export function getStateDir(cwd) {
     return join(getOmcRoot(cwd), "state");
-}
-function discoverModeRegistrySessions(cwd) {
-    const sessionsDir = join(getStateDir(cwd), "sessions");
-    if (!existsSync(sessionsDir)) {
-        return { status: "missing", sessionIds: [] };
-    }
-    try {
-        return {
-            status: "valid",
-            sessionIds: readdirSync(sessionsDir, { withFileTypes: true })
-                .filter((entry) => entry.isDirectory() && SESSION_ID_PATTERN.test(entry.name))
-                .map((entry) => entry.name),
-        };
-    }
-    catch {
-        return { status: "failed", sessionIds: [] };
-    }
 }
 /**
  * Ensure the state directory exists
@@ -351,22 +331,13 @@ function clearObservedJsonFile(filePath, predicate = () => true) {
     const snapshot = JSON.stringify(observed);
     return clearStateFileLockedIf(filePath, (current) => predicate(current) && JSON.stringify(current) === snapshot) !== 'failed';
 }
-function inspectJsonSnapshot(filePath) {
-    if (!existsSync(filePath))
-        return { status: "missing" };
+function readJsonSnapshot(filePath) {
     try {
         const state = JSON.parse(readFileSync(filePath, "utf-8"));
-        if (!state || typeof state !== "object" || Array.isArray(state)) {
-            return { status: "corrupt" };
-        }
-        return {
-            status: "valid",
-            state: state,
-            snapshot: JSON.stringify(state),
-        };
+        return { state, snapshot: JSON.stringify(state) };
     }
     catch {
-        return { status: "corrupt" };
+        return null;
     }
 }
 function clearDiscoveredJsonFile(filePath, observed, predicate = () => true) {
@@ -391,49 +362,22 @@ function clearDiscoveredJsonFile(filePath, observed, predicate = () => true) {
  * @returns true if all files were deleted successfully (or didn't exist)
  */
 export function clearModeState(mode, cwd, sessionId, expectedState) {
-    const locked = withStateFileMutationLock(join(getStateDir(cwd), MODE_REGISTRY_BARRIER_FILE), () => clearModeStateUnderBarrier(mode, cwd, sessionId, expectedState));
-    return locked.acquired && locked.value === true;
-}
-function clearModeStateUnderBarrier(mode, cwd, sessionId, expectedState) {
     const config = MODE_CONFIGS[mode];
     let success = true;
     const markerFile = getMarkerFilePath(cwd, mode);
     const isSessionScopedClear = Boolean(sessionId);
+    const markerSnapshot = markerFile ? readJsonSnapshot(markerFile) : null;
     const sessionMarkerFile = isSessionScopedClear && sessionId && config.markerFile
         ? resolveSessionStatePath(config.markerFile.replace(/\.json$/i, ""), sessionId, cwd)
         : null;
-    const sessionStateFile = isSessionScopedClear && sessionId
-        ? resolveSessionStatePath(mode, sessionId, cwd)
-        : null;
-    const stateFile = getStateFilePath(cwd, mode);
-    const inspections = new Map();
-    for (const path of [
-        ...(isSessionScopedClear ? [sessionStateFile, sessionMarkerFile] : [stateFile]),
-        markerFile,
-    ].filter((path) => !!path)) {
-        inspections.set(path, inspectJsonSnapshot(path));
-    }
-    if ([...inspections.values()].some(({ status }) => status === "corrupt")) {
-        return false;
-    }
-    const markerInspection = markerFile
-        ? inspections.get(markerFile)
-        : undefined;
-    const markerSnapshot = markerInspection?.status === "valid"
-        ? markerInspection
-        : null;
-    const sessionMarkerInspection = sessionMarkerFile
-        ? inspections.get(sessionMarkerFile)
-        : undefined;
-    const sessionMarkerSnapshot = sessionMarkerInspection?.status === "valid"
-        ? sessionMarkerInspection
-        : null;
+    const sessionMarkerSnapshot = sessionMarkerFile ? readJsonSnapshot(sessionMarkerFile) : null;
     // Delete session-scoped state file if sessionId provided
-    if (isSessionScopedClear && sessionId && sessionStateFile) {
+    if (isSessionScopedClear && sessionId) {
+        const sessionStateFile = resolveSessionStatePath(mode, sessionId, cwd);
         try {
             const result = clearStateFileLockedIf(sessionStateFile, (current) => canClearStateForSession(current, sessionId) && (!expectedState || JSON.stringify(current) === JSON.stringify(expectedState)));
             if (result === 'failed' || (result === 'skipped' && existsSync(sessionStateFile)))
-                throw new Error("state mutation lock unavailable");
+                throw new Error(getStateMutationLockFailureMessage());
         }
         catch (err) {
             if (err.code !== "ENOENT") {
@@ -445,7 +389,7 @@ function clearModeStateUnderBarrier(mode, cwd, sessionId, expectedState) {
         if (sessionMarkerFile) {
             try {
                 if (!clearDiscoveredJsonFile(sessionMarkerFile, sessionMarkerSnapshot, (current) => canClearStateForSession(current, sessionId)))
-                    throw new Error("state mutation lock unavailable");
+                    throw new Error(getStateMutationLockFailureMessage());
             }
             catch (err) {
                 if (err.code !== "ENOENT") {
@@ -462,7 +406,7 @@ function clearModeStateUnderBarrier(mode, cwd, sessionId, expectedState) {
                 if (!markerSessionId || markerSessionId === sessionId) {
                     try {
                         if (!clearDiscoveredJsonFile(markerFile, markerSnapshot, (current) => canClearStateForSession(current, sessionId)))
-                            throw new Error("state mutation lock unavailable");
+                            throw new Error(getStateMutationLockFailureMessage());
                     }
                     catch (err) {
                         if (err.code !== "ENOENT") {
@@ -475,7 +419,7 @@ function clearModeStateUnderBarrier(mode, cwd, sessionId, expectedState) {
                 // Malformed or unreadable session-scoped markers fail closed.
                 try {
                     if (!clearDiscoveredJsonFile(markerFile, markerSnapshot, (current) => canClearStateForSession(current, sessionId)))
-                        throw new Error("state mutation lock unavailable");
+                        throw new Error(getStateMutationLockFailureMessage());
                 }
                 catch (err) {
                     if (err.code !== "ENOENT") {
@@ -486,11 +430,12 @@ function clearModeStateUnderBarrier(mode, cwd, sessionId, expectedState) {
         }
     }
     // Delete local state file (legacy path) for non-session clears
+    const stateFile = getStateFilePath(cwd, mode);
     if (!isSessionScopedClear) {
         try {
             const result = clearStateFileLockedIf(stateFile, (current) => !expectedState || JSON.stringify(current) === JSON.stringify(expectedState));
             if (result === 'failed' || (result === 'skipped' && existsSync(stateFile)))
-                throw new Error("state mutation lock unavailable");
+                throw new Error(getStateMutationLockFailureMessage());
         }
         catch (err) {
             if (err.code !== "ENOENT") {
@@ -502,7 +447,7 @@ function clearModeStateUnderBarrier(mode, cwd, sessionId, expectedState) {
     if (markerFile && !isSessionScopedClear) {
         try {
             if (!clearDiscoveredJsonFile(markerFile, markerSnapshot))
-                throw new Error("state mutation lock unavailable");
+                throw new Error(getStateMutationLockFailureMessage());
         }
         catch (err) {
             if (err.code !== "ENOENT")
@@ -516,59 +461,35 @@ function clearModeStateUnderBarrier(mode, cwd, sessionId, expectedState) {
  * Clear all mode states (force clear)
  */
 export function clearAllModeStates(cwd) {
-    const locked = withStateFileMutationLock(join(getStateDir(cwd), MODE_REGISTRY_BARRIER_FILE), () => {
-        const discovered = discoverModeRegistrySessions(cwd);
-        if (discovered.status === "failed")
-            return false;
-        const modes = Object.keys(MODE_CONFIGS);
-        const candidates = new Set();
-        for (const mode of modes) {
-            candidates.add(getStateFilePath(cwd, mode));
-            const marker = getMarkerFilePath(cwd, mode);
-            if (marker)
-                candidates.add(marker);
-            const config = MODE_CONFIGS[mode];
-            for (const sessionId of discovered.sessionIds) {
-                candidates.add(resolveSessionStatePath(mode, sessionId, cwd));
-                if (config.markerFile) {
-                    candidates.add(resolveSessionStatePath(config.markerFile.replace(/\.json$/i, ""), sessionId, cwd));
-                }
-            }
+    let success = true;
+    for (const mode of Object.keys(MODE_CONFIGS)) {
+        if (!clearModeState(mode, cwd)) {
+            success = false;
         }
-        if ([...candidates].some((path) => inspectJsonSnapshot(path).status === "corrupt")) {
-            return false;
+    }
+    // Clear skill-active-state.json (issue #1033)
+    const skillStatePath = join(getStateDir(cwd), "skill-active-state.json");
+    try {
+        if (!clearObservedJsonFile(skillStatePath))
+            throw new Error(getStateMutationLockFailureMessage());
+    }
+    catch (err) {
+        if (err.code !== "ENOENT") {
+            success = false;
         }
-        let success = true;
-        if (!clearAllSkillActiveStateLocked(cwd)) {
-            return false;
+    }
+    // Also clean up session directories
+    try {
+        const sessionIds = listSessionIds(cwd);
+        for (const sid of sessionIds) {
+            const sessionDir = getSessionStateDir(sid, cwd);
+            rmSync(sessionDir, { recursive: true, force: true });
         }
-        for (const sessionId of discovered.sessionIds) {
-            for (const mode of modes) {
-                if (!clearModeStateUnderBarrier(mode, cwd, sessionId)) {
-                    success = false;
-                }
-            }
-        }
-        for (const mode of modes) {
-            if (!clearModeStateUnderBarrier(mode, cwd)) {
-                success = false;
-            }
-        }
-        for (const sessionId of discovered.sessionIds) {
-            const sessionDir = getSessionStateDir(sessionId, cwd);
-            try {
-                if (existsSync(sessionDir)
-                    && readdirSync(sessionDir).length === 0) {
-                    rmdirSync(sessionDir);
-                }
-            }
-            catch {
-                success = false;
-            }
-        }
-        return success;
-    });
-    return locked.acquired && locked.value === true;
+    }
+    catch {
+        success = false;
+    }
+    return success;
 }
 /**
  * Check if a mode is active in any session
@@ -612,10 +533,6 @@ export function getActiveSessionsForMode(mode, cwd) {
  * @returns Array of removed session IDs
  */
 export function clearStaleSessionDirs(cwd, maxAgeMs = 24 * 60 * 60 * 1000) {
-    const locked = withStateFileMutationLock(join(getStateDir(cwd), MODE_REGISTRY_BARRIER_FILE), () => clearStaleSessionDirsUnderBarrier(cwd, maxAgeMs));
-    return locked.acquired && locked.value ? locked.value : [];
-}
-function clearStaleSessionDirsUnderBarrier(cwd, maxAgeMs) {
     const removed = [];
     const sessionIds = listSessionIds(cwd);
     for (const sid of sessionIds) {
@@ -659,10 +576,6 @@ function clearStaleSessionDirsUnderBarrier(cwd, maxAgeMs) {
  * @param metadata - Optional metadata to store in marker
  */
 export function createModeMarker(mode, cwd, metadata) {
-    const locked = withStateFileMutationLock(join(getStateDir(cwd), MODE_REGISTRY_BARRIER_FILE), () => createModeMarkerUnderBarrier(mode, cwd, metadata));
-    return locked.acquired && locked.value === true;
-}
-function createModeMarkerUnderBarrier(mode, cwd, metadata) {
     const markerPath = getMarkerFilePath(cwd, mode);
     if (!markerPath) {
         console.error(`Mode ${mode} does not use a marker file`);
@@ -692,10 +605,6 @@ function createModeMarkerUnderBarrier(mode, cwd, metadata) {
  * @param cwd - Working directory
  */
 export function removeModeMarker(mode, cwd) {
-    const locked = withStateFileMutationLock(join(getStateDir(cwd), MODE_REGISTRY_BARRIER_FILE), () => removeModeMarkerUnderBarrier(mode, cwd));
-    return locked.acquired && locked.value === true;
-}
-function removeModeMarkerUnderBarrier(mode, cwd) {
     const markerPath = getMarkerFilePath(cwd, mode);
     if (!markerPath) {
         return true; // No marker to remove
@@ -743,10 +652,6 @@ export function readModeMarker(mode, cwd) {
  * @param cwd - Working directory
  */
 export function forceRemoveMarker(mode, cwd) {
-    const locked = withStateFileMutationLock(join(getStateDir(cwd), MODE_REGISTRY_BARRIER_FILE), () => forceRemoveMarkerUnderBarrier(mode, cwd));
-    return locked.acquired && locked.value === true;
-}
-function forceRemoveMarkerUnderBarrier(mode, cwd) {
     const markerPath = getMarkerFilePath(cwd, mode);
     if (!markerPath) {
         return true; // No marker to remove

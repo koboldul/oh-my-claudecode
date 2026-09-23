@@ -20,5 +20,27 @@ describe('runtime-v2 explicit provider + role preservation', () => {
         expect(assignment.agentType).toBe('claude');
         expect(assignment.role).toBe('executor');
     });
+    it('preserves an explicit Copilot reviewer provider without native-agent fallback', () => {
+        const assignment = resolveTaskAssignment({ subject: 'Review', description: 'review the change', role: 'code-reviewer' }, resolvedRouting, undefined, 'copilot');
+        expect(assignment).toEqual({
+            agentType: 'copilot',
+            model: '',
+            role: 'code-reviewer',
+        });
+    });
+    // A routed provider is authoritative: binary availability is validated later,
+    // before any worker launch, instead of silently rewriting provider identity.
+    it('propagates routed Copilot model and effort regardless of binary availability', () => {
+        const routed = buildResolvedRoutingSnapshot({
+            team: { roleRouting: { critic: { provider: 'copilot' } } },
+        });
+        const assignment = resolveTaskAssignment({ subject: 'Critique', description: 'challenge the plan', role: 'critic' }, routed, { critic: { provider: 'copilot' } }, 'claude');
+        expect(assignment).toMatchObject({
+            agentType: 'copilot',
+            model: 'gpt-5.6-sol',
+            reasoningEffort: 'max',
+            role: 'critic',
+        });
+    });
 });
 //# sourceMappingURL=runtime-v2.explicit-provider-routing.test.js.map

@@ -38,11 +38,8 @@ export {
   validateTmux,
   sanitizeName,
   sessionName,
-  createSession,
-  killSession,
   isSessionAlive,
   listActiveSessions,
-  spawnBridgeInSession,
 } from './tmux-session.js';
 
 export {
@@ -272,9 +269,8 @@ export type {
   TeamRuntime,
   WorkerStatus as RuntimeWorkerStatus,
   TeamSnapshot,
-  WatchdogCompletionEvent,
 } from './runtime.js';
-export { startTeam, monitorTeam, assignTask, shutdownTeam, resumeTeam, watchdogCliWorkers } from './runtime.js';
+export { startTeam, monitorTeam, shutdownTeam, resumeTeam } from './runtime.js';
 export {
   setRuntimeOwnerRecoveryClient,
   recoverDeadWorkerV2,

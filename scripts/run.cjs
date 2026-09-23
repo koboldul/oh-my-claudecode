@@ -272,7 +272,14 @@ function inferPluginRootFromTarget(targetPath) {
 
 function resolveChildEnv(targetPath) {
   const originalPluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
-  const inferredPluginRoot = originalPluginRoot ? null : inferPluginRootFromTarget(targetPath);
+  const hasCopilotEnvSignal = Boolean(
+    process.env.COPILOT_CLI
+    || process.env.COPILOT_AGENT_SESSION_ID
+    || process.env.OMC_HOST === 'copilot'
+  );
+  const inferredPluginRoot = !originalPluginRoot && hasCopilotEnvSignal
+    ? inferPluginRootFromTarget(targetPath)
+    : null;
   const effectivePluginRoot = originalPluginRoot || inferredPluginRoot;
   const childEnv = { ...process.env };
 
@@ -281,9 +288,6 @@ function resolveChildEnv(targetPath) {
   }
 
   if (!childEnv.OMC_HOST) {
-    const hasCopilotEnvSignal = Boolean(
-      process.env.COPILOT_CLI || process.env.COPILOT_AGENT_SESSION_ID
-    );
     const pluginRootUnderCopilot = Boolean(
       effectivePluginRoot &&
       /[\\/]\.copilot[\\/]installed-plugins[\\/]/i.test(effectivePluginRoot)

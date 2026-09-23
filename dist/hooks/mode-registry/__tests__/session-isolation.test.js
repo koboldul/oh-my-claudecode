@@ -8,6 +8,9 @@ import { join } from 'path';
 // Import functions to test
 import { getStateFilePath, isModeActive, getActiveModes, clearModeState, createModeMarker, hasModeState, isModeActiveInAnySession, getActiveSessionsForMode, clearStaleSessionDirs, } from '../index.js';
 import { validateSessionId, resolveSessionStatePath, listSessionIds, } from '../../../lib/worktree-paths.js';
+function toPosixPath(path) {
+    return path.replaceAll('\\', '/');
+}
 describe('Session-Scoped State Isolation', () => {
     let tempDir;
     let previousHome;
@@ -72,7 +75,7 @@ describe('Session-Scoped State Isolation', () => {
     describe('resolveSessionStatePath', () => {
         it('should return session-scoped path', () => {
             const path = resolveSessionStatePath('ralph', 'session-123', tempDir);
-            expect(path).toContain('.omc/state/sessions/session-123/ralph-state.json');
+            expect(toPosixPath(path)).toContain('.omc/state/sessions/session-123/ralph-state.json');
         });
         it('should normalize state name', () => {
             const path1 = resolveSessionStatePath('ralph', 'sid', tempDir);
@@ -101,12 +104,12 @@ describe('Session-Scoped State Isolation', () => {
     describe('Session-scoped path resolution', () => {
         it('should return session-scoped path when sessionId provided for autoresearch', () => {
             const path = getStateFilePath(tempDir, 'autoresearch', 'session-123');
-            expect(path).toContain('sessions/session-123');
+            expect(toPosixPath(path)).toContain('sessions/session-123');
             expect(path).toContain('autoresearch-state.json');
         });
         it('should return session-scoped path when sessionId provided', () => {
             const path = getStateFilePath(tempDir, 'ralph', 'session-123');
-            expect(path).toContain('sessions/session-123');
+            expect(toPosixPath(path)).toContain('sessions/session-123');
         });
         it('should return legacy path when no sessionId', () => {
             const path = getStateFilePath(tempDir, 'ralph');
@@ -324,7 +327,7 @@ describe('Session-Scoped State Isolation', () => {
         });
         it('should return correct state file path for team mode', () => {
             const path = getStateFilePath(tempDir, 'team', 'session-team-123');
-            expect(path).toContain('sessions/session-team-123');
+            expect(toPosixPath(path)).toContain('sessions/session-team-123');
             expect(path).toContain('team-state.json');
         });
         it('should isolate team state between sessions', () => {

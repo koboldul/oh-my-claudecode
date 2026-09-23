@@ -18,6 +18,32 @@
       "transformations": []
     },
     {
+      "id": "agent-doc-discipline",
+      "source": "skills/agent-doc-discipline/SKILL.md",
+      "output": "skills-copilot/agent-doc-discipline/SKILL.md",
+      "intendedOutcome": "Apply checkable, fresh-session-ready discipline to agent-facing documents.",
+      "claudeMechanism": "Canonical Claude skill prompt.",
+      "copilotMechanism": "Generated canonical prompt with declared host transforms.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "architecture-survey",
+      "source": "skills/architecture-survey/SKILL.md",
+      "output": "skills-copilot/architecture-survey/SKILL.md",
+      "intendedOutcome": "Survey architecture and report evidence-ranked deepening candidates without edits.",
+      "claudeMechanism": "Canonical Claude skill prompt.",
+      "copilotMechanism": "Generated canonical prompt with declared host transforms.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
       "id": "ask",
       "source": "skills/ask/SKILL.md",
       "output": "skills-copilot/ask/SKILL.md",
@@ -155,6 +181,19 @@
       ]
     },
     {
+      "id": "diagram",
+      "source": "skills/diagram/SKILL.md",
+      "output": "skills-copilot/diagram/SKILL.md",
+      "intendedOutcome": "Use the smallest visual artifact that makes technical structure comprehensible.",
+      "claudeMechanism": "Canonical Claude skill prompt.",
+      "copilotMechanism": "Generated canonical prompt with declared host transforms.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
       "id": "drydock",
       "source": "skills/drydock/SKILL.md",
       "output": "skills-copilot/drydock/SKILL.md",
@@ -212,6 +251,19 @@
       ]
     },
     {
+      "id": "harbor",
+      "source": "skills/harbor/SKILL.md",
+      "output": "skills-copilot/harbor/SKILL.md",
+      "intendedOutcome": "Verify external issue and pull-request claims and prepare evidence-backed intake decisions without merging.",
+      "claudeMechanism": "Canonical Claude skill prompt.",
+      "copilotMechanism": "Generated canonical prompt with declared host transforms.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
       "id": "hud",
       "source": "skills/hud/SKILL.md",
       "output": "skills-copilot/hud/SKILL.md",
@@ -227,6 +279,19 @@
         "role",
         "scope"
       ]
+    },
+    {
+      "id": "intent",
+      "source": "skills/intent/SKILL.md",
+      "output": "skills-copilot/intent/SKILL.md",
+      "intendedOutcome": "Turn non-engineer feedback into a reviewable, signed intent mission brief.",
+      "claudeMechanism": "Canonical Claude skill prompt.",
+      "copilotMechanism": "Generated canonical prompt with declared host transforms.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
     },
     {
       "id": "launch",
@@ -259,6 +324,19 @@
       "source": "skills/minimal-code-discipline/SKILL.md",
       "output": "skills-copilot/minimal-code-discipline/SKILL.md",
       "intendedOutcome": "YAGNI-ladder writing-time discipline: reuse first, shortest correct diff.",
+      "claudeMechanism": "Canonical Claude skill prompt.",
+      "copilotMechanism": "Generated canonical prompt with declared host transforms.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "minimal-prose-discipline",
+      "source": "skills/minimal-prose-discipline/SKILL.md",
+      "output": "skills-copilot/minimal-prose-discipline/SKILL.md",
+      "intendedOutcome": "Apply protected-core, action-first prose discipline to agent replies.",
       "claudeMechanism": "Canonical Claude skill prompt.",
       "copilotMechanism": "Generated canonical prompt with declared host transforms.",
       "automatedEvidence": "generator drift, manifest routing, package surface",

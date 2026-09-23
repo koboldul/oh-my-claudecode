@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { claimSessionEndAction, claimSessionEndJob, finishSessionEndAction, isManifestTerminal, markSessionEndActionRunner, mutateSessionEndJob, prepareCoreManifest, readSessionEndJob, reapStaleSessionEndOwner, releaseSessionEndJob, renewSessionEndLease, sealCoreManifest, sealWikiManifest, sessionEndJobsDirectory, takeSessionEndDiscoveryPage, updateSessionEndActionPayload, } from '../cleanup-manifest.js';
+import { claimSessionEndAction, claimSessionEndJob, finishSessionEndAction, isManifestTerminal, markSessionEndActionRunner, mutateSessionEndJob, prepareCoreManifest, readSessionEndJob, reapStaleSessionEndOwner, releaseSessionEndJob, renewSessionEndLease, sealCoreManifest, sealWikiManifest, sessionEndJobPath, sessionEndJobsDirectory, sessionEndScopeKey, takeSessionEndDiscoveryPage, updateSessionEndActionPayload, } from '../cleanup-manifest.js';
 const directories = [];
 beforeEach(() => {
     const stateRoot = mkdtempSync(join(tmpdir(), 'omc-cleanup-state-'));
@@ -26,6 +27,82 @@ afterEach(() => {
     vi.unstubAllEnvs();
 });
 describe('durable SessionEnd cleanup manifest', () => {
+    it('isolates identical session ids under scoped v2 manifest paths', () => {
+        const first = project();
+        const second = project();
+        const sessionId = 'same-session';
+        expect(prepareCoreManifest(first, sessionId, { scope: 'first' })).not.toBeNull();
+        expect(prepareCoreManifest(second, sessionId, { scope: 'second' })).not.toBeNull();
+        expect(sessionEndJobPath(first, sessionId)).not.toBe(sessionEndJobPath(second, sessionId));
+        expect(readSessionEndJob(first, sessionId)?.scopeKey).toBe(sessionEndScopeKey(first));
+        expect(readSessionEndJob(second, sessionId)?.scopeKey).toBe(sessionEndScopeKey(second));
+        expect(readSessionEndJob(first, sessionId)?.actions.callback.payload).toMatchObject({
+            scope: 'first',
+        });
+        expect(readSessionEndJob(second, sessionId)?.actions.callback.payload).toMatchObject({
+            scope: 'second',
+        });
+    });
+    it('migrates only a v1 manifest whose legacy scope matches the worktree', () => {
+        const directory = project();
+        const sessionId = 'matching-v1';
+        expect(prepareCoreManifest(directory, sessionId, { legacy: true })).not.toBeNull();
+        const created = readSessionEndJob(directory, sessionId);
+        const legacyRoot = join(directory, '.omc', 'state', 'session-end-jobs');
+        const legacyPath = join(legacyRoot, `${sessionId}.json`);
+        const legacyScopeKey = createHash('sha256')
+            .update(JSON.stringify(directory))
+            .digest('hex');
+        mkdirSync(legacyRoot, { recursive: true });
+        writeFileSync(legacyPath, JSON.stringify({
+            ...created,
+            scopeKey: legacyScopeKey,
+        }));
+        rmSync(join(legacyRoot, 'v2'), { recursive: true, force: true });
+        const migrated = readSessionEndJob(directory, sessionId);
+        expect(migrated?.scopeKey).toBe(sessionEndScopeKey(directory));
+        expect(migrated?.revision).toBe(created.revision + 1);
+        expect(readFileSync(sessionEndJobPath(directory, sessionId), 'utf8')).toContain(sessionEndScopeKey(directory));
+    });
+    it('leaves a mismatched v1 manifest untouched', () => {
+        const directory = project();
+        const sessionId = 'foreign-v1';
+        expect(prepareCoreManifest(directory, sessionId, { legacy: true })).not.toBeNull();
+        const created = readSessionEndJob(directory, sessionId);
+        const legacyRoot = join(directory, '.omc', 'state', 'session-end-jobs');
+        const legacyPath = join(legacyRoot, `${sessionId}.json`);
+        mkdirSync(legacyRoot, { recursive: true });
+        writeFileSync(legacyPath, JSON.stringify({
+            ...created,
+            scopeKey: '00'.repeat(32),
+        }));
+        rmSync(join(legacyRoot, 'v2'), { recursive: true, force: true });
+        expect(readSessionEndJob(directory, sessionId)).toBeNull();
+        expect(readFileSync(legacyPath, 'utf8')).toContain('00'.repeat(32));
+    });
+    it('keeps the first producer eventId/rawDigest authoritative across replay', () => {
+        const directory = project();
+        const sessionId = 'producer-idempotency';
+        const first = {
+            eventId: '11'.repeat(32),
+            rawDigest: '22'.repeat(32),
+        };
+        const replay = {
+            eventId: '33'.repeat(32),
+            rawDigest: '44'.repeat(32),
+        };
+        expect(prepareCoreManifest(directory, sessionId, { source: 'first' }, first)).not.toBeNull();
+        expect(prepareCoreManifest(directory, sessionId, { source: 'replay' }, replay)).not.toBeNull();
+        expect(sealWikiManifest(directory, sessionId, { source: 'wiki-first' }, first)).not.toBeNull();
+        expect(sealWikiManifest(directory, sessionId, { source: 'wiki-replay' }, replay)).not.toBeNull();
+        const manifest = readSessionEndJob(directory, sessionId);
+        expect(manifest.producers.core).toMatchObject(first);
+        expect(manifest.producers.wiki).toMatchObject(first);
+        expect(manifest.actions.callback.payload).toMatchObject({ source: 'first' });
+        expect(manifest.actions['wiki-capture'].payload).toMatchObject({
+            source: 'wiki-first',
+        });
+    });
     it('serializes concurrent core/wiki producers and rejects a second worker claim', async () => {
         const directory = project();
         const sessionId = 'concurrent-producers';
@@ -155,9 +232,29 @@ describe('durable SessionEnd cleanup manifest', () => {
         expect(markSessionEndActionRunner(directory, sessionId, 'crashed-owner', 'python-cleanup', runner.runnerNonce, 'armed')).not.toBeNull();
         expect(finishSessionEndAction(directory, sessionId, 'crashed-owner', 'python-cleanup', runner.runnerNonce, false, 'simulated-crash')).not.toBeNull();
         expect(readSessionEndJob(directory, sessionId)?.actions['python-cleanup']).toMatchObject({ status: 'retryable', lastOutcomeCode: 'simulated-crash', runner: { phase: 'terminal' } });
-        expect(releaseSessionEndJob(directory, sessionId, 'crashed-owner', owner.owner.leaseGeneration)).not.toBeNull();
+        expect(releaseSessionEndJob(directory, sessionId, 'crashed-owner', owner.owner.leaseGeneration, 'lease-lost-during-python-cleanup')).not.toBeNull();
         expect(readSessionEndJob(directory, sessionId)).toMatchObject({ owner: null, phase: 'recoverable-failure' });
         expect(takeSessionEndDiscoveryPage(directory, 1)).toEqual([sessionId]);
+    });
+    it('records why a release left the job in recoverable-failure (#4076)', () => {
+        const directory = project();
+        const sessionId = preparedAndSealed(directory, 'release-reason');
+        const owner = claimSessionEndJob(directory, sessionId, 'owner', 'identity', Date.now() + 5_000);
+        expect(releaseSessionEndJob(directory, sessionId, 'owner', owner.owner.leaseGeneration, 'run-deadline-reached')).toMatchObject({
+            phase: 'recoverable-failure',
+            recoverableFailure: { reason: 'run-deadline-reached', ownerNonce: 'owner' },
+        });
+        // The reason must survive on disk: the CI artifact is the only evidence a
+        // non-reproducing failure leaves behind.
+        const persisted = readSessionEndJob(directory, sessionId);
+        expect(persisted.recoverableFailure?.reason).toBe('run-deadline-reached');
+        expect(Number.isFinite(Date.parse(persisted.recoverableFailure.releasedAt))).toBe(true);
+        // Default reason still names the release path when a caller passes nothing.
+        const reclaimed = claimSessionEndJob(directory, sessionId, 'next-owner', 'identity', Date.now() + 5_000);
+        expect(releaseSessionEndJob(directory, sessionId, 'next-owner', reclaimed.owner.leaseGeneration)?.recoverableFailure).toMatchObject({
+            reason: 'worker-released',
+            ownerNonce: 'next-owner',
+        });
     });
     it('bounds required failures and never retries a failed remote delivery attempt', () => {
         const directory = project();

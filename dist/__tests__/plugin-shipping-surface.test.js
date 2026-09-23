@@ -49,6 +49,7 @@ function createFixture(options = {}) {
             },
         },
     });
+    writeFileSync(join(root, '.gitattributes'), '* text=auto eol=lf\n');
     writeFileSync(join(root, '.gitignore'), 'dist/\nbridge/\n');
     writeFileSync(join(root, 'docs', 'CLAUDE.md'), canonicalClaudeMd);
     writeFileSync(join(root, 'dist', 'index.js'), "export { fixture } from './runtime.js';\n");
@@ -98,6 +99,63 @@ afterEach(() => {
     }
 });
 describe('plugin shipping surface transaction', () => {
+    it('discovers both declared host hook manifests and every command variant', async () => {
+        const fixture = createFixture();
+        mkdirSync(join(fixture.root, 'hooks'), { recursive: true });
+        mkdirSync(join(fixture.root, 'scripts'), { recursive: true });
+        writeJson(join(fixture.root, 'plugin.json'), {
+            name: 'fixture-plugin',
+            version: '1.0.0',
+            hooks: './hooks/copilot-hooks.json',
+        });
+        writeJson(join(fixture.root, '.claude-plugin', 'plugin.json'), {
+            name: 'fixture-plugin',
+            version: '1.0.0',
+            mcpServers: './.mcp.json',
+            hooks: './hooks/hooks.json',
+        });
+        writeJson(join(fixture.root, 'hooks', 'hooks.json'), {
+            hooks: {
+                SessionStart: [{
+                        matcher: 'init',
+                        hooks: [{
+                                type: 'command',
+                                command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/claude-hook.mjs',
+                            }],
+                    }],
+            },
+        });
+        writeJson(join(fixture.root, 'hooks', 'copilot-hooks.json'), {
+            version: 1,
+            hooks: {
+                sessionStart: [{
+                        type: 'command',
+                        command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/copilot-command.mjs',
+                        bash: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-bash.mjs"',
+                        powershell: 'node "${CLAUDE_PLUGIN_ROOT}/scripts/copilot-powershell.mjs"',
+                    }],
+            },
+        });
+        for (const name of [
+            'claude-hook.mjs',
+            'copilot-command.mjs',
+            'copilot-bash.mjs',
+            'copilot-powershell.mjs',
+        ]) {
+            writeFileSync(join(fixture.root, 'scripts', name), 'export {};\n');
+        }
+        const module = await shippingSurface;
+        const surface = module.inspectPluginShippingSurface(fixture.root);
+        expect(surface.requiredPaths).toEqual(expect.arrayContaining([
+            'plugin.json',
+            'hooks/hooks.json',
+            'hooks/copilot-hooks.json',
+            'scripts/claude-hook.mjs',
+            'scripts/copilot-command.mjs',
+            'scripts/copilot-bash.mjs',
+            'scripts/copilot-powershell.mjs',
+        ]));
+    });
     it('resolves runtime dependencies beneath a symlinked trusted package root', async () => {
         const fixture = createFixture({ trackCli: false });
         const aliasParent = mkdtempSync(join(tmpdir(), 'omc-shipping-root-alias-'));
@@ -259,7 +317,7 @@ describe('plugin shipping surface transaction', () => {
     it('rejects initial runtime entrypoints that escape through a symlink', () => {
         const fixture = createFixture();
         rmSync(join(fixture.root, 'bridge', 'cli.cjs'));
-        symlinkSync('/etc/passwd', join(fixture.root, 'bridge', 'cli.cjs'));
+        symlinkSync(join(fixture.root, 'package.json'), join(fixture.root, 'bridge', 'cli.cjs'), 'file');
         const result = run(fixture.root, 'verify');
         expect(result.status).not.toBe(0);
         expect(result.stderr).toContain('must not traverse a symbolic link: bridge/cli.cjs');
@@ -362,7 +420,7 @@ describe('plugin shipping surface transaction', () => {
         expect(result.status).not.toBe(0);
         expect(result.stderr).toContain('pull request changes generated artifacts outside the runtime closure: bridge/unrelated.cjs');
     });
-    it('does not let a base-owned generated directory bless a candidate-only runtime artifact', () => {
+    it('includes a built hook runtime in local closure without blessing a feature PR commit', async () => {
         const fixture = createFixture();
         writeJson(join(fixture.root, 'package.json'), {
             name: 'fixture-plugin',
@@ -375,12 +433,16 @@ describe('plugin shipping surface transaction', () => {
         git(fixture.root, ['add', 'package.json']);
         git(fixture.root, ['commit', '--quiet', '-m', 'declare generated directories']);
         const base = git(fixture.root, ['rev-parse', 'HEAD']).trim();
-        writeFileSync(join(fixture.root, 'bridge', 'unrelated.cjs'), 'module.exports = true;\n');
-        git(fixture.root, ['add', '-f', '--', 'bridge/unrelated.cjs']);
-        git(fixture.root, ['commit', '--quiet', '-m', 'add candidate-only generated artifact']);
+        writeFileSync(join(fixture.root, 'bridge', 'hook-runtime.cjs'), 'module.exports = true;\n');
+        const module = await shippingSurface;
+        const localSurface = module.inspectPluginShippingSurface(fixture.root);
+        expect(localSurface.requiredPaths).toContain('bridge/hook-runtime.cjs');
+        expect(localSurface.stagePaths).toContain('bridge/hook-runtime.cjs');
+        git(fixture.root, ['add', '-f', '--', 'bridge/hook-runtime.cjs']);
+        git(fixture.root, ['commit', '--quiet', '-m', 'add candidate-only hook runtime']);
         const result = run(fixture.root, 'check-pr', '--base', base);
         expect(result.status).not.toBe(0);
-        expect(result.stderr).toContain('pull request changes generated artifacts outside the runtime closure: bridge/unrelated.cjs');
+        expect(result.stderr).toContain('pull request changes generated artifacts outside the runtime closure: bridge/hook-runtime.cjs');
     });
     it('rejects changes to a base-tracked generated module that is unreachable from plugin entrypoints', () => {
         const fixture = createFixture({ trackedGeneratedTestPaths: ['dist/unreachable.js'] });

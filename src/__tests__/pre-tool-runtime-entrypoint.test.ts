@@ -91,6 +91,11 @@ function writeJson(path: string, value: unknown): void {
 
 function makeWorktree(label: string): string {
   const path = mkdtempSync(join(tmpdir(), `omc-pretool-${label}-`));
+  execFileSync('git', ['init', '--quiet'], {
+    cwd: path,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
   tempRoots.push(path);
   return path;
 }
