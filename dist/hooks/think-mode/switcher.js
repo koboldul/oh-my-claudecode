@@ -96,7 +96,7 @@ const THINKING_CAPABLE_MODELS = {
     anthropic: ['claude'],
     'amazon-bedrock': ['claude', 'anthropic'],
     google: ['gemini-2', 'gemini-3'],
-    openai: ['gpt-4', 'gpt-5', 'o1', 'o3'],
+    openai: ['gpt-4', 'gpt-5', 'gpt-6', 'o1', 'o3'],
 };
 /**
  * Get the high-reasoning variant for a model ID.

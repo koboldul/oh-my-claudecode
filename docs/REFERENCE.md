@@ -60,6 +60,10 @@ OMC is also packaged as a [GitHub Copilot CLI](https://docs.github.com/copilot/h
 
 Manifest exposure and behavioral parity are separate claims. Copilot agent profiles declare **`gpt-6-luna` for Sonnet-tier sources and `gpt-6-sol` for the existing Opus-5 profile tier**, both with `max` reasoning (set by `scripts/generate-copilot-agents.mjs`), and direct custom-agent selection uses those profiles. This is distinct from the Copilot *provider* default `gpt-5.6-sol` (`externalModels.defaults.copilotModel`), which drives `omc ask copilot`, Copilot team workers, and delegated Task/Agent defaulting in the pre-tool enforcer; both surfaces share `max` reasoning effort. Copilot CLI 1.0.72-1 delivers `PreToolUse` as a batched native `preToolUse` payload with `toolCalls[]`, so OMC must adapt per-call inputs and outputs before delegated Task/Agent defaulting through `updatedInput` can be claimed as equivalent to Claude Code.
 
+**GPT-6 model IDs**
+
+Explicit GPT model selection supports `gpt-6-astra`, `gpt-6-luna`, `gpt-6-sol`, and `gpt-6.1-sol`; availability depends on the installed CLI and your account. OMC's think-mode hook recognizes the GPT-6 and GPT-6.1 families for OpenAI and GitHub Copilot providers, including provider-prefixed IDs such as `openai/gpt-6.1-sol`. These models keep their IDs: Astra remains already high-end, while Luna, Sol, and GPT-6.1 Sol receive the existing OpenAI reasoning configuration when think mode is requested. Provider defaults and agent-tier mappings above are unchanged.
+
 **Prerequisites**
 
 - [Copilot CLI](https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli): `npm install -g @github/copilot` (needs Node.js 22+), or `winget install GitHub.Copilot`, or `brew install --cask copilot-cli`

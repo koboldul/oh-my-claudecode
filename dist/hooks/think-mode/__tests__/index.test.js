@@ -295,6 +295,72 @@ World`);
             expect(config).toBeNull();
         });
     });
+    describe.each(['openai', 'github-copilot'])('GPT-6 family on %s', (providerId) => {
+        describe.each([
+            'gpt-6-luna',
+            'openai/gpt-6-luna',
+            'gpt-6-sol',
+            'openai/gpt-6-sol',
+            'gpt-6.1-sol',
+            'openai/gpt-6.1-sol',
+        ])('%s', (modelId) => {
+            it('should use the existing OpenAI reasoning config without a synthetic high variant', () => {
+                expect(getThinkingConfig(providerId, modelId)).toEqual({ reasoning_effort: 'high' });
+                expect(getHighVariant(modelId)).toBeNull();
+                expect(isAlreadyHighVariant(modelId)).toBe(false);
+            });
+            it('should inject reasoning config and preserve the selected model', () => {
+                const hook = createThinkModeHook();
+                const model = { providerId, modelId };
+                const input = {
+                    parts: [{ type: 'text', text: 'think deeply' }],
+                    message: { model },
+                };
+                const state = hook.processChatParams('test-session', input);
+                expect(state).toMatchObject({
+                    requested: true,
+                    modelSwitched: false,
+                    thinkingConfigInjected: true,
+                });
+                expect(input.message).toEqual({ model, reasoning_effort: 'high' });
+                expect(input.message.model).toBe(model);
+            });
+            it('should leave the message unchanged when think mode is not requested', () => {
+                const hook = createThinkModeHook();
+                const model = { providerId, modelId };
+                const input = {
+                    parts: [{ type: 'text', text: 'implement this change' }],
+                    message: { model },
+                };
+                const state = hook.processChatParams('test-session', input);
+                expect(state).toMatchObject({
+                    requested: false,
+                    modelSwitched: false,
+                    thinkingConfigInjected: false,
+                });
+                expect(input.message).toEqual({ model });
+            });
+        });
+        it.each(['gpt-6-astra', 'openai/gpt-6-astra'])('should preserve already-high-end %s without injecting reasoning config', (modelId) => {
+            expect(isAlreadyHighVariant(modelId)).toBe(true);
+            expect(getHighVariant(modelId)).toBeNull();
+            expect(getThinkingConfig(providerId, modelId)).toBeNull();
+            const hook = createThinkModeHook();
+            const model = { providerId, modelId };
+            const input = {
+                parts: [{ type: 'text', text: 'think deeply' }],
+                message: { model },
+            };
+            const state = hook.processChatParams('test-session', input);
+            expect(state).toMatchObject({
+                requested: true,
+                modelSwitched: false,
+                thinkingConfigInjected: false,
+            });
+            expect(input.message).toEqual({ model });
+            expect(input.message.model).toBe(model);
+        });
+    });
     describe('switcher - getClaudeThinkingConfig', () => {
         it('should return default config with 64000 tokens', () => {
             const config = getClaudeThinkingConfig();
