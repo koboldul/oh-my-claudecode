@@ -13,6 +13,7 @@ import { getOmcRoot, probeGitTopLevel, resolveStatePath, resolveSessionStatePath
 import { getProcessStartIdentitySync } from '../platform/process-utils.js';
 import { atomicWriteJsonSync } from './atomic-write.js';
 import { MODE_CONFIRMATION_SKILL_MAP } from './mode-names.js';
+import { decodeProcessStartFromFilename, encodeProcessStartForFilename, normalizeProcessStartIdentity } from '../../templates/hooks/lib/process-start-identity.mjs';
 // better-sqlite3 is externalized from plugin bundles and its native install
 // script may not have run in a Claude Code plugin cache. Keep loading optional
 // so mode state can use the owner-file lock fallback instead of failing import.
@@ -211,7 +212,8 @@ function ownerLive(owner) {
     const current = processStartIdentity(owner.pid);
     if (current === null)
         return null;
-    return current === 'absent' ? false : current === owner.processStart;
+    return current === 'absent' ? false :
+        normalizeProcessStartIdentity(current) === normalizeProcessStartIdentity(owner.processStart);
 }
 function publishLockOwner(path, owner) {
     const tempPath = `${path}.${owner.pid}.${owner.nonce}.tmp`;
@@ -884,7 +886,8 @@ function sameEmergencyOwner(left, right) {
 /** Unknown process identity is treated as live: stealing a claim is never safe. */
 function isEmergencyOwnerLive(owner) {
     const current = processStartIdentity(owner.pid);
-    return current === null || (current !== 'absent' && current === owner.processStart);
+    return current === null || (current !== 'absent' &&
+        normalizeProcessStartIdentity(current) === normalizeProcessStartIdentity(owner.processStart));
 }
 function journalIsOwned(path, transactionId, owner) {
     const current = readEmergencyJournal(path);
@@ -900,20 +903,6 @@ function writeEmergencyJournal(path, journal, requireOwnership = true) {
     catch {
         return false;
     }
-}
-// Windows processStart is formatted as `windows-dmtf-us:<microseconds>` (see
-// getProcessStartIdentitySync); the literal colon is illegal in NTFS
-// filenames and made every linkSync() in publishEmergencyFileExclusive fail
-// with EINVAL. Filename-embedded process-start identities are sanitized
-// through these two functions (encode when building a temp name, decode
-// when parsing one back out of a directory listing) so the pid-reuse
-// staleness check in reconcileEmergencyPublicationTemps keeps working
-// unchanged cross-platform.
-function encodeProcessStartForFilename(processStart) {
-    return processStart.replace(/:/g, '_c_');
-}
-function decodeProcessStartFromFilename(encoded) {
-    return encoded.replace(/_c_/g, ':');
 }
 function emergencyPublicationTempPath(path) {
     const processStart = ownProcessStartIdentity();
@@ -1179,7 +1168,8 @@ function reconcileEmergencyPublicationTemps(filePath, authorizeState) {
         const path = join(directory, name);
         const matchedProcessStart = decodeProcessStartFromFilename(match[3]);
         const currentStart = processStartIdentity(Number(match[2]));
-        if (currentStart === null || currentStart === matchedProcessStart)
+        if (currentStart === null ||
+            normalizeProcessStartIdentity(currentStart) === normalizeProcessStartIdentity(matchedProcessStart))
             return false;
         const generation = fileIdentity(path);
         try {

@@ -16,7 +16,17 @@ function finalizedContexts(plan, reduction, commitReport) {
         ...advisoryMessages,
     ]);
 }
-function suppressedPresentation(presentation) {
+function suppressedPresentation(presentation, context) {
+    if (context) {
+        return {
+            kind: 'context',
+            callId: presentation.callId,
+            context,
+            ...(presentation.kind === 'context' && presentation.updatedInput
+                ? { updatedInput: presentation.updatedInput }
+                : {}),
+        };
+    }
     return presentation.kind === 'context' && presentation.updatedInput
         ? {
             kind: 'suppressed-with-mutation',
@@ -55,7 +65,7 @@ function finalizeLegacyPresentation(plan, reduction, commitReport) {
     const claim = commitReport.advisoryClaims[solePresentation.advisoryIntentId]
         ?? 'indeterminate';
     return claim === 'throttled'
-        ? suppressedPresentation(solePresentation)
+        ? suppressedPresentation(solePresentation, reduction.contexts.join('\n\n'))
         : solePresentation;
 }
 /**

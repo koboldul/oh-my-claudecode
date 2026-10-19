@@ -12,16 +12,12 @@
  * parameters so agents inherit the user's configured model instead of receiving
  * Claude-specific tier names (sonnet/opus/haiku) that the provider won't recognize.
  */
-import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
 import { getAgentDefinitions } from '../agents/definitions.js';
 import { normalizeDelegationRole } from './delegation-routing/types.js';
 import { loadConfig } from '../config/loader.js';
 import { isProviderSpecificModelId, resolveClaudeFamily } from '../config/models.js';
-import { createBuiltinSkills, getSkillsDir } from './builtin-skills/skills.js';
+import { readBuiltinSkillRegistrations } from './builtin-skills/registry.js';
 import { recordModelRoutingShadow } from './jev-model-routing.js';
-import { isSkininthegamebrosUser } from '../utils/skininthegamebros-user.js';
-import entitlementManifest from '../config/builtin-skill-entitlements.json' with { type: 'json' };
 // ---------------------------------------------------------------------------
 // Config cache — avoids repeated disk reads on every enforceModel() call (F10)
 //
@@ -122,17 +118,6 @@ function skillInvocationHint(agentType, originalSubagentType) {
     }
     return ` "${agentType}" is a bundled Skill, not an agent — invoke it with the Skill tool (Skill(skill="oh-my-claudecode:${primary}")) instead of Task/Agent subagent_type, and do NOT substitute a similarly-named agent`;
 }
-const SKININTHEGAMEBROS_ONLY_SKILLS = new Set(entitlementManifest.skininthegamebrosOnlySkills.map((skill) => skill.trim().toLowerCase()));
-/**
- * Whether a bundled skill directory is visible to the current user, mirroring
- * loadSkillsFromDirectory's entitlement filter. Hidden skills must never be
- * suggested as invocable, even when their directory exists on disk.
- */
-function isSkillVisibleToUser(skillName) {
-    // Case-fold before the Set lookup: identifiers are matched case-insensitively
-    // while filesystem lookup is case-insensitive on Windows/macOS.
-    return !SKININTHEGAMEBROS_ONLY_SKILLS.has(skillName.toLowerCase()) || isSkininthegamebrosUser();
-}
 /**
  * Resolve the canonical primary name for a bundled-skill identifier, mirroring
  * the PreToolUse hook's resolution order (issue #3667): canonical registry
@@ -155,10 +140,10 @@ function resolveBundledSkillPrimary(agentType, originalSubagentType) {
         : foldedInput.startsWith('omc:')
             ? foldedInput.slice('omc:'.length)
             : foldedInput;
-    const skills = createBuiltinSkills();
-    const match = skills.find((s) => s.name.toLowerCase() === stripped);
+    const registrations = readBuiltinSkillRegistrations();
+    const match = registrations.find((registration) => registration.registeredNames.some((name) => name.toLowerCase() === stripped));
     if (match) {
-        return match.aliasOf ?? match.name;
+        return match.primaryName;
     }
     // Bare (un-namespaced) identifiers stop here: the directory shortcut is
     // reserved for the pinned plugin namespace so native/session-defined agents
@@ -169,31 +154,9 @@ function resolveBundledSkillPrimary(agentType, originalSubagentType) {
     if (!wasNamespaced) {
         return null;
     }
-    // Fail closed before the directory shortcut: a hidden skill directory must
-    // never be recommended as an invocable bundled skill.
-    if (!isSkillVisibleToUser(stripped)) {
-        return null;
-    }
-    // Directory shortcut parity with the hook: names that exist as skill
-    // directories but are not canonical claims (e.g. plan -> omc-plan).
-    const directPath = join(getSkillsDir(), stripped, 'SKILL.md');
-    if (!existsSync(directPath)) {
-        return null;
-    }
-    try {
-        const content = readFileSync(directPath, 'utf-8').replace(/^\uFEFF/, '');
-        const fmMatch = content.match(/^---[\r\n]+([\s\S]*?)[\r\n]+---/);
-        if (fmMatch) {
-            const nameMatch = fmMatch[1].match(/^name:\s*(\S+)/m);
-            if (nameMatch) {
-                return nameMatch[1].trim().replace(/^["']|["']$/g, '');
-            }
-        }
-    }
-    catch {
-        // Fall through to the directory name.
-    }
-    return stripped;
+    // Only visible, readable runtime registrations can supply a directory
+    // shortcut; hidden directories must never become invocable suggestions.
+    return registrations.find((registration) => registration.skillName.toLowerCase() === stripped)?.primaryName ?? null;
 }
 /**
  * Enforce model parameter for an agent delegation call

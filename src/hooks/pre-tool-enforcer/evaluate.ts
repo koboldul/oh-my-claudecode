@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { MODE_CONFIRMATION_SKILL_MAP } from '../../lib/mode-names.js';
+import {
+  evaluateReadBudgetObservation,
+  READ_BUDGET_WARNING_RETENTION_SECONDS,
+} from '../../../scripts/lib/read-budget-preflight.mjs';
 import type {
   CanonicalHookEnvelope,
   CanonicalToolCall,
@@ -19,6 +23,8 @@ import {
   type PreToolBatchSnapshot,
   type PreToolCallPlan,
   type PreToolHookEffect,
+  type ReadBudgetWarningEffectPayload,
+  type ReadBudgetWarningEntry,
   type SupportSkillUpsertEffectPayload,
   type TraceSkillAttemptEffectPayload,
   type VirtualForceDelegationEvent,
@@ -420,8 +426,18 @@ export function evaluateModelRouting(
     const updatedInput = { ...input };
     const patch: Record<string, unknown> = {};
     if (!hasExplicitModel) {
-      updatedInput.model = snapshot.modelRouting.copilotDefaults.model;
-      patch.model = snapshot.modelRouting.copilotDefaults.model;
+      const canonicalAgent = normalizeAgentType(agentType);
+      const configuredModel =
+        snapshot.modelRouting.configuredAgentModels[canonicalAgent];
+      const defaults = snapshot.modelRouting.copilotDefaults;
+      const model = canonicalAgent === 'executor' && configuredModel !== 'inherit'
+        ? configuredModel
+          || defaults.modelOverride
+          || snapshot.modelRouting.agentDefinitionModels[canonicalAgent]
+          || defaults.model
+        : defaults.model;
+      updatedInput.model = model;
+      patch.model = model;
     }
     if (!hasExplicitReasoning) {
       updatedInput.reasoning_effort =
@@ -1101,6 +1117,8 @@ export function evaluatePreToolCall(
   envelope: CanonicalHookEnvelope,
   snapshot: PreToolBatchSnapshot,
   ledger: VirtualForceDelegationLedger,
+  readBudgetWarnings: Readonly<Record<string, ReadBudgetWarningEntry>> =
+    snapshot.readBudget.warnings,
 ): PreToolCallPlan {
   if (snapshot.disabled) {
     return {
@@ -1118,6 +1136,76 @@ export function evaluatePreToolCall(
   }
 
   const effects: PreToolHookEffect[] = [];
+  if (AGENT_HEAVY_TOOLS.has(call.canonicalName) && isRecord(call.input)) {
+    const agentType = getAgentType(call.input);
+    const primary = snapshot.skillAgentTypes[agentType];
+    if (primary) {
+      const name = agentType.replace(/^(?:oh-my-claudecode|omc):/i, '');
+      const queriedName = name.toLowerCase() === primary.toLowerCase()
+        ? `"${agentType}"`
+        : `"${agentType}" (alias of "${primary}")`;
+      const field = nonEmptyString(call.input.subagent_type)
+        ? 'subagent_type'
+        : 'agent_type';
+      return deniedCallPlan(
+        call,
+        `[SKILL vs AGENT] ${queriedName} is a Skill, not an agent. `
+          + `Do NOT call it via ${call.canonicalName}(${field}=...) — that agent type does not exist. `
+          + `Use the Skill tool instead: Skill(skill="oh-my-claudecode:${primary}"). `
+          + 'Do NOT substitute a similarly-named agent as a "closest match".',
+        effects,
+        ledger,
+      );
+    }
+  }
+  let readBudgetWarning = '';
+  const readObservation = snapshot.readBudget.observations[call.id];
+  if (readObservation) {
+    const { candidate, measurement } = readObservation;
+    const intentId = effectIntentId(
+      snapshot,
+      call,
+      'pretool.read-budget-warning.v1',
+      candidate.path,
+    );
+    const previous = readBudgetWarnings[candidate.path];
+    const readBudget = evaluateReadBudgetObservation(
+      candidate,
+      measurement,
+      !!previous
+        && previous.warnedAtSec >
+          snapshot.observedAtSec - READ_BUDGET_WARNING_RETENTION_SECONDS
+        && previous.intentId !== intentId,
+    );
+    if (readBudget?.decision === 'block') {
+      return deniedCallPlan(
+        call,
+        readBudget.reason,
+        effects,
+        ledger,
+      );
+    }
+    if (readBudget?.decision === 'warn') {
+      readBudgetWarning = readBudget.reason;
+      if (candidate.mode === 'warn-then-deny') {
+        const payload: ReadBudgetWarningEffectPayload = {
+          version: PRE_TOOL_EFFECT_PAYLOAD_VERSION,
+          intentId,
+          originalIndex: call.originalIndex,
+          stateDir: snapshot.stateDir,
+          path: candidate.path,
+          observedAtSec: snapshot.observedAtSec,
+        };
+        effects.push(hookEffect(
+          call,
+          'pretool.read-budget-warning.v1',
+          payload,
+          'accepted',
+          true,
+        ));
+      }
+    }
+  }
   if (call.canonicalName === 'Skill') {
     const skill = extractSkill(call.input);
     if (skill) {
@@ -1318,7 +1406,7 @@ export function evaluatePreToolCall(
     source: 'handler',
     decision: 'pass',
     ...(mutation ? { mutation } : {}),
-    contexts: [],
+    contexts: readBudgetWarning ? [readBudgetWarning] : [],
     effects,
   };
   let legacyPresentation: LegacyPresentation;
@@ -1326,11 +1414,20 @@ export function evaluatePreToolCall(
     legacyPresentation = {
       kind: 'context',
       callId: call.id,
-      context: advisoryCandidate.message,
+      context: combineMessages(readBudgetWarning, advisoryCandidate.message),
       ...(modelRouting.updatedInput
         ? { updatedInput: modelRouting.updatedInput }
         : {}),
       advisoryIntentId: advisoryCandidate.intentId,
+    };
+  } else if (readBudgetWarning) {
+    legacyPresentation = {
+      kind: 'context',
+      callId: call.id,
+      context: readBudgetWarning,
+      ...(modelRouting.updatedInput
+        ? { updatedInput: modelRouting.updatedInput }
+        : {}),
     };
   } else if (modelRouting.updatedInput) {
     legacyPresentation = {
@@ -1382,6 +1479,7 @@ export function planPreToolBatch(
   }
 
   let ledger = snapshot.forceDelegationLedger;
+  const readBudgetWarnings = { ...snapshot.readBudget.warnings };
   const seenAdvisoryHashes = new Set<string>();
   const calls: PreToolCallPlan[] = [];
   for (
@@ -1389,8 +1487,34 @@ export function planPreToolBatch(
       .filter((candidate) => !candidate.malformed)
       .sort((left, right) => left.originalIndex - right.originalIndex)
   ) {
-    let plan = evaluatePreToolCall(call, envelope, snapshot, ledger);
+    let plan = evaluatePreToolCall(
+      call,
+      envelope,
+      snapshot,
+      ledger,
+      readBudgetWarnings,
+    );
     ledger = plan.nextForceDelegationLedger;
+    if (
+      plan.evaluation.decision === 'pass'
+      || plan.evaluation.decision === 'allow'
+    ) {
+      for (const effect of plan.evaluation.effects ?? []) {
+        if (effect.type !== 'pretool.read-budget-warning.v1') continue;
+        const payload = effect.payload;
+        if (
+          !isRecord(payload)
+          || payload.version !== PRE_TOOL_EFFECT_PAYLOAD_VERSION
+          || typeof payload.path !== 'string'
+          || typeof payload.observedAtSec !== 'number'
+          || typeof payload.intentId !== 'string'
+        ) continue;
+        readBudgetWarnings[payload.path] = {
+          warnedAtSec: payload.observedAtSec,
+          intentId: payload.intentId,
+        };
+      }
+    }
     const advisory = plan.advisoryCandidate;
     if (advisory && seenAdvisoryHashes.has(advisory.messageHash)) {
       const effects = (plan.evaluation.effects ?? []).filter(
@@ -1400,13 +1524,21 @@ export function planPreToolBatch(
         plan.legacyPresentation.kind === 'context'
           ? plan.legacyPresentation.updatedInput
           : undefined;
+      const unthrottledContext = plan.evaluation.contexts?.join('\n\n');
       plan = {
         ...plan,
         evaluation: {
           ...plan.evaluation,
           effects,
         },
-        legacyPresentation: updatedInput
+        legacyPresentation: unthrottledContext
+          ? {
+              kind: 'context',
+              callId: call.id,
+              context: unthrottledContext,
+              ...(updatedInput ? { updatedInput } : {}),
+            }
+          : updatedInput
           ? {
               kind: 'suppressed-with-mutation',
               callId: call.id,

@@ -10,6 +10,7 @@ import { clearWorktreeCache, getOmcRoot, getProjectIdentifier } from '../worktre
 import { getProcessStartIdentitySync } from '../../platform/process-utils.js';
 import { pathToFileURL } from 'node:url';
 import { provisionStandaloneStateLockBridge } from '../../installer/index.js';
+import { decodeProcessStartFromFilename, encodeProcessStartForFilename, normalizeProcessStartIdentity } from '../../../templates/hooks/lib/process-start-identity.mjs';
 async function installedAtomicHelper() {
     const hooks = join(tempDir, 'installed-hooks');
     cpSync(join(process.cwd(), 'templates', 'hooks'), hooks, { recursive: true });
@@ -71,6 +72,25 @@ describe('mode-state-io', () => {
         delete process.env.OMC_TEST_EMERGENCY_CAPTURE_REPLACEMENT_PATH;
         delete process.env.OMC_TEST_EMERGENCY_CAPTURE_REPLACEMENT_BASE64;
         delete process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID;
+    });
+    describe('Windows process-start identity compatibility', () => {
+        it.each([
+            ['ticks:639028224001234560', 'windows-dmtf-us:1767225600123456'],
+            ['ticks:639028224001234569', 'windows-dmtf-us:1767225600123456'],
+            ['windows-dmtf-us:1767225600123456', 'windows-dmtf-us:1767225600123456'],
+            ['123456', '123456'],
+            ['ticks:unavailable', 'ticks:unavailable'],
+        ])('normalizes only recognized Windows birth metadata (%s)', (identity, expected) => {
+            expect(normalizeProcessStartIdentity(identity)).toBe(expected);
+        });
+        it('does not equate distinct process births', () => {
+            expect(normalizeProcessStartIdentity('ticks:639028224001234570')).not.toBe(normalizeProcessStartIdentity('windows-dmtf-us:1767225600123456'));
+        });
+        it.each(['ticks:639028224001234560', 'windows-dmtf-us:1767225600123456'])('round-trips Windows birth metadata without illegal filename colons (%s)', identity => {
+            const encoded = encodeProcessStartForFilename(identity);
+            expect(encoded).not.toContain(':');
+            expect(decodeProcessStartFromFilename(encoded)).toBe(identity);
+        });
     });
     // -----------------------------------------------------------------------
     // writeModeState
@@ -1007,17 +1027,18 @@ describe('mode-state-io', () => {
             ];
             const processStart = currentProcessStart();
             for (const [index, recover] of helpers.entries()) {
+                const helperName = ['typescript', 'plugin', 'template'][index];
                 const path = join(tempDir, '.omc', 'state', `autopilot-live-publication-${index}.json`);
-                const temp = `${path}.emergency-journal.json.${process.pid}.${processStart}.${randomUUID()}.tmp`;
+                const temp = `${path}.emergency-journal.json.${process.pid}.${encodeProcessStartForFilename(processStart)}.${randomUUID()}.tmp`;
                 mkdirSync(dirname(path), { recursive: true });
                 writeFileSync(path, '{}');
                 writeFileSync(temp, 'unpublished');
-                expect(recover(path)).toBe(false);
-                expect(existsSync(temp)).toBe(true);
+                expect(recover(path), `${helperName}: live owner`).toBe(false);
+                expect(existsSync(temp), `${helperName}: retain live publication`).toBe(true);
                 writeFileSync(temp, 'unpublished');
                 process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID = String(process.pid);
-                expect(recover(path)).toBe(false);
-                expect(existsSync(temp)).toBe(true);
+                expect(recover(path), `${helperName}: unknown owner`).toBe(false);
+                expect(existsSync(temp), `${helperName}: retain unknown publication`).toBe(true);
                 delete process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID;
             }
         });

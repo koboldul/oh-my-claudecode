@@ -18271,6 +18271,17 @@ var fs2 = __toESM(require("fs/promises"), 1);
 var fsSync = __toESM(require("fs"), 1);
 var path2 = __toESM(require("path"), 1);
 var crypto2 = __toESM(require("crypto"), 1);
+
+// src/lib/file-identity.ts
+function identitiesEqual(left, right) {
+  if (!left || left.ino !== right.ino) return false;
+  if (left.dev === 0 || right.dev === 0) {
+    return left.ino !== 0 && (process.platform === "win32" || left.dev === right.dev);
+  }
+  return left.dev === right.dev;
+}
+
+// src/lib/atomic-write.ts
 function ensureDirSync(dir) {
   if (fsSync.existsSync(dir)) {
     return;
@@ -18313,7 +18324,7 @@ function verifyPrivateTempFile(fd, tempPath, label, operations) {
       `${label} temporary file must be a private regular single-link file`
     );
   }
-  if (fdStats.dev !== pathStats.dev || fdStats.ino !== pathStats.ino) {
+  if (!identitiesEqual(fdStats, pathStats)) {
     throw new Error(`${label} temporary file was replaced before rename`);
   }
 }
@@ -18325,7 +18336,7 @@ function verifyPublishedFile(fd, filePath, label, operations) {
   } catch {
     throw new Error(`${label} target was replaced at publication`);
   }
-  if (!pathStats.isFile() || fdStats.dev !== pathStats.dev || fdStats.ino !== pathStats.ino) {
+  if (!pathStats.isFile() || !identitiesEqual(fdStats, pathStats)) {
     throw new Error(`${label} target was replaced at publication`);
   }
 }
@@ -18368,8 +18379,7 @@ function descriptorIdentity(fd) {
 function rollbackPriorTarget(filePath, backupPath, expectedIdentity, operations) {
   if (expectedIdentity === null) return;
   const current = currentFileIdentity(filePath, operations);
-  if (current === null) return;
-  if (expectedIdentity !== null && (current.dev !== expectedIdentity.dev || current.ino !== expectedIdentity.ino)) {
+  if (!identitiesEqual(current, expectedIdentity)) {
     return;
   }
   try {
@@ -18425,6 +18435,10 @@ async function atomicWriteJson(filePath, data, hooks) {
         hooks?.afterRename?.();
         verifyPublishedFile(fd.fd, filePath, "atomic JSON write");
       } catch (error2) {
+        if (process.platform === "win32") {
+          await fd.close();
+          fd = null;
+        }
         rollbackPriorTarget(
           filePath,
           backupPath,
@@ -18433,8 +18447,10 @@ async function atomicWriteJson(filePath, data, hooks) {
         throw error2;
       }
     } finally {
-      await fd.close();
-      fd = null;
+      if (fd !== null) {
+        await fd.close();
+        fd = null;
+      }
     }
     success = true;
     removeBackup(backupPath);
@@ -18479,6 +18495,10 @@ function atomicWriteFileSync(filePath, content, hooks, operations) {
       hooks?.afterRename?.();
       verifyPublishedFile(fd, filePath, "atomic write", operations);
     } catch (error2) {
+      if (process.platform === "win32") {
+        fsSync.closeSync(fd);
+        fd = null;
+      }
       rollbackPriorTarget(
         filePath,
         backupPath,
@@ -24902,6 +24922,18 @@ var SESSION_METRICS_MODE_FILES = [
   { file: MODE_STATE_FILE_MAP[MODE_NAMES.SELF_IMPROVE], mode: MODE_NAMES.SELF_IMPROVE }
 ];
 
+// templates/hooks/lib/process-start-identity.mjs
+function normalizeProcessStartIdentity(identity) {
+  const ticks = /^ticks:(\d{1,19})$/.exec(identity);
+  return ticks ? `windows-dmtf-us:${(BigInt(ticks[1]) - 621355968000000000n) / 10n}` : identity;
+}
+function encodeProcessStartForFilename(identity) {
+  return identity.replace(/:/g, "_c_");
+}
+function decodeProcessStartFromFilename(encoded) {
+  return encoded.replace(/_c_/g, ":");
+}
+
 // src/lib/mode-state-io.ts
 var require2 = (0, import_module2.createRequire)(
   importMetaUrl || (typeof __filename === "string" ? __filename : process.cwd() + "/")
@@ -25048,7 +25080,7 @@ function ownerLive(owner) {
   if (process.env.NODE_ENV === "test" && process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(owner.pid)) return null;
   const current = processStartIdentity(owner.pid);
   if (current === null) return null;
-  return current === "absent" ? false : current === owner.processStart;
+  return current === "absent" ? false : normalizeProcessStartIdentity(current) === normalizeProcessStartIdentity(owner.processStart);
 }
 function publishLockOwner(path13, owner) {
   const tempPath = `${path13}.${owner.pid}.${owner.nonce}.tmp`;
@@ -25599,7 +25631,7 @@ function sameEmergencyOwner(left, right) {
 }
 function isEmergencyOwnerLive(owner) {
   const current = processStartIdentity(owner.pid);
-  return current === null || current !== "absent" && current === owner.processStart;
+  return current === null || current !== "absent" && normalizeProcessStartIdentity(current) === normalizeProcessStartIdentity(owner.processStart);
 }
 function journalIsOwned(path13, transactionId, owner) {
   const current = readEmergencyJournal(path13);
@@ -25613,12 +25645,6 @@ function writeEmergencyJournal(path13, journal, requireOwnership = true) {
   } catch {
     return false;
   }
-}
-function encodeProcessStartForFilename(processStart) {
-  return processStart.replace(/:/g, "_c_");
-}
-function decodeProcessStartFromFilename(encoded) {
-  return encoded.replace(/_c_/g, ":");
 }
 function emergencyPublicationTempPath(path13) {
   const processStart = ownProcessStartIdentity();
@@ -25807,7 +25833,7 @@ function reconcileEmergencyPublicationTemps(filePath, authorizeState) {
     const path13 = (0, import_path14.join)(directory, name);
     const matchedProcessStart = decodeProcessStartFromFilename(match[3]);
     const currentStart = processStartIdentity(Number(match[2]));
-    if (currentStart === null || currentStart === matchedProcessStart) return false;
+    if (currentStart === null || normalizeProcessStartIdentity(currentStart) === normalizeProcessStartIdentity(matchedProcessStart)) return false;
     const generation = fileIdentity(path13);
     try {
       if (!generation) return false;
@@ -28208,12 +28234,6 @@ function identityForPath(lockPath) {
   } catch {
     return null;
   }
-}
-function identitiesEqual(left, right) {
-  if (!left) return false;
-  if (left.ino !== right.ino) return false;
-  if (left.dev === 0 || right.dev === 0) return left.ino !== 0;
-  return left.dev === right.dev;
 }
 function parseObservedLock(raw) {
   try {

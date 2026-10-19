@@ -3,6 +3,7 @@
 import {
   loadHookRuntime,
   resolveHookNotificationChildPath,
+  resolveHookPluginRoot,
   resolveHookRuntimePath,
   surfaceCriticalHookFailure,
 } from './lib/hook-runtime-loader.mjs';
@@ -68,7 +69,9 @@ async function main() {
       if (processorFailure) throw processorFailure;
 
       try {
-        const snapshot = runtime.loadPreToolBatchSnapshot(envelope);
+        const snapshot = runtime.loadPreToolBatchSnapshot(envelope, {
+          pluginRoot: resolveHookPluginRoot(),
+        });
         const reservation = runtime.reserveAndPlanPreToolBatch(
           envelope,
           snapshot,

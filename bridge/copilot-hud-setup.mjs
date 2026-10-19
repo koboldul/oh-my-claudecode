@@ -1980,6 +1980,17 @@ function isOmcStatusLine(statusLine) {
 import * as fsSync from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
+
+// src/lib/file-identity.ts
+function identitiesEqual(left, right) {
+  if (!left || left.ino !== right.ino) return false;
+  if (left.dev === 0 || right.dev === 0) {
+    return left.ino !== 0 && (process.platform === "win32" || left.dev === right.dev);
+  }
+  return left.dev === right.dev;
+}
+
+// src/lib/atomic-write.ts
 function ensureDirSync(dir) {
   if (fsSync.existsSync(dir)) {
     return;
@@ -2022,7 +2033,7 @@ function verifyPrivateTempFile(fd, tempPath, label, operations) {
       `${label} temporary file must be a private regular single-link file`
     );
   }
-  if (fdStats.dev !== pathStats.dev || fdStats.ino !== pathStats.ino) {
+  if (!identitiesEqual(fdStats, pathStats)) {
     throw new Error(`${label} temporary file was replaced before rename`);
   }
 }
@@ -2034,7 +2045,7 @@ function verifyPublishedFile(fd, filePath, label, operations) {
   } catch {
     throw new Error(`${label} target was replaced at publication`);
   }
-  if (!pathStats.isFile() || fdStats.dev !== pathStats.dev || fdStats.ino !== pathStats.ino) {
+  if (!pathStats.isFile() || !identitiesEqual(fdStats, pathStats)) {
     throw new Error(`${label} target was replaced at publication`);
   }
 }
@@ -2077,8 +2088,7 @@ function descriptorIdentity(fd) {
 function rollbackPriorTarget(filePath, backupPath, expectedIdentity, operations) {
   if (expectedIdentity === null) return;
   const current = currentFileIdentity(filePath, operations);
-  if (current === null) return;
-  if (expectedIdentity !== null && (current.dev !== expectedIdentity.dev || current.ino !== expectedIdentity.ino)) {
+  if (!identitiesEqual(current, expectedIdentity)) {
     return;
   }
   try {
@@ -2121,6 +2131,10 @@ function atomicWriteFileSync(filePath, content, hooks, operations) {
       hooks?.afterRename?.();
       verifyPublishedFile(fd, filePath, "atomic write", operations);
     } catch (error) {
+      if (process.platform === "win32") {
+        fsSync.closeSync(fd);
+        fd = null;
+      }
       rollbackPriorTarget(
         filePath,
         backupPath,

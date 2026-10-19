@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { atomicWriteJsonSync } from '../../lib/atomic-write.js';
 import {
   confirmModeAwaitingConfirmationLocked,
@@ -39,12 +39,19 @@ import {
   type PreToolFinalDisposition,
   type PreToolBatchSnapshot,
   type PreToolHookEffect,
+  type ReadBudgetWarningEffectPayload,
+  type ReadBudgetWarningMutationResult,
   type ReplayAppendOnceResult,
   type SupportSkillMutationResult,
   type SupportSkillUpsertEffectPayload,
   type TraceSkillAttemptEffectPayload,
 } from './types.js';
 import { planPreToolBatch } from './evaluate.js';
+import {
+  READ_BUDGET_STATE_FILENAME,
+  READ_BUDGET_WARNING_RETENTION_SECONDS,
+  pruneReadBudgetWarnings,
+} from '../../../scripts/lib/read-budget-preflight.mjs';
 
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/;
 const FORCE_DELEGATION_STATE_FILE = 'force-agent-delegation-events.json';
@@ -416,6 +423,80 @@ export function writeForceDelegationAttemptLocked(
   }
 }
 
+/**
+ * Consume the warn-once allowance only for an accepted read. The owner lock
+ * merges unrelated warnings and detects a concurrent winner or replay.
+ */
+export function recordReadBudgetWarningLocked(
+  payload: ReadBudgetWarningEffectPayload,
+): ReadBudgetWarningMutationResult {
+  if (
+    !payload.intentId
+    || !isAbsolute(payload.path)
+    || !validEpochSeconds(payload.observedAtSec, Math.floor(Date.now() / 1000))
+  ) return { status: 'failed' };
+  const path = join(payload.stateDir, READ_BUDGET_STATE_FILENAME);
+  try {
+    const locked = withStateFileMutationLock(path, () => {
+      const lockNowSec = Math.floor(Date.now() / 1000);
+      if (
+        !validEpochSeconds(payload.observedAtSec, lockNowSec)
+        || payload.observedAtSec <=
+          lockNowSec - READ_BUDGET_WARNING_RETENTION_SECONDS
+      ) return { status: 'failed' as const };
+      const inspected = inspectJsonRecord(path);
+      if (inspected.status === 'corrupt') return { status: 'failed' as const };
+      const stored = inspected.status === 'valid' ? inspected.value : null;
+      const generation = storedGeneration(stored?.generation);
+      if (
+        generation === null
+        || (stored?.warned !== undefined && !isRecord(stored.warned))
+        || (stored?.intentIds !== undefined && !isRecord(stored.intentIds))
+      ) return { status: 'failed' as const };
+      const warned = Object.fromEntries(Object.entries(pruneReadBudgetWarnings(
+        isRecord(stored?.warned) ? stored.warned : {},
+        lockNowSec,
+      )).filter(([, timestamp]) => validEpochSeconds(timestamp, lockNowSec)));
+      const priorIntents = isRecord(stored?.intentIds) ? stored.intentIds : {};
+      if (warned[payload.path] !== undefined) {
+        return {
+          status: priorIntents[payload.path] === payload.intentId
+            ? 'duplicate' as const
+            : 'changed' as const,
+        };
+      }
+      const intentIds = Object.fromEntries(Object.keys(warned)
+        .filter((key) => typeof priorIntents[key] === 'string')
+        .map((key) => [key, priorIntents[key]]));
+      warned[payload.path] = payload.observedAtSec;
+      intentIds[payload.path] = payload.intentId;
+      const next = nextGeneration(generation);
+      if (next === null) return { status: 'failed' as const };
+      atomicWriteJsonSync(path, {
+        version: 1,
+        generation: next,
+        warned,
+        intentIds,
+      });
+      const committed = inspectJsonRecord(path);
+      if (
+        committed.status !== 'valid'
+        || storedGeneration(committed.value.generation) !== next
+        || !isRecord(committed.value.warned)
+        || committed.value.warned[payload.path] !== payload.observedAtSec
+        || !isRecord(committed.value.intentIds)
+        || committed.value.intentIds[payload.path] !== payload.intentId
+      ) return { status: 'failed' as const };
+      return { status: 'written' as const };
+    });
+    return locked.acquired && locked.value
+      ? locked.value
+      : { status: 'failed' };
+  } catch {
+    return { status: 'failed' };
+  }
+}
+
 function advisoryPath(stateDir: string, sessionId: string): string | null {
   if (sessionId && !SESSION_ID_PATTERN.test(sessionId)) return null;
   return sessionId
@@ -716,6 +797,7 @@ export const DEFAULT_PRE_TOOL_EFFECT_DEPENDENCIES:
 PreToolEffectDependencies = {
   appendTraceAttempt,
   writeForceDelegationAttempt: writeForceDelegationAttemptLocked,
+  recordReadBudgetWarning: recordReadBudgetWarningLocked,
   upsertSupportSkill,
   confirmMode,
   claimAdvisory: claimAdvisoryThrottleLocked,
@@ -733,6 +815,7 @@ function isPreToolEffect(effect: HookEffect): effect is PreToolHookEffect {
     && [
       'pretool.trace-skill-attempt.v1',
       'pretool.force-delegation-attempt.v1',
+      'pretool.read-budget-warning.v1',
       'pretool.support-skill-upsert.v1',
       'pretool.mode-confirm.v1',
       'pretool.advisory-claim.v1',
@@ -792,6 +875,28 @@ async function commitOneEffect(
           disposition,
         );
         return { ...base, status: resultStatus(result.status) };
+      }
+      case 'pretool.read-budget-warning.v1': {
+        const payload = effect.payload;
+        if (!('path' in payload)) {
+          return { ...base, status: 'failed', detail: 'Invalid read-budget warning payload.' };
+        }
+        const result = (
+          dependencies.recordReadBudgetWarning
+          ?? recordReadBudgetWarningLocked
+        )(payload);
+        return {
+          ...base,
+          status: resultStatus(result.status),
+          ...(result.status === 'changed'
+            ? {
+                detail: '[OMC READ BUDGET] Another accepted full read already consumed '
+                  + 'the warning allowance. Retry with a bounded range.',
+              }
+            : result.status === 'failed'
+              ? { detail: 'Read-budget warning state could not be verified.' }
+              : {}),
+        };
       }
       case 'pretool.support-skill-upsert.v1': {
         const result = dependencies.upsertSupportSkill(

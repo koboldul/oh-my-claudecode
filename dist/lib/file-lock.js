@@ -13,6 +13,7 @@ import { openSync, closeSync, fstatSync, fsyncSync, linkSync, lstatSync, readdir
 import { randomUUID } from "crypto";
 import * as path from "path";
 import { ensureDirSync } from "./atomic-write.js";
+import { identitiesEqual } from "./file-identity.js";
 import { getProcessStartIdentitySync, isProcessAlive, } from "../platform/index.js";
 // ============================================================================
 // Constants
@@ -38,17 +39,6 @@ function identityForPath(lockPath) {
     catch {
         return null;
     }
-}
-function identitiesEqual(left, right) {
-    if (!left)
-        return false;
-    if (left.ino !== right.ino)
-        return false;
-    // Windows reports a volume serial for fstat but 0 for path-based stat, so a
-    // zero device on either side carries no information and only ino can decide.
-    if (left.dev === 0 || right.dev === 0)
-        return left.ino !== 0;
-    return left.dev === right.dev;
 }
 function parseObservedLock(raw) {
     try {

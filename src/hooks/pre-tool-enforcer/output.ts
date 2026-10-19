@@ -35,7 +35,18 @@ function finalizedContexts(
 
 function suppressedPresentation(
   presentation: LegacyPresentation,
+  context: string,
 ): LegacyPresentation {
+  if (context) {
+    return {
+      kind: 'context',
+      callId: presentation.callId,
+      context,
+      ...(presentation.kind === 'context' && presentation.updatedInput
+        ? { updatedInput: presentation.updatedInput }
+        : {}),
+    };
+  }
   return presentation.kind === 'context' && presentation.updatedInput
     ? {
         kind: 'suppressed-with-mutation',
@@ -85,7 +96,10 @@ function finalizeLegacyPresentation(
     commitReport.advisoryClaims[solePresentation.advisoryIntentId]
     ?? 'indeterminate';
   return claim === 'throttled'
-    ? suppressedPresentation(solePresentation)
+    ? suppressedPresentation(
+        solePresentation,
+        reduction.contexts.join('\n\n'),
+      )
     : solePresentation;
 }
 

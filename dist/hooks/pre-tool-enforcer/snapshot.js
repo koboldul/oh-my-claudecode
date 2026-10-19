@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fstatSync, lstatSync, openSync, readFileSync, readSync, readdirSync, } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
-import { getOmcRoot } from '../../lib/worktree-paths.js';
+import { basename, dirname, join } from 'node:path';
+import { getOmcRoot, resolveSessionStatePaths, } from '../../lib/worktree-paths.js';
+import { getSkillsDir, loadBuiltinSkillRegistrations, } from '../../features/builtin-skills/registry.js';
 import { parseJsonc } from '../../utils/jsonc.js';
+import { READ_BUDGET_STATE_FILENAME, measureReadBudget, prepareReadBudget, pruneReadBudgetWarnings, } from '../../../scripts/lib/read-budget-preflight.mjs';
 import { PRE_TOOL_MAX_FUTURE_SKEW_MS, PRE_TOOL_MIN_EPOCH_MS, PRE_TOOL_SNAPSHOT_VERSION, } from './types.js';
 const SESSION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/;
 const MAX_TRANSCRIPT_BYTES = 25 * 1024 * 1024;
@@ -278,6 +280,61 @@ function normalizeAgentType(rawAgentType) {
     const unprefixed = rawAgentType.replace(/^oh-my-claudecode:/, '');
     return DEPRECATED_ROLE_ALIASES[unprefixed] ?? unprefixed;
 }
+function loadSkillAgentTypes(envelope, directory, environment, readText, listDirectories, fileExists, runtimePluginRoot) {
+    const agentTypes = [...new Set(envelope.toolCalls
+            .filter((call) => call.canonicalName === 'Task' || call.canonicalName === 'Agent')
+            .map((call) => getAgentType(call.input))
+            .filter(Boolean))];
+    if (agentTypes.length === 0)
+        return {};
+    const pluginRoots = [...new Set([
+            stringValue(environment.CLAUDE_PLUGIN_ROOT),
+            runtimePluginRoot ?? '',
+            dirname(getSkillsDir()),
+        ].filter(Boolean))];
+    const registrations = loadBuiltinSkillRegistrations(pluginRoots.map((root) => join(root, 'skills')), readText, listDirectories, environment.USER_TYPE);
+    const names = new Map();
+    const directoryNames = new Map();
+    for (const registration of registrations) {
+        for (const name of registration.registeredNames) {
+            names.set(name.toLowerCase(), registration.primaryName);
+        }
+        const key = registration.skillName.toLowerCase();
+        if (!directoryNames.has(key)) {
+            directoryNames.set(key, registration.primaryName);
+        }
+    }
+    const pluginAgentDirectories = pluginRoots.flatMap((root) => envelope.host === 'copilot'
+        ? [join(root, 'agents-copilot'), join(root, 'agents')]
+        : [join(root, 'agents')]);
+    const nativeAgentDirectories = envelope.host === 'copilot'
+        ? [
+            join(directory, '.github', 'agents'),
+            join(directory, '.copilot', 'agents'),
+            join(resolveHome(environment), '.copilot', 'agents'),
+        ]
+        : [
+            join(directory, '.claude', 'agents'),
+            join(resolveClaudeConfigDirectory(environment), 'agents'),
+        ];
+    return Object.fromEntries(agentTypes.flatMap((agentType) => {
+        const namespaced = /^(?:oh-my-claudecode|omc):/i.test(agentType);
+        const name = agentType.replace(/^(?:oh-my-claudecode|omc):/i, '')
+            .toLowerCase();
+        if (!/^[a-z0-9_-]+$/.test(name))
+            return [];
+        const agentDirectories = [
+            ...pluginAgentDirectories,
+            ...(namespaced ? [] : nativeAgentDirectories),
+        ];
+        if (agentDirectories.some((path) => fileExists(join(path, `${name}.md`))
+            || fileExists(join(path, `${name}.agent.md`))))
+            return [];
+        const primary = names.get(name)
+            ?? (namespaced ? directoryNames.get(name) : undefined);
+        return primary ? [[agentType, primary]] : [];
+    }));
+}
 function loadJsoncRecord(path, readText) {
     const content = readText(path);
     if (content === null)
@@ -313,17 +370,21 @@ function resolveConfiguredCopilotDefault(key, projectConfig, userConfig) {
     }
     return '';
 }
-function readAgentDefinitionModel(agentType, environment, currentDirectory, readText) {
+function readAgentDefinitionModel(agentType, host, environment, currentDirectory, readText, runtimePluginRoot) {
     const canonical = normalizeAgentType(agentType);
     if (!/^[a-zA-Z0-9_-]+$/.test(canonical))
         return null;
     const pluginRoot = stringValue(environment.CLAUDE_PLUGIN_ROOT);
     const candidateRoots = [
         ...(pluginRoot ? [pluginRoot] : []),
+        ...(host === 'copilot' && runtimePluginRoot ? [runtimePluginRoot] : []),
         currentDirectory,
     ];
     for (const root of candidateRoots) {
-        const content = readText(join(root, 'agents', `${canonical}.md`));
+        const definitionPath = host === 'copilot'
+            ? join(root, 'agents-copilot', `${canonical}.agent.md`)
+            : join(root, 'agents', `${canonical}.md`);
+        const content = readText(definitionPath);
         if (content === null)
             continue;
         const frontmatter = content.replace(/^\uFEFF/, '').match(/^---[\r\n]+([\s\S]*?)[\r\n]+---/);
@@ -365,6 +426,77 @@ function extractTracking(value) {
             ? record.total_spawned
             : 0,
     };
+}
+function readTracking(directory, stateDir, sessionId, readJson, resolvePaths) {
+    const paths = resolvePaths('subagent-tracking', SESSION_ID_PATTERN.test(sessionId) ? sessionId : undefined, directory);
+    for (const path of [
+        paths.sessionScoped,
+        paths.legacy,
+        join(stateDir, 'subagent-tracking.json'),
+    ].filter(Boolean)) {
+        const state = asRecord(readJson(path));
+        if (!state || !Array.isArray(state.agents))
+            continue;
+        if (state.total_spawned !== undefined
+            && (typeof state.total_spawned !== 'number'
+                || !Number.isSafeInteger(state.total_spawned)
+                || state.total_spawned < 0))
+            continue;
+        const owner = stringValue(state.session_id)
+            || stringValue(asRecord(state._meta)?.sessionId);
+        if (sessionId && owner && owner !== sessionId)
+            continue;
+        return extractTracking(state);
+    }
+    return { running: 0, total: 0 };
+}
+function loadReadBudgetSnapshot(envelope, directory, stateDir, environment, config, observedAtSec, readJson, measure, disabled) {
+    const statePath = join(stateDir, READ_BUDGET_STATE_FILENAME);
+    if (disabled)
+        return { statePath, warnings: {}, observations: {} };
+    const observations = {};
+    const measurements = new Map();
+    for (const call of envelope.toolCalls) {
+        if (call.malformed)
+            continue;
+        const candidate = prepareReadBudget({
+            toolName: call.canonicalName,
+            toolInput: call.input,
+            env: environment,
+            config,
+            cwd: directory,
+        });
+        if (!candidate)
+            continue;
+        const key = `${candidate.path}\0${candidate.maxLines}\0${candidate.maxBytes}`;
+        if (!measurements.has(key)) {
+            measurements.set(key, cloneObservation(measure(candidate)));
+        }
+        const measurement = measurements.get(key);
+        if (measurement)
+            observations[call.id] = { candidate, measurement };
+    }
+    if (Object.keys(observations).length === 0) {
+        return { statePath, warnings: {}, observations };
+    }
+    const stored = asRecord(readJson(statePath));
+    const intentIds = asRecord(stored?.intentIds);
+    const warned = pruneReadBudgetWarnings(asRecord(stored?.warned) ?? {}, observedAtSec);
+    const warnings = Object.fromEntries(Object.entries(warned)
+        .filter(([, timestamp]) => Number.isSafeInteger(timestamp)
+        && timestamp >= Math.floor(PRE_TOOL_MIN_EPOCH_MS / 1000)
+        && timestamp <=
+            observedAtSec + Math.floor(PRE_TOOL_MAX_FUTURE_SKEW_MS / 1000))
+        .map(([path, warnedAtSec]) => [
+        path,
+        {
+            warnedAtSec,
+            ...(typeof intentIds?.[path] === 'string'
+                ? { intentId: intentIds[path] }
+                : {}),
+        },
+    ]));
+    return { statePath, warnings, observations };
 }
 function sessionStatePath(stateDir, sessionId, fileName) {
     return SESSION_ID_PATTERN.test(sessionId)
@@ -697,6 +829,11 @@ export function loadPreToolBatchSnapshot(envelope, dependencies = {}) {
     const observedAt = new Date(loadedAtMs).toISOString();
     const observedAtSec = Math.floor(loadedAtMs / 1000);
     const environment = { ...environmentProvider() };
+    const disabled = environment.DISABLE_OMC === '1'
+        || (environment.OMC_SKIP_HOOKS ?? '')
+            .split(',')
+            .map((value) => value.trim())
+            .includes('pre-tool-use');
     const runtimeDirectory = currentDirectory();
     const directory = envelope.directory || runtimeDirectory;
     const omcRoot = resolveOmcRoot(directory);
@@ -705,9 +842,19 @@ export function loadPreToolBatchSnapshot(envelope, dependencies = {}) {
     const deliveryId = deliveryIdForEnvelope(envelope, createDeliveryNonce);
     const userOmcConfigPath = join(resolveClaudeConfigDirectory(environment), '.omc-config.json');
     const projectOmcConfigPath = join(omcRoot, 'config.json');
-    const omcConfig = asRecord(readJson(userOmcConfigPath))
-        ?? asRecord(readJson(projectOmcConfigPath))
-        ?? {};
+    const globalOmcConfig = asRecord(readJson(userOmcConfigPath));
+    const projectOmcConfig = asRecord(readJson(projectOmcConfigPath));
+    const omcConfig = globalOmcConfig ?? projectOmcConfig ?? {};
+    // Budget fields inherit global defaults, with explicit project overrides.
+    // Keep the legacy generic config/force-delegation selection unchanged.
+    const readBudgetConfig = {
+        context: {
+            readBudget: {
+                ...(asRecord(asRecord(globalOmcConfig?.context)?.readBudget) ?? {}),
+                ...(asRecord(asRecord(projectOmcConfig?.context)?.readBudget) ?? {}),
+            },
+        },
+    };
     const userConfig = loadJsoncRecord(join(resolveUserConfigDirectory(environment), 'claude-omc', 'config.jsonc'), readText);
     const projectConfig = loadJsoncRecord(join(directory, '.claude', 'omc.jsonc'), readText);
     const agentTypes = [...new Set(envelope.toolCalls
@@ -720,17 +867,17 @@ export function loadPreToolBatchSnapshot(envelope, dependencies = {}) {
     ]));
     const agentDefinitionModels = Object.fromEntries(agentTypes.map((agentType) => [
         agentType,
-        readAgentDefinitionModel(agentType, environment, runtimeDirectory, readText),
+        readAgentDefinitionModel(agentType, envelope.host, environment, runtimeDirectory, readText, dependencies.pluginRoot),
     ]));
-    const configuredCopilotModel = resolveConfiguredCopilotDefault('copilotModel', projectConfig, userConfig);
+    const configuredCopilotModel = stringValue(environment.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL)
+        || stringValue(environment.OMC_COPILOT_DEFAULT_MODEL)
+        || resolveConfiguredCopilotDefault('copilotModel', projectConfig, userConfig);
     const configuredCopilotEffort = stringValue(environment.OMC_COPILOT_REASONING_EFFORT) || resolveConfiguredCopilotDefault('copilotReasoningEffort', projectConfig, userConfig) || COPILOT_DEFAULT_REASONING_EFFORT;
     const normalizedCopilotEffort = configuredCopilotEffort.toLowerCase();
     const copilotEffortValid = COPILOT_REASONING_EFFORTS.has(normalizedCopilotEffort);
     const copilotDefaults = {
-        model: stringValue(environment.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL)
-            || stringValue(environment.OMC_COPILOT_DEFAULT_MODEL)
-            || configuredCopilotModel
-            || COPILOT_DEFAULT_MODEL,
+        model: configuredCopilotModel || COPILOT_DEFAULT_MODEL,
+        modelOverride: configuredCopilotModel,
         reasoningEffort: copilotEffortValid
             ? normalizedCopilotEffort
             : COPILOT_DEFAULT_REASONING_EFFORT,
@@ -772,7 +919,7 @@ export function loadPreToolBatchSnapshot(envelope, dependencies = {}) {
     const todoLabel = todoCounts.pending + todoCounts.inProgress > 0
         ? `[${todoCounts.inProgress} active, ${todoCounts.pending} pending] `
         : '';
-    const tracking = extractTracking(readJson(join(stateDir, 'subagent-tracking.json')));
+    const tracking = readTracking(directory, stateDir, sessionId, readJson, dependencies.resolveSessionStatePaths ?? resolveSessionStatePaths);
     const transcriptPath = envelope.transcriptPath;
     const transcriptTail = transcriptPath
         ? readTextTail(transcriptPath, TRANSCRIPT_TAIL_BYTES) ?? ''
@@ -821,21 +968,19 @@ export function loadPreToolBatchSnapshot(envelope, dependencies = {}) {
         sessionId,
         deliveryId,
         environment,
-        disabled: environment.DISABLE_OMC === '1'
-            || (environment.OMC_SKIP_HOOKS ?? '')
-                .split(',')
-                .map((value) => value.trim())
-                .includes('pre-tool-use'),
+        disabled,
         quietLevel: numberFromEnvironment(environment.OMC_QUIET, 0, 0),
         todo: {
             ...todoCounts,
             label: todoLabel,
         },
         tracking,
+        readBudget: loadReadBudgetSnapshot(envelope, directory, stateDir, environment, readBudgetConfig, observedAtSec, readJson, dependencies.measureReadBudget ?? measureReadBudget, disabled),
         team,
         modeActive,
         modeStates,
         omcConfig,
+        skillAgentTypes: loadSkillAgentTypes(envelope, directory, environment, readText, listDirectories, fileExists, dependencies.pluginRoot),
         modelRouting: {
             forceInherit: environment.OMC_ROUTING_FORCE_INHERIT === 'true'
                 || routing?.forceInherit === true,

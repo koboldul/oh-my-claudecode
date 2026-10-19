@@ -220,6 +220,11 @@ function stagePlugin(options: {
   copyFileSync(LOADER_PATH, loaderPath);
   copyFileSync(STDIN_PATH, stdinPath);
   copyFileSync(NOTIFICATION_CHILD_PATH, notificationChildPath);
+  mkdirSync(join(root, 'agents-copilot'), { recursive: true });
+  copyFileSync(
+    join(REPO_ROOT, 'agents-copilot', 'executor.agent.md'),
+    join(root, 'agents-copilot', 'executor.agent.md'),
+  );
   writeFileSync(
     join(root, 'package.json'),
     JSON.stringify({ type: 'module' }),
@@ -630,9 +635,15 @@ describe('shipped PreToolUse canonical runtime entrypoint', () => {
     );
   });
 
-  it('encodes a representable Copilot singleton mutation', () => {
+  it.each([
+    ['present', 'gpt-6.1-sol'],
+    ['missing', 'gpt-5.6-sol'],
+  ])('encodes a representable Copilot singleton mutation (%s executor profile)', (profile, expectedModel) => {
     const staged = stagePlugin();
     const cwd = makeWorktree('copilot-singleton-mutation');
+    if (profile === 'missing') {
+      rmSync(join(staged.root, 'agents-copilot', 'executor.agent.md'));
+    }
 
     expectExactOutput(
       runHook(
@@ -643,12 +654,12 @@ describe('shipped PreToolUse canonical runtime entrypoint', () => {
           args: { agent_type: 'oh-my-claudecode:executor' },
         }]),
         cwd,
-        { env: { OMC_QUIET: '2' } },
+        { env: { OMC_QUIET: '2', CLAUDE_PLUGIN_ROOT: '' } },
       ),
       {
         modifiedArgs: {
           agent_type: 'oh-my-claudecode:executor',
-          model: 'gpt-5.6-sol',
+          model: expectedModel,
           reasoning_effort: 'max',
         },
       },
@@ -683,7 +694,7 @@ describe('shipped PreToolUse canonical runtime entrypoint', () => {
     expect(output.permissionDecision).toBe('deny');
     expect(output).not.toHaveProperty('modifiedArgs');
     for (const patch of [
-      'call agent-a: model=gpt-5.6-sol, reasoning_effort=max',
+      'call agent-a: model=gpt-6.1-sol, reasoning_effort=max',
       'call agent-b: model=gpt-5.6-sol, reasoning_effort=max',
     ]) {
       expect(output.permissionDecisionReason).toContain(
@@ -1093,7 +1104,7 @@ describe('shipped PreToolUse canonical runtime entrypoint', () => {
     expect(source).toMatch(
       /runtime\.runHookJson\(\s*['"]pre-tool-use['"]/,
     );
-    expect(source).toContain('runtime.loadPreToolBatchSnapshot(envelope)');
+    expect(source).toContain('runtime.loadPreToolBatchSnapshot(envelope,');
     expect(source).toContain('runtime.reserveAndPlanPreToolBatch(');
     expect(source).toContain('runtime.commitPreToolEffects(');
     expect(source).toContain('runtime.finalizePreToolReduction(');

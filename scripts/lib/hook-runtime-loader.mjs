@@ -44,6 +44,13 @@ function requireNonEmptyPath(value, label) {
   return value;
 }
 
+export function resolveHookPluginRoot({ pluginRoot } = {}) {
+  return resolve(requireNonEmptyPath(
+    pluginRoot ?? scriptRelativePluginRoot,
+    'pluginRoot',
+  ));
+}
+
 /**
  * Resolve the generated runtime bundle. The colocated loader-relative plugin
  * root is authoritative by default; only explicit options may select another
@@ -57,9 +64,8 @@ export function resolveHookRuntimePath({
     return resolve(requireNonEmptyPath(testBundlePath, 'testBundlePath'));
   }
 
-  const root = pluginRoot ?? scriptRelativePluginRoot;
   return join(
-    resolve(requireNonEmptyPath(root, 'pluginRoot')),
+    resolveHookPluginRoot({ pluginRoot }),
     'bridge',
     'hook-runtime.cjs',
   );
@@ -68,9 +74,8 @@ export function resolveHookRuntimePath({
 export function resolveHookNotificationChildPath({
   pluginRoot,
 } = {}) {
-  const root = pluginRoot ?? scriptRelativePluginRoot;
   return join(
-    resolve(requireNonEmptyPath(root, 'pluginRoot')),
+    resolveHookPluginRoot({ pluginRoot }),
     'scripts',
     'lib',
     'notification-child.cjs',

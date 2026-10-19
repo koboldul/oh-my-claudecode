@@ -1,11 +1,12 @@
 /**
  * Atomic, durable file writes for oh-my-claudecode.
- * Self-contained module with no external dependencies.
+ * No external dependencies.
  */
 import * as fs from "fs/promises";
 import * as fsSync from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
+import { identitiesEqual } from "./file-identity.js";
 /**
  * Create directory recursively (inline implementation).
  * Ensures parent directories exist before creating the target directory.
@@ -65,7 +66,7 @@ function verifyPrivateTempFile(fd, tempPath, label, operations) {
         !isPrivateRegularSingleLink(pathStats)) {
         throw new Error(`${label} temporary file must be a private regular single-link file`);
     }
-    if (fdStats.dev !== pathStats.dev || fdStats.ino !== pathStats.ino) {
+    if (!identitiesEqual(fdStats, pathStats)) {
         throw new Error(`${label} temporary file was replaced before rename`);
     }
 }
@@ -80,8 +81,7 @@ function verifyPublishedFile(fd, filePath, label, operations) {
         throw new Error(`${label} target was replaced at publication`);
     }
     if (!pathStats.isFile() ||
-        fdStats.dev !== pathStats.dev ||
-        fdStats.ino !== pathStats.ino) {
+        !identitiesEqual(fdStats, pathStats)) {
         throw new Error(`${label} target was replaced at publication`);
     }
 }
@@ -128,16 +128,18 @@ function descriptorIdentity(fd) {
         return null;
     }
 }
+/**
+ * Restore the prior target without exposing a partially written generation.
+ * Windows callers first release the published descriptor: MoveFileEx cannot
+ * replace an open destination. The recorded identity still fences rollback.
+ */
 function rollbackPriorTarget(filePath, backupPath, expectedIdentity, operations) {
     // Without a positively identified published inode, the target may be a
     // concurrent foreign replacement. Leave it untouched and fail closed.
     if (expectedIdentity === null)
         return;
     const current = currentFileIdentity(filePath, operations);
-    if (current === null)
-        return;
-    if (expectedIdentity !== null &&
-        (current.dev !== expectedIdentity.dev || current.ino !== expectedIdentity.ino)) {
+    if (!identitiesEqual(current, expectedIdentity)) {
         return;
     }
     try {
@@ -209,13 +211,19 @@ export async function atomicWriteJson(filePath, data, hooks) {
                 verifyPublishedFile(fd.fd, filePath, "atomic JSON write");
             }
             catch (error) {
+                if (process.platform === "win32") {
+                    await fd.close();
+                    fd = null;
+                }
                 rollbackPriorTarget(filePath, backupPath, publishedIdentity);
                 throw error;
             }
         }
         finally {
-            await fd.close();
-            fd = null;
+            if (fd !== null) {
+                await fd.close();
+                fd = null;
+            }
         }
         success = true;
         removeBackup(backupPath);
@@ -302,6 +310,10 @@ export function atomicWriteFileSync(filePath, content, hooks, operations) {
             verifyPublishedFile(fd, filePath, "atomic write", operations);
         }
         catch (error) {
+            if (process.platform === "win32") {
+                fsSync.closeSync(fd);
+                fd = null;
+            }
             rollbackPriorTarget(filePath, backupPath, publishedIdentity, operations);
             throw error;
         }
@@ -431,6 +443,10 @@ export function atomicWriteBatchSync(writes, hooks) {
                 verifyPublishedFile(write.fd, write.path, "atomic batch write");
             }
             catch (error) {
+                if (process.platform === "win32") {
+                    fsSync.closeSync(write.fd);
+                    write.fd = null;
+                }
                 rollbackPriorTarget(write.path, write.backupPath, publishedIdentity);
                 throw error;
             }

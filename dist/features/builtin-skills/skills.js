@@ -8,66 +8,18 @@
  *
  * Adapted from oh-my-opencode's builtin-skills feature.
  */
-import { existsSync, readdirSync, readFileSync } from 'fs';
-import { join, dirname, basename, resolve, relative, isAbsolute, win32 } from 'path';
-import { fileURLToPath } from 'url';
-import { parseFrontmatter, parseFrontmatterAliases } from '../../utils/frontmatter.js';
+import { existsSync, readFileSync } from 'fs';
+import { join, dirname, resolve, relative, isAbsolute, win32 } from 'path';
+import { parseFrontmatter } from '../../utils/frontmatter.js';
 import { rewriteOmcCliInvocations } from '../../utils/omc-cli-rendering.js';
 import { parseSkillPipelineMetadata, renderSkillPipelineGuidance } from '../../utils/skill-pipeline.js';
 import { renderSkillResourcesGuidance } from '../../utils/skill-resources.js';
 import { renderSkillRuntimeGuidance } from './runtime-guidance.js';
-import { isSkininthegamebrosUser } from '../../utils/skininthegamebros-user.js';
 import { getClaudeConfigDir } from '../../utils/config-dir.js';
-import entitlementManifest from '../../config/builtin-skill-entitlements.json' with { type: 'json' };
-function getPackageDir() {
-    if (typeof __dirname !== 'undefined' && __dirname) {
-        const currentDirName = basename(__dirname);
-        const parentDirName = basename(dirname(__dirname));
-        const grandparentDirName = basename(dirname(dirname(__dirname)));
-        if (currentDirName === 'bridge') {
-            return join(__dirname, '..');
-        }
-        if (currentDirName === 'builtin-skills'
-            && parentDirName === 'features'
-            && (grandparentDirName === 'src' || grandparentDirName === 'dist')) {
-            return join(__dirname, '..', '..', '..');
-        }
-    }
-    try {
-        const __filename = fileURLToPath(import.meta.url);
-        const __dirname = dirname(__filename);
-        return join(__dirname, '..', '..', '..');
-    }
-    catch {
-        return process.cwd();
-    }
-}
-const SKILLS_DIR = join(getPackageDir(), 'skills');
-/**
- * Claude Code native commands that must not be shadowed by OMC skill short names.
- * Skills with these names will still load but their name will be prefixed with 'omc-'
- * to avoid overriding built-in /review, /plan, /security-review etc.
- */
-const CC_NATIVE_COMMANDS = new Set([
-    'review',
-    'plan',
-    'security-review',
-    'init',
-    'doctor',
-    'help',
-    'config',
-    'clear',
-    'compact',
-    'memory',
-]);
-const SKININTHEGAMEBROS_ONLY_SKILLS = new Set(entitlementManifest.skininthegamebrosOnlySkills.map((skill) => skill.trim().toLowerCase()));
+import { getBuiltinSkillIdentifiers, getPackageDir, getSkillsDir, readBuiltinSkillRegistrations, } from './registry.js';
+export { getSkillsDir, loadBuiltinSkillRegistrations, } from './registry.js';
+const SKILLS_DIR = getSkillsDir();
 const DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD = 0.2;
-function toSafeSkillName(name) {
-    const normalized = name.trim();
-    return CC_NATIVE_COMMANDS.has(normalized.toLowerCase())
-        ? `omc-${normalized}`
-        : normalized;
-}
 function readJsonObject(path) {
     if (!existsSync(path)) {
         return null;
@@ -188,12 +140,10 @@ export function renderBundledSkillBody(skillName, body) {
 /**
  * Load a single skill from a SKILL.md file
  */
-function loadSkillFromFile(skillPath, skillName) {
+function loadSkillFromFile(skillPath, skillName, content) {
     try {
-        const content = readFileSync(skillPath, 'utf-8');
         const { metadata, body } = parseFrontmatter(content);
-        const resolvedName = metadata.name || skillName;
-        const safePrimaryName = toSafeSkillName(resolvedName);
+        const { primaryName: safePrimaryName, aliases: safeAliases } = getBuiltinSkillIdentifiers(metadata, skillName);
         const pipeline = parseSkillPipelineMetadata(metadata);
         const fullBody = readSkillBodyOverride(skillPath, metadata, body);
         const renderedBody = renderBundledSkillBody(safePrimaryName, fullBody);
@@ -203,9 +153,6 @@ function loadSkillFromFile(skillPath, skillName) {
             renderSkillPipelineGuidance(safePrimaryName, pipeline),
             renderSkillResourcesGuidance(skillPath),
         ].filter((section) => section.trim().length > 0).join('\n\n');
-        const safeAliases = Array.from(new Set(parseFrontmatterAliases(metadata.aliases)
-            .map((alias) => toSafeSkillName(alias))
-            .filter((alias) => alias.length > 0 && alias.toLowerCase() !== safePrimaryName.toLowerCase())));
         const allNames = [safePrimaryName, ...safeAliases];
         const skillEntries = [];
         const seen = new Set();
@@ -245,35 +192,11 @@ function loadSkillsFromDirectory() {
         return [];
     }
     const skills = [];
-    const seenNames = new Set();
     try {
-        const entries = readdirSync(SKILLS_DIR, { withFileTypes: true })
-            .sort((a, b) => {
-            // Public canonical skill-making surface must claim its deprecated
-            // learner alias before the legacy compatibility skill is encountered.
-            if (a.name === 'skillify')
-                return -1;
-            if (b.name === 'skillify')
-                return 1;
-            return a.name.localeCompare(b.name);
-        });
-        for (const entry of entries) {
-            if (!entry.isDirectory())
-                continue;
-            if (SKININTHEGAMEBROS_ONLY_SKILLS.has(entry.name.toLowerCase()) && !isSkininthegamebrosUser()) {
-                continue;
-            }
-            const skillPath = join(SKILLS_DIR, entry.name, 'SKILL.md');
-            if (existsSync(skillPath)) {
-                const skillEntries = loadSkillFromFile(skillPath, entry.name);
-                for (const skill of skillEntries) {
-                    const key = skill.name.toLowerCase();
-                    if (seenNames.has(key))
-                        continue;
-                    seenNames.add(key);
-                    skills.push(skill);
-                }
-            }
+        const registrations = readBuiltinSkillRegistrations();
+        for (const registration of registrations) {
+            const registeredNames = new Set(registration.registeredNames.map((name) => name.toLowerCase()));
+            skills.push(...loadSkillFromFile(registration.skillPath, registration.skillName, registration.content).filter((skill) => registeredNames.has(skill.name.toLowerCase())));
         }
     }
     catch {
@@ -316,11 +239,7 @@ export function getBuiltinSkill(name) {
  */
 export function listBuiltinSkillNames(options) {
     const { includeAliases = false } = options ?? {};
-    const skills = createBuiltinSkills();
-    if (includeAliases) {
-        return skills.map((s) => s.name);
-    }
-    return skills.filter((s) => !s.aliasOf).map((s) => s.name);
+    return readBuiltinSkillRegistrations().flatMap((registration) => registration.registeredNames.filter((name) => includeAliases || name === registration.primaryName));
 }
 /**
  * Clear the skills cache (useful for testing)
@@ -328,11 +247,5 @@ export function listBuiltinSkillNames(options) {
 export function clearSkillsCache() {
     cachedSkills = null;
     cachedSkillsKey = null;
-}
-/**
- * Get the skills directory path (useful for debugging)
- */
-export function getSkillsDir() {
-    return SKILLS_DIR;
 }
 //# sourceMappingURL=skills.js.map

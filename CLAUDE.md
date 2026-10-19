@@ -20,7 +20,7 @@ Route code to `executor`. Under Claude Code, use `model=opus` for complex work; 
 </delegation_rules>
 
 <model_routing>
-`haiku` (quick lookups), `sonnet` (standard), `opus` (architecture, deep analysis), `fable` (Claude Fable 5, above Opus). For explicit GPT routing, `gpt-6-astra` is the top-of-the-line GPT model; the Copilot *provider* default (`omc ask copilot`, Copilot team workers) remains the cost-effective `gpt-5.6-sol`. Copilot agent profiles map Sonnet-tier agents to `gpt-6-luna` and the existing Opus-5 profile tier to `gpt-6-sol`, both with `max` reasoning.
+`haiku` (quick lookups), `sonnet` (standard), `opus` (architecture, deep analysis), `fable` (Claude Fable 5, above Opus). For explicit GPT routing, `gpt-6-astra` is the top-of-the-line GPT model; the Copilot *provider* default (`omc ask copilot`, Copilot team workers) remains the cost-effective `gpt-5.6-sol`. Copilot agent profiles pin `executor` to `gpt-6.1-sol`, other Sonnet-tier agents to `gpt-6-luna`, and the existing Opus-5 profile tier to `gpt-6-sol`, all with `max` reasoning.
 The session model set via `/model` governs the main loop only; delegated agents run on their pinned tier unless you pass `model` explicitly or set a per-agent `agents.<name>.model` override.
 Direct writes OK for: `~/.claude/**`, `.omc/**`, `.claude/**`, `CLAUDE.md`, `AGENTS.md`.
 </model_routing>
@@ -63,7 +63,7 @@ Kill switches: `DISABLE_OMC`, `OMC_SKIP_HOOKS` (comma-separated).
 </cancellation>
 
 <host_isolation>
-Under GitHub Copilot CLI (`OMC_HOST=copilot`, or `COPILOT_CLI`/`COPILOT_AGENT_SESSION_ID` set), do not require or diagnose `~/.claude`, HUD/statusLine, or `/omc-setup` unless the user explicitly asks to configure Claude Code too. Bundled `oh-my-claudecode:*` agents use Copilot-specific profiles mapped to `gpt-6-luna` for Sonnet-tier sources and `gpt-6-sol` for the existing Opus-5 profile tier, both with `max` reasoning; delegated Task/Agent calls default to the Copilot provider model `gpt-5.6-sol` at the same `max` effort, while preserving explicit per-call choices. Use Copilot's plugin manager (`copilot plugin update oh-my-claudecode`) and `/env` to verify/update instead.
+Under GitHub Copilot CLI (`OMC_HOST=copilot`, or `COPILOT_CLI`/`COPILOT_AGENT_SESSION_ID` set), do not require or diagnose `~/.claude`, HUD/statusLine, or `/omc-setup` unless the user explicitly asks to configure Claude Code too. Bundled `oh-my-claudecode:*` agents use the Copilot-specific profiles above. Delegated executor calls use `gpt-6.1-sol` unless overridden per call, per agent, or through explicit provider configuration; other delegated Task/Agent calls retain the Copilot provider default `gpt-5.6-sol`. All retain `max` effort unless explicitly overridden. Use Copilot's plugin manager (`copilot plugin update oh-my-claudecode`) and `/env` to verify/update instead.
 </host_isolation>
 
 <worktree_paths>

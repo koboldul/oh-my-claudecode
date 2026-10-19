@@ -1976,13 +1976,14 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
         }, {
             APPDATA: xdgConfigHome,
             XDG_CONFIG_HOME: xdgConfigHome,
+            CLAUDE_PLUGIN_ROOT: process.cwd(),
             ...env,
         });
     }
     function updatedInput(output) {
         return output.modifiedArgs;
     }
-    it('defaults bundled OMC subagents to GPT-5.6 Sol with max reasoning', () => {
+    it('defaults the executor to its GPT-6.1 Sol profile with max reasoning', () => {
         const output = run({
             tool_name: 'Task',
             toolInput: {
@@ -1993,7 +1994,39 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
             session_id: 'copilot-defaults',
         });
         expect(updatedInput(output)).toMatchObject({
-            model: 'gpt-5.6-sol',
+            model: 'gpt-6.1-sol',
+            reasoning_effort: 'max',
+        });
+    });
+    it('uses the executor profile for Agent payloads and the deprecated executor alias', () => {
+        const output = run({
+            tool_name: 'Agent',
+            toolInput: {
+                agent_type: 'oh-my-claudecode:deep-executor',
+                prompt: 'Implement the change',
+                description: 'Implement change',
+            },
+            session_id: 'copilot-executor-alias',
+        });
+        expect(updatedInput(output)).toMatchObject({
+            model: 'gpt-6.1-sol',
+            reasoning_effort: 'max',
+        });
+    });
+    it.each(['unset', 'missing'])('uses the shipped executor profile when the plugin root is %s', (pluginRoot) => {
+        const output = run({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'oh-my-claudecode:executor',
+                prompt: 'Implement',
+                description: 'Implement',
+            },
+            session_id: 'copilot-executor-missing-profile',
+        }, {
+            CLAUDE_PLUGIN_ROOT: pluginRoot === 'unset' ? '' : join(tempDir, 'missing-plugin'),
+        });
+        expect(updatedInput(output)).toMatchObject({
+            model: 'gpt-6.1-sol',
             reasoning_effort: 'max',
         });
     });
@@ -2019,7 +2052,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
         const output = run({
             tool_name: 'Agent',
             toolInput: {
-                agent_type: 'oh-my-claudecode:architect',
+                agent_type: 'oh-my-claudecode:executor',
                 model: 'gpt-5.5',
                 reasoning_effort: 'high',
                 prompt: 'Review the design',
@@ -2055,15 +2088,15 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
             reasoning_effort: 'max',
         });
         expect(updatedInput(effortExplicit)).toMatchObject({
-            model: 'gpt-5.6-sol',
+            model: 'gpt-6.1-sol',
             reasoning_effort: 'high',
         });
     });
-    it('uses Copilot-specific environment overrides', () => {
+    it.each(['executor', 'verifier'])('uses Copilot-specific environment overrides for %s', (agent) => {
         const output = run({
             tool_name: 'Task',
             toolInput: {
-                subagent_type: 'oh-my-claudecode:verifier',
+                subagent_type: `oh-my-claudecode:${agent}`,
                 prompt: 'Verify',
                 description: 'Verify',
             },
@@ -2077,14 +2110,14 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
             reasoning_effort: 'xhigh',
         });
     });
-    it('uses project Copilot defaults over user defaults', () => {
+    it.each(['executor', 'critic'])('uses project Copilot defaults over user defaults for %s', (agent) => {
         writeFileSync(join(xdgConfigHome, 'claude-omc', 'config.jsonc'), '{ "externalModels": { "defaults": { "copilotModel": "gpt-5.5", "copilotReasoningEffort": "high" } } }');
         mkdirSync(join(tempDir, '.claude'), { recursive: true });
         writeFileSync(join(tempDir, '.claude', 'omc.jsonc'), '{ "externalModels": { "defaults": { "copilotModel": "gpt-5.6-sol" } } }');
         const output = run({
             tool_name: 'Task',
             toolInput: {
-                subagent_type: 'oh-my-claudecode:critic',
+                subagent_type: `oh-my-claudecode:${agent}`,
                 prompt: 'Critique',
                 description: 'Critique',
             },
@@ -2093,6 +2126,29 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
         expect(updatedInput(output)).toMatchObject({
             model: 'gpt-5.6-sol',
             reasoning_effort: 'high',
+        });
+    });
+    it.each([
+        ['gpt-6-astra', 'gpt-6-astra'],
+        ['inherit', 'gpt-5.6-terra'],
+    ])('respects the executor per-agent model setting %s', (configuredModel, expectedModel) => {
+        writeJson(join(tempDir, '.claude', 'omc.jsonc'), {
+            agents: { executor: { model: configuredModel } },
+        });
+        const output = run({
+            tool_name: 'Task',
+            toolInput: {
+                subagent_type: 'oh-my-claudecode:executor',
+                prompt: 'Implement',
+                description: 'Implement',
+            },
+            session_id: 'copilot-executor-agent-override',
+        }, {
+            OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL: 'gpt-5.6-terra',
+        });
+        expect(updatedInput(output)).toMatchObject({
+            model: expectedModel,
+            reasoning_effort: 'max',
         });
     });
     it('falls back to max and emits a warning for invalid configured effort', () => {
@@ -2159,7 +2215,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
             session_id: 'copilot-force-inherit',
         }, { OMC_ROUTING_FORCE_INHERIT: 'true' });
         expect(updatedInput(output)).toMatchObject({
-            model: 'gpt-5.6-sol',
+            model: 'gpt-6.1-sol',
             reasoning_effort: 'max',
         });
     });
@@ -2306,8 +2362,10 @@ describe('pre-tool-enforcer skill vs agent namespace guard (issue #3667)', () =>
     it('does NOT deny non-string or empty subagent_type values', () => {
         const numeric = runTask(42);
         const empty = runTask('   ');
-        expect(numeric.hookSpecificOutput).not.toHaveProperty('permissionDecision');
-        expect(empty.hookSpecificOutput).not.toHaveProperty('permissionDecision');
+        // Identical routine advisories may be throttled, but neither output may
+        // acquire a permission decision for an absent/invalid agent identifier.
+        expect(numeric).not.toHaveProperty('hookSpecificOutput.permissionDecision');
+        expect(empty).not.toHaveProperty('hookSpecificOutput.permissionDecision');
     });
     it.each(['remember', 'verify', 'debug'])('denies the namespaced %s skill for a non-skininthegamebros user (USER_TYPE != ant)', (skill) => {
         const output = runTask(`oh-my-claudecode:${skill}`, 'Task', {}, { USER_TYPE: '' });

@@ -1,6 +1,6 @@
 /**
  * Atomic, durable file writes for oh-my-claudecode.
- * Self-contained module with no external dependencies.
+ * No external dependencies.
  */
 import * as fsSync from "fs";
 /** Optional basename-based backend for an already-open directory. */

@@ -50,8 +50,8 @@
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'fs';
 import { extname, isAbsolute, join, relative, resolve } from 'path';
 
-const STATE_FILENAME = 'read-budget-warnings.json';
-const WARNING_RETENTION_SECONDS = 6 * 3600;
+export const READ_BUDGET_STATE_FILENAME = 'read-budget-warnings.json';
+export const READ_BUDGET_WARNING_RETENTION_SECONDS = 6 * 3600;
 const DEFAULT_MAX_LINES = 1500;
 // Truncating reads observed in practice run ~2.4-2.8 bytes per token, putting
 // the 25,000-token cap around 60-70 KB. 45 KB sits deliberately below that: a
@@ -164,6 +164,13 @@ function hasTargetedRange(toolInput) {
     if (typeof value === 'number' && Number.isFinite(value)) return true;
     if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return true;
   }
+  const viewRange = toolInput?.view_range ?? toolInput?.viewRange;
+  if (
+    Array.isArray(viewRange) && viewRange.length === 2 &&
+    Number.isInteger(viewRange[0]) && viewRange[0] >= 1 &&
+    Number.isInteger(viewRange[1]) &&
+    (viewRange[1] >= viewRange[0] || (viewRange[1] === -1 && viewRange[0] > 1))
+  ) return true;
   // `pages` is the range key Read itself requires on a PDF over 10 pages, so a
   // call carrying it is targeted by the tool's own contract (issue #4062).
   const pages = toolInput?.pages;
@@ -256,7 +263,7 @@ function measure(absolutePath, maxLines, maxBytes) {
 function loadWarnings(stateDir) {
   if (!stateDir) return {};
   try {
-    const p = join(stateDir, STATE_FILENAME);
+    const p = join(stateDir, READ_BUDGET_STATE_FILENAME);
     if (!existsSync(p)) return {};
     const parsed = JSON.parse(readFileSync(p, 'utf-8'));
     return parsed && typeof parsed.warned === 'object' && parsed.warned ? parsed.warned : {};
@@ -269,7 +276,7 @@ function saveWarnings(stateDir, warned) {
   if (!stateDir) return;
   try {
     mkdirSync(stateDir, { recursive: true });
-    writeFileSync(join(stateDir, STATE_FILENAME), JSON.stringify({ warned }, null, 2));
+    writeFileSync(join(stateDir, READ_BUDGET_STATE_FILENAME), JSON.stringify({ warned }, null, 2));
   } catch {
     // Non-critical: a failed write means the next full read warns again instead
     // of denying, which fails open by design.
@@ -279,17 +286,20 @@ function saveWarnings(stateDir, warned) {
 function alreadyWarned(stateDir, key) {
   const warned = loadWarnings(stateDir);
   const ts = warned[key];
-  return typeof ts === 'number' && ts > nowSec() - WARNING_RETENTION_SECONDS;
+  return typeof ts === 'number' && ts > nowSec() - READ_BUDGET_WARNING_RETENTION_SECONDS;
+}
+
+export function pruneReadBudgetWarnings(warned, referenceSec) {
+  const cutoff = referenceSec - READ_BUDGET_WARNING_RETENTION_SECONDS;
+  return Object.fromEntries(Object.entries(warned ?? {}).filter(
+    ([, ts]) => typeof ts === 'number' && Number.isFinite(ts) && ts > cutoff,
+  ));
 }
 
 function recordWarning(stateDir, key) {
-  const cutoff = nowSec() - WARNING_RETENTION_SECONDS;
-  const warned = loadWarnings(stateDir);
-  const pruned = {};
-  for (const [k, ts] of Object.entries(warned)) {
-    if (typeof ts === 'number' && ts > cutoff) pruned[k] = ts;
-  }
-  pruned[key] = nowSec();
+  const referenceSec = nowSec();
+  const pruned = pruneReadBudgetWarnings(loadWarnings(stateDir), referenceSec);
+  pruned[key] = referenceSec;
   saveWarnings(stateDir, pruned);
 }
 
@@ -338,31 +348,18 @@ function denyReason(displayPath, measurement, maxLines, maxBytes) {
   );
 }
 
-/**
- * Evaluate the read budget for the current PreToolUse call.
- *
- * @param {object} args
- * @param {string} args.toolName - Claude Code tool name.
- * @param {object} [args.toolInput] - Tool input payload.
- * @param {string} [args.stateDir] - Directory used to persist warn-once state.
- * @param {object} [args.env=process.env] - Environment for the off switch/threshold.
- * @param {Function} [args.loadOmcConfig] - Resolved OMC config loader.
- * @param {string} [args.cwd=process.cwd()] - Directory used to resolve relative paths.
- * @returns {null | { decision: 'block' | 'warn', reason: string, path: string, lineCount: number,
- *   byteSize: number, trigger: 'bytes' | 'lines' }}
- */
-export function evaluateReadBudget({
+/** Resolve an eligible full read from supplied config/environment, without I/O. */
+export function prepareReadBudget({
   toolName,
   toolInput,
-  stateDir,
-  env = process.env,
-  loadOmcConfig,
-  cwd = process.cwd(),
+  env,
+  config,
+  cwd,
 } = {}) {
   if (!toolName) return null;
-  if ((env.OMC_READ_BUDGET || '').trim().toLowerCase() === 'off') return null;
+  if ((env?.OMC_READ_BUDGET || '').trim().toLowerCase() === 'off') return null;
 
-  const cfg = readBudgetConfig(loadOmcConfig);
+  const cfg = config?.context?.readBudget;
   if (cfg && cfg.enabled === false) return null;
 
   const input = toolInput && typeof toolInput === 'object' ? toolInput : {};
@@ -377,23 +374,33 @@ export function evaluateReadBudget({
   if (!rawPath) return null;
 
   const absolutePath = isAbsolute(rawPath) ? resolve(rawPath) : resolve(cwd, rawPath);
-  if (!existsSync(absolutePath)) return null;
   if (isAllowlisted(cfg, absolutePath, cwd)) return null;
 
-  const maxLines = resolveMaxLines(cfg, env);
-  const maxBytes = resolveMaxBytes(cfg, env);
-  let measurement;
+  return {
+    path: absolutePath,
+    displayPath: relative(cwd, absolutePath).split('\\').join('/') || rawPath,
+    maxLines: resolveMaxLines(cfg, env ?? {}),
+    maxBytes: resolveMaxBytes(cfg, env ?? {}),
+    mode: resolveMode(cfg),
+  };
+}
+
+/** The shared measurement boundary; canonical hooks call this only in snapshot loading. */
+export function measureReadBudget(candidate) {
   try {
-    measurement = measure(absolutePath, maxLines, maxBytes);
+    if (!existsSync(candidate.path)) return null;
+    return measure(candidate.path, candidate.maxLines, candidate.maxBytes);
   } catch {
     return null;
   }
-  if (!measurement || !measurement.over) return null;
+}
 
-  const displayPath = relative(cwd, absolutePath).split('\\').join('/') || rawPath;
-  const mode = resolveMode(cfg);
+/** Decide from an immutable measurement and warning observation, without I/O. */
+export function evaluateReadBudgetObservation(candidate, measurement, warned) {
+  if (!measurement || !measurement.over) return null;
+  const { path, displayPath, maxLines, maxBytes, mode } = candidate;
   const base = {
-    path: absolutePath,
+    path,
     lineCount: measurement.lineCount,
     byteSize: measurement.byteSize,
     trigger: measurement.trigger,
@@ -404,7 +411,39 @@ export function evaluateReadBudget({
   if (mode === 'warn') return warn;
   if (mode === 'deny') return block;
 
-  if (alreadyWarned(stateDir, absolutePath)) return block;
-  recordWarning(stateDir, absolutePath);
-  return warn;
+  return warned ? block : warn;
+}
+
+/**
+ * Standalone compatibility entry point. The canonical runtime shares the
+ * preparation, measurement and decision above, and owns its warning effects.
+ */
+export function evaluateReadBudget({
+  toolName,
+  toolInput,
+  stateDir,
+  env = process.env,
+  loadOmcConfig,
+  cwd = process.cwd(),
+} = {}) {
+  if (!toolName) return null;
+  if ((env.OMC_READ_BUDGET || '').trim().toLowerCase() === 'off') return null;
+  const cfg = readBudgetConfig(loadOmcConfig);
+  const candidate = prepareReadBudget({
+    toolName,
+    toolInput,
+    env,
+    config: { context: { readBudget: cfg } },
+    cwd,
+  });
+  if (!candidate) return null;
+  const result = evaluateReadBudgetObservation(
+    candidate,
+    measureReadBudget(candidate),
+    candidate.mode === 'warn-then-deny' && alreadyWarned(stateDir, candidate.path),
+  );
+  if (result?.decision === 'warn' && candidate.mode === 'warn-then-deny') {
+    recordWarning(stateDir, candidate.path);
+  }
+  return result;
 }

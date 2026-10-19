@@ -10,13 +10,27 @@ import {
   readdirSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import type {
   CanonicalGoalSnapshot,
   CanonicalHookEnvelope,
 } from '../hook-protocol.js';
-import { getOmcRoot } from '../../lib/worktree-paths.js';
+import {
+  getOmcRoot,
+  resolveSessionStatePaths,
+} from '../../lib/worktree-paths.js';
+import {
+  getSkillsDir,
+  loadBuiltinSkillRegistrations,
+} from '../../features/builtin-skills/registry.js';
 import { parseJsonc } from '../../utils/jsonc.js';
+import {
+  READ_BUDGET_STATE_FILENAME,
+  measureReadBudget,
+  prepareReadBudget,
+  pruneReadBudgetWarnings,
+  type ReadBudgetMeasurement,
+} from '../../../scripts/lib/read-budget-preflight.mjs';
 import {
   PRE_TOOL_MAX_FUTURE_SKEW_MS,
   PRE_TOOL_MIN_EPOCH_MS,
@@ -25,6 +39,7 @@ import {
   type ForceDelegationConfig,
   type ForceDelegationRule,
   type PreToolBatchSnapshot,
+  type PreToolReadBudgetSnapshot,
   type PreToolSnapshotDependencies,
   type PreToolStateSnapshot,
   type VirtualForceDelegationEvent,
@@ -321,6 +336,80 @@ function normalizeAgentType(rawAgentType: string): string {
   return DEPRECATED_ROLE_ALIASES[unprefixed] ?? unprefixed;
 }
 
+function loadSkillAgentTypes(
+  envelope: CanonicalHookEnvelope,
+  directory: string,
+  environment: Readonly<Record<string, string | undefined>>,
+  readText: (path: string) => string | null,
+  listDirectories: (path: string) => readonly string[],
+  fileExists: (path: string) => boolean,
+  runtimePluginRoot?: string,
+): Record<string, string> {
+  const agentTypes = [...new Set(envelope.toolCalls
+    .filter((call) =>
+      call.canonicalName === 'Task' || call.canonicalName === 'Agent',
+    )
+    .map((call) => getAgentType(call.input))
+    .filter(Boolean))];
+  if (agentTypes.length === 0) return {};
+  const pluginRoots = [...new Set([
+    stringValue(environment.CLAUDE_PLUGIN_ROOT),
+    runtimePluginRoot ?? '',
+    dirname(getSkillsDir()),
+  ].filter(Boolean))];
+  const registrations = loadBuiltinSkillRegistrations(
+    pluginRoots.map((root) => join(root, 'skills')),
+    readText,
+    listDirectories,
+    environment.USER_TYPE,
+  );
+  const names = new Map<string, string>();
+  const directoryNames = new Map<string, string>();
+  for (const registration of registrations) {
+    for (const name of registration.registeredNames) {
+      names.set(name.toLowerCase(), registration.primaryName);
+    }
+    const key = registration.skillName.toLowerCase();
+    if (!directoryNames.has(key)) {
+      directoryNames.set(key, registration.primaryName);
+    }
+  }
+
+  const pluginAgentDirectories = pluginRoots.flatMap((root) =>
+    envelope.host === 'copilot'
+      ? [join(root, 'agents-copilot'), join(root, 'agents')]
+      : [join(root, 'agents')],
+  );
+  const nativeAgentDirectories = envelope.host === 'copilot'
+    ? [
+        join(directory, '.github', 'agents'),
+        join(directory, '.copilot', 'agents'),
+        join(resolveHome(environment), '.copilot', 'agents'),
+      ]
+    : [
+        join(directory, '.claude', 'agents'),
+        join(resolveClaudeConfigDirectory(environment), 'agents'),
+      ];
+
+  return Object.fromEntries(agentTypes.flatMap((agentType) => {
+    const namespaced = /^(?:oh-my-claudecode|omc):/i.test(agentType);
+    const name = agentType.replace(/^(?:oh-my-claudecode|omc):/i, '')
+      .toLowerCase();
+    if (!/^[a-z0-9_-]+$/.test(name)) return [];
+    const agentDirectories = [
+      ...pluginAgentDirectories,
+      ...(namespaced ? [] : nativeAgentDirectories),
+    ];
+    if (agentDirectories.some((path) =>
+      fileExists(join(path, `${name}.md`))
+      || fileExists(join(path, `${name}.agent.md`)),
+    )) return [];
+    const primary = names.get(name)
+      ?? (namespaced ? directoryNames.get(name) : undefined);
+    return primary ? [[agentType, primary]] : [];
+  }));
+}
+
 function loadJsoncRecord(
   path: string,
   readText: (path: string, maxBytes?: number) => string | null,
@@ -368,9 +457,11 @@ function resolveConfiguredCopilotDefault(
 
 function readAgentDefinitionModel(
   agentType: string,
+  host: CanonicalHookEnvelope['host'],
   environment: Readonly<Record<string, string | undefined>>,
   currentDirectory: string,
   readText: (path: string, maxBytes?: number) => string | null,
+  runtimePluginRoot?: string,
 ): string | null {
   const canonical = normalizeAgentType(agentType);
   if (!/^[a-zA-Z0-9_-]+$/.test(canonical)) return null;
@@ -378,10 +469,14 @@ function readAgentDefinitionModel(
   const pluginRoot = stringValue(environment.CLAUDE_PLUGIN_ROOT);
   const candidateRoots = [
     ...(pluginRoot ? [pluginRoot] : []),
+    ...(host === 'copilot' && runtimePluginRoot ? [runtimePluginRoot] : []),
     currentDirectory,
   ];
   for (const root of candidateRoots) {
-    const content = readText(join(root, 'agents', `${canonical}.md`));
+    const definitionPath = host === 'copilot'
+      ? join(root, 'agents-copilot', `${canonical}.agent.md`)
+      : join(root, 'agents', `${canonical}.md`);
+    const content = readText(definitionPath);
     if (content === null) continue;
     const frontmatter = content.replace(/^\uFEFF/, '').match(
       /^---[\r\n]+([\s\S]*?)[\r\n]+---/,
@@ -428,6 +523,104 @@ function extractTracking(value: unknown): { running: number; total: number } {
       ? record.total_spawned
       : 0,
   };
+}
+
+function readTracking(
+  directory: string,
+  stateDir: string,
+  sessionId: string,
+  readJson: (path: string) => unknown,
+  resolvePaths: typeof resolveSessionStatePaths,
+): { running: number; total: number } {
+  const paths = resolvePaths(
+    'subagent-tracking',
+    SESSION_ID_PATTERN.test(sessionId) ? sessionId : undefined,
+    directory,
+  );
+  for (const path of [
+    paths.sessionScoped,
+    paths.legacy,
+    join(stateDir, 'subagent-tracking.json'),
+  ].filter(Boolean)) {
+    const state = asRecord(readJson(path));
+    if (!state || !Array.isArray(state.agents)) continue;
+    if (
+      state.total_spawned !== undefined
+      && (
+        typeof state.total_spawned !== 'number'
+        || !Number.isSafeInteger(state.total_spawned)
+        || state.total_spawned < 0
+      )
+    ) continue;
+    const owner = stringValue(state.session_id)
+      || stringValue(asRecord(state._meta)?.sessionId);
+    if (sessionId && owner && owner !== sessionId) continue;
+    return extractTracking(state);
+  }
+  return { running: 0, total: 0 };
+}
+
+function loadReadBudgetSnapshot(
+  envelope: CanonicalHookEnvelope,
+  directory: string,
+  stateDir: string,
+  environment: Readonly<Record<string, string | undefined>>,
+  config: Readonly<Record<string, unknown>>,
+  observedAtSec: number,
+  readJson: (path: string) => unknown,
+  measure: typeof measureReadBudget,
+  disabled: boolean,
+): PreToolReadBudgetSnapshot {
+  const statePath = join(stateDir, READ_BUDGET_STATE_FILENAME);
+  if (disabled) return { statePath, warnings: {}, observations: {} };
+  const observations: Record<
+    string,
+    PreToolReadBudgetSnapshot['observations'][string]
+  > = {};
+  const measurements = new Map<string, ReadBudgetMeasurement | null>();
+  for (const call of envelope.toolCalls) {
+    if (call.malformed) continue;
+    const candidate = prepareReadBudget({
+      toolName: call.canonicalName,
+      toolInput: call.input,
+      env: environment,
+      config,
+      cwd: directory,
+    });
+    if (!candidate) continue;
+    const key = `${candidate.path}\0${candidate.maxLines}\0${candidate.maxBytes}`;
+    if (!measurements.has(key)) {
+      measurements.set(key, cloneObservation(measure(candidate)));
+    }
+    const measurement = measurements.get(key);
+    if (measurement) observations[call.id] = { candidate, measurement };
+  }
+  if (Object.keys(observations).length === 0) {
+    return { statePath, warnings: {}, observations };
+  }
+  const stored = asRecord(readJson(statePath));
+  const intentIds = asRecord(stored?.intentIds);
+  const warned = pruneReadBudgetWarnings(
+    asRecord(stored?.warned) ?? {},
+    observedAtSec,
+  );
+  const warnings = Object.fromEntries(Object.entries(warned)
+    .filter(([, timestamp]) =>
+      Number.isSafeInteger(timestamp)
+      && timestamp >= Math.floor(PRE_TOOL_MIN_EPOCH_MS / 1000)
+      && timestamp <=
+        observedAtSec + Math.floor(PRE_TOOL_MAX_FUTURE_SKEW_MS / 1000),
+    )
+    .map(([path, warnedAtSec]) => [
+      path,
+      {
+        warnedAtSec,
+        ...(typeof intentIds?.[path] === 'string'
+          ? { intentId: intentIds[path] }
+          : {}),
+      },
+    ]));
+  return { statePath, warnings, observations };
 }
 
 function sessionStatePath(
@@ -825,6 +1018,12 @@ export function loadPreToolBatchSnapshot(
   const observedAt = new Date(loadedAtMs).toISOString();
   const observedAtSec = Math.floor(loadedAtMs / 1000);
   const environment = { ...environmentProvider() };
+  const disabled =
+    environment.DISABLE_OMC === '1'
+    || (environment.OMC_SKIP_HOOKS ?? '')
+      .split(',')
+      .map((value) => value.trim())
+      .includes('pre-tool-use');
   const runtimeDirectory = currentDirectory();
   const directory = envelope.directory || runtimeDirectory;
   const omcRoot = resolveOmcRoot(directory);
@@ -837,10 +1036,19 @@ export function loadPreToolBatchSnapshot(
     '.omc-config.json',
   );
   const projectOmcConfigPath = join(omcRoot, 'config.json');
-  const omcConfig =
-    asRecord(readJson(userOmcConfigPath))
-    ?? asRecord(readJson(projectOmcConfigPath))
-    ?? {};
+  const globalOmcConfig = asRecord(readJson(userOmcConfigPath));
+  const projectOmcConfig = asRecord(readJson(projectOmcConfigPath));
+  const omcConfig = globalOmcConfig ?? projectOmcConfig ?? {};
+  // Budget fields inherit global defaults, with explicit project overrides.
+  // Keep the legacy generic config/force-delegation selection unchanged.
+  const readBudgetConfig = {
+    context: {
+      readBudget: {
+        ...(asRecord(asRecord(globalOmcConfig?.context)?.readBudget) ?? {}),
+        ...(asRecord(asRecord(projectOmcConfig?.context)?.readBudget) ?? {}),
+      },
+    },
+  };
 
   const userConfig = loadJsoncRecord(
     join(
@@ -872,18 +1080,23 @@ export function loadPreToolBatchSnapshot(
       agentType,
       readAgentDefinitionModel(
         agentType,
+        envelope.host,
         environment,
         runtimeDirectory,
         readText,
+        dependencies.pluginRoot,
       ),
     ]),
   );
 
-  const configuredCopilotModel = resolveConfiguredCopilotDefault(
-    'copilotModel',
-    projectConfig,
-    userConfig,
-  );
+  const configuredCopilotModel =
+    stringValue(environment.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL)
+    || stringValue(environment.OMC_COPILOT_DEFAULT_MODEL)
+    || resolveConfiguredCopilotDefault(
+      'copilotModel',
+      projectConfig,
+      userConfig,
+    );
   const configuredCopilotEffort = stringValue(
     environment.OMC_COPILOT_REASONING_EFFORT,
   ) || resolveConfiguredCopilotDefault(
@@ -896,11 +1109,8 @@ export function loadPreToolBatchSnapshot(
     normalizedCopilotEffort,
   );
   const copilotDefaults = {
-    model:
-      stringValue(environment.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL)
-      || stringValue(environment.OMC_COPILOT_DEFAULT_MODEL)
-      || configuredCopilotModel
-      || COPILOT_DEFAULT_MODEL,
+    model: configuredCopilotModel || COPILOT_DEFAULT_MODEL,
+    modelOverride: configuredCopilotModel,
     reasoningEffort: copilotEffortValid
       ? normalizedCopilotEffort
       : COPILOT_DEFAULT_REASONING_EFFORT,
@@ -973,8 +1183,12 @@ export function loadPreToolBatchSnapshot(
   const todoLabel = todoCounts.pending + todoCounts.inProgress > 0
     ? `[${todoCounts.inProgress} active, ${todoCounts.pending} pending] `
     : '';
-  const tracking = extractTracking(
-    readJson(join(stateDir, 'subagent-tracking.json')),
+  const tracking = readTracking(
+    directory,
+    stateDir,
+    sessionId,
+    readJson,
+    dependencies.resolveSessionStatePaths ?? resolveSessionStatePaths,
   );
 
   const transcriptPath = envelope.transcriptPath;
@@ -1055,22 +1269,37 @@ export function loadPreToolBatchSnapshot(
     sessionId,
     deliveryId,
     environment,
-    disabled:
-      environment.DISABLE_OMC === '1'
-      || (environment.OMC_SKIP_HOOKS ?? '')
-        .split(',')
-        .map((value) => value.trim())
-        .includes('pre-tool-use'),
+    disabled,
     quietLevel: numberFromEnvironment(environment.OMC_QUIET, 0, 0),
     todo: {
       ...todoCounts,
       label: todoLabel,
     },
     tracking,
+    readBudget: loadReadBudgetSnapshot(
+      envelope,
+      directory,
+      stateDir,
+      environment,
+      readBudgetConfig,
+      observedAtSec,
+      readJson,
+      dependencies.measureReadBudget ?? measureReadBudget,
+      disabled,
+    ),
     team,
     modeActive,
     modeStates,
     omcConfig,
+    skillAgentTypes: loadSkillAgentTypes(
+      envelope,
+      directory,
+      environment,
+      readText,
+      listDirectories,
+      fileExists,
+      dependencies.pluginRoot,
+    ),
     modelRouting: {
       forceInherit:
         environment.OMC_ROUTING_FORCE_INHERIT === 'true'

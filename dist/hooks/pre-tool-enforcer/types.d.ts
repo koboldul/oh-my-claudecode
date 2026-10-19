@@ -1,4 +1,6 @@
 import type { CanonicalGoalSnapshot, CanonicalHookEnvelope, CanonicalToolCall, HookEffect, HookEvaluation, HookReduction } from '../hook-protocol.js';
+import type { resolveSessionStatePaths } from '../../lib/worktree-paths.js';
+import type { ReadBudgetCandidate, ReadBudgetMeasurement } from '../../../scripts/lib/read-budget-preflight.mjs';
 export declare const PRE_TOOL_SNAPSHOT_VERSION: 1;
 export declare const PRE_TOOL_EFFECT_PAYLOAD_VERSION: 1;
 export declare const PRE_TOOL_MAX_FUTURE_SKEW_MS: number;
@@ -13,6 +15,18 @@ export interface PreToolTodoSnapshot {
 export interface PreToolTrackingSnapshot {
     readonly running: number;
     readonly total: number;
+}
+export interface ReadBudgetWarningEntry {
+    readonly warnedAtSec: number;
+    readonly intentId?: string;
+}
+export interface PreToolReadBudgetSnapshot {
+    readonly statePath: string;
+    readonly warnings: Readonly<Record<string, ReadBudgetWarningEntry>>;
+    readonly observations: Readonly<Record<string, {
+        readonly candidate: ReadBudgetCandidate;
+        readonly measurement: ReadBudgetMeasurement;
+    }>>;
 }
 export interface PreToolTeamSnapshot {
     readonly active: boolean;
@@ -31,6 +45,7 @@ export interface PreToolTranscriptSnapshot {
 }
 export interface PreToolCopilotDefaultsSnapshot {
     readonly model: string;
+    readonly modelOverride?: string;
     readonly reasoningEffort: string;
     readonly warning: string;
 }
@@ -104,10 +119,12 @@ export interface PreToolBatchSnapshot {
     readonly quietLevel: number;
     readonly todo: PreToolTodoSnapshot;
     readonly tracking: PreToolTrackingSnapshot;
+    readonly readBudget: PreToolReadBudgetSnapshot;
     readonly team: PreToolTeamSnapshot;
     readonly modeActive: boolean;
     readonly modeStates: Readonly<Record<string, PreToolStateSnapshot>>;
     readonly omcConfig: Readonly<Record<string, unknown>>;
+    readonly skillAgentTypes: Readonly<Record<string, string>>;
     readonly modelRouting: PreToolModelRoutingSnapshot;
     readonly transcript: PreToolTranscriptSnapshot;
     readonly ultragoal: PreToolUltragoalSnapshot;
@@ -158,6 +175,11 @@ export interface ForceDelegationAttemptEffectPayload extends PreToolEffectPayloa
     readonly toolName: string;
     readonly observedAtSec: number;
 }
+export interface ReadBudgetWarningEffectPayload extends PreToolEffectPayloadBase {
+    readonly stateDir: string;
+    readonly path: string;
+    readonly observedAtSec: number;
+}
 export interface SupportSkillUpsertEffectPayload extends PreToolEffectPayloadBase {
     readonly directory: string;
     readonly sessionId: string;
@@ -190,8 +212,8 @@ export interface AskUserNotifyEffectPayload extends PreToolEffectPayloadBase {
     readonly sessionId: string;
     readonly question: string;
 }
-export type PreToolEffectPayload = TraceSkillAttemptEffectPayload | ForceDelegationAttemptEffectPayload | SupportSkillUpsertEffectPayload | ModeConfirmEffectPayload | AdvisoryClaimEffectPayload | AskUserNotifyEffectPayload;
-export type PreToolEffectType = 'pretool.trace-skill-attempt.v1' | 'pretool.force-delegation-attempt.v1' | 'pretool.support-skill-upsert.v1' | 'pretool.mode-confirm.v1' | 'pretool.advisory-claim.v1' | 'pretool.ask-user-notify.v1';
+export type PreToolEffectPayload = TraceSkillAttemptEffectPayload | ForceDelegationAttemptEffectPayload | ReadBudgetWarningEffectPayload | SupportSkillUpsertEffectPayload | ModeConfirmEffectPayload | AdvisoryClaimEffectPayload | AskUserNotifyEffectPayload;
+export type PreToolEffectType = 'pretool.trace-skill-attempt.v1' | 'pretool.force-delegation-attempt.v1' | 'pretool.read-budget-warning.v1' | 'pretool.support-skill-upsert.v1' | 'pretool.mode-confirm.v1' | 'pretool.advisory-claim.v1' | 'pretool.ask-user-notify.v1';
 export interface PreToolHookEffect extends HookEffect {
     readonly type: PreToolEffectType;
     readonly payload: PreToolEffectPayload;
@@ -245,13 +267,19 @@ export interface PreToolSnapshotDependencies {
     readonly now?: () => number;
     readonly createDeliveryNonce?: () => string;
     readonly currentDirectory?: () => string;
+    readonly pluginRoot?: string;
     readonly environment?: () => Readonly<Record<string, string | undefined>>;
     readonly resolveOmcRoot?: (directory: string) => string;
+    readonly resolveSessionStatePaths?: typeof resolveSessionStatePaths;
     readonly readJson?: (path: string) => unknown;
     readonly readText?: (path: string, maxBytes?: number) => string | null;
     readonly readTextTail?: (path: string, maxBytes: number) => string | null;
     readonly listDirectories?: (path: string) => readonly string[];
     readonly fileExists?: (path: string) => boolean;
+    readonly measureReadBudget?: (candidate: ReadBudgetCandidate) => ReadBudgetMeasurement | null;
+}
+export interface ReadBudgetWarningMutationResult {
+    readonly status: 'written' | 'duplicate' | 'changed' | 'failed';
 }
 export interface SupportSkillMutationResult {
     readonly status: 'written' | 'skipped' | 'repaired' | 'failed';
@@ -283,6 +311,7 @@ export type ForceDelegationReservationResult = {
 export interface PreToolEffectDependencies {
     readonly appendTraceAttempt: (payload: TraceSkillAttemptEffectPayload, disposition: PreToolFinalDisposition) => ReplayAppendOnceResult;
     readonly writeForceDelegationAttempt: (payload: ForceDelegationAttemptEffectPayload, disposition: PreToolFinalDisposition) => ForceDelegationWriteResult;
+    readonly recordReadBudgetWarning?: (payload: ReadBudgetWarningEffectPayload) => ReadBudgetWarningMutationResult;
     readonly upsertSupportSkill: (payload: SupportSkillUpsertEffectPayload) => SupportSkillMutationResult;
     readonly confirmMode: (payload: ModeConfirmEffectPayload) => ModeConfirmationMutationResult;
     readonly claimAdvisory: (payload: AdvisoryClaimEffectPayload) => AdvisoryClaimDisposition;

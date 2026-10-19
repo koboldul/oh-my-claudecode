@@ -6,18 +6,12 @@
 import { openSync, writeSync, fsyncSync, closeSync, renameSync, unlinkSync, mkdirSync, existsSync, readFileSync, readdirSync, linkSync, statSync, fstatSync } from 'fs';
 import { dirname, basename, join } from 'path';
 import { createHash, randomUUID } from 'crypto';
+import { decodeProcessStartFromFilename, encodeProcessStartForFilename, normalizeProcessStartIdentity } from '../../templates/hooks/lib/process-start-identity.mjs';
 import { processStartIdentity, acquireStateFileLockSync, releaseStateFileLockSync, withStateFileLockSync, isStateFileLockingSupported, isExclusiveStateLockingAvailable, getStateFileLockDiagnostic, getStateFileLockFailureMessage, acquireRecoveryClaim, readRecoveryClaim, releaseRecoveryClaim, sameRecoveryClaim, isEmergencyOwnerLive } from './state-lock.mjs';
 export { acquireStateFileLockSync, releaseStateFileLockSync, withStateFileLockSync, isStateFileLockingSupported, isExclusiveStateLockingAvailable, getStateFileLockDiagnostic, getStateFileLockFailureMessage };
 function journalIsOwned(path, transactionId, owner) { const current = readEmergencyJournal(path); return current !== null && current.transactionId === transactionId && isSameEmergencyOwner(current.owner, owner); }
 function isSameEmergencyOwner(left, right) { return left && right && left.pid === right.pid && left.processStart === right.processStart && left.nonce === right.nonce; }
 function emergencyJournalPath(path) { return `${path}.emergency-journal.json`; }
-// Windows process-start identities carry a `<scheme>:<value>` prefix (see
-// processStartIdentity in state-lock.mjs); the literal colon is illegal in
-// NTFS filenames, so identities embedded in temp names are encoded here and
-// decoded when parsed back out of a directory listing. Mirrors
-// encodeProcessStartForFilename in src/lib/mode-state-io.ts.
-function encodeProcessStartForFilename(processStart) { return processStart.replace(/:/g, '_c_'); }
-function decodeProcessStartFromFilename(encoded) { return encoded.replace(/_c_/g, ':'); }
 function stateDigest(raw) { return createHash('sha256').update(raw).digest('hex'); }
 function publishEmergencyFileExclusive(path, content) { const processStart = processStartIdentity(process.pid); if (!processStart || processStart === 'absent') return false; const tempPath = `${path}.${process.pid}.${encodeProcessStartForFilename(processStart)}.${randomUUID()}.tmp`; let fd; try { ensureDirSync(dirname(path)); fd = openSync(tempPath, 'wx', 0o600); writeAllSync(fd, content, 'emergency publication'); fsyncSync(fd); closeSync(fd); fd = undefined; linkSync(tempPath, path); unlinkSync(tempPath); return true; } catch { try { if (fd !== undefined) closeSync(fd); } catch {} try { unlinkSync(tempPath); } catch {} return false; } }
 function writeEmergencyJournal(path, journal, requireOwnership = true) {
@@ -158,8 +152,10 @@ function reconcileEmergencyPublicationTemps(filePath, authorizeState) {
     const match = pattern.exec(name);
     if (!match) continue;
     const path = join(directory, name);
+    const matchedProcessStart = decodeProcessStartFromFilename(match[3]);
     const currentStart = processStartIdentity(Number(match[2]));
-    if (currentStart === null || currentStart === decodeProcessStartFromFilename(match[3])) return false;
+    if (currentStart === null ||
+      normalizeProcessStartIdentity(currentStart) === normalizeProcessStartIdentity(matchedProcessStart)) return false;
     const generation = fileIdentity(path);
     try {
       if (!generation) return false;
@@ -173,7 +169,7 @@ function reconcileEmergencyPublicationTemps(filePath, authorizeState) {
           if (!state || typeof state !== 'object' || Array.isArray(state) || !authorizeState(state)) return false;
         } else {
           const claim = readRecoveryClaim(path);
-          if (!claim || claim.pid !== Number(match[2]) || claim.processStart !== match[3] || claim.nonce !== match[4]) return false;
+          if (!claim || claim.pid !== Number(match[2]) || claim.processStart !== matchedProcessStart || claim.nonce !== match[4]) return false;
         }
       }
       if (!sameFile(path, generation) || stateDigest(readFileSync(path, 'utf8')) !== stateDigest(raw)) return false;

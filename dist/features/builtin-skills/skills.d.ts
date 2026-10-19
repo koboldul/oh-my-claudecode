@@ -9,6 +9,7 @@
  * Adapted from oh-my-opencode's builtin-skills feature.
  */
 import type { BuiltinSkill } from './types.js';
+export { getSkillsDir, loadBuiltinSkillRegistrations, type BuiltinSkillRegistration, } from './registry.js';
 export declare function getDeepInterviewSettingsPaths(): {
     profile: string;
     project: string;
@@ -37,8 +38,4 @@ export declare function listBuiltinSkillNames(options?: ListBuiltinSkillNamesOpt
  * Clear the skills cache (useful for testing)
  */
 export declare function clearSkillsCache(): void;
-/**
- * Get the skills directory path (useful for debugging)
- */
-export declare function getSkillsDir(): string;
 //# sourceMappingURL=skills.d.ts.map

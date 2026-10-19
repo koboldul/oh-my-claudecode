@@ -1413,6 +1413,17 @@ var fs = __toESM(require("fs/promises"), 1);
 var fsSync = __toESM(require("fs"), 1);
 var path = __toESM(require("path"), 1);
 var crypto = __toESM(require("crypto"), 1);
+
+// src/lib/file-identity.ts
+function identitiesEqual(left, right) {
+  if (!left || left.ino !== right.ino) return false;
+  if (left.dev === 0 || right.dev === 0) {
+    return left.ino !== 0 && (process.platform === "win32" || left.dev === right.dev);
+  }
+  return left.dev === right.dev;
+}
+
+// src/lib/atomic-write.ts
 function ensureDirSync(dir) {
   if (fsSync.existsSync(dir)) {
     return;
@@ -1459,12 +1470,6 @@ function identityForPath(lockPath) {
   } catch {
     return null;
   }
-}
-function identitiesEqual(left, right) {
-  if (!left) return false;
-  if (left.ino !== right.ino) return false;
-  if (left.dev === 0 || right.dev === 0) return left.ino !== 0;
-  return left.dev === right.dev;
 }
 function parseObservedLock(raw) {
   try {

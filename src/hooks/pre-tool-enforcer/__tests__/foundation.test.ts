@@ -1,15 +1,17 @@
 import {
   closeSync,
   ftruncateSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
   rmSync,
+  writeFileSync,
   writeSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { normalizeHookEnvelope } from '../../bridge-normalize.js';
 import { reduceHookEvaluations } from '../../hook-runtime.js';
 import type {
@@ -59,12 +61,18 @@ function makeSnapshot(
       running: 0,
       total: 0,
     },
+    readBudget: {
+      statePath: join(STATE_DIR, 'read-budget-warnings.json'),
+      warnings: {},
+      observations: {},
+    },
     team: {
       active: false,
     },
     modeActive: false,
     modeStates: {},
     omcConfig: {},
+    skillAgentTypes: {},
     modelRouting: {
       forceInherit: false,
       claudeModel: '',
@@ -643,6 +651,157 @@ describe('transactional PreToolUse foundation', () => {
     expect(source).not.toMatch(/notifyOnce|appendReplayEventOnce|writeFileSync/);
   });
 
+  it.each(['agent_type', 'subagent_type'])(
+    'denies a canonical skill passed via native Copilot %s before routing',
+    (field) => {
+      const pluginRoot = join(DIRECTORY, 'plugin');
+      const skillsDirectory = join(pluginRoot, 'skills');
+      const input = {
+        [field]: 'OMC:LeArNeR',
+        prompt: 'Use the registered skill',
+        model: 'gpt-6.1-sol',
+        reasoning_effort: 'high',
+      };
+      const envelope = copilotEnvelope([{
+        id: 'native-skill-agent',
+        name: 'task',
+        args: input,
+      }]);
+      expect(envelope.host).toBe('copilot');
+      expect(envelope.toolCalls[0].canonicalName).toBe('Task');
+      const snapshot = loadPreToolBatchSnapshot(envelope, {
+        now: () => NOW_MS,
+        environment: () => ({
+          HOME: 'C:\\home',
+          OMC_ROUTING_FORCE_INHERIT: 'true',
+        }),
+        pluginRoot,
+        resolveOmcRoot: () => OMC_ROOT,
+        readJson: () => null,
+        readText: (path) =>
+          path === join(skillsDirectory, 'skillify', 'SKILL.md')
+            ? '---\nname: skillify\naliases: [learner]\n---\nSkill body'
+            : path === join(skillsDirectory, 'learner', 'SKILL.md')
+              ? '---\nname: learner\n---\nLegacy body'
+              : null,
+        listDirectories: (path) =>
+          path === skillsDirectory ? ['learner', 'skillify'] : [],
+        fileExists: () => false,
+      });
+
+      const { reduction, plan } = reducePlan(envelope, snapshot);
+
+      expect(reduction.decision).toBe('deny');
+      expect(reduction.reason).toContain('[SKILL vs AGENT]');
+      expect(reduction.reason).toContain('Skill(skill="oh-my-claudecode:skillify")');
+      expect(reduction.reason).toContain('Do NOT substitute');
+      expect(plan.evaluations[0].mutation).toBeUndefined();
+      expect(envelope.toolCalls[0].input).toEqual(input);
+    },
+  );
+
+  it('measures native full views once and skips native bounded and page reads', () => {
+    const path = join(DIRECTORY, 'large.ts');
+    const borrowedMeasurement = {
+      over: true,
+      lineCount: Number.NaN,
+      byteSize: 90_000,
+      trigger: 'bytes' as const,
+    };
+    const measure = vi.fn(() => borrowedMeasurement);
+    const envelope = copilotEnvelope([
+      { id: 'full-view', name: 'view', args: { path } },
+      { id: 'bounded-view', name: 'view', args: { path, view_range: [1, 100] } },
+      { id: 'tail-view', name: 'view', args: { path, view_range: [100, -1] } },
+      { id: 'whole-range', name: 'view', args: { path, view_range: [1, -1] } },
+      { id: 'page-read', name: 'read', args: { path, pages: '2-4' } },
+    ]);
+    expect(envelope.toolCalls.map((call) => call.canonicalName))
+      .toEqual(['Read', 'Read', 'Read', 'Read', 'Read']);
+    const snapshot = loadPreToolBatchSnapshot(envelope, {
+      now: () => NOW_MS,
+      environment: () => ({ HOME: 'C:\\home', OMC_QUIET: '2' }),
+      resolveOmcRoot: () => OMC_ROOT,
+      readJson: () => null,
+      readText: () => null,
+      listDirectories: () => [],
+      fileExists: () => false,
+      measureReadBudget: measure,
+    });
+    borrowedMeasurement.byteSize = 1;
+
+    expect(measure).toHaveBeenCalledTimes(1);
+    expect(Object.keys(snapshot.readBudget.observations)).toEqual([
+      'full-view',
+      'whole-range',
+    ]);
+    expect(snapshot.readBudget.observations['full-view'].measurement.byteSize)
+      .toBe(90_000);
+    expect(Object.isFrozen(borrowedMeasurement)).toBe(false);
+    expect(Object.isFrozen(snapshot.readBudget.observations['full-view'].measurement))
+      .toBe(true);
+    const { plan, reduction } = reducePlan(envelope, snapshot);
+    expect(plan.evaluations.map((evaluation) => evaluation.decision))
+      .toEqual(['pass', 'pass', 'pass', 'deny', 'pass']);
+    expect(reduction.decision).toBe('deny');
+    expect(reduction.reason).toContain('[OMC READ BUDGET]');
+    expect(plan.evaluations[0].effects).toEqual([
+      expect.objectContaining({
+        type: 'pretool.read-budget-warning.v1',
+        commitOn: 'accepted',
+        critical: true,
+      }),
+    ]);
+    expect(measure).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a read-budget warning visible when its routine advisory is throttled', () => {
+    const envelope = claudeEnvelope('Read', {
+      file_path: join(DIRECTORY, 'large.ts'),
+    });
+    const snapshot = makeSnapshot({
+      quietLevel: 0,
+      readBudget: {
+        statePath: join(STATE_DIR, 'read-budget-warnings.json'),
+        warnings: {},
+        observations: {
+          'call-1': {
+            candidate: {
+              path: join(DIRECTORY, 'large.ts'),
+              displayPath: 'large.ts',
+              maxLines: 1500,
+              maxBytes: 45000,
+              mode: 'warn-then-deny',
+            },
+            measurement: {
+              over: true,
+              lineCount: Number.NaN,
+              byteSize: 90_000,
+              trigger: 'bytes',
+            },
+          },
+        },
+      },
+    });
+    const { plan, reduction } = reducePlan(envelope, snapshot);
+    const advisory = plan.calls[0].advisoryCandidate;
+    expect(advisory).toBeDefined();
+    if (!advisory) throw new Error('Expected the routine Read advisory.');
+
+    const output = encodePreToolEnforcerOutput(envelope, finalizePreToolReduction(
+      plan,
+      reduction,
+      commitReport('accepted', { [advisory.intentId]: 'throttled' }),
+    ));
+
+    expect(output).toMatchObject({
+      hookSpecificOutput: {
+        additionalContext: expect.stringContaining('[OMC READ BUDGET]'),
+      },
+    });
+    expect(output.suppressOutput).toBeUndefined();
+  });
+
   it('plans deterministically without mutating its envelope or snapshot', () => {
     const envelope = claudeEnvelope('Skill', {
       skill: 'oh-my-claudecode:plan',
@@ -1131,6 +1290,154 @@ describe('transactional PreToolUse foundation', () => {
       expect(finalized.legacyPresentation?.kind).toBe(presentation);
     },
   );
+});
+
+describe('read-budget configuration precedence', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'pretool-budget-config-'));
+    mkdirSync(join(tempDir, 'profile'), { recursive: true });
+    mkdirSync(join(tempDir, '.omc'), { recursive: true });
+    for (const name of ['large.ts', 'global-allowed.ts', 'project-allowed.ts']) {
+      writeFileSync(join(tempDir, name), 'x\n'.repeat(20));
+    }
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function configuredBudget(
+    globalConfig: Record<string, unknown>,
+    projectConfig: Record<string, unknown>,
+    files: readonly string[] = ['large.ts'],
+    environment: Readonly<Record<string, string>> = {},
+  ) {
+    writeFileSync(
+      join(tempDir, 'profile', '.omc-config.json'),
+      JSON.stringify(globalConfig),
+    );
+    writeFileSync(
+      join(tempDir, '.omc', 'config.json'),
+      JSON.stringify(projectConfig),
+    );
+    const envelope = normalizeHookEnvelope({
+      sessionId: 'budget-config-session',
+      cwd: tempDir,
+      toolCalls: files.map((name, index) => ({
+        id: `config-read-${index}`,
+        name: 'view',
+        args: JSON.stringify({ path: join(tempDir, name) }),
+      })),
+    }, 'pre-tool-use');
+    const snapshot = loadPreToolBatchSnapshot(envelope, {
+      now: () => NOW_MS,
+      currentDirectory: () => tempDir,
+      environment: () => ({
+        HOME: tempDir,
+        USERPROFILE: tempDir,
+        CLAUDE_CONFIG_DIR: join(tempDir, 'profile'),
+        OMC_QUIET: '2',
+        ...environment,
+      }),
+      resolveOmcRoot: () => join(tempDir, '.omc'),
+      readText: () => null,
+      listDirectories: () => [],
+      fileExists: () => false,
+    });
+    return { snapshot, ...reducePlan(envelope, snapshot) };
+  }
+
+  it('honors project deny limits despite an unrelated global config without merging generic policy', () => {
+    const globalConfig = { notifications: { enabled: true } };
+    const { snapshot, reduction } = configuredBudget(globalConfig, {
+      context: { readBudget: { mode: 'deny', maxLines: 5, maxBytes: 1000 } },
+      routing: {
+        forceDelegation: {
+          enforce: true,
+          rules: [{ pattern: 'Read', threshold: { count: 1 } }],
+        },
+      },
+    });
+
+    expect(snapshot.omcConfig).toEqual(globalConfig);
+    expect(snapshot.forceDelegation).toBeNull();
+    expect(reduction.decision).toBe('deny');
+    expect(reduction.reason).toContain('20 lines (budget 5)');
+  });
+
+  it.each([
+    ['enabled:false', { enabled: false }, ['pass', 'pass']],
+    ['replacement allowPaths', { allowPaths: ['**/project-allowed.ts'] }, ['deny', 'pass']],
+    ['empty allowPaths', { allowPaths: [] }, ['deny', 'deny']],
+  ] as const)('honors project %s over global budget fields', (_name, readBudget, decisions) => {
+    const { plan } = configuredBudget({
+      context: {
+        readBudget: {
+          enabled: true,
+          mode: 'deny',
+          maxLines: 5,
+          maxBytes: 1000,
+          allowPaths: ['**/global-allowed.ts'],
+        },
+      },
+    }, { context: { readBudget } }, ['global-allowed.ts', 'project-allowed.ts']);
+
+    expect(plan.evaluations.map((evaluation) => evaluation.decision))
+      .toEqual(decisions);
+  });
+
+  it('inherits unspecified global limits, mode, and allowPaths with a partial project override', () => {
+    const { snapshot, plan } = configuredBudget({
+      context: {
+        readBudget: {
+          enabled: true,
+          mode: 'deny',
+          maxLines: 50,
+          maxBytes: 25,
+          allowPaths: ['**/global-allowed.ts'],
+        },
+      },
+    }, {
+      context: { readBudget: { maxLines: 100 } },
+    }, ['large.ts', 'global-allowed.ts']);
+
+    expect(snapshot.readBudget.observations['config-read-0'].candidate)
+      .toMatchObject({ maxLines: 100, maxBytes: 25, mode: 'deny' });
+    expect(plan.evaluations.map((evaluation) => evaluation.decision))
+      .toEqual(['deny', 'pass']);
+    expect(plan.evaluations[0].reason).toContain('40 bytes (budget 25)');
+  });
+
+  it.each([
+    ['project fields', {}, 'deny', { maxLines: 5, maxBytes: 100 }],
+    [
+      'environment limits',
+      { OMC_READ_BUDGET_MAX_LINES: '100', OMC_READ_BUDGET_MAX_BYTES: '1000' },
+      'pass',
+      { maxLines: 100, maxBytes: 1000 },
+    ],
+    ['environment off switch', { OMC_READ_BUDGET: 'off' }, 'pass', null],
+  ] as const)('applies %s at the correct precedence', (_name, environment, decision, limits) => {
+    const { snapshot, reduction } = configuredBudget({
+      context: {
+        readBudget: { enabled: false, mode: 'warn', maxLines: 1000, maxBytes: 10000 },
+      },
+    }, {
+      context: {
+        readBudget: { enabled: true, mode: 'deny', maxLines: 5, maxBytes: 100 },
+      },
+    }, ['large.ts'], environment);
+
+    expect(reduction.decision).toBe(decision);
+    if (limits) {
+      expect(snapshot.readBudget.observations['config-read-0'].candidate)
+        .toMatchObject({ ...limits, mode: 'deny' });
+    } else {
+      expect(snapshot.readBudget.observations).toEqual({});
+    }
+  });
 });
 
 describe('Claude legacy output goldens', () => {

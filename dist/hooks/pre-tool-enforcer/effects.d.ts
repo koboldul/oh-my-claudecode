@@ -1,5 +1,5 @@
 import type { CanonicalHookEnvelope, HookEffect, HookReduction } from '../hook-protocol.js';
-import { type AdvisoryClaimDisposition, type AdvisoryClaimEffectPayload, type ForceDelegationAttemptEffectPayload, type ForceDelegationReservationResult, type ForceDelegationWriteResult, type PreToolEffectCommitReport, type PreToolEffectDependencies, type PreToolEffectRuntimeContext, type PreToolFinalDisposition, type PreToolBatchSnapshot } from './types.js';
+import { type AdvisoryClaimDisposition, type AdvisoryClaimEffectPayload, type ForceDelegationAttemptEffectPayload, type ForceDelegationReservationResult, type ForceDelegationWriteResult, type PreToolEffectCommitReport, type PreToolEffectDependencies, type PreToolEffectRuntimeContext, type PreToolFinalDisposition, type PreToolBatchSnapshot, type ReadBudgetWarningEffectPayload, type ReadBudgetWarningMutationResult } from './types.js';
 /**
  * Re-plan and reserve force-delegation attempts against the latest durable
  * ledger under one owner lock. Callers must use the returned plan for final
@@ -10,6 +10,11 @@ export declare function reserveAndPlanPreToolBatch(envelope: CanonicalHookEnvelo
  * Atomic, bounded owner write for the force-delegation attempt window.
  */
 export declare function writeForceDelegationAttemptLocked(payload: ForceDelegationAttemptEffectPayload, disposition: PreToolFinalDisposition): ForceDelegationWriteResult;
+/**
+ * Consume the warn-once allowance only for an accepted read. The owner lock
+ * merges unrelated warnings and detects a concurrent winner or replay.
+ */
+export declare function recordReadBudgetWarningLocked(payload: ReadBudgetWarningEffectPayload): ReadBudgetWarningMutationResult;
 /**
  * Post-reduction tri-state advisory claim. State failure is indeterminate so
  * the caller can fail open and still emit the safety context.

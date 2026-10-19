@@ -143,14 +143,19 @@ The `init` and `maintenance` matchers remain explicit Claude behavior in `hooks/
 
 ### PreToolUse
 
-Fires immediately before Claude uses a tool.
+Fires immediately before Claude Code or GitHub Copilot CLI uses a tool.
 
 | Script | Role | Timeout |
 |--------|------|---------|
 | `pre-tool-enforcer.mjs` | Validates rules before tool use | 10s |
 
 Runs on all tool calls (`matcher: "*"`). Enforces agent permission restrictions (e.g., blocking Write/Edit for read-only agents).
-Denies Task/Agent calls whose `subagent_type` names a bundled skill (issue #3667): instead of Claude Code's generic native "Agent type not found", the hook returns a precise error naming the Skill tool and the correct identifier, and forbids closest-match agent substitution.
+Denies Task/Agent calls whose `subagent_type` or `agent_type` names a bundled skill (issue #3667): instead of the generic native "Agent type not found", the hook returns a precise error naming the Skill tool and canonical skill identifier, and forbids closest-match agent substitution. Real agent definitions win name collisions; bare native agent names are not mistaken for skill-directory aliases. This guard runs before model routing, including explicit-model and force-inherit paths.
+The thin shipped wrapper delegates observations, pure call planning, and durable effects to `src\hooks\pre-tool-enforcer`; upstream behavior changes belong in that canonical runtime rather than a separate wrapper implementation.
+
+Active-agent counters use the current session's canonical tracking state before validated legacy fallbacks, including centralized `OMC_STATE_DIR` storage. Invoking `ralph` confirms Ralph state only; it does not confirm retired `ultrawork` state.
+
+Unbounded `Read`/`View` calls and bare `cat <file>` shell reads are subject to `context.readBudget`. Defaults are 1,500 lines, 45,000 bytes, and `mode: "warn-then-deny"`; `warn` and `deny` modes are also supported. Project budget fields override corresponding global fields and inherit unspecified global settings; unrelated global configuration does not mask a project budget. Bounded reads, page selections, binary files, and configured `allowPaths` remain allowed. `OMC_READ_BUDGET=off` disables the gate; `OMC_READ_BUDGET_MAX_LINES` and `OMC_READ_BUDGET_MAX_BYTES` override the limits.
 The exact canonical shipped script runs in the trusted Worker path; untrusted paths, event mismatches, and extra arguments retain the isolated child-process fallback.
 
 ### PermissionRequest

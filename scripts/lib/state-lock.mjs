@@ -3,6 +3,7 @@ import { basename, dirname, join, resolve } from 'path';
 import { randomUUID } from 'crypto';
 import { spawnSync } from 'child_process';
 import { createRequire } from 'module';
+import { normalizeProcessStartIdentity } from '../../templates/hooks/lib/process-start-identity.mjs';
 
 const require = createRequire(import.meta.url);
 const SQLITE_NATIVE_BINDING = 'better_sqlite3.node';
@@ -41,6 +42,7 @@ let lastLockFailure = null;
 let lastLockFailureDetail = null;
 
 function ownProcessStartIdentity() {
+  if (process.env.NODE_ENV === 'test' && process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(process.pid)) return null;
   if (ownIdentityCache === null) ownIdentityCache = processStartIdentity(process.pid);
   return ownIdentityCache;
 }
@@ -59,6 +61,8 @@ function writeAllSync(fd, content, label) {
 export function processStartIdentity(pid) {
   if (process.env.NODE_ENV === 'test' && process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(pid)) return null;
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  // Only our own process lifetime is immutable; external PIDs must be re-probed.
+  if (pid === process.pid && ownIdentityCache !== null) return ownIdentityCache;
   if (process.platform === 'linux') {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
@@ -138,7 +142,8 @@ function readOwner(path) {
 
 function ownerLive(owner) {
   const current = processStartIdentity(owner.pid);
-  return current === null ? null : current === 'absent' ? false : current === owner.processStart;
+  return current === null ? null : current === 'absent' ? false :
+    normalizeProcessStartIdentity(current) === normalizeProcessStartIdentity(owner.processStart);
 }
 
 function sameOwner(left, right) {

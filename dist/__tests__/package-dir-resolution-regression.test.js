@@ -38,8 +38,8 @@ describe('package dir resolution regression (#1322, #1324)', () => {
         expect(snippet).toContain('fileURLToPath(import.meta.url)');
         expect(snippet.indexOf("typeof __dirname !== 'undefined'")).toBeLessThan(snippet.indexOf('fileURLToPath(import.meta.url)'));
     });
-    it('src/features/builtin-skills/skills.ts checks __dirname before import.meta.url', () => {
-        const source = readFileSync(join(REPO_ROOT, 'src', 'features', 'builtin-skills', 'skills.ts'), 'utf-8');
+    it('src/features/builtin-skills/registry.ts checks __dirname before import.meta.url', () => {
+        const source = readFileSync(join(REPO_ROOT, 'src', 'features', 'builtin-skills', 'registry.ts'), 'utf-8');
         const snippet = getSnippetByMarker(source, 'function getPackageDir(): string {');
         expect(snippet).toContain("typeof __dirname !== 'undefined'");
         expect(snippet).toContain("currentDirName === 'bridge'");

@@ -38,9 +38,8 @@ export type ModeName = typeof MODE_NAMES[keyof typeof MODE_NAMES];
 export const MODE_CONFIRMATION_SKILL_MAP: Readonly<
   Record<string, readonly string[]>
 > = {
-  ralph: ['ralph', 'ultrawork'],
+  ralph: ['ralph'],
   ultragoal: ['ultragoal'],
-  ultrawork: ['ultrawork'],
   autopilot: ['autopilot'],
   ralplan: ['ralplan'],
 };

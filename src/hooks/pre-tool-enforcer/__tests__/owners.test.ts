@@ -60,10 +60,13 @@ import {
   claimAdvisoryThrottleLocked,
   commitPreToolEffects,
   reserveAndPlanPreToolBatch,
+  recordReadBudgetWarningLocked,
   writeForceDelegationAttemptLocked,
 } from '../effects.js';
 import { loadPreToolBatchSnapshot } from '../snapshot.js';
+import { planPreToolBatch } from '../evaluate.js';
 import { normalizeHookEnvelope } from '../../bridge-normalize.js';
+import { reduceHookEvaluations } from '../../hook-runtime.js';
 import {
   claimProvisionalNotificationReceipt,
   finalizeNotificationReceiptQueued,
@@ -73,6 +76,7 @@ import {
 import type {
   AdvisoryClaimEffectPayload,
   ForceDelegationAttemptEffectPayload,
+  ReadBudgetWarningEffectPayload,
 } from '../types.js';
 import { PRE_TOOL_EFFECT_PAYLOAD_VERSION } from '../types.js';
 import type { HookReduction } from '../../hook-protocol.js';
@@ -1380,6 +1384,167 @@ describe('PreToolUse owner APIs', () => {
     })).toBe('indeterminate');
     expect(readJson(advisoryPath).generation)
       .toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it('commits read-budget warnings once and denies subsequent native full views', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW_MS);
+    const filePath = join(tempDir, 'large.ts');
+    const statePath = join(tempDir, '.omc', 'state', 'read-budget-warnings.json');
+    writeFileSync(filePath, 'x'.repeat(50_000));
+    const input = { path: filePath, forceReadLargeFiles: true };
+    const envelopeFor = (id: string, args: Record<string, unknown> = input) => normalizeHookEnvelope({
+      sessionId: 'read-budget-owner',
+      cwd: tempDir,
+      toolCalls: [{ id, name: 'view', args: JSON.stringify(args) }],
+    }, 'pre-tool-use');
+    const load = (envelope: ReturnType<typeof envelopeFor>) =>
+      loadPreToolBatchSnapshot(envelope, {
+        now: () => NOW_MS,
+        environment: () => ({
+          HOME: tempDir,
+          USERPROFILE: tempDir,
+          OMC_QUIET: '2',
+        }),
+      });
+    const envelope = envelopeFor('first-full-view');
+    expect(envelope.toolCalls[0].canonicalName).toBe('Read');
+    const firstPlan = planPreToolBatch(envelope, load(envelope));
+    const firstReduction = reduceHookEvaluations(envelope, firstPlan.evaluations);
+
+    expect(firstReduction.decision).toBe('pass');
+    expect(firstReduction.context).toContain('[OMC READ BUDGET]');
+    const firstCommit = await commitPreToolEffects(
+      firstReduction.stagedEffects,
+      firstReduction,
+    );
+    expect(firstCommit.results).toContainEqual(expect.objectContaining({
+      type: 'pretool.read-budget-warning.v1',
+      status: 'committed',
+      critical: true,
+    }));
+    expect(readJson(statePath)).toMatchObject({
+      generation: 1,
+      warned: { [filePath]: NOW_SEC },
+    });
+    const persisted = readFileSync(statePath, 'utf8');
+
+    const replayPlan = planPreToolBatch(envelope, load(envelope));
+    const replayReduction = reduceHookEvaluations(envelope, replayPlan.evaluations);
+    expect(replayReduction.decision).toBe('pass');
+    const replayCommit = await commitPreToolEffects(
+      replayReduction.stagedEffects,
+      replayReduction,
+    );
+    expect(replayCommit.results).toContainEqual(expect.objectContaining({
+      type: 'pretool.read-budget-warning.v1',
+      status: 'duplicate',
+    }));
+    expect(readFileSync(statePath, 'utf8')).toBe(persisted);
+
+    const repeated = envelopeFor('second-full-view');
+    const repeatedPlan = planPreToolBatch(repeated, load(repeated));
+    expect(repeatedPlan.evaluations[0].decision).toBe('deny');
+    expect(repeatedPlan.evaluations[0].reason).toContain('[OMC READ BUDGET]');
+    expect(repeated.toolCalls[0].input).toEqual(input);
+
+    const bounded = envelopeFor('bounded-view', { ...input, view_range: [1, 100] });
+    expect(planPreToolBatch(bounded, load(bounded)).evaluations[0].decision)
+      .toBe('pass');
+    expect(bounded.toolCalls[0].input).toEqual({ ...input, view_range: [1, 100] });
+    expect(readFileSync(statePath, 'utf8')).toBe(persisted);
+  });
+
+  it('does not consume read-budget warnings when a repeated native batch is rejected', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW_MS);
+    const filePath = join(tempDir, 'large.ts');
+    writeFileSync(filePath, 'x'.repeat(50_000));
+    const envelope = normalizeHookEnvelope({
+      sessionId: 'read-budget-batch',
+      cwd: tempDir,
+      toolCalls: ['first-read', 'second-read'].map((id) => ({
+        id,
+        name: 'view',
+        args: JSON.stringify({ path: filePath }),
+      })),
+    }, 'pre-tool-use');
+    expect(envelope.toolCalls.map((call) => call.canonicalName))
+      .toEqual(['Read', 'Read']);
+    const snapshot = loadPreToolBatchSnapshot(envelope, {
+      now: () => NOW_MS,
+      environment: () => ({
+        HOME: tempDir,
+        USERPROFILE: tempDir,
+        OMC_QUIET: '2',
+      }),
+    });
+    const plan = planPreToolBatch(envelope, snapshot);
+    const reduction = reduceHookEvaluations(envelope, plan.evaluations);
+
+    expect(plan.evaluations.map((evaluation) => evaluation.decision))
+      .toEqual(['pass', 'deny']);
+    expect(reduction.decision).toBe('deny');
+    const report = await commitPreToolEffects(reduction.stagedEffects, reduction);
+    expect(report.disposition).toBe('rejected');
+    expect(report.results).toEqual([]);
+    expect(existsSync(snapshot.readBudget.statePath)).toBe(false);
+  });
+
+  it('merges read-budget warnings without extending replay timestamps or losing a concurrent winner', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW_MS);
+    const stateDir = join(tempDir, '.omc', 'state');
+    const first: ReadBudgetWarningEffectPayload = {
+      version: 1,
+      intentId: 'read-warning-first',
+      originalIndex: 0,
+      stateDir,
+      path: join(tempDir, 'first.ts'),
+      observedAtSec: NOW_SEC,
+    };
+    const second: ReadBudgetWarningEffectPayload = {
+      ...first,
+      intentId: 'read-warning-second',
+      path: join(tempDir, 'second.ts'),
+    };
+
+    expect(recordReadBudgetWarningLocked(first)).toEqual({ status: 'written' });
+    expect(recordReadBudgetWarningLocked(second)).toEqual({ status: 'written' });
+    const statePath = join(stateDir, 'read-budget-warnings.json');
+    const persisted = readFileSync(statePath, 'utf8');
+    expect(recordReadBudgetWarningLocked({
+      ...first,
+      observedAtSec: NOW_SEC + 1,
+    })).toEqual({ status: 'duplicate' });
+    expect(recordReadBudgetWarningLocked({
+      ...first,
+      intentId: 'read-warning-stale-snapshot',
+    })).toEqual({ status: 'changed' });
+    expect(readFileSync(statePath, 'utf8')).toBe(persisted);
+    expect(readJson(statePath)).toMatchObject({
+      generation: 2,
+      warned: { [first.path]: NOW_SEC, [second.path]: NOW_SEC },
+      intentIds: {
+        [first.path]: first.intentId,
+        [second.path]: second.intentId,
+      },
+    });
+  });
+
+  it('fails closed without overwriting a malformed read-budget warning ledger', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW_MS);
+    const stateDir = join(tempDir, '.omc', 'state');
+    const statePath = join(stateDir, 'read-budget-warnings.json');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(statePath, '{malformed');
+
+    expect(recordReadBudgetWarningLocked({
+      version: 1,
+      intentId: 'read-warning-corrupt',
+      originalIndex: 0,
+      stateDir,
+      path: join(tempDir, 'large.ts'),
+      observedAtSec: NOW_SEC,
+    })).toEqual({ status: 'failed' });
+    expect(readFileSync(statePath, 'utf8')).toBe('{malformed');
   });
 
   it('returns all throttle dispositions and retains only bounded recent state', () => {

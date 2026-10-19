@@ -19,6 +19,9 @@ const COPILOT_LUNA_MODEL = 'gpt-6-luna';
 const COPILOT_REASONING_EFFORT = 'max';
 
 function getCopilotModel(frontmatter) {
+  if (/^name:\s*executor\s*$/m.test(frontmatter)) {
+    return 'gpt-6.1-sol';
+  }
   const sourceModel = frontmatter.match(/^model:\s*(\S+)/m)?.[1] ?? '';
   return sourceModel.toLowerCase().includes('sonnet')
     ? COPILOT_LUNA_MODEL

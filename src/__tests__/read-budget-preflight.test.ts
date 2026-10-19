@@ -3,7 +3,6 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-// @ts-expect-error Local hook helper is a JS module loaded directly by the tests.
 import { evaluateReadBudget } from '../../scripts/lib/read-budget-preflight.mjs';
 
 type Evaluation = {
@@ -86,6 +85,19 @@ describe('read budget preflight: binaries, pages, remedy order, byte budget (iss
     expect(evaluate({ file_path: pdf, pages: '3-5' }, { maxBytes: 1000 })).toBeNull();
     expect(evaluate({ file_path: pdf, pages: 4 }, { maxBytes: 1000 })).toBeNull();
     expect(evaluate({ file_path: pdf, pages: [] }, { maxBytes: 1000 })).toBeNull(); // PDF is binary anyway
+  });
+
+  it('accepts native view ranges without letting [1, -1] bypass a full-read budget', () => {
+    const file = writeLines('native-view.ts', 4000);
+
+    expect(evaluate({ path: file, view_range: [1, 100] }, { maxLines: 100 }))
+      .toBeNull();
+    expect(evaluate({ path: file, view_range: [200, -1] }, { maxLines: 100 }))
+      .toBeNull();
+    expect(evaluate({ path: file, view_range: [1, -1] }, { maxLines: 100 })?.decision)
+      .toBe('block');
+    expect(evaluate({ path: file, view_range: [200, 100] }, { maxLines: 100 })?.decision)
+      .toBe('block');
   });
 
   it('fires on bytes when the line count is under budget', () => {

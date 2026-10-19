@@ -30,9 +30,8 @@ export const DEPRECATED_MODE_NAMES = {
  * outside ModeName but participates in the same confirmation-state contract.
  */
 export const MODE_CONFIRMATION_SKILL_MAP = {
-    ralph: ['ralph', 'ultrawork'],
+    ralph: ['ralph'],
     ultragoal: ['ultragoal'],
-    ultrawork: ['ultrawork'],
     autopilot: ['autopilot'],
     ralplan: ['ralplan'],
 };

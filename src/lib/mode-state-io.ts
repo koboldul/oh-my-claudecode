@@ -23,6 +23,7 @@ import {
 import { getProcessStartIdentitySync } from '../platform/process-utils.js';
 import { atomicWriteJsonSync } from './atomic-write.js';
 import { MODE_CONFIRMATION_SKILL_MAP } from './mode-names.js';
+import { decodeProcessStartFromFilename, encodeProcessStartForFilename, normalizeProcessStartIdentity } from '../../templates/hooks/lib/process-start-identity.mjs';
 
 type MutationLockOwner = { version: 1; pid: number; processStart: string; createdAt: string; nonce: string };
 type BetterSqlite3 = import('better-sqlite3').Database;
@@ -241,7 +242,8 @@ function ownerLive(owner: MutationLockOwner): boolean | null {
   if (process.env.NODE_ENV === 'test' && process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(owner.pid)) return null;
   const current = processStartIdentity(owner.pid);
   if (current === null) return null;
-  return current === 'absent' ? false : current === owner.processStart;
+  return current === 'absent' ? false :
+    normalizeProcessStartIdentity(current) === normalizeProcessStartIdentity(owner.processStart);
 }
 
 function publishLockOwner(path: string, owner: MutationLockOwner): boolean {
@@ -880,7 +882,8 @@ function sameEmergencyOwner(left: EmergencyJournalOwner, right: EmergencyJournal
 /** Unknown process identity is treated as live: stealing a claim is never safe. */
 function isEmergencyOwnerLive(owner: EmergencyJournalOwner): boolean {
   const current = processStartIdentity(owner.pid);
-  return current === null || (current !== 'absent' && current === owner.processStart);
+  return current === null || (current !== 'absent' &&
+    normalizeProcessStartIdentity(current) === normalizeProcessStartIdentity(owner.processStart));
 }
 
 function journalIsOwned(path: string, transactionId: string, owner: EmergencyJournalOwner): boolean {
@@ -894,22 +897,6 @@ function writeEmergencyJournal(path: string, journal: EmergencyMutationJournal, 
     atomicWriteJsonSync(path, journal);
     return !requireOwnership || journalIsOwned(path, journal.transactionId, journal.owner);
   } catch { return false; }
-}
-
-// Windows processStart is formatted as `windows-dmtf-us:<microseconds>` (see
-// getProcessStartIdentitySync); the literal colon is illegal in NTFS
-// filenames and made every linkSync() in publishEmergencyFileExclusive fail
-// with EINVAL. Filename-embedded process-start identities are sanitized
-// through these two functions (encode when building a temp name, decode
-// when parsing one back out of a directory listing) so the pid-reuse
-// staleness check in reconcileEmergencyPublicationTemps keeps working
-// unchanged cross-platform.
-function encodeProcessStartForFilename(processStart: string): string {
-  return processStart.replace(/:/g, '_c_');
-}
-
-function decodeProcessStartFromFilename(encoded: string): string {
-  return encoded.replace(/_c_/g, ':');
 }
 
 function emergencyPublicationTempPath(path: string): string | null {
@@ -1125,7 +1112,8 @@ function reconcileEmergencyPublicationTemps(filePath: string, authorizeState?: E
     const path = join(directory, name);
     const matchedProcessStart = decodeProcessStartFromFilename(match[3]);
     const currentStart = processStartIdentity(Number(match[2]));
-    if (currentStart === null || currentStart === matchedProcessStart) return false;
+    if (currentStart === null ||
+      normalizeProcessStartIdentity(currentStart) === normalizeProcessStartIdentity(matchedProcessStart)) return false;
     const generation = fileIdentity(path);
     try {
       if (!generation) return false;

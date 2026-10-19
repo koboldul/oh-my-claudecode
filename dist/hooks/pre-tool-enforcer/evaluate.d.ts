@@ -1,5 +1,5 @@
 import type { CanonicalHookEnvelope, CanonicalToolCall } from '../hook-protocol.js';
-import { type AdvisoryCandidate, type PreToolBatchPlan, type PreToolBatchSnapshot, type PreToolCallPlan, type PreToolHookEffect, type VirtualForceDelegationLedger } from './types.js';
+import { type AdvisoryCandidate, type PreToolBatchPlan, type PreToolBatchSnapshot, type PreToolCallPlan, type PreToolHookEffect, type ReadBudgetWarningEntry, type VirtualForceDelegationLedger } from './types.js';
 export interface ModelRoutingEvaluation {
     readonly updatedInput?: Readonly<Record<string, unknown>>;
     readonly warning: string;
@@ -32,7 +32,7 @@ export declare function buildAdvisoryCandidate(call: CanonicalToolCall, snapshot
  * Evaluate one canonical call without any filesystem, environment, clock,
  * subprocess, import, notification, or trace access.
  */
-export declare function evaluatePreToolCall(call: CanonicalToolCall, envelope: CanonicalHookEnvelope, snapshot: PreToolBatchSnapshot, ledger: VirtualForceDelegationLedger): PreToolCallPlan;
+export declare function evaluatePreToolCall(call: CanonicalToolCall, envelope: CanonicalHookEnvelope, snapshot: PreToolBatchSnapshot, ledger: VirtualForceDelegationLedger, readBudgetWarnings?: Readonly<Record<string, ReadBudgetWarningEntry>>): PreToolCallPlan;
 /**
  * Fold canonical calls in original host order while threading the virtual
  * force-delegation ledger. Duplicate advisory messages are claimed once.
