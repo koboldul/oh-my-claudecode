@@ -39,6 +39,11 @@ export declare function parseWindowsProcessStartIdentity(value: string): string 
  * `absent` proves the PID is not live; `null` means identity is unavailable.
  */
 export declare function getProcessStartIdentitySync(pid: number): ProcessStartIdentitySync;
+export interface CurrentProcessIdentityWarmOptions {
+    deadlineAt?: number;
+    signal?: AbortSignal;
+    onProbeSpawn?: (pid: number) => void;
+}
 /**
  * Get process start time for PID reuse detection.
  * Returns milliseconds timestamp on macOS/Windows, jiffies on Linux.
@@ -50,6 +55,11 @@ export declare function getProcessStartTime(pid: number, deadlineAt?: number): P
 export declare function gracefulKill(pid: number, gracePeriodMs?: number): Promise<'graceful' | 'forced' | 'failed'>;
 /** Convert a WMIC/CIM DMTF datetime to .NET ticks for a single Windows identity format. */
 export declare function dmtfCreationDateToTicks(dmtf: string): string | null;
+/**
+ * Warm the exact current-process identity used by synchronous file locking.
+ * Foreign PIDs are intentionally unsupported so no caller can seed authority.
+ */
+export declare function warmCurrentProcessStartIdentitySyncCache(options?: CurrentProcessIdentityWarmOptions): Promise<boolean>;
 /** Stable PID-reuse identity suitable for a durable worker manifest. */
 export declare function getProcessStartIdentity(pid: number, deadlineAt?: number): Promise<string | null>;
 export declare function isProcessIdentityLive(pid: number, expectedStartIdentity: string, deadlineAt?: number): Promise<'live' | 'dead' | 'mismatch' | 'unknown'>;

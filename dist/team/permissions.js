@@ -6,7 +6,7 @@
  * and cannot be mechanically restricted. Permissions are injected into
  * prompts as instructions for the LLM to follow.
  */
-import { relative, resolve } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 /**
  * Simple glob matching for path patterns.
  * Supports: * (any non-/ chars), ** (any depth including /), ? (single non-/ char), exact match.
@@ -89,10 +89,12 @@ function matchGlob(pattern, path) {
 export function isPathAllowed(permissions, filePath, workingDirectory) {
     // Normalize to relative path
     const absPath = resolve(workingDirectory, filePath);
-    const relPath = relative(workingDirectory, absPath);
+    const nativeRelPath = relative(workingDirectory, absPath);
     // If path escapes working directory, always deny
-    if (relPath.startsWith('..'))
+    if (nativeRelPath === '..' || nativeRelPath.startsWith(`..${sep}`) || isAbsolute(nativeRelPath)) {
         return false;
+    }
+    const relPath = nativeRelPath.split(sep).join('/');
     // Check denied paths first (they override)
     for (const pattern of permissions.deniedPaths) {
         if (matchGlob(pattern, relPath))
@@ -196,9 +198,13 @@ export function findPermissionViolations(changedPaths, permissions, cwd) {
         if (!isPathAllowed(permissions, filePath, cwd)) {
             // Determine which deny pattern matched for the reason
             const absPath = resolve(cwd, filePath);
-            const relPath = relative(cwd, absPath);
+            const nativeRelPath = relative(cwd, absPath);
+            const escaped = nativeRelPath === '..'
+                || nativeRelPath.startsWith(`..${sep}`)
+                || isAbsolute(nativeRelPath);
+            const relPath = nativeRelPath.split(sep).join('/');
             let reason;
-            if (relPath.startsWith('..')) {
+            if (escaped) {
                 reason = `Path escapes working directory: ${relPath}`;
             }
             else {

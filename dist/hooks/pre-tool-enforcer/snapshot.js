@@ -95,10 +95,13 @@ function stringValue(value) {
     return typeof value === 'string' ? value.trim() : '';
 }
 function numberFromEnvironment(value, fallback, minimum = Number.NEGATIVE_INFINITY, maximum = Number.POSITIVE_INFINITY) {
-    if (value === undefined || value === '')
+    if (value === undefined)
         return fallback;
-    const parsed = Number.parseInt(value, 10);
-    if (!Number.isFinite(parsed))
+    const normalized = value.trim();
+    if (!/^[+-]?\d+$/.test(normalized))
+        return fallback;
+    const parsed = Number(normalized);
+    if (!Number.isSafeInteger(parsed))
         return fallback;
     return Math.max(minimum, Math.min(maximum, parsed));
 }

@@ -12,6 +12,8 @@ import { isValidTeamInstanceId, type TeamInstanceId } from './types.js';
 import { absPath, TeamPaths } from './state-paths.js';
 import { atomicWriteJson } from '../lib/atomic-write.js';
 import { lockPathFor, withFileLock } from '../lib/file-lock.js';
+import { checkHostLoadGate } from '../lib/host-load-gate.js';
+import { gzipSync } from 'node:zlib';
 
 const WORKER_LAUNCH_SCHEMA_VERSION = 1 as const;
 
@@ -42,25 +44,114 @@ export function buildWindowsSupervisorSource(): string {
     'if ($hash -ne $payload.authority_digest) { throw "worker_launch_authority_digest_mismatch" }',
     'Add-Type @"',
     'using System; using System.Text; using System.Runtime.InteropServices;',
-    `public static class O { [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct STARTUPINFO { public int cb; public IntPtr lpReserved; public IntPtr lpDesktop; public IntPtr lpTitle; public int dwX; public int dwY; public int dwXSize; public int dwYSize; public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; } [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public uint dwProcessId; public uint dwThreadId; } [StructLayout(LayoutKind.Sequential)] public struct JOBOBJECT_BASIC_LIMIT_INFORMATION { public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass; } [StructLayout(LayoutKind.Sequential)] public struct IO_COUNTERS { public ulong ReadOperationCount; public ulong WriteOperationCount; public ulong OtherOperationCount; public ulong ReadTransferCount; public ulong WriteTransferCount; public ulong OtherTransferCount; } [StructLayout(LayoutKind.Sequential)] public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION { public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation; public IO_COUNTERS IoInfo; public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit; public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed; } [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir, ref STARTUPINFO si, out PROCESS_INFORMATION pi); [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr a, string n); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j, int c, IntPtr i, uint l); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p); [DllImport("kernel32.dll", SetLastError=true)] public static extern uint ResumeThread(IntPtr h); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j, uint c); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateProcess(IntPtr p, uint c); [DllImport("kernel32.dll", SetLastError=true)] public static extern uint WaitForSingleObject(IntPtr h, uint ms); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetExitCodeProcess(IntPtr h, out uint code); [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); public static string Quote(string value) { var b = new StringBuilder(); b.Append('\"'); int slashes = 0; foreach (var c in value) { if (c == '\\') { slashes++; continue; } if (c == '\"') { b.Append('\\', slashes * 2 + 1); b.Append('\"'); slashes = 0; continue; } b.Append('\\', slashes); slashes = 0; b.Append(c); } b.Append('\\', slashes * 2); b.Append('\"'); return b.ToString(); } public static string BuildCommandLine(string[] argv) { var b = new StringBuilder(); for (var i = 0; i < argv.Length; i++) { if (i != 0) b.Append(' '); b.Append(Quote(argv[i])); } return b.ToString(); } }`,
+    String.raw`public static partial class O { [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct STARTUPINFO { public int cb; public IntPtr lpReserved; public IntPtr lpDesktop; public IntPtr lpTitle; public int dwX; public int dwY; public int dwXSize; public int dwYSize; public int dwXCountChars; public int dwYCountChars; public int dwFillAttribute; public int dwFlags; public short wShowWindow; public short cbReserved2; public IntPtr lpReserved2; public IntPtr hStdInput; public IntPtr hStdOutput; public IntPtr hStdError; } [StructLayout(LayoutKind.Sequential)] public struct PROCESS_INFORMATION { public IntPtr hProcess; public IntPtr hThread; public uint dwProcessId; public uint dwThreadId; } [StructLayout(LayoutKind.Sequential)] public struct JOBOBJECT_BASIC_LIMIT_INFORMATION { public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass; } [StructLayout(LayoutKind.Sequential)] public struct IO_COUNTERS { public ulong ReadOperationCount; public ulong WriteOperationCount; public ulong OtherOperationCount; public ulong ReadTransferCount; public ulong WriteTransferCount; public ulong OtherTransferCount; } [StructLayout(LayoutKind.Sequential)] public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION { public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation; public IO_COUNTERS IoInfo; public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit; public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed; } [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr CreateJobObjectW(IntPtr a, string n); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j, int c, IntPtr i, uint l); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p); [DllImport("kernel32.dll", SetLastError=true)] public static extern uint ResumeThread(IntPtr h); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j, uint c); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool TerminateProcess(IntPtr p, uint c); [DllImport("kernel32.dll", SetLastError=true)] public static extern uint WaitForSingleObject(IntPtr h, uint ms); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetExitCodeProcess(IntPtr h, out uint code); [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h); public static System.Threading.Tasks.Task<string> ReadLineAsync() { return System.Threading.Tasks.Task.Run(() => Console.In.ReadLine()); } public static string Quote(string value) { var b = new StringBuilder(); b.Append('\"'); int slashes = 0; foreach (var c in value) { if (c == '\\') { slashes++; continue; } if (c == '\"') { b.Append('\\', slashes * 2 + 1); b.Append('\"'); slashes = 0; continue; } b.Append('\\', slashes); slashes = 0; b.Append(c); } b.Append('\\', slashes * 2); b.Append('\"'); return b.ToString(); } public static string BuildCommandLine(string[] argv) { var b = new StringBuilder(); for (var i = 0; i < argv.Length; i++) { if (i != 0) b.Append(' '); b.Append(Quote(argv[i])); } return b.ToString(); } }`.split('\n').map(line => line.trim()).filter(line => line.length > 0 && !line.startsWith('//')).join(' '),
+    String.raw`public static partial class O {
+  [StructLayout(LayoutKind.Sequential)]
+  private struct SECURITY_ATTRIBUTES {
+    public int nLength;
+    public IntPtr lpSecurityDescriptor;
+    [MarshalAs(UnmanagedType.Bool)] public bool bInheritHandle;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  private struct STARTUPINFOEX {
+    public STARTUPINFO StartupInfo;
+    public IntPtr lpAttributeList;
+  }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  private static extern IntPtr CreateFileW(string name, uint access, uint share, ref SECURITY_ATTRIBUTES attributes, uint disposition, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, uint flags, ref IntPtr size);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  private static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returnedSize);
+  [DllImport("kernel32.dll")]
+  private static extern void DeleteProcThreadAttributeList(IntPtr list);
+  [DllImport("kernel32.dll", EntryPoint="CreateProcessW", CharSet=CharSet.Unicode, SetLastError=true)]
+  private static extern bool CreateProcessWithConsole(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir, ref STARTUPINFOEX si, out PROCESS_INFORMATION pi);
+  private static System.ComponentModel.Win32Exception LaunchError(string operation) {
+    int error = Marshal.GetLastWin32Error();
+    return new System.ComponentModel.Win32Exception(error, operation + ": Win32=" + error);
+  }
+  public static void CreateConsoleProcess(string app, string commandLine, IntPtr environment, string cwd, out PROCESS_INFORMATION pi) {
+    pi = new PROCESS_INFORMATION();
+    // lpApplicationName must never search a provider-controlled cwd or PATH.
+    // Accept only an existing executable at a fully qualified Windows path.
+    if (String.IsNullOrWhiteSpace(app)
+        || !System.Text.RegularExpressions.Regex.IsMatch(app, @"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+[\\/])")
+        || !String.Equals(System.IO.Path.GetExtension(app), ".exe", StringComparison.OrdinalIgnoreCase)
+        || !System.IO.File.Exists(app)) {
+      throw new ArgumentException("worker_launch_provider_executable_invalid");
+    }
+    IntPtr input = new IntPtr(-1), output = new IntPtr(-1);
+    IntPtr attributeList = IntPtr.Zero, handles = IntPtr.Zero;
+    bool attributeListInitialized = false;
+    try {
+      var security = new SECURITY_ATTRIBUTES();
+      security.nLength = Marshal.SizeOf(security);
+      security.bInheritHandle = true;
+      // Open the existing pane console; supervisor standard handles remain
+      // dedicated to the authenticated JSON control protocol.
+      input = CreateFileW("CONIN$", 0xC0000000, 3, ref security, 3, 0, IntPtr.Zero);
+      if (input == new IntPtr(-1)) throw LaunchError("worker_launch_console_input_failed");
+      output = CreateFileW("CONOUT$", 0xC0000000, 3, ref security, 3, 0, IntPtr.Zero);
+      if (output == new IntPtr(-1)) throw LaunchError("worker_launch_console_output_failed");
+      IntPtr size = IntPtr.Zero;
+      InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+      if (size == IntPtr.Zero) throw LaunchError("worker_launch_attribute_size_failed");
+      attributeList = Marshal.AllocHGlobal(size);
+      if (!InitializeProcThreadAttributeList(attributeList, 1, 0, ref size)) throw LaunchError("worker_launch_attribute_init_failed");
+      attributeListInitialized = true;
+      handles = Marshal.AllocHGlobal(IntPtr.Size * 2);
+      Marshal.WriteIntPtr(handles, 0, input);
+      Marshal.WriteIntPtr(handles, IntPtr.Size, output);
+      if (!UpdateProcThreadAttribute(attributeList, 0, new IntPtr(0x20002), handles, new IntPtr(IntPtr.Size * 2), IntPtr.Zero, IntPtr.Zero)) throw LaunchError("worker_launch_handle_list_failed");
+      var startup = new STARTUPINFOEX();
+      startup.StartupInfo.cb = Marshal.SizeOf(startup);
+      // STARTF_USESTDHANDLES
+      startup.StartupInfo.dwFlags = 0x100;
+      startup.StartupInfo.hStdInput = input;
+      startup.StartupInfo.hStdOutput = output;
+      startup.StartupInfo.hStdError = output;
+      startup.lpAttributeList = attributeList;
+      // Only console input/output are inherited. In particular, neither
+      // the JSON pipes nor any supervisor Job handle enters the child.
+      if (!CreateProcessWithConsole(app, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, true, 0x00000004 | 0x00000400 | 0x00080000, environment, cwd, ref startup, out pi)) throw LaunchError("worker_launch_create_process_failed");
+    } finally {
+      if (attributeListInitialized) DeleteProcThreadAttributeList(attributeList);
+      if (handles != IntPtr.Zero) Marshal.FreeHGlobal(handles);
+      if (attributeList != IntPtr.Zero) Marshal.FreeHGlobal(attributeList);
+      if (output != new IntPtr(-1)) CloseHandle(output);
+      if (input != new IntPtr(-1)) CloseHandle(input);
+    }
+  }
+}`,
     '"@',
-    '$pi = New-Object O+PROCESS_INFORMATION; $job = [IntPtr]::Zero; $envPtr = [IntPtr]::Zero; $cmd = $null',
+    '$pi = New-Object O+PROCESS_INFORMATION; $job = [IntPtr]::Zero; $jobAssigned = $false; $envPtr = [IntPtr]::Zero; $cmd = $null',
     'try {',
     '  $cmd = [O]::BuildCommandLine([string[]]$payload.provider_argv)',
     '  $envPairs = @($payload.provider_env.psobject.Properties | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }); $envText = (($envPairs -join [char]0) + [char]0 + [char]0); $envBytes = [Text.Encoding]::Unicode.GetBytes($envText); $envPtr = [Runtime.InteropServices.Marshal]::AllocHGlobal($envBytes.Length); [Runtime.InteropServices.Marshal]::Copy($envBytes, 0, $envPtr, $envBytes.Length)',
-    '  $si = New-Object O+STARTUPINFO; $si.cb = [Runtime.InteropServices.Marshal]::SizeOf($si); $flags = 0x00000004 -bor 0x00000400; if (-not [O]::CreateProcessW($null, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $false, $flags, $envPtr, $payload.cwd, [ref]$si, [ref]$pi)) { throw "worker_launch_create_process_failed" }',
-    '  $job = [O]::CreateJobObjectW([IntPtr]::Zero, $null); if ($job -eq [IntPtr]::Zero) { throw "worker_launch_create_job_failed" }; $info = New-Object O+JOBOBJECT_EXTENDED_LIMIT_INFORMATION; $info.BasicLimitInformation.LimitFlags = 0x2000; $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal([Runtime.InteropServices.Marshal]::SizeOf($info)); try { [Runtime.InteropServices.Marshal]::StructureToPtr($info, $ptr, $false); if (-not [O]::SetInformationJobObject($job, 9, $ptr, [Runtime.InteropServices.Marshal]::SizeOf($info))) { throw "worker_launch_job_config_failed" } } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr) }; if (-not [O]::AssignProcessToJobObject($job, $pi.hProcess)) { throw "worker_launch_assign_job_failed" }; if ([O]::ResumeThread($pi.hThread) -eq [uint32]0xffffffff) { throw "worker_launch_resume_failed" }',
+    '  [O]::CreateConsoleProcess([string]$payload.provider_argv[0], $cmd, $envPtr, $payload.cwd, [ref]$pi)',
+    '  $job = [O]::CreateJobObjectW([IntPtr]::Zero, $null); if ($job -eq [IntPtr]::Zero) { throw "worker_launch_create_job_failed" }; $info = New-Object O+JOBOBJECT_EXTENDED_LIMIT_INFORMATION; $info.BasicLimitInformation.LimitFlags = 0x2000; $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal([Runtime.InteropServices.Marshal]::SizeOf($info)); try { [Runtime.InteropServices.Marshal]::StructureToPtr($info, $ptr, $false); if (-not [O]::SetInformationJobObject($job, 9, $ptr, [Runtime.InteropServices.Marshal]::SizeOf($info))) { throw "worker_launch_job_config_failed" } } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr) }; if (-not [O]::AssignProcessToJobObject($job, $pi.hProcess)) { throw "worker_launch_assign_job_failed" }; $jobAssigned = $true; if ([O]::ResumeThread($pi.hThread) -eq [uint32]::MaxValue) { throw "worker_launch_resume_failed" }',
     '  $ticks = ([DateTime]((Get-Process -Id $pi.dwProcessId).StartTime)).ToUniversalTime().Ticks; $ready = @{ protocol="' + WINDOWS_SUPERVISOR_PROTOCOL + '"; kind="ready"; attempt_id=$payload.identity.attempt_id; instance_id=$payload.identity.instance_id; authority_digest=$payload.authority_digest; containment_nonce=$payload.containment_nonce; pid=$pi.dwProcessId; process_start_identity=("ticks:" + $ticks) } | ConvertTo-Json -Compress; [Console]::Out.WriteLine($ready); [Console]::Out.Flush()',
-    '  $readTask = [Console]::In.ReadLineAsync(); while ($true) { if ([O]::WaitForSingleObject($pi.hProcess, 50) -eq 0) { $exitCode = [uint32]0; [O]::GetExitCodeProcess($pi.hProcess, [ref]$exitCode) | Out-Null; if (-not [O]::TerminateJobObject($job, $exitCode)) { throw "worker_launch_job_terminate_failed" }; if ([O]::WaitForSingleObject($job, 5000) -ne 0) { throw "worker_launch_job_cleanup_timeout" }; $terminal = @{ protocol="' + WINDOWS_SUPERVISOR_PROTOCOL + '"; kind="terminal"; attempt_id=$payload.identity.attempt_id; instance_id=$payload.identity.instance_id; authority_digest=$payload.authority_digest; containment_nonce=$payload.containment_nonce; pid=$pi.dwProcessId; outcome="exit"; cleanup_verified=$true; exit_code=$exitCode } | ConvertTo-Json -Compress; [Console]::Out.WriteLine($terminal); [Console]::Out.Flush(); break }; if (-not $readTask.IsCompleted) { continue }; $line = $readTask.Result; if ($null -eq $line) { throw "worker_launch_authority_lost" }; $readTask = [Console]::In.ReadLineAsync(); if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -gt 4096) { continue }; try { $msg = $line | ConvertFrom-Json } catch { continue }; if ($msg.protocol -ne "' + WINDOWS_SUPERVISOR_PROTOCOL + '" -or $msg.attempt_id -ne $payload.identity.attempt_id -or $msg.instance_id -ne $payload.identity.instance_id -or $msg.authority_digest -ne $payload.authority_digest -or $msg.containment_nonce -ne $payload.containment_nonce -or $msg.kind -ne "terminate") { continue }; if (-not [O]::TerminateJobObject($job, 1)) { throw "worker_launch_job_terminate_failed" }; if ([O]::WaitForSingleObject($job, 5000) -ne 0) { throw "worker_launch_job_cleanup_timeout" }; $terminal = @{ protocol="' + WINDOWS_SUPERVISOR_PROTOCOL + '"; kind="terminal"; attempt_id=$payload.identity.attempt_id; instance_id=$payload.identity.instance_id; authority_digest=$payload.authority_digest; containment_nonce=$payload.containment_nonce; pid=$pi.dwProcessId; outcome="terminated"; cleanup_verified=$true } | ConvertTo-Json -Compress; [Console]::Out.WriteLine($terminal); [Console]::Out.Flush(); break }',
-    '} catch { if ($pi.hProcess -ne [IntPtr]::Zero) { if ($job -ne [IntPtr]::Zero) { [O]::TerminateJobObject($job, 1) | Out-Null } else { [O]::TerminateProcess($pi.hProcess, 1) | Out-Null }; [O]::WaitForSingleObject($pi.hProcess, 5000) | Out-Null }; throw } finally { if ($envPtr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($envPtr) }; if ($pi.hThread -ne [IntPtr]::Zero) { [O]::CloseHandle($pi.hThread) | Out-Null }; if ($pi.hProcess -ne [IntPtr]::Zero) { [O]::CloseHandle($pi.hProcess) | Out-Null }; if ($job -ne [IntPtr]::Zero) { [O]::CloseHandle($job) | Out-Null } }',
-  ].join("`n");
+    '  $readTask = [O]::ReadLineAsync(); while ($true) { if ([O]::WaitForSingleObject($pi.hProcess, 50) -eq 0) { $exitCode = [uint32]0; if (-not [O]::GetExitCodeProcess($pi.hProcess, [ref]$exitCode)) { throw "worker_launch_exit_code_failed" }; if (-not [O]::TerminateJobObject($job, $exitCode)) { throw "worker_launch_job_terminate_failed" }; if ([O]::WaitForSingleObject($job, 5000) -ne 0) { throw "worker_launch_job_cleanup_timeout" }; $terminal = @{ protocol="' + WINDOWS_SUPERVISOR_PROTOCOL + '"; kind="terminal"; attempt_id=$payload.identity.attempt_id; instance_id=$payload.identity.instance_id; authority_digest=$payload.authority_digest; containment_nonce=$payload.containment_nonce; pid=$pi.dwProcessId; outcome="exit"; cleanup_verified=$true; exit_code=$exitCode } | ConvertTo-Json -Compress; [Console]::Out.WriteLine($terminal); [Console]::Out.Flush(); break }; if (-not $readTask.IsCompleted) { continue }; $line = $readTask.Result; if ($null -eq $line) { throw "worker_launch_authority_lost" }; $readTask = [O]::ReadLineAsync(); if ([string]::IsNullOrWhiteSpace($line) -or $line.Length -gt 4096) { continue }; try { $msg = $line | ConvertFrom-Json } catch { continue }; if ($msg.protocol -ne "' + WINDOWS_SUPERVISOR_PROTOCOL + '" -or $msg.attempt_id -ne $payload.identity.attempt_id -or $msg.instance_id -ne $payload.identity.instance_id -or $msg.authority_digest -ne $payload.authority_digest -or $msg.containment_nonce -ne $payload.containment_nonce -or $msg.kind -ne "terminate") { continue }; if (-not [O]::TerminateJobObject($job, 1)) { throw "worker_launch_job_terminate_failed" }; if ([O]::WaitForSingleObject($job, 5000) -ne 0) { throw "worker_launch_job_cleanup_timeout" }; $terminal = @{ protocol="' + WINDOWS_SUPERVISOR_PROTOCOL + '"; kind="terminal"; attempt_id=$payload.identity.attempt_id; instance_id=$payload.identity.instance_id; authority_digest=$payload.authority_digest; containment_nonce=$payload.containment_nonce; pid=$pi.dwProcessId; outcome="terminated"; cleanup_verified=$true; exit_code=1 } | ConvertTo-Json -Compress; [Console]::Out.WriteLine($terminal); [Console]::Out.Flush(); break }',
+    '} catch { if ($pi.hProcess -ne [IntPtr]::Zero) { if ($jobAssigned) { [O]::TerminateJobObject($job, 1) | Out-Null } else { [O]::TerminateProcess($pi.hProcess, 1) | Out-Null }; [O]::WaitForSingleObject($pi.hProcess, 5000) | Out-Null }; throw } finally { if ($envPtr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($envPtr) }; if ($pi.hThread -ne [IntPtr]::Zero) { [O]::CloseHandle($pi.hThread) | Out-Null }; if ($pi.hProcess -ne [IntPtr]::Zero) { [O]::CloseHandle($pi.hProcess) | Out-Null }; if ($job -ne [IntPtr]::Zero) { [O]::CloseHandle($job) | Out-Null } }',
+  ].join('\n');
 }
 
 function encodePowerShell(source: string): string {
-  return Buffer.from(source, 'utf16le').toString('base64');
+  // Keep the complete, source-bound supervisor below CreateProcessW's command
+  // line limit without putting launch payloads or secrets in argv or a file.
+  const compressed = gzipSync(Buffer.from(source, 'utf8')).toString('base64');
+  const loader = [
+    '$ErrorActionPreference = "Stop"',
+    `$memory = [IO.MemoryStream]::new([Convert]::FromBase64String('${compressed}'))`,
+    '$gzip = [IO.Compression.GZipStream]::new($memory, [IO.Compression.CompressionMode]::Decompress)',
+    '$reader = [IO.StreamReader]::new($gzip, [Text.Encoding]::UTF8)',
+    'try { & ([ScriptBlock]::Create($reader.ReadToEnd())) } finally { $reader.Dispose(); $gzip.Dispose(); $memory.Dispose() }',
+  ].join('\n');
+  return Buffer.from(loader, 'utf16le').toString('base64');
 }
 const WINDOWS_RESERVED_ENV_KEYS = new Set([...WORKER_LAUNCH_INTERNAL_ENV_KEYS, 'SystemRoot'].map(key => key.toUpperCase()));
-const SAFE_BASELINE_ENV_KEYS = ['PATH', 'SystemRoot', 'SYSTEMROOT', 'TEMP', 'TMP'] as const;
+const SAFE_BASELINE_ENV_KEYS = ['PATH', 'TEMP', 'TMP', 'TERM', 'COLORTERM'] as const;
 
 function canonicalAuthorityDigest(input: {
   identity: WorkerLaunchIdentity;
@@ -245,26 +336,47 @@ function isValidProviderEnvironment(value: unknown, platform: NodeJS.Platform = 
   try { normalizeProviderEnvironment(value as Record<string, string>, platform); return true; } catch { return false; }
 }
 
+function parseEnvPassthrough(value: string | undefined): string[] {
+  if (!value || value.trim().length === 0) return [];
+  // Split by comma and trim each key
+  return value.split(',').map(k => k.trim()).filter(k => k.length > 0);
+}
+
 export function buildProviderEnvironment(
   providerEnv: NodeJS.ProcessEnv | Record<string, string> | undefined,
   sourceEnv: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
+  envPassthrough?: readonly string[],
 ): Record<string, string> {
   const normalized = normalizeProviderEnvironment(providerEnv, platform);
   const baseline: Record<string, string> = {};
-  for (const key of SAFE_BASELINE_ENV_KEYS) {
+  // claude finds its macOS keychain login through USER; without it the worker starts logged out.
+  const identityKeys = platform === 'win32' ? ['USERPROFILE'] : ['HOME', 'USER'];
+  for (const key of [...SAFE_BASELINE_ENV_KEYS, ...identityKeys]) {
     const value = sourceEnv[key];
     if (typeof value === 'string' && value.length > 0) baseline[key] = value;
   }
-  const homeKey = platform === 'win32' ? 'USERPROFILE' : 'HOME';
-  const home = sourceEnv[homeKey];
-  const hasExplicitHome = Object.keys(normalized).some(key => (
-    platform === 'win32' ? key.toUpperCase() === homeKey : key === homeKey
-  ));
-  if (!hasExplicitHome && typeof home === 'string' && home.length > 0) baseline[homeKey] = home;
   if (platform === 'win32') {
-    const systemRoot = sourceEnv.SystemRoot ?? sourceEnv.SYSTEMROOT;
-    if (typeof systemRoot === 'string' && /^[A-Za-z]:\\/.test(systemRoot)) baseline.SystemRoot = systemRoot;
+    const systemRoot = [sourceEnv.SystemRoot, sourceEnv.SYSTEMROOT]
+      .find(value => typeof value === 'string' && /^[A-Za-z]:\\/.test(value));
+    if (typeof systemRoot === 'string') baseline.SystemRoot = systemRoot;
+  }
+
+  // Resolve passthrough environment variables from the source environment
+  const passthroughList = envPassthrough ?? parseEnvPassthrough(sourceEnv.OMC_TEAM_WORKER_ENV_PASSTHROUGH);
+  for (const key of passthroughList) {
+    if (!isValidEnvironmentKey(key)) throw new Error('worker_launch_env_passthrough_key_invalid');
+    if (WORKER_LAUNCH_INTERNAL_ENV_KEYS.has(key)) throw new Error('worker_launch_env_passthrough_key_reserved');
+    if (platform === 'win32' && WINDOWS_RESERVED_ENV_KEYS.has(key.toUpperCase())) throw new Error('worker_launch_env_passthrough_key_reserved');
+    const value = sourceEnv[key];
+    if (typeof value === 'string') baseline[key] = value;
+  }
+
+  if (platform === 'win32') {
+    for (const key of Object.keys(normalized)) {
+      const baselineKey = Object.keys(baseline).find(candidate => candidate.toUpperCase() === key.toUpperCase());
+      if (baselineKey) delete baseline[baselineKey];
+    }
   }
   return { ...baseline, ...normalized };
 }
@@ -455,9 +567,34 @@ async function writeExclusiveTextAtomic(path: string, value: string): Promise<vo
   }
 }
 
+const DECIMAL_INTEGER_TEXT = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+
+function parseExactInteger(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const negative = trimmed.startsWith('-');
+  const magnitude = negative || trimmed.startsWith('+') ? trimmed.slice(1) : trimmed;
+  const match = DECIMAL_INTEGER_TEXT.exec(magnitude);
+  if (!match) return null;
+  const integerDigits = match[1] ?? '';
+  const fractionDigits = match[2] ?? match[3] ?? '';
+  const exponent = match[4] === undefined ? 0 : Number(match[4]);
+  const shift = fractionDigits.length - exponent;
+  if (shift > 0) {
+    const significand = integerDigits + fractionDigits;
+    if (/[1-9]/.test(significand)) {
+      const trailingZeros = significand.length - significand.replace(/0+$/, '').length;
+      if (trailingZeros < shift) return null;
+    }
+  }
+  const parsed = (negative ? -1 : 1) * Number(magnitude);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
 function resolvePositiveInteger(value: string | undefined, fallback: number): number {
-  const parsed = Number.parseInt(value ?? '', 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  if (value == null || value.trim() === '') return fallback;
+  const parsed = parseExactInteger(value);
+  return parsed !== null && parsed > 0 ? parsed : fallback;
 }
 
 export async function prepareWorkerLaunchAttempt(input: {
@@ -600,10 +737,10 @@ export function buildWorkerLaunchBootstrapSpec(
   attempt: WorkerLaunchAttempt,
   providerArgv: string[],
   cwd: string,
-  options: { releaseAfterSpawn?: boolean; providerEnv?: NodeJS.ProcessEnv | Record<string, string> } = {},
+  options: { releaseAfterSpawn?: boolean; providerEnv?: NodeJS.ProcessEnv | Record<string, string>; platform?: NodeJS.Platform } = {},
 ): WorkerLaunchBootstrapSpec {
   if (!isValidIdentity(attempt)) throw new Error('worker_launch_attempt_identity_invalid');
-  const providerEnv = buildProviderEnvironment(options.providerEnv);
+  const providerEnv = normalizeProviderEnvironment(options.providerEnv, options.platform ?? process.platform);
   const absoluteCwd = resolve(cwd);
   const containmentNonce = randomUUID();
   const supervisorSourceSha256 = createHash('sha256').update(buildWindowsSupervisorSource(), 'utf8').digest('hex');
@@ -704,6 +841,7 @@ export async function materializeWorkerLaunchTransport(input: {
   cwd: string;
   providerEnv?: NodeJS.ProcessEnv | Record<string, string>;
   releaseAfterSpawn?: boolean;
+  platform?: NodeJS.Platform;
   /** Native-Windows delivery resolves a cwd-relative wrapper command. POSIX
    *  delivery launches the runtime CLI with OMC_WORKER_LAUNCH_SPEC_FILE, so
    *  the wrapper relative path is neither computed nor returned. */
@@ -714,6 +852,7 @@ export async function materializeWorkerLaunchTransport(input: {
   const spec = buildWorkerLaunchBootstrapSpec(attempt, input.providerArgv, input.cwd, {
     providerEnv: input.providerEnv,
     releaseAfterSpawn: input.releaseAfterSpawn,
+    platform: input.platform,
   });
   const windowsDelivery = input.windowsDelivery !== false;
   const owner: WorkerLaunchTransportOwner = {
@@ -724,7 +863,7 @@ export async function materializeWorkerLaunchTransport(input: {
   const wrapperRelativePath = windowsDelivery
     ? windowsWrapperRelativePath(input.cwd, attempt.wrapperPath)
     : '';
-  const wrapper = buildWorkerLaunchWrapper(attempt, windowsDelivery ? 'win32' : process.platform);
+  const wrapper = buildWorkerLaunchWrapper(attempt, windowsDelivery ? 'win32' : input.platform ?? process.platform);
   let ownerCreated = false;
   let descriptorCreated = false;
   let wrapperCreated = false;
@@ -826,7 +965,10 @@ export async function cleanupWorkerLaunchTransport(attempt: WorkerLaunchAttempt,
   }
 }
 
-export async function readAndConsumeWorkerLaunchDescriptor(descriptorPath: string): Promise<unknown> {
+export async function readAndConsumeWorkerLaunchDescriptor(
+  descriptorPath: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<unknown> {
   let parsed: unknown;
   let handle;
   try {
@@ -840,7 +982,7 @@ export async function readAndConsumeWorkerLaunchDescriptor(descriptorPath: strin
   } finally {
     await handle?.close().catch(() => undefined);
   }
-  if (!isValidBootstrapSpec(parsed)) throw new Error('worker_launch_descriptor_invalid');
+  if (!isValidBootstrapSpec(parsed, platform)) throw new Error('worker_launch_descriptor_invalid');
   const spec = parsed;
   if (resolve(descriptorPath) !== resolve(spec.bootstrap_descriptor_path)) throw new Error('worker_launch_descriptor_path_mismatch');
   const owner = await readJson(spec.transport_owner_path);
@@ -1704,7 +1846,10 @@ function isDeterministicTransportPath(expectedPath: string, candidate: unknown, 
     && resolve(candidate) === resolve(join(dirname(expectedPath), fileName));
 }
 
-function isValidBootstrapSpec(value: unknown): value is WorkerLaunchBootstrapSpec {
+function isValidBootstrapSpec(
+  value: unknown,
+  platform: NodeJS.Platform = process.platform,
+): value is WorkerLaunchBootstrapSpec {
   if (!isValidIdentity(value)) return false;
   const spec = value as Partial<WorkerLaunchBootstrapSpec>;
   return isExactText(spec.current_path)
@@ -1720,7 +1865,7 @@ function isValidBootstrapSpec(value: unknown): value is WorkerLaunchBootstrapSpe
     && spec.provider_argv.length > 0
     && isExactText(spec.provider_argv[0])
     && spec.provider_argv.slice(1).every(argument => typeof argument === 'string')
-    && isValidProviderEnvironment(spec.provider_env)
+    && isValidProviderEnvironment(spec.provider_env, platform)
     && typeof spec.cwd === 'string'
     && spec.cwd.length > 0
     && Number.isSafeInteger(spec.decision_timeout_ms)
@@ -1772,15 +1917,33 @@ async function waitForBootstrapDecision(spec: WorkerLaunchBootstrapSpec): Promis
   return 'timeout';
 }
 
-function buildWindowsSupervisorInvocation(spec: WorkerLaunchBootstrapSpec): MaterializedProviderSpawnInvocation {
-  const env = Object.fromEntries(Object.entries(spec.provider_env).sort(([a], [b]) => a.localeCompare(b)));
+function buildBootstrapProviderEnvironment(
+  spec: WorkerLaunchBootstrapSpec,
+  sourceEnv: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): NodeJS.ProcessEnv {
+  return {
+    ...buildProviderEnvironment(spec.provider_env, sourceEnv, platform),
+    ...(typeof spec.provider_env.OMC_RECOVERY_GATE_SPEC === 'string'
+      || typeof spec.provider_env.OMC_RECOVERY_GATE_SPEC_B64 === 'string'
+      ? { [WORKER_LAUNCH_RECOVERY_GATE_CONTAINED_ENV]: '1' }
+      : {}),
+  };
+}
+
+export function buildWindowsSupervisorInvocation(
+  spec: WorkerLaunchBootstrapSpec,
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+): MaterializedProviderSpawnInvocation {
+  const authorityEnv = Object.fromEntries(Object.entries(spec.provider_env).sort(([a], [b]) => a.localeCompare(b)));
+  const env = Object.fromEntries(Object.entries(buildBootstrapProviderEnvironment(spec, sourceEnv, 'win32')).sort(([a], [b]) => a.localeCompare(b)));
   const canonical_json = JSON.stringify({
     protocol: WORKER_LAUNCH_AUTHORITY_PROTOCOL,
     nonce: spec.containment_nonce,
     supervisor_source_sha256: spec.supervisor_source_sha256,
     identity: identityOf(spec),
     provider_argv: [...spec.provider_argv],
-    provider_env: env,
+    provider_env: authorityEnv,
     cwd: resolve(spec.cwd),
   });
   const payload = Buffer.from(JSON.stringify({
@@ -1793,7 +1956,7 @@ function buildWindowsSupervisorInvocation(spec: WorkerLaunchBootstrapSpec): Mate
     provider_env: env,
     cwd: resolve(spec.cwd),
   }), 'utf8').toString('base64');
-  const systemRoot = spec.provider_env.SystemRoot ?? spec.provider_env.SYSTEMROOT;
+  const systemRoot = env.SystemRoot;
   if (!systemRoot || !/^[A-Za-z]:\\/.test(systemRoot)) throw new Error('worker_launch_powershell_authority_missing');
   return {
     command: `${systemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
@@ -1975,13 +2138,7 @@ export async function runWorkerLaunchBootstrap(value: unknown): Promise<WorkerLa
   // process group already captured and proven by this bootstrap. The marker
   // is injected after authority validation and is stripped by the gate before
   // the actual provider receives its environment.
-  const providerEnv: NodeJS.ProcessEnv = {
-    ...spec.provider_env,
-    ...(typeof spec.provider_env.OMC_RECOVERY_GATE_SPEC === 'string'
-      || typeof spec.provider_env.OMC_RECOVERY_GATE_SPEC_B64 === 'string'
-      ? { [WORKER_LAUNCH_RECOVERY_GATE_CONTAINED_ENV]: '1' }
-      : {}),
-  };
+  const providerEnv = buildBootstrapProviderEnvironment(spec, process.env, process.platform);
   try {
     const launched = await withFileLock(lockPathFor(spec.current_path), async () => {
       if (!await isCurrentLaunchIdentity(spec.current_path, spec)
@@ -2016,6 +2173,13 @@ export async function runWorkerLaunchBootstrap(value: unknown): Promise<WorkerLa
           return { outcome: 'provider_spawn_failed' as const };
         }
       }
+      // Check host load gate to prevent resource exhaustion during concurrent worker launches
+      const gateResult = checkHostLoadGate();
+      if (!gateResult.allowed && gateResult.reason) {
+        // If gate denies, log it but proceed anyway (fail-open design)
+        // Log is for observability; the gate is advisory, not hard-blocking
+        // Uncomment for debugging: console.warn(`Worker launch proceeding despite host load saturation: ${gateResult.reason}`);
+      }
       const child = spawn(invocation.command, invocation.args, {
         cwd: spec.cwd,
         env: providerEnv,
@@ -2026,9 +2190,6 @@ export async function runWorkerLaunchBootstrap(value: unknown): Promise<WorkerLa
             : ['inherit', 'inherit', 'inherit', 'pipe'],
         detached: process.platform !== 'win32',
       });
-      if (process.platform === 'win32' && invocation.stdinPayload && child.stdin?.writable) {
-        child.stdin.write(`${invocation.stdinPayload}\n`);
-      }
       let settled = false;
       let providerPid: number | null = null;
       let providerStartIdentity: string | null = null;
@@ -2071,6 +2232,18 @@ export async function runWorkerLaunchBootstrap(value: unknown): Promise<WorkerLa
       let resolveWindowsTerminal!: (verified: boolean) => void;
       const windowsReady = new Promise<boolean>(resolve => { resolveWindowsReady = resolve; });
       const windowsTerminal = new Promise<boolean>(resolve => { resolveWindowsTerminal = resolve; });
+      if (process.platform === 'win32') {
+        // Own control-pipe errors for the entire child lifetime. An EPIPE
+        // cannot establish readiness or cleanup; the existing proof paths do.
+        child.stdin?.on('error', () => {
+          resolveWindowsReady(false);
+          resolveWindowsTerminal(false);
+        });
+        child.stderr?.resume();
+        if (invocation.stdinPayload && child.stdin?.writable) {
+          child.stdin.write(`${invocation.stdinPayload}\n`);
+        }
+      }
       if (providerGate) {
         // Own the extra stream's error for its entire lifetime. ChildProcess
         // does not forward errors from additional stdio sockets, so leaving
@@ -2129,7 +2302,10 @@ export async function runWorkerLaunchBootstrap(value: unknown): Promise<WorkerLa
               resolveWindowsReady(true);
             } else if (message.kind === 'terminal' && message.pid === providerPid
               && (message.outcome === 'terminated' || message.outcome === 'exit')
+              && Number.isSafeInteger(message.exit_code) && Number(message.exit_code) >= 0
+              && Number(message.exit_code) <= 0xffffffff
               && message.cleanup_verified === true) {
+              supervisedExitCode = Number(message.exit_code);
               void writeExclusiveAtomic(`${spec.started_path}.termination-complete`, {
                 ...identityOf(spec), kind: 'worker_launch_termination_complete', cleanup_verified: true,
                 pid: providerPid, process_start_identity: providerStartIdentity,
@@ -2145,7 +2321,9 @@ export async function runWorkerLaunchBootstrap(value: unknown): Promise<WorkerLa
       }
       const completion = new Promise<WorkerLaunchBootstrapResult>(resolve => {
         resolveCompletion = resolve;
-        child.once('exit', async (exitCode, signal) => {
+        // On Windows, drain the bound terminal frame before interpreting the
+        // supervisor's exit code as the provider's result.
+        child.once(process.platform === 'win32' ? 'close' : 'exit', async (exitCode, signal) => {
           if ((settled && process.platform === 'win32') || childExitObserved) return;
           childExitObserved = true;
           settled = true;

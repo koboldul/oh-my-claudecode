@@ -10,6 +10,50 @@ import { resolve, dirname, parse, join } from 'path';
 import { pathToFileURL } from 'url';
 import { resolveDevContainerContext, hostUriToContainerUri, containerUriToHostUri } from './devcontainer.js';
 import { getServerForFile, commandExists } from './servers.js';
+/** Decimal magnitude whose integrality can be decided from the text. */
+const DECIMAL_INTEGER_TEXT = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+/** Largest timeout delay Node.js timers preserve without overflowing to 1 ms. */
+const MAX_NODE_TIMER_DELAY_MS = 2_147_483_647;
+/**
+ * Read one exact integer from an environment value.
+ *
+ * parseInt stops at the first character it cannot read, so "1e5" becomes 1,
+ * "8.9" becomes 8, and "15_000" becomes 15. Number() consumes the whole
+ * token, and the digit check rejects values that are not integers even when
+ * the nearest double would round onto one.
+ */
+function parseExactInteger(raw) {
+    const trimmed = raw.trim();
+    if (!trimmed)
+        return null;
+    const negative = trimmed.startsWith('-');
+    const magnitude = negative || trimmed.startsWith('+') ? trimmed.slice(1) : trimmed;
+    const match = DECIMAL_INTEGER_TEXT.exec(magnitude);
+    if (!match)
+        return null;
+    const integerDigits = match[1] ?? '';
+    const fractionDigits = match[2] ?? match[3] ?? '';
+    const exponent = match[4] === undefined ? 0 : Number(match[4]);
+    const shift = fractionDigits.length - exponent;
+    if (shift > 0) {
+        const significand = integerDigits + fractionDigits;
+        if (/[1-9]/.test(significand)) {
+            const trailingZeros = significand.length - significand.replace(/0+$/, '').length;
+            if (trailingZeros < shift)
+                return null;
+        }
+    }
+    const parsed = (negative ? -1 : 1) * Number(magnitude);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+}
+function readPositiveIntEnv(name, fallback) {
+    const env = process.env[name];
+    if (!env || !env.trim()) {
+        return fallback;
+    }
+    const parsed = parseExactInteger(env);
+    return parsed !== null && parsed > 0 && parsed <= MAX_NODE_TIMER_DELAY_MS ? parsed : fallback;
+}
 /** Default timeout (ms) for LSP requests. Override with OMC_LSP_TIMEOUT_MS env var. */
 export const DEFAULT_LSP_REQUEST_TIMEOUT_MS = (() => {
     return readPositiveIntEnv('OMC_LSP_TIMEOUT_MS', 15_000);
@@ -20,17 +64,37 @@ export function getLspRequestTimeout(serverConfig, method, baseTimeout = DEFAULT
     }
     return baseTimeout;
 }
-function readPositiveIntEnv(name, fallback) {
-    const env = process.env[name];
-    if (!env) {
-        return fallback;
-    }
-    const parsed = parseInt(env, 10);
-    return !isNaN(parsed) && parsed > 0 ? parsed : fallback;
-}
 /** Convert a file path to a valid file:// URI (cross-platform) */
 function fileUri(filePath) {
     return pathToFileURL(resolve(filePath)).href;
+}
+/**
+ * Normalize a URI for use as a diagnostics key.
+ * Handles Windows drive letter encoding (%3A/%3a colon) and case normalization.
+ * Platform-independent: works correctly whether the input comes from Windows or POSIX systems.
+ * Non-file URIs pass through unchanged.
+ */
+function uriKey(uri) {
+    if (!uri.startsWith('file://')) {
+        return uri;
+    }
+    // Decode percent-encoded characters to handle %3A/%3a (colon). A malformed
+    // escape must not throw out of the notification handler: keep it verbatim.
+    let decoded;
+    try {
+        decoded = decodeURIComponent(uri);
+    }
+    catch {
+        decoded = uri;
+    }
+    // For Windows paths like file:///c:/Users/... normalize drive letter to uppercase
+    // Match: file:///<single_char>:/ and uppercase the drive letter
+    const match = decoded.match(/^(file:\/\/)(\/[a-zA-Z])(:.*)$/);
+    if (match) {
+        const driveLetter = match[2].charAt(1).toUpperCase();
+        decoded = `${match[1]}/${driveLetter}${match[3]}`;
+    }
+    return decoded;
 }
 function createCancellationSignal() {
     let cancel;
@@ -422,11 +486,12 @@ export class LspClient {
     handleNotification(notification) {
         if (notification.method === 'textDocument/publishDiagnostics') {
             const params = this.translateIncomingPayload(notification.params);
-            this.diagnostics.set(params.uri, params.diagnostics);
+            const key = uriKey(params.uri);
+            this.diagnostics.set(key, params.diagnostics);
             // Wake any waiters registered via waitForDiagnostics()
-            const waiters = this.diagnosticWaiters.get(params.uri);
+            const waiters = this.diagnosticWaiters.get(key);
             if (waiters && waiters.length > 0) {
-                this.diagnosticWaiters.delete(params.uri);
+                this.diagnosticWaiters.delete(key);
                 for (const wake of waiters)
                     wake();
             }
@@ -629,7 +694,7 @@ export class LspClient {
         const languageId = this.getLanguageId(filePath);
         // A reopened document needs fresh diagnostics rather than a cached result
         // from its previous didOpen/didClose lifecycle.
-        this.diagnostics.delete(hostUri);
+        this.diagnostics.delete(uriKey(hostUri));
         await this.notifyWithBackpressure('textDocument/didOpen', {
             textDocument: {
                 uri,
@@ -833,7 +898,7 @@ export class LspClient {
      */
     getDiagnostics(filePath) {
         const uri = fileUri(filePath);
-        return this.diagnostics.get(uri) || [];
+        return this.diagnostics.get(uriKey(uri)) || [];
     }
     /**
      * Whether the server supports LSP 3.17 pull diagnostics (textDocument/diagnostic).
@@ -867,6 +932,7 @@ export class LspClient {
      */
     waitForDiagnostics(filePath, timeoutMs = 2000) {
         const uri = fileUri(filePath);
+        const key = uriKey(uri);
         try {
             this.throwIfTerminal();
         }
@@ -874,21 +940,21 @@ export class LspClient {
             return Promise.reject(error);
         }
         // If diagnostics are already present, resolve immediately.
-        if (this.diagnostics.has(uri)) {
+        if (this.diagnostics.has(key)) {
             return Promise.resolve();
         }
         return new Promise((resolve, reject) => {
             let resolved = false;
             const removeWaiter = (waiter) => {
-                const waiters = this.diagnosticWaiters.get(uri);
+                const waiters = this.diagnosticWaiters.get(key);
                 if (!waiters)
                     return;
                 const remaining = waiters.filter(candidate => candidate !== waiter);
                 if (remaining.length === 0) {
-                    this.diagnosticWaiters.delete(uri);
+                    this.diagnosticWaiters.delete(key);
                 }
                 else {
-                    this.diagnosticWaiters.set(uri, remaining);
+                    this.diagnosticWaiters.set(key, remaining);
                 }
             };
             const waiter = (error) => {
@@ -911,9 +977,9 @@ export class LspClient {
                 }
             }, timeoutMs);
             // Store the resolver so handleNotification can wake it up.
-            const existing = this.diagnosticWaiters.get(uri) || [];
+            const existing = this.diagnosticWaiters.get(key) || [];
             existing.push(waiter);
-            this.diagnosticWaiters.set(uri, existing);
+            this.diagnosticWaiters.set(key, existing);
         });
     }
     /**

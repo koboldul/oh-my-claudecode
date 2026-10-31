@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { closeSync, mkdirSync, readdirSync, rmSync, existsSync, readFileSync, unlinkSync, writeFileSync, utimesSync } from 'fs';
 import { spawn, spawnSync } from 'child_process';
 import { join } from 'path';
@@ -31,6 +31,8 @@ describe('file-lock', () => {
         if (existsSync(testDir)) {
             rmSync(testDir, { recursive: true, force: true });
         }
+        vi.doUnmock('../platform/index.js');
+        vi.resetModules();
     });
     function currentOwner(timestamp = Date.now()) {
         const processStartIdentity = getProcessStartIdentitySync(process.pid);
@@ -49,6 +51,46 @@ describe('file-lock', () => {
     describe('lockPathFor', () => {
         it('should append .lock to the file path', () => {
             expect(lockPathFor('/path/to/file.json')).toBe('/path/to/file.json.lock');
+        });
+    });
+    describe('cross-domain stale ownership', () => {
+        it.each([
+            ['windows-dmtf-us:1767225600123456', 'processStartIdentity', 'ticks:639028224001234569', false],
+            ['windows-dmtf-us:1767225600123456', 'processStart', 'dmtf:20260101000000.123456+000', false],
+            ['windows-dmtf-us:1767225600123456', 'processStartIdentity', 'ticks:639028224001234570', true],
+            ['ticks:639028224001234568', 'processStartIdentity', 'ticks:639028224001234569', true],
+            ['windows-dmtf-us:1767225600123456', 'processStartIdentity', 'ticks:not-a-number', false],
+            ['windows-dmtf-us:1767225600123456', 'processStartIdentity', 'windows-dmtf-us:999999999999999999', false],
+            ['windows-dmtf-us:1767225600123456', 'processStartIdentity', 'unrecognized-owner-identity', false],
+        ])('current=%s %s=%s acquired=%s', async (currentIdentity, identityField, expectedIdentity, shouldAcquire) => {
+            const actualPlatform = await vi.importActual('../platform/index.js');
+            vi.doMock('../platform/index.js', () => ({
+                ...actualPlatform,
+                getProcessStartIdentitySync: () => currentIdentity,
+                isProcessAlive: () => true,
+            }));
+            vi.resetModules();
+            const dynamicFileLock = await import('../lib/file-lock.js');
+            const lockPath = join(testDir, 'cross-domain.lock');
+            const owner = {
+                version: 2,
+                pid: 4242,
+                nonce: '12121212-1212-4212-8212-121212121212',
+                timestamp: Date.now() - 60_000,
+                [identityField]: expectedIdentity,
+            };
+            const raw = JSON.stringify(owner);
+            writeFileSync(lockPath, raw);
+            const oldTime = new Date(Date.now() - 60_000);
+            utimesSync(lockPath, oldTime, oldTime);
+            const handle = dynamicFileLock.acquireFileLockSync(lockPath, { staleLockMs: 1_000 });
+            expect(Boolean(handle)).toBe(shouldAcquire);
+            if (handle) {
+                dynamicFileLock.releaseFileLockSync(handle);
+            }
+            else {
+                expect(readFileSync(lockPath, 'utf8')).toBe(raw);
+            }
         });
     });
     describe('lock file residue', () => {

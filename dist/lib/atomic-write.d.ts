@@ -3,6 +3,8 @@
  * No external dependencies.
  */
 import * as fsSync from "fs";
+import { fileIdentityOf, sameFileIdentity } from "./file-identity.js";
+export { fileIdentityOf, sameFileIdentity };
 /** Optional basename-based backend for an already-open directory. */
 export interface AtomicWriteOperations {
     open(name: string, flags: number, mode?: number): number;

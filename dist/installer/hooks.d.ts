@@ -8,8 +8,6 @@
  * This module provides Node.js scripts (.mjs) for cross-platform support (Windows, macOS, Linux).
  * Bash scripts were deprecated in v3.8.6 and removed in v3.9.0.
  */
-/** Minimum required Node.js version for hooks (must match package.json engines) */
-export declare const MIN_NODE_VERSION = 20;
 /** Check if running on Windows */
 export declare function isWindows(): boolean;
 /** Get the hooks directory path */
@@ -115,6 +113,13 @@ export declare const HOOKS_SETTINGS_CONFIG_NODE: {
             hooks: {
                 type: "command";
                 command: string;
+            }[];
+        }[];
+        SessionEnd: {
+            hooks: {
+                type: "command";
+                command: string;
+                async: true;
             }[];
         }[];
     };

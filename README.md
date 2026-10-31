@@ -148,7 +148,7 @@ OMC exposes two different surfaces:
 | Feature                                        | Terminal CLI                                  | In-session skill                                                        | Notes                                                                                                                                |
 | ---------------------------------------------- | --------------------------------------------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | Setup                                          | `omc setup`                                   | `/omc-setup`                                                            | Both are real entrypoints.                                                                                                            |
-| Ask providers                                  | `omc ask copilot "review this patch"`         | `/ask copilot "review this patch"`                                      | Both route through the same advisor flow. Providers: `claude`, `copilot`, `codex`, `gemini`, `antigravity`, `grok`, `cursor`.         |
+| Ask providers                                  | `omc ask copilot "review this patch"`         | `/ask copilot "review this patch"`                                      | Both route through the same advisor flow. Providers: `claude`, `copilot`, `codex`, `gemini`, `antigravity`, `grok`, `cursor`, `muse`. |
 | Team orchestration                             | `omc team 2:codex "review auth flow"`         | `/team 3:executor "fix all TypeScript errors"`                          | Both exist, but they are different runtimes: `omc team` launches tmux CLI workers; `/team` runs the in-session native team workflow. |
 | Pre-flight danger scan                         | `omc lookout scan --brief "..." [--json] [--strict]` | —                                                                | Advisory only: scans the task briefing and workspace before an unattended run and reports danger findings (findings/severity contract). Exit codes: 0 for successful non-strict scans (and strict scans without high-risk signals), 1 `--strict` with high-risk signals, 2 usage/scan error. |
 | Autopilot / Ralph / Execute / Deep Interview   | —                                             | `/autopilot ...`, `/ralph ...`, `/execute ...`, `/deep-interview ...`   | These are in-session skills. There is no `omc autopilot` / `omc ralph` / `omc execute` CLI subcommand in this repo.                  |
@@ -434,6 +434,7 @@ omc ask gemini --prompt "propose UI polish ideas"
 omc ask antigravity --prompt "propose UI polish ideas"
 omc ask grok --prompt "cross-check this code review"
 omc ask cursor --prompt "apply this implementation plan"
+omc ask muse --agent-prompt critic --prompt "review this plan"
 omc ask claude --agent-prompt executor --prompt "draft implementation steps"
 
 # Inside a Claude Code / OMC session
@@ -442,6 +443,7 @@ omc ask claude --agent-prompt executor --prompt "draft implementation steps"
 /ask codex "identify architecture risks"
 /ask antigravity "propose UI polish ideas"
 /ask cursor "apply this implementation plan"
+/ask muse --agent-prompt critic "review this plan"
 ```
 
 Canonical env vars:
@@ -489,6 +491,23 @@ Use the HUD for live observability and the current session/replay artifacts for 
 - Replay logs: `.omc/state/agent-replay-*.jsonl`
 - Live HUD rendering: `omc hud`
 - Local friction reports: `omc session friction report --since 24h` summarizes context-bloat and operator-friction signals from local session artifacts without printing raw prompts or tool output; add `--json` for automation.
+
+### Jev Judgment Configuration
+
+**Jev** brings calibrated decision-making to OMC's orchestration. Enable it with environment variables:
+
+```bash
+export TYPESAFE_API_KEY="sk-..."              # Jev API key (required)
+export OMC_JEV="all:active"                    # All judgment points active
+export OMC_JEV_TIMEOUT_MS="2000"               # Per-call timeout (default: 2000ms)
+```
+
+**Modes:**
+- `shadow` (default): Jev is queried but heuristics decide; answers logged for analysis
+- `active`: Jev's answer overrides the heuristic; adds latency (bounded by `OMC_JEV_TIMEOUT_MS`)
+- `off`: No Jev queries sent (zero egress)
+
+Jev decides skill triggering, model routing, loop continuation, context pruning, task sizing, and completion verdicts. On timeout, HTTP error, or parse failure, active mode degrades to the heuristic without blocking. Defaults to zero egress: without configuration, nothing is sent to the API. See **[Jev Judgment Points](docs/HOOKS.md#jev-judgment-points)** in HOOKS.md for the full configuration reference and point registry.
 
 ### Notification Tags (Telegram/Discord/Slack)
 
@@ -658,23 +677,23 @@ MIT
 
 Top personal non-fork, non-archived repos from all-time OMC contributors (100+ GitHub stars).
 
-- [@Yeachan-Heo](https://github.com/Yeachan-Heo) — [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode) (⭐ 39k)
-- [@junhoyeo](https://github.com/junhoyeo) — [tokscale](https://github.com/junhoyeo/tokscale) (⭐ 5.5k)
-- [@psmux](https://github.com/psmux) — [psmux](https://github.com/psmux/psmux) (⭐ 3.5k)
-- [@MeroZemory](https://github.com/MeroZemory) — [ida-multi-mcp](https://github.com/MeroZemory/ida-multi-mcp) (⭐ 434)
-- [@devswha](https://github.com/devswha) — [patina](https://github.com/devswha/patina) (⭐ 358)
-- [@GeiserX](https://github.com/GeiserX) — [awesome-spain](https://github.com/GeiserX/awesome-spain) (⭐ 345)
-- [@BowTiedSwan](https://github.com/BowTiedSwan) — [buildflow](https://github.com/BowTiedSwan/buildflow) (⭐ 299)
+- [@Yeachan-Heo](https://github.com/Yeachan-Heo) — [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode) (⭐ 40k)
+- [@junhoyeo](https://github.com/junhoyeo) — [tokscale](https://github.com/junhoyeo/tokscale) (⭐ 5.7k)
+- [@psmux](https://github.com/psmux) — [psmux](https://github.com/psmux/psmux) (⭐ 3.7k)
+- [@devswha](https://github.com/devswha) — [ovis](https://github.com/devswha/ovis) (⭐ 1.5k)
+- [@MeroZemory](https://github.com/MeroZemory) — [ida-multi-mcp](https://github.com/MeroZemory/ida-multi-mcp) (⭐ 463)
+- [@GeiserX](https://github.com/GeiserX) — [awesome-spain](https://github.com/GeiserX/awesome-spain) (⭐ 361)
+- [@BowTiedSwan](https://github.com/BowTiedSwan) — [buildflow](https://github.com/BowTiedSwan/buildflow) (⭐ 296)
 - [@J-Pster](https://github.com/J-Pster) — [Psters_AI_Workflow](https://github.com/J-Pster/Psters_AI_Workflow) (⭐ 289)
-- [@alohays](https://github.com/alohays) — [awesome-visual-representation-learning-with-transformers](https://github.com/alohays/awesome-visual-representation-learning-with-transformers) (⭐ 271)
+- [@alohays](https://github.com/alohays) — [awesome-visual-representation-learning-with-transformers](https://github.com/alohays/awesome-visual-representation-learning-with-transformers) (⭐ 272)
+- [@HaD0Yun](https://github.com/HaD0Yun) — [Doyunha-Gopeak](https://github.com/HaD0Yun/Doyunha-Gopeak) (⭐ 269)
+- [@changeroa](https://github.com/changeroa) — [StyleGallery](https://github.com/changeroa/StyleGallery) (⭐ 265)
 - [@jcwleo](https://github.com/jcwleo) — [random-network-distillation-pytorch](https://github.com/jcwleo/random-network-distillation-pytorch) (⭐ 264)
-- [@HaD0Yun](https://github.com/HaD0Yun) — [Doyunha-Gopeak](https://github.com/HaD0Yun/Doyunha-Gopeak) (⭐ 259)
 - [@HwangTaehyun](https://github.com/HwangTaehyun) — [github-repository-contribution-stats](https://github.com/HwangTaehyun/github-repository-contribution-stats) (⭐ 241)
-- [@shaun0927](https://github.com/shaun0927) — [openchrome](https://github.com/shaun0927/openchrome) (⭐ 237)
-- [@changeroa](https://github.com/changeroa) — [StyleGallery](https://github.com/changeroa/StyleGallery) (⭐ 235)
+- [@shaun0927](https://github.com/shaun0927) — [openchrome](https://github.com/shaun0927/openchrome) (⭐ 235)
 - [@emgeee](https://github.com/emgeee) — [mean-tutorial](https://github.com/emgeee/mean-tutorial) (⭐ 199)
 - [@anduinnn](https://github.com/anduinnn) — [HiFiNi-Auto-CheckIn](https://github.com/anduinnn/HiFiNi-Auto-CheckIn) (⭐ 172)
-- [@Znuff](https://github.com/Znuff) — [consolas-powerline](https://github.com/Znuff/consolas-powerline) (⭐ 145)
+- [@Znuff](https://github.com/Znuff) — [consolas-powerline](https://github.com/Znuff/consolas-powerline) (⭐ 146)
 
 <!-- OMC:FEATURED-CONTRIBUTORS:END -->
 

@@ -634,8 +634,9 @@ function output(value: unknown, asJson: boolean): void {
 }
 
 function toInt(value: string, flag: string): number {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) {
+  const trimmed = value.trim();
+  const parsed = Number(trimmed);
+  if (!/^[+-]?\d+$/.test(trimmed) || !Number.isSafeInteger(parsed)) {
     throw new Error(`Invalid ${flag} value: ${value}`);
   }
   return parsed;
@@ -1011,11 +1012,56 @@ export async function teamShutdownByName(teamName: string, options: { cwd?: stri
   const cwd = options.cwd ?? process.cwd();
 
   const runtimeV2 = await import('../team/runtime-v2.js');
-  const config = await readTeamConfig(teamName, cwd);
-  const instanceId = config?.instance_id;
-  if (!instanceId || !isValidTeamInstanceId(instanceId)) {
-    throw new Error('team_shutdown_instance_identity_missing');
+  
+  // Attempt to clean up any stale reservations from dead processes first
+  try {
+    await runtimeV2.cleanupStaleReservations(teamName, cwd);
+  } catch {
+    // Best-effort cleanup; proceed with shutdown attempt
   }
+  
+  const config = await readTeamConfig(teamName, cwd);
+  
+  // If team doesn't exist, report cleanly without error (like team status)
+  if (!config) {
+    console.log(`No team state found for ${teamName}`);
+    return {
+      teamName,
+      shutdown: false,
+      forced: Boolean(options.force),
+      sessionFound: false,
+    };
+  }
+  
+  const instanceId = config.instance_id;
+  if (!instanceId || !isValidTeamInstanceId(instanceId)) {
+    // Team exists but has no valid instance ID - partial startup failure
+    // Clean up the abandoned state and exit non-zero
+    console.error(`Team ${teamName} has incomplete startup state (config but no valid instance_id); cleaning up...`);
+    try {
+      await runtimeV2.cleanupAbandonedTeamState(teamName, cwd);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`Failed to clean up abandoned team state: ${detail}`);
+      process.exitCode = 1;
+      return {
+        teamName,
+        shutdown: false,
+        forced: Boolean(options.force),
+        sessionFound: false,
+        error: `cleanup_failed:${detail}`,
+      };
+    }
+    process.exitCode = 1;
+    return {
+      teamName,
+      shutdown: false,
+      forced: Boolean(options.force),
+      sessionFound: false,
+      cleaned: true,
+    };
+  }
+  
   const shutdown = await runtimeV2.shutdownTeamV2(teamName, cwd, {
     instanceId,
     force: Boolean(options.force),
@@ -1143,6 +1189,10 @@ Usage:
 Worktrees:
   Native per-worker git worktree mode is opt-in/config-gated with team.ops.worktreeMode or OMC_TEAM_WORKTREE_MODE=detached|named.
   Status JSON includes workspace_mode, worktree_mode, team_state_root, and per-worker worktree metadata.
+  --force skips the task-status gate and graceful waits; it does not bypass ownership or cleanup verification.
+  Unverified worker/provider cleanup preserves worktrees and team state. Errors report the outcome and reason/detail; preserved outcomes name affected workers.
+  Some failures also write details to stderr.
+  Retained paths need later operator or janitor cleanup.
 
 Auto-merge (v2-only):
   --auto-merge          Enable per-commit auto-merge to leader and auto-rebase fanout.
@@ -1150,6 +1200,10 @@ Auto-merge (v2-only):
                         Bursts of rapid worker commits coalesce to a single merge of HEAD.
                         Requires OMC_RUNTIME_V2=1. Leader branch must not be 'main' or 'master'.
                         Equivalent to OMC_TEAMS_AUTO_MERGE=1.
+
+Runtime safety:
+  This command reports only the tmux runtime-v2 outcome. An implicit team
+  finishing does not make it succeed, and it does not finish an implicit team.
 
 Examples:
   omc team start --agent codex --count 2 --task "review auth flow" --new-window
@@ -1699,11 +1753,21 @@ export async function teamCommand(argv: string[]): Promise<void> {
 
   if (command === 'shutdown') {
     const parsed = parseTeamTargetArgs(rest, 'shutdown');
-    const result = await teamShutdownByName(parsed.teamName, {
-      cwd: parsed.cwd ?? process.cwd(),
-      force: Boolean(parsed.force),
-    });
-    output(result, parsed.json);
+    try {
+      const result = await teamShutdownByName(parsed.teamName, {
+        cwd: parsed.cwd ?? process.cwd(),
+        force: Boolean(parsed.force),
+      });
+      output(result, parsed.json);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!parsed.json) {
+        console.error(message);
+        process.exitCode = 1;
+      } else {
+        output({ ok: false, error: { message } }, parsed.json);
+      }
+    }
     return;
   }
 

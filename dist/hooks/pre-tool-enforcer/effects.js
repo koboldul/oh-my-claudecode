@@ -114,11 +114,11 @@ function boundedForceDelegationEvents(events, retentionReferenceSec, validationR
  * ledger under one owner lock. Callers must use the returned plan for final
  * reduction; a failed reservation is an indeterminate safety failure.
  */
-export function reserveAndPlanPreToolBatch(envelope, snapshot) {
+export function reserveAndPlanPreToolBatch(envelope, snapshot, modelRoutingOverrides = {}) {
     if (!snapshot.forceDelegation?.enforce) {
         return {
             status: 'planned',
-            plan: planPreToolBatch(envelope, snapshot),
+            plan: planPreToolBatch(envelope, snapshot, modelRoutingOverrides),
             generation: snapshot.forceDelegationLedger.generation ?? 0,
         };
     }
@@ -160,7 +160,7 @@ export function reserveAndPlanPreToolBatch(envelope, snapshot) {
                     })),
                 },
             };
-            const plan = planPreToolBatch(envelope, currentSnapshot);
+            const plan = planPreToolBatch(envelope, currentSnapshot, modelRoutingOverrides);
             const reservations = plan.evaluations.flatMap((evaluation) => evaluation.effects ?? []).filter((effect) => effect.type === 'pretool.force-delegation-attempt.v1');
             const events = [...persisted.events];
             let changed = false;

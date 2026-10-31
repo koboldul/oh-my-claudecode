@@ -14,9 +14,12 @@
 import { createHash } from 'crypto';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { stripLeadingUtf8Bom } from '../../../scripts/lib/utf8-bom.mjs';
 import { getOmcRoot, getSessionStateDir } from '../../lib/worktree-paths.js';
 import { withStateFileMutationLock } from '../../lib/mode-state-io.js';
 import { atomicWriteJsonSync } from '../../lib/atomic-write.js';
+export const REPO_QUALITY_CLASSES = ['prototype', 'production', 'library'];
+export const MAX_FEEDBACK_COMMANDS = 20;
 // ============================================================================
 // Constants
 // ============================================================================
@@ -188,13 +191,36 @@ function normalizePrd(candidate) {
         return null;
     }
     const reconciliation = normalizeReconciliation(prd.reconciliation);
+    const repoQualityClass = normalizeRepoQualityClass(prd.repoQualityClass);
+    const feedbackCommands = normalizeFeedbackCommands(prd.feedbackCommands);
     return {
         project: prd.project,
         branchName: prd.branchName,
         description: prd.description,
         userStories: userStories,
-        ...(reconciliation ? { reconciliation } : {})
+        ...(reconciliation ? { reconciliation } : {}),
+        ...(repoQualityClass ? { repoQualityClass } : {}),
+        ...(feedbackCommands ? { feedbackCommands } : {})
     };
+}
+/**
+ * Fail-soft validators for the executor-declared run fields: an invalid value
+ * is dropped (the run falls back to defaults) rather than invalidating an
+ * otherwise valid PRD.
+ */
+function normalizeRepoQualityClass(candidate) {
+    return typeof candidate === 'string' && REPO_QUALITY_CLASSES.includes(candidate)
+        ? candidate
+        : undefined;
+}
+function normalizeFeedbackCommands(candidate) {
+    if (!Array.isArray(candidate)) {
+        return undefined;
+    }
+    const commands = candidate
+        .filter((entry) => typeof entry === 'string' && entry.trim().length > 0)
+        .slice(0, MAX_FEEDBACK_COMMANDS);
+    return commands.length > 0 ? commands : undefined;
 }
 /**
  * Validate and preserve the optional reconciliation config. Returns undefined
@@ -263,7 +289,9 @@ function normalizeObservableCheck(candidate) {
 }
 export function readPrdFromPath(prdPath) {
     try {
-        const content = readFileSync(prdPath, 'utf-8');
+        // A prd.json edited in an editor that saves "UTF-8 with BOM" keeps U+FEFF as the
+        // first character, which JSON.parse rejects.
+        const content = stripLeadingUtf8Bom(readFileSync(prdPath, 'utf-8'));
         const parsed = JSON.parse(content);
         const normalized = normalizePrd(parsed);
         if (!normalized) {

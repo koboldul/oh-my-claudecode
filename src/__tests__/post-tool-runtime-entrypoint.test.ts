@@ -7,7 +7,6 @@ import {
 } from 'node:child_process';
 import {
   copyFileSync,
-  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -27,6 +26,7 @@ import {
   expect,
   it,
 } from 'vitest';
+import { stageHookRuntimeSupport } from './helpers/staged-hook-runtime.js';
 
 const REPO_ROOT = process.cwd();
 const BUILD_RUNTIME_PATH = join(REPO_ROOT, 'scripts', 'build-hook-runtime.mjs');
@@ -171,12 +171,7 @@ describe('shipped post-tool canonical runtime entrypoints', () => {
     tempRoots.push(root);
 
     const scriptsDir = join(root, 'scripts');
-    mkdirSync(scriptsDir, { recursive: true });
-    cpSync(
-      join(REPO_ROOT, 'scripts', 'lib'),
-      join(scriptsDir, 'lib'),
-      { recursive: true },
-    );
+    stageHookRuntimeSupport(root, REPO_ROOT);
 
     const scripts = {} as Record<ScriptName, string>;
     for (const [name, config] of Object.entries(SCRIPT_CONFIG) as Array<
@@ -316,13 +311,17 @@ describe('shipped post-tool canonical runtime entrypoints', () => {
       ...process.env,
       CLAUDE_CONFIG_DIR: join(cwd, '.claude-test'),
       CLAUDE_PLUGIN_ROOT: staged.root,
+      COPILOT_AGENT_SESSION_ID: '',
+      COPILOT_CLI: '',
       DISABLE_OMC: '',
       HOME: testHome,
       NODE_ENV: 'test',
+      OMC_HOST: '',
       OMC_QUIET: '0',
       OMC_SESSION_ID: '',
       OMC_SKIP_HOOKS: '',
       OMC_STATE_DIR: '',
+      PLUGIN_ROOT: '',
       USERPROFILE: testHome,
       ...extraEnv,
     };
@@ -1006,6 +1005,102 @@ describe('shipped post-tool canonical runtime entrypoints', () => {
     );
   });
 
+  it('keeps a cumulatively over-budget Copilot rule complete and retryable', () => {
+    const staged = stagePlugin({ productionRulesInjector: true });
+    const { cwd, targetPath } = prepareRulesWorktree(
+      'rules-cumulative-boundary',
+    );
+    const sessionId = 'rules-cumulative-boundary';
+    const firstPath = writeAlwaysRule(
+      cwd,
+      'a-first.md',
+      `FIRST-COMPLETE:${'a'.repeat(4_000)}`,
+    );
+    const secondPath = writeAlwaysRule(
+      cwd,
+      'z-second.md',
+      `SECOND-COMPLETE:${'b'.repeat(2_500)}`,
+    );
+
+    const first = runHook(
+      staged,
+      'post-tool-rules-injector',
+      rulesPayload('copilot', cwd, targetPath, sessionId),
+      cwd,
+    );
+    const firstContext = outputAdditionalContext(first, 'copilot');
+    expect(firstContext).toContain('FIRST-COMPLETE:');
+    expect(firstContext).not.toContain('SECOND-COMPLETE:');
+    expect(readRulesState(cwd, sessionId).injectedRealPaths).toEqual([
+      realpathSync(firstPath),
+    ]);
+
+    const second = runHook(
+      staged,
+      'post-tool-rules-injector',
+      rulesPayload('copilot', cwd, targetPath, sessionId),
+      cwd,
+    );
+    expect(outputAdditionalContext(second, 'copilot')).toContain(
+      'SECOND-COMPLETE:',
+    );
+    expect([...readRulesState(cwd, sessionId).injectedRealPaths].sort())
+      .toEqual([realpathSync(firstPath), realpathSync(secondPath)].sort());
+  });
+
+  it('commits only structurally emitted rules when one context embeds another', () => {
+    const staged = stagePlugin({ productionRulesInjector: true });
+    const { cwd, targetPath } = prepareRulesWorktree(
+      'rules-embedded-context',
+    );
+    const sessionId = 'rules-embedded-context';
+    const embeddedContent = `EMBEDDED-RULE:${'e'.repeat(1_200)}`;
+    const embeddedPath = writeAlwaysRule(
+      cwd,
+      'z-embedded.md',
+      embeddedContent,
+    );
+    const embeddedContext = ruleContext(
+      cwd,
+      embeddedPath,
+      embeddedContent,
+      false,
+    );
+    const embeddingPath = writeAlwaysRule(
+      cwd,
+      'a-embedding.md',
+      `EMBEDDING-RULE\n${embeddedContext}\n${'x'.repeat(4_000)}`,
+    );
+
+    const first = runHook(
+      staged,
+      'post-tool-rules-injector',
+      rulesPayload('copilot', cwd, targetPath, sessionId),
+      cwd,
+    );
+    const firstContext = outputAdditionalContext(first, 'copilot');
+    expect(firstContext).toContain('EMBEDDING-RULE');
+    expect(firstContext).toContain(embeddedContext);
+    expect(readRulesState(cwd, sessionId).injectedRealPaths).toEqual([
+      realpathSync(embeddingPath),
+    ]);
+
+    const second = runHook(
+      staged,
+      'post-tool-rules-injector',
+      rulesPayload('copilot', cwd, targetPath, sessionId),
+      cwd,
+    );
+    expect(outputAdditionalContext(second, 'copilot')).toBe(
+      embeddedContext,
+    );
+    expect([...readRulesState(cwd, sessionId).injectedRealPaths].sort())
+      .toEqual([
+        realpathSync(embeddingPath),
+        realpathSync(embeddedPath),
+      ].sort());
+  });
+
   it('prevents duplicate delivery across concurrent rules hook processes', async () => {
     const staged = stagePlugin({ productionRulesInjector: true });
     const { cwd, targetPath } = prepareRulesWorktree('rules-concurrent-reserve');
@@ -1222,6 +1317,13 @@ describe('shipped post-tool canonical runtime entrypoints', () => {
     const staged = stagePlugin();
     const claudeCwd = makeWorktree('failure-claude');
     const copilotCwd = makeWorktree('failure-copilot');
+    for (const cwd of [claudeCwd, copilotCwd]) {
+      execFileSync('git', ['init', '--quiet'], {
+        cwd,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+    }
 
     expectExactOutput(
       runHook(
@@ -1418,15 +1520,21 @@ describe('shipped post-tool canonical runtime entrypoints', () => {
       >;
     };
 
-    const postToolFiles = manifest.hooks.PostToolUse[0].hooks.map((hook) => {
-      const match = hook.command.match(/scripts\/([a-z0-9-]+\.mjs)/i);
-      return match?.[1];
-    });
-    expect(manifest.hooks.PostToolUse[0].matcher).toBe('*');
+    const postToolFiles = manifest.hooks.PostToolUse.flatMap(
+      (group) => group.hooks.map((hook) => {
+        const match = hook.command.match(/scripts\/([a-z0-9-]+\.mjs)/i);
+        return match?.[1];
+      }),
+    );
+    expect(manifest.hooks.PostToolUse.map((group) => group.matcher)).toEqual([
+      '*',
+      'Read|Write|Edit|MultiEdit',
+    ]);
     expect(postToolFiles).toEqual([
       'post-tool-verifier.mjs',
       'project-memory-posttool.mjs',
       'post-tool-rules-injector.mjs',
+      'post-tool-directory-context-injector.mjs',
     ]);
 
     const failureHook = manifest.hooks.PostToolUseFailure[0];

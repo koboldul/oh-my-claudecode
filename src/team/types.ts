@@ -407,6 +407,16 @@ export interface TeamRuntimeOwnerEpoch {
   created_at: string;
 }
 
+export interface TeamScaleUpWorktreeCleanupReceipt {
+  worker_name: string;
+  path: string;
+  branch: string;
+  mode: 'detached' | 'named';
+  created: true;
+  reused: false;
+  effect_scope: 'created_before_worker_persist';
+}
+
 /** Durable lifecycle fence for a scale-up operation. */
 export interface TeamScaleUpAttempt {
   /** Missing on older records, which cannot authorize instance-bound effects. */
@@ -419,6 +429,9 @@ export interface TeamScaleUpAttempt {
   created_at: string;
   updated_at: string;
   failure_reason?: string;
+  cleanup_failures?: string[];
+  baseline_worker_names?: string[];
+  worktree_cleanup_receipts?: TeamScaleUpWorktreeCleanupReceipt[];
 }
 
 export interface TeamRecoveryAttempt {
@@ -737,6 +750,34 @@ export interface TeamInstanceCleanupRecord {
   created_at: string;
   updated_at: string;
   failure_reason?: string;
+}
+
+export interface TeamScaleUpWorktreeRecoveryEvidence {
+  schema_version: 1;
+  kind: 'team-scale-up-worktree-recovery';
+  instance_id: TeamInstanceId;
+  team_name: string;
+  cwd: string;
+  workspace_hash: string;
+  state_root: string;
+  operation_id: string;
+  evidence_path: string;
+  receipt: TeamScaleUpWorktreeCleanupReceipt;
+  original_error: string;
+  cleanup_error: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TeamScaleUpWorktreeRecoveryRetirementProof {
+  protocol: 'team-scale-up-worktree-recovery-settled-v1';
+  operation_id: string;
+  worktree: 'absent';
+  worker_state: 'absent';
+  worker_config: 'absent';
+  provider_effects: 'absent';
+  pane_effects: 'absent';
+  scale_up_fence: 'released';
 }
 
 export type TeamInstanceObservedState = 'missing' | 'empty' | 'bound';

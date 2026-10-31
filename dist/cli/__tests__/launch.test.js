@@ -6,7 +6,7 @@
  * - No OMC HUD pane spawning in tmux launch paths
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -15,6 +15,7 @@ vi.mock('child_process', async (importOriginal) => {
     return {
         ...actual,
         execFileSync: vi.fn(),
+        spawnSync: vi.fn(),
     };
 });
 vi.mock('../tmux-utils.js', async (importOriginal) => {
@@ -163,17 +164,41 @@ describe('runClaude — exit code propagation', () => {
             runClaude('/tmp', [], 'sid');
             expect(processExitSpy).not.toHaveBeenCalled();
         });
-        it('uses shell:true on win32 so claude.cmd can launch', () => {
+        it('launches claude via COMSPEC with verbatim args on win32 (no shell:true, #4154)', () => {
+            const originalPlatform = process.platform;
+            const originalComspec = process.env.COMSPEC;
+            Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+            process.env.COMSPEC = 'C:\\Windows\\System32\\cmd.exe';
+            try {
+                vi.mocked(spawnSync).mockReturnValue({ status: 0 });
+                runClaude('/tmp', ['--resume', 'a b'], 'sid');
+                expect(vi.mocked(execFileSync)).not.toHaveBeenCalled();
+                expect(vi.mocked(spawnSync)).toHaveBeenCalledWith('C:\\Windows\\System32\\cmd.exe', ['/d', '/s', '/c', 'claude --resume "a b"'], { cwd: '/tmp', stdio: 'inherit', windowsVerbatimArguments: true });
+            }
+            finally {
+                Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+                if (originalComspec === undefined)
+                    delete process.env.COMSPEC;
+                else
+                    process.env.COMSPEC = originalComspec;
+            }
+        });
+        it('maps cmd.exe exit 9009 on win32 to the claude-not-found error', () => {
             const originalPlatform = process.platform;
             Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-            execFileSync.mockReturnValue(Buffer.from(''));
-            runClaude('/tmp', ['--resume'], 'sid');
-            expect(vi.mocked(execFileSync)).toHaveBeenCalledWith('claude', ['--resume'], {
-                cwd: '/tmp',
-                stdio: 'inherit',
-                shell: true,
-            });
-            Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+            const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => undefined));
+            const errSpy = vi.spyOn(console, 'error').mockImplementation(() => { });
+            try {
+                vi.mocked(spawnSync).mockReturnValue({ status: 9009 });
+                runClaude('/tmp', [], 'sid');
+                expect(errSpy).toHaveBeenCalledWith('[omc] Error: claude CLI not found in PATH.');
+                expect(exitSpy).toHaveBeenCalledWith(1);
+            }
+            finally {
+                exitSpy.mockRestore();
+                errSpy.mockRestore();
+                Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+            }
         });
     });
     describe('inside-tmux policy', () => {
@@ -568,6 +593,7 @@ describe('buildTmuxClaudeCommand — pane process identity (issue #4005)', () =>
             expect(command).toContain('$HOME');
             expect(command).toContain('command -v claude');
             expect(command).toContain('claude CLI not found in PATH.');
+            expect(command).toContain('exit 127; }; ');
             expect(command).toContain('exec');
             expect(command).toContain('claude');
             expect(vi.mocked(buildTmuxShellCommand)).toHaveBeenCalledWith('claude', args);
@@ -586,6 +612,43 @@ describe('buildTmuxClaudeCommand — pane process identity (issue #4005)', () =>
             }
             else {
                 process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+            }
+        }
+    });
+    it('groups the native Windows availability guard before the env and Claude chain', () => {
+        const originalPlatform = process.platform;
+        const originalEnv = { ...process.env };
+        const originalNativeWindowsImplementation = vi.mocked(isNativeWindowsShell).getMockImplementation();
+        try {
+            for (const name of Object.keys(process.env))
+                delete process.env[name];
+            Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+            process.env.CLAUDE_CONFIG_DIR = '/tmp/omc-native-windows-test';
+            vi.mocked(isNativeWindowsShell).mockReturnValue(true);
+            const command = buildTmuxClaudeCommand([]);
+            const shellCommandMarker = '/c "';
+            const shellCommandIndex = command.indexOf(shellCommandMarker);
+            expect(shellCommandIndex).toBeGreaterThanOrEqual(0);
+            const nativeCommand = command
+                .slice(shellCommandIndex + shellCommandMarker.length, -1)
+                .replace(/""/g, '"');
+            expect(nativeCommand).toMatch(/^\(where claude >nul 2>nul \|\| \(echo \[omc\] Error: claude CLI not found in PATH\. 1>&2 & exit \/b 1\)\) && /);
+            expect(nativeCommand).toContain(')) && exec set "CLAUDE_CONFIG_DIR=/tmp/omc-native-windows-test" && claude');
+            const guardSeparator = nativeCommand.indexOf(')) && ');
+            expect(guardSeparator).toBeGreaterThanOrEqual(0);
+            const claudeIndex = nativeCommand.indexOf('claude', guardSeparator + ')) && '.length);
+            expect(claudeIndex).toBeGreaterThan(guardSeparator);
+        }
+        finally {
+            for (const name of Object.keys(process.env))
+                delete process.env[name];
+            Object.assign(process.env, originalEnv);
+            Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+            if (originalNativeWindowsImplementation) {
+                vi.mocked(isNativeWindowsShell).mockImplementation(originalNativeWindowsImplementation);
+            }
+            else {
+                vi.mocked(isNativeWindowsShell).mockReset();
             }
         }
     });

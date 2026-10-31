@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { getOmcRoot } from '../lib/worktree-paths.js';
-import { teamStateRoot } from './state-paths.js';
+import { canonicalTeamCwd, canonicalTeamStatePath, canonicalTeamStateRoot, teamStateRoot, } from './state-paths.js';
 import { TEAM_NAME_SAFE_PATTERN, WORKER_NAME_SAFE_PATTERN, TASK_ID_SAFE_PATTERN, TEAM_TASK_STATUSES, TEAM_EVENT_TYPES, TEAM_TASK_APPROVAL_STATUSES, } from './contracts.js';
 import { teamSendMessage as sendDirectMessage, teamBroadcast as broadcastMessage, teamListMailbox as listMailboxMessages, teamMarkMessageDelivered as markMessageDelivered, teamMarkMessageNotified as markMessageNotified, teamCreateTask, teamReadTask, teamListTasks, teamUpdateTask, teamClaimTask, teamTransitionTaskStatus, teamReleaseTaskClaim, teamReadConfig, teamReadManifest, teamReadWorkerStatus, teamReadWorkerHeartbeat, teamUpdateWorkerHeartbeat, teamWriteWorkerInbox, teamWriteWorkerIdentity, teamAppendEvent, teamGetSummary, teamWriteShutdownRequest, teamReadShutdownAck, teamReadMonitorSnapshot, teamWriteMonitorSnapshot, teamReadTaskApproval, teamWriteTaskApproval, teamPublishTaskRecoveryCheckpoint, teamReadCanonicalMailboxMessageStrict, } from './team-ops.js';
 import { queueBroadcastMailboxMessage, queueDirectMailboxMessage, runMailboxNotificationAttempt, } from './mcp-comm.js';
@@ -280,14 +280,19 @@ async function executeTeamCleanupViaRuntime(teamName, cwd, options = {}) {
     if (shutdown.outcome !== 'cleaned')
         throw new Error(`team_shutdown_${shutdown.outcome}:${shutdown.reason}`);
 }
-function readTeamStateRootFromFile(path) {
+function readTeamStateLocationMetadata(path) {
     if (!existsSync(path))
         return null;
     try {
         const parsed = JSON.parse(readFileSync(path, 'utf8'));
-        return typeof parsed.team_state_root === 'string' && parsed.team_state_root.trim() !== ''
-            ? parsed.team_state_root.trim()
-            : null;
+        return {
+            leaderCwd: typeof parsed.leader_cwd === 'string' && parsed.leader_cwd.trim() !== ''
+                ? parsed.leader_cwd.trim()
+                : null,
+            teamStateRoot: typeof parsed.team_state_root === 'string' && parsed.team_state_root.trim() !== ''
+                ? parsed.team_state_root.trim()
+                : null,
+        };
     }
     catch {
         return null;
@@ -316,22 +321,40 @@ function stateRootToWorkingDirectory(stateRoot) {
     }
     return dirname(dirname(absolute));
 }
-function resolveTeamWorkingDirectoryFromMetadata(teamName, candidateCwd, workerContext) {
+function teamStateRootsMatch(teamName, leaderCwd, advertisedRoot, discoveredRoot, discoveredCwd) {
+    const expectedCanonicalRoot = resolvePath(canonicalTeamStateRoot(leaderCwd, teamName));
+    const matchesExpectedRoot = (root, cwd) => {
+        return resolvePath(canonicalTeamStatePath(cwd, root)) === expectedCanonicalRoot;
+    };
+    return matchesExpectedRoot(advertisedRoot, leaderCwd)
+        && matchesExpectedRoot(discoveredRoot, discoveredCwd);
+}
+function resolveTeamWorkingDirectoryFromMetadata(teamName, candidateCwd) {
     const teamRoot = join(getOmcRoot(candidateCwd), 'state', 'team', teamName);
     if (!existsSync(teamRoot))
         return null;
-    if (workerContext?.teamName === teamName) {
-        const workerRoot = readTeamStateRootFromFile(join(teamRoot, 'workers', workerContext.workerName, 'identity.json'));
-        if (workerRoot)
-            return stateRootToWorkingDirectory(workerRoot);
-    }
-    const fromConfig = readTeamStateRootFromFile(join(teamRoot, 'config.json'));
-    if (fromConfig)
-        return stateRootToWorkingDirectory(fromConfig);
-    for (const manifestName of ['manifest.json', 'manifest.v2.json']) {
-        const fromManifest = readTeamStateRootFromFile(join(teamRoot, manifestName));
-        if (fromManifest)
-            return stateRootToWorkingDirectory(fromManifest);
+    const resolveValidatedLeaderCwd = (path) => {
+        const metadata = readTeamStateLocationMetadata(path);
+        if (!metadata?.leaderCwd || !metadata.teamStateRoot)
+            return null;
+        try {
+            if (!teamStateRootsMatch(teamName, metadata.leaderCwd, metadata.teamStateRoot, teamRoot, candidateCwd))
+                return null;
+            return canonicalTeamCwd(metadata.leaderCwd);
+        }
+        catch {
+            return null;
+        }
+    };
+    const metadataPaths = [
+        join(teamRoot, 'config.json'),
+        join(teamRoot, 'manifest.json'),
+        join(teamRoot, 'manifest.v2.json'),
+    ];
+    for (const metadataPath of metadataPaths) {
+        const leaderCwd = resolveValidatedLeaderCwd(metadataPath);
+        if (leaderCwd)
+            return leaderCwd;
     }
     return null;
 }
@@ -341,6 +364,15 @@ function resolveTeamWorkingDirectory(teamName, preferredCwd) {
         return preferredCwd;
     const envTeamStateRoot = readTeamStateRootFromEnv();
     if (typeof envTeamStateRoot === 'string' && envTeamStateRoot.trim() !== '') {
+        const leaderCwd = process.env.OMC_TEAM_LEADER_CWD?.trim();
+        // Centralized state roots do not encode their originating workspace path.
+        // The worker launch env carries both values, so trust the cwd only when it
+        // resolves to the exact team root advertised to this worker.
+        if (leaderCwd
+            && teamStateExists(normalizedTeamName, leaderCwd)
+            && teamStateRootsMatch(normalizedTeamName, leaderCwd, envTeamStateRoot, join(getOmcRoot(leaderCwd), 'state', 'team', normalizedTeamName), leaderCwd)) {
+            return canonicalTeamCwd(leaderCwd);
+        }
         const envWorkingDirectory = stateRootToWorkingDirectory(envTeamStateRoot.trim());
         if (teamStateExists(normalizedTeamName, envWorkingDirectory)) {
             return envWorkingDirectory;
@@ -353,12 +385,11 @@ function resolveTeamWorkingDirectory(teamName, preferredCwd) {
         if (!seeds.includes(seed))
             seeds.push(seed);
     }
-    const workerContext = parseTeamWorkerContextFromEnv();
     for (const seed of seeds) {
         let cursor = seed;
         while (cursor) {
             if (teamStateExists(normalizedTeamName, cursor)) {
-                return resolveTeamWorkingDirectoryFromMetadata(normalizedTeamName, cursor, workerContext) ?? cursor;
+                return resolveTeamWorkingDirectoryFromMetadata(normalizedTeamName, cursor) ?? cursor;
             }
             const parent = dirname(cursor);
             if (!parent || parent === cursor)

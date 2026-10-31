@@ -1,4 +1,5 @@
 import type { GitProvider, PRInfo, IssueInfo } from './types.js';
+export declare function isAzureDevOpsHost(host: string): boolean;
 export declare class AzureDevOpsProvider implements GitProvider {
     readonly name: "azure-devops";
     readonly displayName = "Azure DevOps";

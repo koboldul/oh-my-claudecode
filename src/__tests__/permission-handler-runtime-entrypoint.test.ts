@@ -249,6 +249,53 @@ describe('scripts/permission-handler.mjs canonical runtime entrypoint', () => {
     }
   });
 
+  it('auto-allows repo-scoped inspection but not tests inside a git worktree', () => {
+    mkdirSync(join(cwd, 'src', '__tests__'), { recursive: true });
+    writeFileSync(join(cwd, 'src', 'sample.ts'), 'export const value = 1;\n');
+    writeFileSync(
+      join(cwd, 'src', '__tests__', 'sample.test.ts'),
+      'test("x", () => {});\n',
+    );
+    execFileSync('git', ['init', '--quiet'], {
+      cwd,
+      stdio: 'pipe',
+      windowsHide: true,
+    });
+
+    expectExactOutput(
+      runPermissionHandler(
+        productionScriptPath,
+        claudePayload(cwd, 'cat src/sample.ts'),
+        claudeConfigDir,
+      ),
+      claudeDecision('allow'),
+    );
+    expectExactOutput(
+      runPermissionHandler(
+        productionScriptPath,
+        claudePayload(cwd, 'vitest run src/__tests__/sample.test.ts'),
+        claudeConfigDir,
+      ),
+      {},
+    );
+  });
+
+  it.each([
+    `git commit -m "$(cat <<'EOF'\nfeat: commit message\nEOF\n)"`,
+    `git tag -a v1.0.0 -m "$(cat <<'EOF'\nRelease v1.0.0\nEOF\n)"`,
+    `git commit -m "$(cat <<EOF\n$(touch /tmp/permission-bypass)\nEOF\n)"`,
+    `git commit; rm -rf / <<'EOF'\nmalicious payload\nEOF`,
+  ])('does not auto-allow Git heredoc commands: %s', (command) => {
+    expectExactOutput(
+      runPermissionHandler(
+        productionScriptPath,
+        claudePayload(cwd, command),
+        claudeConfigDir,
+      ),
+      {},
+    );
+  });
+
   it('passes observed safe Copilot powershell requests to native permission handling', () => {
     const result = runPermissionHandler(
       productionScriptPath,
@@ -288,7 +335,7 @@ describe('scripts/permission-handler.mjs canonical runtime entrypoint', () => {
     }
   });
 
-  it('never applies POSIX heredoc auto-allow to Copilot powershell', () => {
+  it('keeps POSIX heredoc commands on native permission paths for both hosts', () => {
     expectExactOutput(
       runPermissionHandler(
         productionScriptPath,
@@ -303,11 +350,11 @@ describe('scripts/permission-handler.mjs canonical runtime entrypoint', () => {
         claudePayload(cwd, SAFE_POSIX_HEREDOC_COMMAND),
         claudeConfigDir,
       ),
-      claudeDecision('allow'),
+      {},
     );
   });
 
-  it('requires quoted delimiters for POSIX heredoc auto-allow', () => {
+  it('does not auto-allow quoted or unquoted POSIX heredocs', () => {
     for (const command of [
       SAFE_POSIX_HEREDOC_COMMAND,
       SAFE_DOUBLE_QUOTED_POSIX_HEREDOC_COMMAND,
@@ -318,7 +365,7 @@ describe('scripts/permission-handler.mjs canonical runtime entrypoint', () => {
           claudePayload(cwd, command),
           claudeConfigDir,
         ),
-        claudeDecision('allow'),
+        {},
       );
     }
 

@@ -105,8 +105,8 @@ export declare const graphCommandNodeSchema: z.ZodObject<{
     id: z.ZodString;
     title: z.ZodString;
 }, "strict", z.ZodTypeAny, {
-    title: string;
     command: string;
+    title: string;
     id: string;
     kind: "command";
     timeout_ms: number;
@@ -120,8 +120,8 @@ export declare const graphCommandNodeSchema: z.ZodObject<{
         policy: "reconcile";
     };
 }, {
-    title: string;
     command: string;
+    title: string;
     id: string;
     kind: "command";
     timeout_ms: number;
@@ -259,8 +259,8 @@ export declare const graphNodeSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodObje
     id: z.ZodString;
     title: z.ZodString;
 }, "strict", z.ZodTypeAny, {
-    title: string;
     command: string;
+    title: string;
     id: string;
     kind: "command";
     timeout_ms: number;
@@ -274,8 +274,8 @@ export declare const graphNodeSchema: z.ZodDiscriminatedUnion<"kind", [z.ZodObje
         policy: "reconcile";
     };
 }, {
-    title: string;
     command: string;
+    title: string;
     id: string;
     kind: "command";
     timeout_ms: number;
@@ -571,8 +571,8 @@ export declare const graphDescriptorSchema: z.ZodObject<{
         id: z.ZodString;
         title: z.ZodString;
     }, "strict", z.ZodTypeAny, {
-        title: string;
         command: string;
+        title: string;
         id: string;
         kind: "command";
         timeout_ms: number;
@@ -586,8 +586,8 @@ export declare const graphDescriptorSchema: z.ZodObject<{
             policy: "reconcile";
         };
     }, {
-        title: string;
         command: string;
+        title: string;
         id: string;
         kind: "command";
         timeout_ms: number;
@@ -735,8 +735,8 @@ export declare const graphDescriptorSchema: z.ZodObject<{
             policy: "reconcile";
         };
     } | {
-        title: string;
         command: string;
+        title: string;
         id: string;
         kind: "command";
         timeout_ms: number;
@@ -812,8 +812,8 @@ export declare const graphDescriptorSchema: z.ZodObject<{
             policy: "reconcile";
         };
     } | {
-        title: string;
         command: string;
+        title: string;
         id: string;
         kind: "command";
         timeout_ms: number;
@@ -874,11 +874,11 @@ export declare const graphEvidenceReferenceSchema: z.ZodObject<{
     ref: z.ZodString;
     summary: z.ZodOptional<z.ZodString>;
 }, "strict", z.ZodTypeAny, {
-    kind: "file" | "command" | "test" | "url" | "human";
+    kind: "command" | "file" | "test" | "url" | "human";
     ref: string;
     summary?: string | undefined;
 }, {
-    kind: "file" | "command" | "test" | "url" | "human";
+    kind: "command" | "file" | "test" | "url" | "human";
     ref: string;
     summary?: string | undefined;
 }>;
@@ -892,11 +892,11 @@ export declare const graphNodeResultSchema: z.ZodObject<{
         ref: z.ZodString;
         summary: z.ZodOptional<z.ZodString>;
     }, "strict", z.ZodTypeAny, {
-        kind: "file" | "command" | "test" | "url" | "human";
+        kind: "command" | "file" | "test" | "url" | "human";
         ref: string;
         summary?: string | undefined;
     }, {
-        kind: "file" | "command" | "test" | "url" | "human";
+        kind: "command" | "file" | "test" | "url" | "human";
         ref: string;
         summary?: string | undefined;
     }>, "many">;
@@ -905,7 +905,7 @@ export declare const graphNodeResultSchema: z.ZodObject<{
     outcome: "failed" | "succeeded";
     attempt_id: string;
     evidence_refs: {
-        kind: "file" | "command" | "test" | "url" | "human";
+        kind: "command" | "file" | "test" | "url" | "human";
         ref: string;
         summary?: string | undefined;
     }[];
@@ -916,7 +916,7 @@ export declare const graphNodeResultSchema: z.ZodObject<{
     outcome: "failed" | "succeeded";
     attempt_id: string;
     evidence_refs: {
-        kind: "file" | "command" | "test" | "url" | "human";
+        kind: "command" | "file" | "test" | "url" | "human";
         ref: string;
         summary?: string | undefined;
     }[];
@@ -931,11 +931,11 @@ export declare const graphApprovalDecisionSchema: z.ZodObject<{
         ref: z.ZodString;
         summary: z.ZodOptional<z.ZodString>;
     }, "strict", z.ZodTypeAny, {
-        kind: "file" | "command" | "test" | "url" | "human";
+        kind: "command" | "file" | "test" | "url" | "human";
         ref: string;
         summary?: string | undefined;
     }, {
-        kind: "file" | "command" | "test" | "url" | "human";
+        kind: "command" | "file" | "test" | "url" | "human";
         ref: string;
         summary?: string | undefined;
     }>, "many">;
@@ -943,7 +943,7 @@ export declare const graphApprovalDecisionSchema: z.ZodObject<{
 }, "strict", z.ZodTypeAny, {
     decision: "approved" | "denied";
     evidence_refs: {
-        kind: "file" | "command" | "test" | "url" | "human";
+        kind: "command" | "file" | "test" | "url" | "human";
         ref: string;
         summary?: string | undefined;
     }[];
@@ -951,7 +951,7 @@ export declare const graphApprovalDecisionSchema: z.ZodObject<{
 }, {
     decision: "approved" | "denied";
     evidence_refs: {
-        kind: "file" | "command" | "test" | "url" | "human";
+        kind: "command" | "file" | "test" | "url" | "human";
         ref: string;
         summary?: string | undefined;
     }[];

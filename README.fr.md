@@ -131,7 +131,7 @@ Plusieurs stratégies pour différents cas d'utilisation — de l'orchestration 
 
 ### Expérience développeur
 
-- **Mots-clés magiques** — `ralph`, `ulw`, `eco`, `plan` pour un contrôle explicite
+- **Mots-clés magiques** — `ralph`, `ulw`, `plan` pour un contrôle explicite
 - **HUD statusline** — Métriques d'orchestration en temps réel dans votre barre d'état
   - Si vous lancez Claude Code directement avec `claude --plugin-dir <path>` (en contournant le shim `omc`), exportez `OMC_PLUGIN_ROOT=<path>` dans votre shell afin que le bundle HUD se résolve vers le même checkout que le chargeur de plugin. Voir [la section Plugin directory flags dans REFERENCE.md](./docs/REFERENCE.md#plugin-directory-flags) pour les détails.
 
@@ -184,7 +184,7 @@ Raccourcis optionnels pour les utilisateurs avancés. Le langage naturel fonctio
 | `autopilot`  | Exécution entièrement autonome      | `autopilot: build a todo app`                                   |
 | `ralph`      | Mode persistant                     | `ralph: refactor auth`                                          |
 | `ulw`        | Parallélisme maximal                | `ulw fix all errors`                                            |
-| `eco`        | Exécution économe en tokens         | `eco: migrate database`                                         |
+
 | `plan`       | Entretien de planification          | `plan the API`                                                  |
 | `ralplan`    | Consensus de planification itératif | `ralplan this feature`                                          |
 | `swarm`      | Ancien mot-clé (redirige vers Team) | `swarm 5 agents: fix lint errors`                               |

@@ -7,7 +7,14 @@ import * as fs from "fs/promises";
 import * as fsSync from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { identitiesEqual, type FileIdentity } from "./file-identity.js";
+import {
+  fileIdentityOf,
+  identitiesEqual,
+  sameFileIdentity,
+  type FileIdentity,
+} from "./file-identity.js";
+
+export { fileIdentityOf, sameFileIdentity };
 
 /** Optional basename-based backend for an already-open directory. */
 export interface AtomicWriteOperations {
@@ -69,18 +76,18 @@ function verifyPrivateTempFile(
   label: string,
   operations?: AtomicWriteOperations,
 ): void {
-  const fdStats = fsSync.fstatSync(fd);
-  let pathStats: ReturnType<AtomicWriteOperations["lstat"]>;
+  const fdStats = descriptorStats(fd, operations);
+  let pathStats: IdentityStats;
   try {
-    pathStats = (operations?.lstat ?? fsSync.lstatSync)(tempPath);
+    pathStats = pathnameStats(tempPath, operations);
   } catch {
     throw new Error(`${label} temporary file was replaced before rename`);
   }
   const isWindows = process.platform === "win32";
-  const isPrivateRegularSingleLink = (stats: ReturnType<AtomicWriteOperations["lstat"]>): boolean =>
+  const isPrivateRegularSingleLink = (stats: IdentityStats): boolean =>
     stats.isFile() &&
-    (isWindows ? stats.nlink <= 1 : stats.nlink === 1) &&
-    (isWindows || (stats.mode & 0o777) === 0o600);
+    (isWindows ? Number(stats.nlink) <= 1 : Number(stats.nlink) === 1) &&
+    (isWindows || (Number(stats.mode) & 0o777) === 0o600);
   if (
     !isPrivateRegularSingleLink(fdStats) ||
     !isPrivateRegularSingleLink(pathStats)
@@ -96,10 +103,10 @@ function verifyPrivateTempFile(
 
 /** Verify that publication installed the exact inode we opened and wrote. */
 function verifyPublishedFile(fd: number, filePath: string, label: string, operations?: AtomicWriteOperations): void {
-  const fdStats = fsSync.fstatSync(fd);
-  let pathStats: ReturnType<AtomicWriteOperations["lstat"]>;
+  const fdStats = descriptorStats(fd, operations);
+  let pathStats: IdentityStats;
   try {
-    pathStats = (operations?.lstat ?? fsSync.lstatSync)(filePath);
+    pathStats = pathnameStats(filePath, operations);
   } catch {
     throw new Error(`${label} target was replaced at publication`);
   }
@@ -143,19 +150,39 @@ function preservePriorTarget(filePath: string, operations?: AtomicWriteOperation
   }
 }
 
+/** The stat fields identity and private-file checks read, in either precision. */
+type IdentityStats = {
+  readonly dev: number | bigint;
+  readonly ino: number | bigint;
+  readonly mode: number | bigint;
+  readonly nlink: number | bigint;
+  isFile(): boolean;
+};
+
+/**
+ * Stat with BigInt ids. A contained backend (`operations`, Linux/macOS only)
+ * reports Number stats, so the descriptor side then uses Number stats too and
+ * both sides of a comparison always carry the same precision.
+ */
+function descriptorStats(fd: number, operations?: AtomicWriteOperations): IdentityStats {
+  return operations ? fsSync.fstatSync(fd) : fsSync.fstatSync(fd, { bigint: true });
+}
+
+function pathnameStats(filePath: string, operations?: AtomicWriteOperations): IdentityStats {
+  return operations ? operations.lstat(filePath) : fsSync.lstatSync(filePath, { bigint: true });
+}
+
 function currentFileIdentity(filePath: string, operations?: AtomicWriteOperations): FileIdentity | null {
   try {
-    const stats = (operations?.lstat ?? fsSync.lstatSync)(filePath);
-    return { dev: stats.dev, ino: stats.ino };
+    return fileIdentityOf(pathnameStats(filePath, operations));
   } catch {
     return null;
   }
 }
 
-function descriptorIdentity(fd: number): FileIdentity | null {
+function descriptorIdentity(fd: number, operations?: AtomicWriteOperations): FileIdentity | null {
   try {
-    const stats = fsSync.fstatSync(fd);
-    return { dev: stats.dev, ino: stats.ino };
+    return fileIdentityOf(descriptorStats(fd, operations));
   } catch {
     return null;
   }
@@ -371,7 +398,7 @@ export function atomicWriteFileSync(
     let publishedIdentity: FileIdentity | null = null;
     try {
       verifyPublishedFile(fd, filePath, "atomic write", operations);
-      publishedIdentity = descriptorIdentity(fd);
+      publishedIdentity = descriptorIdentity(fd, operations);
       hooks?.afterRename?.();
       verifyPublishedFile(fd, filePath, "atomic write", operations);
     } catch (error) {

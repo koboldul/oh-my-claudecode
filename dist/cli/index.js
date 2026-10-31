@@ -22,6 +22,7 @@ import { install as installOmc, isInstalled, getInstallInfo } from '../installer
 import { waitCommand, waitStatusCommand, waitDaemonCommand, waitDetectCommand } from './commands/wait.js';
 import { doctorConflictsCommand } from './commands/doctor-conflicts.js';
 import { doctorCopilotCommand } from './commands/doctor-copilot.js';
+import { ralphCommand } from './commands/ralph.js';
 import { doctorTeamRoutingCommand } from './commands/doctor-team-routing.js';
 import { capabilitiesCheckCommand, capabilitiesLockCommand } from './commands/capabilities.js';
 import { sessionSearchCommand } from './commands/session-search.js';
@@ -39,9 +40,12 @@ import { askCommand, ASK_USAGE } from './ask.js';
 import { graphCommand } from './graph.js';
 import { checkpointCommand } from './checkpoint.js';
 import { lookoutCommand } from './lookout.js';
+import { intakeCommand } from './commands/intake.js';
+import { factoryCommand } from './commands/factory.js';
 import { warnIfWin32 } from './win32-warning.js';
 import { autoresearchCommand } from './autoresearch.js';
 import { parseHudWatchInterval, runHudWatchLoop } from './hud-watch.js';
+import { integerOption } from './utils/integer-option.js';
 const version = getRuntimePackageVersion();
 /**
  * Apply a --plugin-dir option value: resolve to absolute path, warn if it
@@ -861,13 +865,6 @@ Examples:
             console.log('    executor            - Focused execution (Sonnet)');
             console.log('    planner          - Strategic planning (Opus)');
             console.log('    qa-tester           - Interactive CLI testing (Sonnet)');
-            console.log(chalk.gray('  Tiered Variants (for smart routing):'));
-            console.log('    architect-medium       - Simpler analysis (Sonnet)');
-            console.log('    architect-low          - Quick questions (Haiku)');
-            console.log('    executor-high       - Complex tasks (Opus)');
-            console.log('    executor-low        - Trivial tasks (Haiku)');
-            console.log('    designer-high       - Design systems (Opus)');
-            console.log('    designer-low        - Simple styling (Haiku)');
             console.log('');
             console.log(chalk.yellow('After Updates:'));
             console.log('  Run \'/omc-default\' (project) or \'/omc-default-global\' (global)');
@@ -927,7 +924,7 @@ waitCmd
     .description('Start or stop the auto-resume daemon')
     .option('-v, --verbose', 'Enable verbose logging')
     .option('-f, --foreground', 'Run in foreground (blocking)')
-    .option('-i, --interval <seconds>', 'Poll interval in seconds', '60')
+    .option('-i, --interval <seconds>', 'Poll interval in seconds', integerOption(1), 60)
     .addHelpText('after', `
 Examples:
   $ omc wait daemon start            Start background daemon
@@ -942,18 +939,18 @@ Examples:
     await waitDaemonCommand(action, {
         verbose: options.verbose,
         foreground: options.foreground,
-        interval: parseInt(options.interval),
+        interval: options.interval,
     });
 });
 waitCmd
     .command('detect')
     .description('Scan for blocked Claude Code sessions in tmux')
     .option('--json', 'Output as JSON')
-    .option('-l, --lines <number>', 'Number of pane lines to analyze', '15')
+    .option('-l, --lines <number>', 'Number of pane lines to analyze', integerOption(1), 15)
     .action(async (options) => {
     await waitDetectCommand({
         json: options.json,
-        lines: parseInt(options.lines),
+        lines: options.lines,
     });
 });
 /**
@@ -1046,22 +1043,22 @@ Examples:
 sessionCmd
     .command('search <query>')
     .description('Search prior local session transcripts and OMC session artifacts')
-    .option('-l, --limit <number>', 'Maximum number of matches to return', '10')
+    .option('-l, --limit <number>', 'Maximum number of matches to return', integerOption(1), 10)
     .option('-s, --session <id>', 'Restrict search to a specific session id')
     .option('--since <duration|date>', 'Only include matches since a duration (e.g. 7d, 24h) or absolute date')
     .option('--project <scope>', 'Project scope. Defaults to current project. Use "all" to search all local projects')
     .option('--json', 'Output results as JSON')
     .option('--case-sensitive', 'Match query case-sensitively')
-    .option('--context <chars>', 'Approximate snippet context on each side of a match', '120')
+    .option('--context <chars>', 'Approximate snippet context on each side of a match', integerOption(0), 120)
     .action(async (query, options) => {
     await sessionSearchCommand(query, {
-        limit: parseInt(options.limit, 10),
+        limit: options.limit,
         session: options.session,
         since: options.since,
         project: options.project,
         json: options.json,
         caseSensitive: options.caseSensitive,
-        context: parseInt(options.context, 10),
+        context: options.context,
         workingDirectory: process.cwd(),
     });
 });
@@ -1070,14 +1067,14 @@ sessionCmd
     .description('Report local session context-bloat and operator-friction signals')
     .command('report')
     .description('Summarize local session/context bloat and friction without raw prompt content')
-    .option('-l, --limit <number>', 'Maximum number of sessions to return', '10')
+    .option('-l, --limit <number>', 'Maximum number of sessions to return', integerOption(1), 10)
     .option('-s, --session <id>', 'Restrict report to a specific session id')
     .option('--since <duration|date>', 'Only include artifacts since a duration (e.g. 7d, 24h) or absolute date')
     .option('--project <scope>', 'Project scope. Defaults to current project. Use "all" to inspect all local projects')
     .option('--json', 'Output report as JSON')
     .action(async (options) => {
     await sessionFrictionReportCommand({
-        limit: parseInt(options.limit, 10),
+        limit: options.limit,
         session: options.session,
         since: options.since,
         project: options.project,
@@ -1181,6 +1178,8 @@ Examples:
     const exitCode = await doctorConflictsCommand(options);
     process.exit(exitCode);
 });
+// Headless AFK ralph launcher (factory AFK profile + declared verify commands).
+ralphCommand(program);
 /**
  * Setup command - Official CLI entry point for omc-setup
  *
@@ -1435,6 +1434,8 @@ program
 program.addCommand(graphCommand());
 program.addCommand(checkpointCommand());
 program.addCommand(lookoutCommand());
+program.addCommand(intakeCommand());
+program.addCommand(factoryCommand());
 /**
  * Returns the fully-configured commander program.
  *

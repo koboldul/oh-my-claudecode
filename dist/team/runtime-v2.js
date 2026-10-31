@@ -19,8 +19,8 @@ import { join, resolve } from 'path';
 import { existsSync } from 'fs';
 import { link, lstat, mkdir, open, readdir, readFile, rm, unlink, writeFile } from 'fs/promises';
 import { performance } from 'perf_hooks';
-import { TeamPaths, absPath, teamStateRoot } from './state-paths.js';
-import { getOmcRoot, validateSessionId } from '../lib/worktree-paths.js';
+import { TeamPaths, absPath, canonicalTeamStatePath, teamStateRoot, teamWorkspaceHash, withTeamStatePathScope, } from './state-paths.js';
+import { validateSessionId } from '../lib/worktree-paths.js';
 import { allocateTasksToWorkers } from './allocation-policy.js';
 import { readTeamConfig, readWorkerStatus, readWorkerHeartbeat, writeShutdownRequest, readShutdownAck, writeWorkerInbox, saveTeamConfig, commitInitialTeamConfigUnderLock, readRevisionedTeamConfig, saveTeamConfigAtRevision, migrateTeamConfigRevision, withTeamConfigMutationLock, readTeamManifest, } from './monitor.js';
 import { appendTeamEvent, emitMonitorDerivedEvents } from './events.js';
@@ -28,12 +28,12 @@ import { DEFAULT_TEAM_GOVERNANCE, DEFAULT_TEAM_TRANSPORT_POLICY, getConfigGovern
 import { inferPhase } from './phase-controller.js';
 import { ABSOLUTE_MAX_WORKERS, isValidTeamInstanceId, isValidTmuxServerIdentity } from './types.js';
 import { validateTeamName } from './team-name.js';
-import { TASK_ID_SAFE_PATTERN, WORKER_NAME_SAFE_PATTERN } from './contracts.js';
+import { isCanonicalWorkerName, TASK_ID_SAFE_PATTERN } from './contracts.js';
 import { buildValidatedWorkerLaunchDescriptor, clearResolvedPathCache, validateWorkerLaunchDescriptor, resolveValidatedBinaryPath, getWorkerEnv as getModelWorkerEnv, isPromptModeAgent, getPromptModeArgs, resolveDefaultWorkerModel, resolveExternalModelsDefaults, assertHeadlessSupported, } from './model-contract.js';
-import { createTeamSession, spawnOwnedWorkerInPane, deliverStartupInbox, probeStartupPaneActivity, retryStartupInboxSubmit, proveWorkerPaneOwnership, adoptWorkerPaneOwnership, getOwnedWorkerLiveness, captureOwnedTeamPane, workerPaneBelongsToOwnedProviderTarget, observeTmuxServerIdentity, killOwnedWorkerPane, verifyTeamTargetOwnership, observeTeamSessionTargetPresence, redactBoundedDiagnostic, killTeamSession, paneHasActiveTask, paneLooksReady, applyMainVerticalLayout, splitTeamWorkerPaneWithEvidence, TeamSessionCreationError, } from './tmux-session.js';
-import { composeInitialInbox, ensureWorkerStateDir, writeWorkerOverlay, generateTriggerMessage, generatePromptModeStartupPrompt, renderRecoveryContinuationInstruction, renderCursorWorkerGuidance, } from './worker-bootstrap.js';
+import { createTeamSession, spawnOwnedWorkerInPane, deliverStartupInbox, probeStartupPaneActivity, retryStartupInboxSubmit, proveWorkerPaneOwnership, adoptWorkerPaneOwnership, getOwnedWorkerLiveness, captureOwnedTeamPane, workerPaneBelongsToOwnedProviderTarget, observeTmuxServerIdentity, killOwnedWorkerPane, verifyTeamTargetOwnership, observeTeamSessionTargetPresence, redactBoundedDiagnostic, killTeamSession, paneHasActiveTask, paneLooksReady, applyMainVerticalLayout, splitTeamWorkerPaneWithEvidence, TMUX_MAILBOX_PANE_ID, TeamSessionCreationError, } from './tmux-session.js';
+import { composeInitialInbox, ensureWorkerStateDir, writeWorkerOverlay, generateTriggerMessage, generatePromptModeStartupPrompt, renderRecoveryContinuationInstruction, renderCursorWorkerGuidance, renderWorkerExitContract, } from './worker-bootstrap.js';
 import { queueInboxInstruction } from './mcp-comm.js';
-import { cleanupTeamWorktrees, inspectTeamWorktreeCleanupSafety, ensureWorkerWorktree, installWorktreeRootAgents, normalizeTeamWorktreeMode, } from './git-worktree.js';
+import { cleanupTeamWorktrees, inspectTeamWorktreeCleanupSafety, ensureWorkerWorktree, isWorktreeMetadataPublicationFailure, installWorktreeRootAgents, normalizeTeamWorktreeMode, } from './git-worktree.js';
 import { formatOmcCliInvocation } from '../utils/omc-cli-rendering.js';
 import { createSwallowedErrorLogger } from '../lib/swallowed-error.js';
 import { CANONICAL_TEAM_ROLES } from '../shared/types.js';
@@ -51,14 +51,23 @@ import { installCommitCadence, startFallbackPoller, uninstallCommitCadence, } fr
 import { createHash, randomUUID } from 'node:crypto';
 import { isMatchingRecoveryFinal, isSafeRecoveryRequestId, readRecoveryFinalState, readRecoveryOutcome, readRecoveryRequestReservation, readRecoveryResult, writeRecoveryFinal } from './recovery-request-store.js';
 import { parseRecoveryIntent, resolveRuntimeCliPath, teamRecoveryState, } from './runtime-owner-client.js';
-import { scaleUpFenceBlocks } from './scaling.js';
+import { recoverFailedScaleUpWorktreeUnderLock, scaleUpFenceBlocks } from './scaling.js';
 import { runRecoverySaga } from './recovery-saga.js';
 import { readTaskRecoveryCheckpoint, selectTaskRecoveryCheckpoint } from './task-recovery-checkpoint.js';
 import { withProcessIdentityFileLock } from './process-identity-lock.js';
 import { teamAdoptRecoveryReservations, teamListTasks, teamMarkTaskCompleted, teamReadMonitorSnapshot, teamReadTask, teamRequeueRecoveredTask, teamTransitionTaskStatus, teamWriteMonitorSnapshot, normalizeTaskRecord, withTaskClaimLock, writeAtomic, } from './team-ops.js';
 import { createTaskRecord, validateTaskDependencies } from './state/tasks.js';
-function workerInstructionStateRoot(cwd, teamName) {
-    return process.platform === 'win32' ? teamStateRoot(cwd, teamName) : '$OMC_TEAM_STATE_ROOT';
+function workerInstructionStateRoot(cwd, teamName, platform = process.platform) {
+    return platform === 'win32' ? teamStateRoot(cwd, teamName) : '$OMC_TEAM_STATE_ROOT';
+}
+export function buildStartupInboxTrigger(cwd, teamName, workerName, attemptId, platform = process.platform) {
+    const suffix = ` [launch:${attemptId.slice(0, 12)}]`;
+    const message = generateTriggerMessage(teamName, workerName, workerInstructionStateRoot(cwd, teamName, platform)) + suffix;
+    if (platform !== 'win32' || message.length <= 200)
+        return message;
+    // Both initial and recovery launches explicitly supply this environment variable.
+    // Name it in prose so the instruction works with PowerShell, cmd, and Bash.
+    return `Read workers/${workerName}/inbox.md under the OMC_TEAM_STATE_ROOT environment variable; execute now, report concrete progress.${suffix}`;
 }
 import { currentProcessStartIdentity, isProcessIdentityDead, publishOwnerEpoch, readLatestOwnerEpoch, requireOwnerFence, requireOwnerProcessIdentity } from './team-owner-epoch.js';
 import { waitForRecoveryGateRecord } from './worker-activation-gate.js';
@@ -85,7 +94,7 @@ export async function recoverDeadWorkerV2(teamName, cwd, { workerName, requestId
         return { outcome: 'failed', committed: false, error: 'invalid_input', requestId, recoveryId: '', teamName, workerName,
             updatedAt: new Date().toISOString(), message: 'teamName is invalid.' };
     }
-    if (!cwd || !WORKER_NAME_SAFE_PATTERN.test(workerName) || !isSafeRecoveryRequestId(requestId) || !Number.isSafeInteger(timeoutMs) || timeoutMs < 180_000 || timeoutMs > 300_000) {
+    if (!cwd || !isCanonicalWorkerName(workerName) || !isSafeRecoveryRequestId(requestId) || !Number.isSafeInteger(timeoutMs) || timeoutMs < 180_000 || timeoutMs > 300_000) {
         return { outcome: 'failed', committed: false, error: 'invalid_input', requestId, recoveryId: '', teamName, workerName,
             updatedAt: new Date().toISOString(), message: 'cwd, workerName, and requestId are required; timeoutMs must be an integer from 180000 through 300000.' };
     }
@@ -426,7 +435,7 @@ export function resolveTaskAssignment(task, resolvedRouting, roleRoutingConfig, 
     const normalized = normalizeDelegationRole(rawRole);
     const canonical = canonicalRoles.has(normalized) ? normalized : null;
     if (!canonical) {
-        return { agentType: fallbackAgent, model: '', role: null };
+        return { agentType: fallbackAgent, model: '', reasoningEffort: undefined, role: null };
     }
     // Snapshot routing only overrides the caller's CLI agentType when the user
     // has explicitly opted in — either by setting `task.role` or by configuring
@@ -435,7 +444,7 @@ export function resolveTaskAssignment(task, resolvedRouting, roleRoutingConfig, 
     // per-role routing, even if the task text incidentally mentions "reviewer".
     const hasConfigForRole = !!getRoleRoutingSpec(roleRoutingConfig, canonical);
     if (!hasExplicitRole && !hasConfigForRole) {
-        return { agentType: fallbackAgent, model: '', role: canonical };
+        return { agentType: fallbackAgent, model: '', reasoningEffort: undefined, role: canonical };
     }
     // Explicit provider + explicit role with NO per-role routing config: the user
     // named the provider directly on the worker spec (e.g. `1:antigravity:executor`
@@ -445,11 +454,11 @@ export function resolveTaskAssignment(task, resolvedRouting, roleRoutingConfig, 
     // launching Claude instead of the requested CLI provider. When `team.roleRouting`
     // *is* configured for the role, that deliberate config still wins (below).
     if (hasExplicitRole && !hasConfigForRole && fallbackAgent !== 'claude') {
-        return { agentType: fallbackAgent, model: '', role: canonical };
+        return { agentType: fallbackAgent, model: '', reasoningEffort: undefined, role: canonical };
     }
     const pair = resolvedRouting[canonical];
     if (!pair) {
-        return { agentType: fallbackAgent, model: '', role: canonical };
+        return { agentType: fallbackAgent, model: '', reasoningEffort: undefined, role: canonical };
     }
     // A routed provider is authoritative. Missing or untrusted binaries fail later
     // before any worker launch instead of silently changing provider identity.
@@ -632,19 +641,22 @@ function buildV2TaskInstruction(teamName, workerName, task, taskId, agentType, c
     const claimTaskCommand = formatOmcCliInvocation(`team api claim-task --input '${JSON.stringify({ team_name: teamName, task_id: taskId, worker: workerName })}' --json`, {});
     const completeTaskCommand = formatOmcCliInvocation(`team api transition-task-status --input '${JSON.stringify({ team_name: teamName, task_id: taskId, from: 'in_progress', to: 'completed', claim_token: '<claim_token>', result: 'Summary: <what changed>\\nVerification: <tests/checks run>\\nSubagent skip reason: worker protocol forbids nested subagents; completed focused probe in-session' })}' --json`);
     const failTaskCommand = formatOmcCliInvocation(`team api transition-task-status --input '${JSON.stringify({ team_name: teamName, task_id: taskId, from: 'in_progress', to: 'failed', claim_token: '<claim_token>' })}' --json`);
-    const cursorReviewer = agentType === 'cursor' && Boolean(cliOutputContract);
+    const persistentCursor = agentType === 'cursor';
+    const cursorReviewer = persistentCursor && Boolean(cliOutputContract);
     const lifecycleInstructions = cursorReviewer
         ? [
-            `3. Write the structured verdict from the trusted reviewer contract below when the review is complete.`,
-            `4. ACK/progress replies are not a stop signal. Keep the Cursor session alive for further mailbox instructions; the leader transitions this task after consuming the verdict.`,
+            `4. Write the structured verdict from the trusted reviewer contract below when the review is complete.`,
+            `5. ${renderWorkerExitContract(agentType, true)}`,
         ]
         : [
-            `3. On completion (use claim_token from step 1):`,
+            `4. On completion (use claim_token from step 1):`,
             `   ${completeTaskCommand}`,
             `   The result field is required for completion evidence. For broad delegated tasks, include either "Subagent skip reason: <why no nested worker was needed/allowed>" or, only when explicitly allowed by the leader, "Subagent spawn evidence: <child task names/thread ids and integrated findings>".`,
-            `4. On failure (use claim_token from step 1):`,
+            `5. On failure (use claim_token from step 1):`,
             `   ${failTaskCommand}`,
-            `5. ACK/progress replies are not a stop signal. Keep executing your assigned or next feasible work until the task is actually complete or failed, then transition and exit.`,
+            persistentCursor
+                ? `6. ${renderWorkerExitContract(agentType, false)}`
+                : `6. ACK/progress replies are not a stop signal. Keep executing your assigned or next feasible work until the task is actually complete or failed, then transition and exit.`,
         ];
     return [
         `## REQUIRED: Task Lifecycle Commands`,
@@ -653,7 +665,9 @@ function buildV2TaskInstruction(teamName, workerName, task, taskId, agentType, c
         `1. Claim your task:`,
         `   ${claimTaskCommand}`,
         `   Save the claim_token from the response.`,
-        `2. Do the work described below.`,
+        `   Only after a successful claim may you continue. If the claim fails, do not send the startup ACK or begin work; report the failure to leader-fixed and wait for instructions.`,
+        `2. Send the startup ACK from the worker overlay exactly once before work; do not resend it if already sent.`,
+        `3. Do the work described below.`,
         ...lifecycleInstructions,
         ``,
         `## Task Assignment`,
@@ -664,8 +678,8 @@ function buildV2TaskInstruction(teamName, workerName, task, taskId, agentType, c
         task.description,
         ``,
         cursorReviewer
-            ? `REMINDER: Write the verdict before yielding the review turn. Do NOT run transition-task-status or write done.json; the leader owns the terminal transition.`
-            : `REMINDER: You MUST run transition-task-status before exiting. Do NOT write done.json or edit task files directly.`,
+            ? `REMINDER: ${renderWorkerExitContract(agentType, true)} Do NOT write done.json; the leader owns the terminal transition.`
+            : `REMINDER: ${renderWorkerExitContract(agentType, false)} Do NOT write done.json or edit task files directly.`,
         ...(agentType === 'cursor' ? [renderCursorWorkerGuidance(Boolean(cliOutputContract))] : []),
         ...(cliOutputContract ? [cliOutputContract] : []),
     ].join('\n');
@@ -734,10 +748,11 @@ const WORKER_STARTUP_EVIDENCE_POLICIES = {
     // bounded resubmit behavior and its effective 6 + (4 * 12) poll windows.
     // An engaged pane (issue #3849: WSL2 cold starts publish first-turn claim
     // evidence well after the initial budget) gets one bounded read-only recheck
-    // before teardown; idle, wrong, or dead panes keep the fast fail-closed path.
+    // before teardown. Unengaged panes also receive a bounded final evidence
+    // recheck and still fail closed when no worker evidence appears.
     claude: {
         initialBudgetMs: 1_250,
-        finalRecheckBudgetMs: 0,
+        finalRecheckBudgetMs: 30_000,
         resubmitAttempts: 4,
         resubmitBudgetMs: 2_750,
         engagedPaneRecheckBudgetMs: 30_000,
@@ -801,8 +816,9 @@ async function waitForWorkerStatusTransition(teamName, workerName, cwd, baseline
  * wait would tear down a healthy provider (issue #3849). In that case the loop
  * stops resubmitting and one bounded read-only engaged-pane recheck runs before
  * the caller's fail-closed teardown. Interactive providers may also supply a
- * read-only activity probe when resubmission is disabled. Panes that are idle,
- * wrong, or dead never earn that recheck and keep the existing fast failure path.
+ * read-only activity probe when resubmission is disabled. `paneBusy` records
+ * that observation and is not startup success. Panes that are idle, wrong, or
+ * dead never earn that recheck and keep the existing fast failure path.
  */
 export async function settleStartupEvidence(policy, waitForCurrentEvidence, resubmit, probeActivity) {
     let settled = await waitForCurrentEvidence(policy.initialBudgetMs);
@@ -831,7 +847,98 @@ export async function settleStartupEvidence(policy, waitForCurrentEvidence, resu
             ? policy.engagedPaneRecheckBudgetMs
             : policy.finalRecheckBudgetMs);
     }
-    return settled;
+    return { settled, paneBusy: engagedPane };
+}
+function startupEvidenceMissingReason(paneBusy, agentType) {
+    const base = agentType ? `${agentType}_startup_evidence_missing` : 'worker_startup_evidence_missing';
+    return paneBusy ? `${base}_pane_busy` : base;
+}
+const CLAIM_ERROR_CAPTURE_MAX = 16_384;
+const CLAIM_ERROR_JSON_LINES_MAX = 80;
+const CLAIM_ERROR_LINE_MAX = 240;
+const CLAIM_ERROR_CODES = new Set([
+    'already_terminal',
+    'blocked_dependency',
+    'claim_conflict',
+    'invalid_input',
+    'operation_failed',
+    'task_not_found',
+    'worker_not_found',
+]);
+function normalizePaneLine(line) {
+    return line.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ').replace(/[ \t]+/g, ' ').trim();
+}
+function claimFailureSummary(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return undefined;
+    const result = value;
+    if (result.ok !== false)
+        return undefined;
+    const error = result.error;
+    const code = error && typeof error === 'object' && !Array.isArray(error)
+        ? error.code
+        : error;
+    return typeof code === 'string' && CLAIM_ERROR_CODES.has(code)
+        ? JSON.stringify({ ok: false, error: code })
+        : undefined;
+}
+function singleLineClaimFailure(line) {
+    const textError = /^error operation=claim-task code=([a-z][a-z0-9_]{0,63})(?:: .*)?$/.exec(line);
+    if (textError) {
+        const code = textError[1];
+        return code && CLAIM_ERROR_CODES.has(code)
+            ? `error operation=claim-task code=${code}`
+            : undefined;
+    }
+    try {
+        const parsed = JSON.parse(line);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+            return undefined;
+        const envelope = parsed;
+        if (envelope.operation !== 'claim-task' || envelope.command !== 'omc team api claim-task')
+            return undefined;
+        if (envelope.ok === false)
+            return claimFailureSummary(envelope);
+        return envelope.ok === true ? claimFailureSummary(envelope.data) : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/** Pretty-printed text mode is `ok operation=claim-task` plus the data object on following lines. */
+function textModeClaimFailure(lines, index) {
+    if (lines[index] !== 'ok operation=claim-task' || lines[index + 1] !== '{')
+        return undefined;
+    const collected = [];
+    let collectedLength = 0;
+    const end = Math.min(lines.length, index + 1 + CLAIM_ERROR_JSON_LINES_MAX);
+    for (let lineIndex = index + 1; lineIndex < end; lineIndex += 1) {
+        const line = lines[lineIndex] ?? '';
+        collectedLength += line.length + 1;
+        if (collectedLength > CLAIM_ERROR_CAPTURE_MAX)
+            return undefined;
+        collected.push(line);
+        try {
+            return claimFailureSummary(JSON.parse(collected.join('\n')));
+        }
+        catch {
+            // Ignore malformed or incomplete JSON and continue within the fixed bounds.
+        }
+    }
+    return undefined;
+}
+/** Last owned-pane line that reports a claim-task failure. Pane text is not startup evidence. */
+export function claimErrorLineFromPane(captured) {
+    const boundedCapture = captured.length > CLAIM_ERROR_CAPTURE_MAX
+        ? captured.slice(-CLAIM_ERROR_CAPTURE_MAX)
+        : captured;
+    const lines = boundedCapture.split(/\r?\n/).map(normalizePaneLine);
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const failure = textModeClaimFailure(lines, index) ?? singleLineClaimFailure(lines[index] ?? '');
+        if (failure)
+            return failure.slice(0, CLAIM_ERROR_LINE_MAX);
+    }
+    return undefined;
 }
 export function promptModeRecoveryRequiresProgressEvidence(promptMode, continuationCount) {
     return promptMode && continuationCount > 0;
@@ -907,7 +1014,14 @@ async function spawnV2Worker(opts) {
         ? opts.leaderPaneId
         : opts.existingWorkerPaneIds[opts.existingWorkerPaneIds.length - 1];
     const splitDirection = opts.existingWorkerPaneIds.length === 0 ? 'right' : 'down';
-    const launchProvider = opts.sessionName.startsWith('cmux:') ? 'cmux' : 'tmux';
+    // Issue #4261: Determine provider based on both session name and pane id format.
+    // cmux's tmux-compat layer sets both TMUX and CMUX_SURFACE_ID, but the pane id is tmux-format (%...).
+    // Use the same logic as verifyTeamTargetOwnership:
+    // - Only use 'cmux' provider if session starts with 'cmux:' AND pane id is cmux-format (not %...).
+    // - Otherwise use 'tmux' provider (including cmux with tmux-compat where paneId is %...).
+    const isTmuxFormatPaneId = TMUX_MAILBOX_PANE_ID.test(opts.leaderPaneId);
+    const isNativeCmuxProvider = opts.sessionName.startsWith('cmux:') && !isTmuxFormatPaneId;
+    const launchProvider = isNativeCmuxProvider ? 'cmux' : 'tmux';
     const tmuxServerIdentity = requireTmuxServerIdentity(opts.sessionName, opts.tmuxServerIdentity);
     if (!await workerPaneBelongsToOwnedProviderTarget({
         provider: launchProvider,
@@ -953,13 +1067,12 @@ async function spawnV2Worker(opts) {
         ? renderCliWorkerOutputContract(opts.role, outputFile)
         : undefined;
     const instruction = buildV2TaskInstruction(opts.teamName, opts.workerName, opts.task, opts.taskId, opts.agentType, cliOutputContract);
-    const instructionStateRoot = workerInstructionStateRoot(opts.cwd, opts.teamName);
     const startupBaseline = await captureWorkerStartupBaseline(opts.teamName, opts.workerName, opts.taskId, opts.cwd);
     if (usePromptMode) {
         await composeInitialInbox(opts.teamName, opts.workerName, instruction, opts.cwd, cliOutputContract);
     }
     const envVars = {
-        ...getModelWorkerEnv(opts.teamName, opts.workerName, opts.agentType),
+        ...getModelWorkerEnv(opts.teamName, opts.workerName, opts.agentType, process.env, opts.role),
         OMC_TEAM_STATE_ROOT: teamStateRoot(opts.cwd, opts.teamName),
         OMC_TEAM_LEADER_CWD: opts.cwd,
         ...(opts.worktreePath ? { OMC_TEAM_WORKTREE_PATH: opts.worktreePath } : {}),
@@ -1013,8 +1126,7 @@ async function spawnV2Worker(opts) {
         }
         throw error;
     }
-    const inboxTriggerMessage = `${generateTriggerMessage(opts.teamName, opts.workerName, instructionStateRoot)} ` +
-        `[launch:${startupContext.attempt.attempt_id.slice(0, 12)}]`;
+    const inboxTriggerMessage = buildStartupInboxTrigger(opts.cwd, opts.teamName, opts.workerName, startupContext.attempt.attempt_id);
     const cleanupStartedLaunch = async (reason) => {
         const cleaned = await retireAndCleanupCurrentWorkerLaunchAttempt(startupContext.attempt, reason, async () => {
             try {
@@ -1036,6 +1148,7 @@ async function spawnV2Worker(opts) {
         ? () => probeStartupPaneActivity(startupContext, { attemptAlreadyFenced: true })
         : undefined;
     const waitForBoundedStartupEvidence = (resubmit) => settleStartupEvidence(evidencePolicy, waitForCurrentEvidence, resubmit, probeActivity);
+    let paneBusyEvidenceMiss = false;
     const fencedDispatch = await (async () => {
         try {
             return await withWorkerLaunchAttemptFence(startupContext.attempt, async () => {
@@ -1060,22 +1173,25 @@ async function spawnV2Worker(opts) {
                     fallbackAllowed: DEFAULT_TEAM_TRANSPORT_POLICY.dispatch_mode === 'hook_preferred_with_fallback',
                     inboxCorrelationKey: `startup:${opts.workerName}:${opts.taskId}:${startupContext.attempt.attempt_id}`,
                     notify: async (_target, triggerMessage) => {
+                        paneBusyEvidenceMiss = false;
                         if (usePromptMode) {
-                            const settled = await waitForBoundedStartupEvidence();
-                            return settled
+                            const settlement = await waitForBoundedStartupEvidence();
+                            paneBusyEvidenceMiss = !settlement.settled && settlement.paneBusy;
+                            return settlement.settled
                                 ? { ok: true, transport: 'prompt_stdin', reason: 'prompt_mode_worker_confirmed' }
-                                : { ok: false, transport: 'prompt_stdin', reason: `${opts.agentType}_startup_evidence_missing` };
+                                : { ok: false, transport: 'prompt_stdin', reason: startupEvidenceMissingReason(settlement.paneBusy, opts.agentType) };
                         }
                         const attempted = await deliverStartupInbox(startupContext, triggerMessage, { attemptAlreadyFenced: true });
                         if (!attempted.ok) {
                             return { ok: false, transport: 'tmux_send_keys', reason: `worker_notify_failed:${attempted.reason}` };
                         }
-                        const settled = await waitForBoundedStartupEvidence(opts.agentType === 'cursor' || opts.agentType === 'codex'
+                        const settlement = await waitForBoundedStartupEvidence(opts.agentType === 'cursor' || opts.agentType === 'codex'
                             ? undefined
                             : () => retryStartupInboxSubmit(startupContext, triggerMessage, { attemptAlreadyFenced: true }));
-                        return settled
+                        paneBusyEvidenceMiss = !settlement.settled && settlement.paneBusy;
+                        return settlement.settled
                             ? { ok: true, transport: 'tmux_send_keys', reason: 'worker_startup_confirmed' }
-                            : { ok: false, transport: 'tmux_send_keys', reason: 'worker_startup_evidence_missing' };
+                            : { ok: false, transport: 'tmux_send_keys', reason: startupEvidenceMissingReason(settlement.paneBusy) };
                     },
                     deps: { writeWorkerInbox },
                 });
@@ -1104,6 +1220,10 @@ async function spawnV2Worker(opts) {
         ? fencedDispatch.value
         : { ok: false, reason: 'worker_launch_attempt_superseded' };
     if (!dispatchOutcome.ok) {
+        const paneBusyFailureReason = startupEvidenceMissingReason(true, usePromptMode ? opts.agentType : undefined);
+        const claimError = paneBusyEvidenceMiss && dispatchOutcome.reason === paneBusyFailureReason
+            ? claimErrorLineFromPane(await captureOwnedTeamPane(ownership, { joinWrappedLines: true }))
+            : undefined;
         try {
             await cleanupStartedLaunch('startup_dispatch_failed');
         }
@@ -1123,6 +1243,7 @@ async function spawnV2Worker(opts) {
             paneId,
             startupAssigned: false,
             startupFailureReason: dispatchOutcome.reason,
+            ...(claimError ? { claimError } : {}),
             launchAttemptId: startupContext.attempt.attempt_id,
         };
     }
@@ -2796,8 +2917,9 @@ export async function executeRecoverDeadWorkerV2Owner(input) {
                 const effects = await withWorkerLaunchAttemptFence(startupContext.attempt, async () => {
                     await ensureFence();
                     if (promptModeRecoveryRequiresProgressEvidence(pending.promptMode, continuations.length)) {
-                        if (!await waitForBoundedStartupEvidence())
-                            return { ok: false, error: `${pending.agentType}_startup_evidence_missing` };
+                        const settlement = await waitForBoundedStartupEvidence();
+                        if (!settlement.settled)
+                            return { ok: false, error: startupEvidenceMissingReason(settlement.paneBusy, pending.agentType) };
                     }
                     else if (pending.promptMode) {
                         // Idle prompt-mode recoveries (for example Gemini with no owned tasks)
@@ -2807,7 +2929,7 @@ export async function executeRecoverDeadWorkerV2Owner(input) {
                         // would turn a successful idle recovery into a deterministic timeout.
                     }
                     else {
-                        const recoveryTriggerMessage = `${generateTriggerMessage(input.teamName, sagaInput.workerName, workerInstructionStateRoot(input.cwd, input.teamName))} [launch:${startupContext.attempt.attempt_id.slice(0, 12)}]`;
+                        const recoveryTriggerMessage = buildStartupInboxTrigger(input.cwd, input.teamName, sagaInput.workerName, startupContext.attempt.attempt_id);
                         const outcome = await queueInboxInstruction({
                             teamName: input.teamName,
                             workerName: sagaInput.workerName,
@@ -2824,12 +2946,12 @@ export async function executeRecoverDeadWorkerV2Owner(input) {
                                 if (!attempted.ok) {
                                     return { ok: false, transport: 'tmux_send_keys', reason: `worker_notify_failed:${attempted.reason}` };
                                 }
-                                const settled = await waitForBoundedStartupEvidence(pending.agentType === 'cursor' || pending.agentType === 'codex'
+                                const settlement = await waitForBoundedStartupEvidence(pending.agentType === 'cursor' || pending.agentType === 'codex'
                                     ? undefined
                                     : () => retryStartupInboxSubmit(startupContext, triggerMessage, { attemptAlreadyFenced: true }));
-                                return settled
+                                return settlement.settled
                                     ? { ok: true, transport: 'tmux_send_keys', reason: 'worker_startup_confirmed' }
-                                    : { ok: false, transport: 'tmux_send_keys', reason: 'worker_startup_evidence_missing' };
+                                    : { ok: false, transport: 'tmux_send_keys', reason: startupEvidenceMissingReason(settlement.paneBusy) };
                             },
                             deps: { writeWorkerInbox },
                         });
@@ -2929,13 +3051,42 @@ async function rollbackUnpersistedNativeWorktreeStartup(teamName, cwd, cause, in
         }
         return false;
     }
+    if (isWorktreeMetadataPublicationFailure(cause) && !cause.cleanupVerified) {
+        try {
+            await writeFailureMarker({
+                instance_id: instance.instance_id,
+                instance_binding: instance,
+                cleanup_incomplete: true,
+                worktree_creation_receipt: {
+                    team_name: cause.teamName,
+                    worker_name: cause.workerName,
+                    path: cause.worktreePath,
+                    branch: cause.worktreeBranch,
+                    mode: cause.worktreeMode,
+                    cleanup_verified: false,
+                    publication_error: cause.cause instanceof Error ? cause.cause.message : String(cause.cause),
+                    cleanup_error: cause.cleanupError instanceof Error
+                        ? cause.cleanupError.message
+                        : String(cause.cleanupError),
+                },
+            });
+        }
+        catch {
+            // The exact receipt remains attached to the surfaced error; never
+            // release the reservation or remove state when durable evidence fails.
+        }
+        return false;
+    }
     const safety = inspectTeamWorktreeCleanupSafety(teamName, cwd);
     try {
         if (safety.hasEvidence) {
             const cleanup = cleanupTeamWorktrees(teamName, cwd);
             if (cleanup.preserved.length > 0) {
-                await writeFailureMarker({ preserved: cleanup.preserved });
-                return true;
+                await writeFailureMarker({
+                    cleanup_incomplete: true,
+                    preserved: cleanup.preserved,
+                });
+                return false;
             }
         }
         await rm(teamRoot, { recursive: true, force: true });
@@ -3100,6 +3251,17 @@ function resolveLeaderClaudeSessionId() {
     }
     return undefined;
 }
+function resolveWorkerBootstrapInstructions(config, workerIndex, preparedRole) {
+    const roles = [preparedRole, config.workerRoles?.[workerIndex]];
+    for (const role of roles) {
+        if (typeof role !== 'string' || role.length === 0)
+            continue;
+        const prompt = config.rolePromptByRole?.[role];
+        if (typeof prompt === 'string' && prompt.length > 0)
+            return prompt;
+    }
+    return config.rolePrompt;
+}
 /**
  * Start a team with the v2 event-driven runtime.
  * Creates state directories, writes config + task files, spawns workers via
@@ -3249,6 +3411,14 @@ export async function startTeamV2(config) {
         const missing = missingBinaryReasons.map(({ agentType, reason }) => `${agentType}:${reason}`).join(';');
         throw new Error(`cli_binary_preflight_failed:${missing}`);
     }
+    // Clean up any stale reservations from dead processes BEFORE acquiring the lifecycle lock.
+    // This prevents nested lock acquisition and ensures old dead-owner reservations don't block startup.
+    try {
+        await cleanupStaleReservations(sanitized, leaderCwd);
+    }
+    catch {
+        // Best-effort; proceed even if cleanup fails
+    }
     return withTeamInstanceLifecycleLock(leaderCwd, sanitized, async () => {
         // Reserve the name before creating any state, worktree, pane, or provider
         // effect.  The reservation remains external and blocks same-name startup
@@ -3291,7 +3461,7 @@ export async function startTeamV2(config) {
             // Create state directories
             await mkdir(absPath(leaderCwd, TeamPaths.tasks(sanitized)), { recursive: true });
             await mkdir(absPath(leaderCwd, TeamPaths.workers(sanitized)), { recursive: true });
-            await mkdir(join(getOmcRoot(leaderCwd), 'state', 'team', sanitized, 'mailbox'), { recursive: true });
+            await mkdir(join(absPath(leaderCwd, TeamPaths.root(sanitized)), 'mailbox'), { recursive: true });
             // Write task files
             for (let i = 0; i < config.tasks.length; i++) {
                 const taskId = String(i + 1);
@@ -3375,13 +3545,14 @@ export async function startTeamV2(config) {
                 if (!prepared)
                     throw new Error(`Missing prepared launch for ${wName}`);
                 await ensureWorkerStateDir(sanitized, wName, leaderCwd);
+                const bootstrapInstructions = resolveWorkerBootstrapInstructions(config, i, prepared.role);
                 const overlayPath = await writeWorkerOverlay({
                     teamName: sanitized, workerName: wName, agentType: prepared.agentType,
                     tasks: config.tasks.map((t, idx) => ({
                         id: String(idx + 1), subject: t.subject, description: t.description,
                     })),
                     cwd: leaderCwd,
-                    ...(config.rolePrompt ? { bootstrapInstructions: config.rolePrompt } : {}),
+                    ...(bootstrapInstructions ? { bootstrapInstructions } : {}),
                     instructionStateRoot: workerInstructionStateRoot(leaderCwd, sanitized),
                     ...(prepared.role && shouldInjectContract(prepared.role, prepared.agentType)
                         ? { reviewerRole: true } : {}),
@@ -3558,6 +3729,7 @@ export async function startTeamV2(config) {
             throw error;
         }
         const launchedWorkers = [];
+        const startupFailures = [];
         try {
             // Reuse the same first-per-worker selection used by assignment and
             // preflight; no second dedupe policy may diverge from startupByWorker.
@@ -3614,6 +3786,11 @@ export async function startTeamV2(config) {
                     }
                 }
                 if (workerLaunch.startupFailureReason) {
+                    startupFailures.push({
+                        worker: wName,
+                        reason: workerLaunch.startupFailureReason,
+                        ...(workerLaunch.claimError ? { claimError: workerLaunch.claimError } : {}),
+                    });
                     const logEventFailure = createSwallowedErrorLogger('team.runtime-v2.startTeamV2 appendTeamEvent failed');
                     appendTeamEvent(sanitized, {
                         type: 'team_leader_nudge',
@@ -3750,6 +3927,7 @@ export async function startTeamV2(config) {
             config: teamConfig,
             cwd: leaderCwd,
             ownsWindow: ownsWindow,
+            startupFailures,
         };
     });
 }
@@ -3820,6 +3998,43 @@ export async function requeueDeadWorkerTasks(teamName, deadWorkerNames, cwd) {
         }
     }
     return [...requeued];
+}
+// ---------------------------------------------------------------------------
+// AC-7: CLI worker verdict completion handler
+// ---------------------------------------------------------------------------
+const CURSOR_RUNTIME_POLICY_SKIP_REASON = 'runtime worker protocol forbids nested subagents';
+const CURSOR_RUNTIME_POLICY_SKIP_PROVENANCE = 'runtime-policy';
+const CURSOR_DELEGATION_EVIDENCE_LINE = /^\s*Subagent (?:spawn evidence|skip reason):/i;
+function stripCursorDelegationEvidenceMarkers(summary) {
+    return summary
+        .split(/\r\n|\r|\n/)
+        .filter(line => !CURSOR_DELEGATION_EVIDENCE_LINE.test(line))
+        .join('\n');
+}
+function cursorTransitionFailureMarkerPath(outputFile) {
+    return `${outputFile}.transition-failure`;
+}
+function cursorTransitionFailureMarkerKey(input) {
+    return createHash('sha256')
+        .update(JSON.stringify([
+        input.instanceId,
+        input.workerName,
+        input.launchAttemptId ?? null,
+        input.claimToken,
+        input.taskId,
+        input.taskVersion,
+        input.error,
+    ]))
+        .digest('hex');
+}
+async function readCursorTransitionFailureMarker(outputFile) {
+    try {
+        const marker = (await readFile(cursorTransitionFailureMarkerPath(outputFile), 'utf8')).trim();
+        return marker || null;
+    }
+    catch {
+        return null;
+    }
 }
 function nonCursorVerdictBindingPath(outputFile) {
     return `${outputFile}.binding`;
@@ -3919,20 +4134,22 @@ async function readNonCursorVerdictBinding(path) {
  * for human review (per plan AC-7).
  */
 export async function processCliWorkerVerdicts(teamName, cwd, expectedInstanceId) {
-    const sanitized = sanitizeTeamName(teamName);
-    let instanceId = expectedInstanceId;
-    if (instanceId === undefined) {
-        const current = await readTeamConfig(sanitized, cwd);
-        // Legacy/name-only state is readable for diagnosis but cannot authorize
-        // verdict task mutation.
-        if (!current?.instance_id)
-            return [];
-        instanceId = current.instance_id;
-    }
-    const instance = createTeamInstanceBinding({ teamName: sanitized, cwd, instanceId });
-    return withTeamInstanceLifecycleLock(instance.cwd, instance.team_name, async () => {
-        await assertTeamInstanceUnderLock(instance);
-        return processCliWorkerVerdictsUnderLock(teamName, cwd, instance.instance_id);
+    return withTeamStatePathScope(cwd, async () => {
+        const sanitized = sanitizeTeamName(teamName);
+        let instanceId = expectedInstanceId;
+        if (instanceId === undefined) {
+            const current = await readTeamConfig(sanitized, cwd);
+            // Legacy/name-only state is readable for diagnosis but cannot authorize
+            // verdict task mutation.
+            if (!current?.instance_id)
+                return [];
+            instanceId = current.instance_id;
+        }
+        const instance = createTeamInstanceBinding({ teamName: sanitized, cwd, instanceId });
+        return withTeamInstanceLifecycleLock(instance.cwd, instance.team_name, async () => {
+            await assertTeamInstanceUnderLock(instance);
+            return processCliWorkerVerdictsUnderLock(teamName, cwd, instance.instance_id);
+        });
     });
 }
 /** Mutating verdict body; callers must already hold the instance lifecycle lock. */
@@ -3941,11 +4158,41 @@ async function processCliWorkerVerdictsUnderLock(teamName, cwd, expectedInstance
     const config = await readTeamConfig(sanitized, cwd);
     if (!config)
         return [];
-    if (!config.instance_id || config.instance_id.toLowerCase() !== expectedInstanceId)
+    const configInstanceId = config.instance_id;
+    if (!configInstanceId || configInstanceId.toLowerCase() !== expectedInstanceId)
         return [];
     const results = [];
     const logEventFailure = createSwallowedErrorLogger('team.runtime-v2.processCliWorkerVerdicts appendTeamEvent failed');
     const logCompletionMarkerFailure = createSwallowedErrorLogger('team.runtime-v2.processCliWorkerVerdicts teamMarkTaskCompleted failed');
+    const logCursorTransitionMarkerFailure = createSwallowedErrorLogger('team.runtime-v2.processCliWorkerVerdicts Cursor transition marker failed');
+    const logCursorTransitionFailure = async (outputFile, workerName, taskId, taskVersion, claimToken, launchAttemptId, error) => {
+        if (error === 'already_terminal')
+            return;
+        const marker = cursorTransitionFailureMarkerKey({
+            instanceId: configInstanceId,
+            workerName,
+            launchAttemptId,
+            claimToken,
+            taskId,
+            taskVersion,
+            error,
+        });
+        if (await readCursorTransitionFailureMarker(outputFile) === marker)
+            return;
+        try {
+            await appendTeamEvent(sanitized, {
+                type: 'team_leader_nudge',
+                worker: 'leader-fixed',
+                task_id: taskId,
+                reason: `cli_worker_verdict_transition_failed:${workerName}:${taskId}:${error}`,
+            }, cwd);
+        }
+        catch (eventError) {
+            logEventFailure(eventError);
+            return;
+        }
+        await writeAtomic(cursorTransitionFailureMarkerPath(outputFile), `${marker}\n`).catch(logCursorTransitionMarkerFailure);
+    };
     const { rename } = await import('fs/promises');
     const { renameSync, readFileSync, existsSync: fsExistsSync } = await import('fs');
     const { withFileLockSync } = await import('../lib/file-lock.js');
@@ -4175,11 +4422,15 @@ async function processCliWorkerVerdictsUnderLock(teamName, cwd, expectedInstance
         let targetTaskId = null;
         let targetTaskPath = null;
         let targetTaskVersion = null;
+        let targetTaskDelegation;
         if (!cursorReviewer && nonCursorBinding) {
             targetTaskId = nonCursorBinding.task_id;
             targetTaskPath = absPath(cwd, TeamPaths.taskFile(sanitized, nonCursorBinding.task_id));
             targetTaskVersion = nonCursorBinding.task_version;
         }
+        // Canonical read of the Cursor verdict's task: undefined when it could not
+        // be read (I/O or schema failure), null when the task file is missing.
+        let cursorVerdictTask;
         for (const taskId of candidateTaskIds) {
             if (targetTaskId)
                 break;
@@ -4195,6 +4446,8 @@ async function processCliWorkerVerdictsUnderLock(teamName, cwd, expectedInstance
                 // can be considered for a verdict publication.
                 continue;
             }
+            if (cursorReviewer)
+                cursorVerdictTask = taskData;
             if (!taskData)
                 continue;
             try {
@@ -4216,6 +4469,7 @@ async function processCliWorkerVerdictsUnderLock(teamName, cwd, expectedInstance
                     targetTaskId = taskId;
                     targetTaskPath = taskPath;
                     targetTaskVersion = taskData.version ?? 1;
+                    targetTaskDelegation = taskData.delegation;
                     break;
                 }
             }
@@ -4225,63 +4479,60 @@ async function processCliWorkerVerdictsUnderLock(teamName, cwd, expectedInstance
         }
         if (!targetTaskId || !targetTaskPath || targetTaskVersion === null) {
             if (cursorReviewer && verdictFile === processingOutputFile) {
-                const processedTaskPath = absPath(cwd, TeamPaths.taskFile(sanitized, payload.task_id));
+                const reportCursorVerdictRetained = (error) => logCursorTransitionFailure(outputFile, worker.name, payload.task_id, payload.task_version ?? 0, payload.claim_token ?? '', worker.launch_attempt_id ?? payload.launch_attempt_id, error);
+                if (!cursorVerdictTask) {
+                    // Missing or unreadable task state cannot prove the claim stale;
+                    // keep the claimed verdict for the next cycle.
+                    await reportCursorVerdictRetained('task_unavailable');
+                    results.push({
+                        workerName: worker.name,
+                        taskId: payload.task_id,
+                        status: 'skipped',
+                        verdict: payload.verdict,
+                        reason: 'cursor_verdict_task_unavailable',
+                    });
+                    continue;
+                }
+                const metadata = cursorVerdictTask.metadata;
+                const taskAlreadyRecorded = cursorVerdictTask.owner === worker.name
+                    && (cursorVerdictTask.status === 'completed' || cursorVerdictTask.status === 'failed')
+                    && typeof cursorVerdictTask.role === 'string'
+                    && normalizeDelegationRole(cursorVerdictTask.role) === workerRole
+                    && metadata?.verdict_source === 'cli_worker_output_contract'
+                    && metadata.verdict_claim_token === payload.claim_token
+                    && metadata.verdict_task_version === payload.task_version
+                    && (worker.launch_attempt_id === undefined
+                        || metadata.verdict_worker_launch_attempt_id === worker.launch_attempt_id)
+                    && metadata.verdict === payload.verdict;
+                // The canonical task no longer carries this verdict's claim (requeued,
+                // reassigned, terminal elsewhere, or token/version/attempt changed),
+                // so the verdict can never apply. Quarantine it as processed.
+                let quarantined = true;
                 try {
-                    const processedTask = JSON.parse(readFileSync(processedTaskPath, 'utf-8'));
-                    const metadata = processedTask.metadata && typeof processedTask.metadata === 'object'
-                        ? processedTask.metadata
-                        : undefined;
-                    const processedTaskRole = typeof processedTask.role === 'string'
-                        ? normalizeDelegationRole(processedTask.role)
-                        : null;
-                    const taskAlreadyRecorded = processedTask.owner === worker.name
-                        && (processedTask.status === 'completed' || processedTask.status === 'failed')
-                        && (!cursorReviewer || processedTaskRole === workerRole)
-                        && metadata?.verdict_source === 'cli_worker_output_contract'
-                        && (!cursorReviewer
-                            || (metadata.verdict_claim_token === payload.claim_token
-                                && metadata.verdict_task_version === payload.task_version))
-                        && (worker.launch_attempt_id === undefined
-                            || metadata.verdict_worker_launch_attempt_id === worker.launch_attempt_id)
-                        && metadata.verdict === payload.verdict;
-                    if (taskAlreadyRecorded) {
-                        try {
-                            await rename(verdictFile, processedOutputFile);
-                        }
-                        catch { /* best-effort */ }
-                        results.push({
-                            workerName: worker.name,
-                            taskId: payload.task_id,
-                            status: 'already_terminal',
-                            verdict: payload.verdict,
-                        });
-                        continue;
-                    }
-                    const currentClaim = processedTask.claim && typeof processedTask.claim === 'object'
-                        ? processedTask.claim
-                        : null;
-                    const activeClaimMismatch = processedTask.owner === worker.name
-                        && processedTask.status === 'in_progress'
-                        && currentClaim?.owner === worker.name
-                        && (!cursorReviewer || processedTaskRole === workerRole);
-                    if (activeClaimMismatch) {
-                        try {
-                            await rename(verdictFile, processedOutputFile);
-                        }
-                        catch { /* best-effort quarantine */ }
-                        results.push({
-                            workerName: worker.name,
-                            taskId: payload.task_id,
-                            status: 'skipped',
-                            verdict: payload.verdict,
-                            reason: 'cursor_verdict_claim_mismatch',
-                        });
-                        continue;
-                    }
+                    await rename(verdictFile, processedOutputFile);
                 }
                 catch {
-                    // Fall through to the existing no-in-progress warning.
+                    quarantined = false;
                 }
+                if (taskAlreadyRecorded) {
+                    results.push({
+                        workerName: worker.name,
+                        taskId: payload.task_id,
+                        status: 'already_terminal',
+                        verdict: payload.verdict,
+                    });
+                    continue;
+                }
+                if (!quarantined)
+                    await reportCursorVerdictRetained('stale_verdict_quarantine_failed');
+                results.push({
+                    workerName: worker.name,
+                    taskId: payload.task_id,
+                    status: 'skipped',
+                    verdict: payload.verdict,
+                    reason: quarantined ? 'cursor_verdict_claim_mismatch' : 'cursor_verdict_quarantine_failed',
+                });
+                continue;
             }
             await appendTeamEvent(sanitized, {
                 type: 'team_leader_nudge',
@@ -4303,9 +4554,18 @@ async function processCliWorkerVerdictsUnderLock(teamName, cwd, expectedInstance
         let publishFailureReason;
         try {
             if (cursorReviewer) {
+                const cursorReviewerSkipEvidenceAllowed = terminalStatus === 'completed'
+                    && targetTaskDelegation?.skip_allowed_reason_required === true
+                    && (targetTaskDelegation.mode === 'auto'
+                        || targetTaskDelegation.mode === 'required'
+                        || targetTaskDelegation.required_parallel_probe === true);
+                const cursorSummary = stripCursorDelegationEvidenceMarkers(payload.summary);
+                const transitionResult = cursorReviewerSkipEvidenceAllowed
+                    ? `${cursorSummary}\nSubagent skip reason: ${CURSOR_RUNTIME_POLICY_SKIP_REASON}`
+                    : cursorSummary;
                 const transition = await teamTransitionTaskStatus(sanitized, targetTaskId, 'in_progress', terminalStatus, payload.claim_token, cwd, terminalStatus === 'completed'
                     ? {
-                        result: payload.summary,
+                        result: transitionResult,
                         metadata: {
                             verdict: payload.verdict,
                             verdict_summary: payload.summary,
@@ -4314,6 +4574,9 @@ async function processCliWorkerVerdictsUnderLock(teamName, cwd, expectedInstance
                             verdict_source: 'cli_worker_output_contract',
                             verdict_claim_token: payload.claim_token,
                             verdict_task_version: payload.task_version,
+                            ...(cursorReviewerSkipEvidenceAllowed
+                                ? { verdict_delegation_provenance: CURSOR_RUNTIME_POLICY_SKIP_PROVENANCE }
+                                : {}),
                             ...(worker.launch_attempt_id
                                 ? { verdict_worker_launch_attempt_id: worker.launch_attempt_id }
                                 : {}),
@@ -4335,6 +4598,8 @@ async function processCliWorkerVerdictsUnderLock(teamName, cwd, expectedInstance
                         },
                     });
                 transitionOk = transition.ok;
+                if (!transition.ok)
+                    publishFailureReason = transition.error;
             }
             else {
                 const artifactResult = await withProcessIdentityFileLock(`${outputFile}.lock`, async () => {
@@ -4486,14 +4751,23 @@ async function processCliWorkerVerdictsUnderLock(teamName, cwd, expectedInstance
                 : 'task_publish_failed';
         }
         if (!transitionOk) {
+            if (cursorReviewer && publishFailureReason) {
+                await logCursorTransitionFailure(outputFile, worker.name, targetTaskId, observedTaskVersion, payload.claim_token, worker.launch_attempt_id ?? payload.launch_attempt_id, publishFailureReason);
+            }
+            const cursorTransitionStatus = publishFailureReason === 'already_terminal'
+                ? 'already_terminal'
+                : 'skipped';
+            const transitionReason = cursorReviewer
+                ? cursorTransitionStatus === 'skipped'
+                    ? publishFailureReason ?? 'task_transition_rejected'
+                    : undefined
+                : publishFailureReason ?? 'task_transition_rejected';
             results.push({
                 workerName: worker.name,
                 taskId: targetTaskId,
-                status: cursorReviewer ? 'already_terminal' : 'skipped',
+                status: cursorReviewer ? cursorTransitionStatus : 'skipped',
                 verdict: payload.verdict,
-                ...(cursorReviewer
-                    ? {}
-                    : { reason: publishFailureReason ?? 'task_transition_rejected' }),
+                ...(transitionReason ? { reason: transitionReason } : {}),
             });
             continue;
         }
@@ -4770,6 +5044,105 @@ export async function monitorTeamV2(teamName, cwd, expectedInstanceId) {
     };
 }
 // ---------------------------------------------------------------------------
+// cleanupStaleReservations — remove reservations owned by dead processes
+// ---------------------------------------------------------------------------
+/**
+ * Best-effort cleanup of stale (pending) team reservations owned by dead
+ * processes. Acquires the lifecycle lock to ensure race-safe removal.
+ * This allows new teams to be created even if a previous team's reservation
+ * file was left behind due to process death during startup.
+ */
+export async function cleanupStaleReservations(teamName, cwd) {
+    const sanitized = sanitizeTeamName(teamName);
+    try {
+        await withTeamInstanceLifecycleLock(cwd, sanitized, async () => {
+            const workspaceHash = teamWorkspaceHash(cwd, sanitized);
+            const reservationPath = canonicalTeamStatePath(cwd, TeamPaths.teamInstanceReservation(workspaceHash, sanitized));
+            if (!existsSync(reservationPath))
+                return;
+            const contentStr = await readFile(reservationPath, 'utf-8');
+            const reservation = JSON.parse(contentStr);
+            // Validate basic shape
+            if (!(reservation &&
+                typeof reservation === 'object' &&
+                !Array.isArray(reservation) &&
+                'owner' in reservation &&
+                typeof reservation.owner === 'object')) {
+                return; // Malformed, leave alone
+            }
+            const owner = reservation.owner;
+            if (!(owner &&
+                typeof owner === 'object' &&
+                !Array.isArray(owner) &&
+                'pid' in owner &&
+                'process_started_at' in owner)) {
+                return; // Malformed owner, leave alone
+            }
+            // Only a pending reservation can be stale. An active reservation is the
+            // running team's instance authority: its owner is the `team start` CLI,
+            // which exits once the team is up, and shutdown itself releases it.
+            if (reservation.phase !== 'pending')
+                return;
+            // Check if the process is dead
+            const ownerRecord = owner;
+            if (isProcessIdentityDead(ownerRecord)) {
+                // Owner process is dead; clean up this reservation
+                await unlink(reservationPath);
+            }
+        }, 5_000);
+    }
+    catch {
+        // Best-effort; silently proceed on any error
+    }
+}
+/**
+ * Clean up abandoned team state when config exists but has no valid instance_id.
+ * This handles partial startup failures and ensures no state is left behind.
+ */
+export async function cleanupAbandonedTeamState(teamName, cwd) {
+    const sanitized = sanitizeTeamName(teamName);
+    await withTeamInstanceLifecycleLock(cwd, sanitized, async () => {
+        // Clean up the reservation if it exists and owner is dead or missing
+        const workspaceHash = teamWorkspaceHash(cwd, sanitized);
+        const reservationPath = canonicalTeamStatePath(cwd, TeamPaths.teamInstanceReservation(workspaceHash, sanitized));
+        if (existsSync(reservationPath)) {
+            try {
+                const contentStr = await readFile(reservationPath, 'utf-8');
+                const reservation = JSON.parse(contentStr);
+                const owner = reservation.owner;
+                // Remove if owner is dead or if this process owns it
+                if (!owner || isProcessIdentityDead(owner) || ownerMatchesCurrent(owner)) {
+                    await unlink(reservationPath);
+                }
+            }
+            catch {
+                // If reservation is malformed, try to remove it anyway
+                try {
+                    await unlink(reservationPath);
+                }
+                catch {
+                    // Reservation removal failed; continue with state dir cleanup
+                }
+            }
+        }
+        // Clean up the team state directory
+        const teamRoot = teamStateRoot(cwd, sanitized);
+        if (existsSync(teamRoot)) {
+            try {
+                await rm(teamRoot, { recursive: true, force: true });
+            }
+            catch (error) {
+                throw new Error(`Failed to remove team state directory at ${teamRoot}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+    }, 10_000);
+}
+// Helper to check if owner matches current process
+function ownerMatchesCurrent(owner) {
+    const processStartedAt = currentProcessStartIdentity();
+    return processStartedAt !== null && owner.pid === process.pid && processStartedAt === owner.process_started_at;
+}
+// ---------------------------------------------------------------------------
 // shutdownTeam — graceful shutdown with gate, ack, force kill
 // ---------------------------------------------------------------------------
 /**
@@ -4853,7 +5226,7 @@ export async function shutdownTeamV2(teamName, cwd, options = {}) {
             && (!observed.instance_id || observed.instance_id.toLowerCase() !== options.instanceId.toLowerCase())) {
             throw new Error(observed.instance_id ? 'team_instance_mismatch' : 'team_instance_authority_missing');
         }
-        const current = await migrateTeamConfigRevision(sanitized, cwd);
+        let current = await migrateTeamConfigRevision(sanitized, cwd);
         if (!current)
             return null;
         if (!current.config.instance_id)
@@ -4868,6 +5241,7 @@ export async function shutdownTeamV2(teamName, cwd, options = {}) {
         });
         instance = boundInstance;
         await assertTeamInstanceUnderLock(boundInstance);
+        current = await recoverFailedScaleUpWorktreeUnderLock(boundInstance, current);
         if (!current.config.tmux_session
             || (!current.config.tmux_session.startsWith('cmux:')
                 && !isValidTmuxServerIdentity(current.config.tmux_server_identity))) {
@@ -5057,7 +5431,9 @@ export async function shutdownTeamV2(teamName, cwd, options = {}) {
             // Write shutdown inbox
             const shutdownRoot = workerInstructionStateRoot(cwd, sanitized);
             const shutdownAckPath = `${shutdownRoot}/workers/${w.name}/shutdown-ack.json`;
-            const shutdownInbox = `# Shutdown Request\n\nAll tasks are complete. Please wrap up and respond with a shutdown acknowledgement.\n\nWrite your ack to: ${shutdownAckPath}\nFormat: {"status":"accept","reason":"ok","updated_at":"<iso>"}\n\nThen exit your session.\n`;
+            const shutdownInbox = force
+                ? `# Shutdown Request\n\nThe leader requests forced shutdown. Please wrap up if possible and acknowledge promptly.\n\nWrite your ack to: ${shutdownAckPath}\nFormat:\n- Accept: {"status":"accept","reason":"ok","updated_at":"<iso>"}\n\nThis is a forced shutdown: a rejection does not veto termination. After acknowledging, exit your session; do not resume task work.\n`
+                : `# Shutdown Request\n\nThe leader requests shutdown. Please wrap up if possible and respond with your shutdown decision.\n\nWrite your ack to: ${shutdownAckPath}\nFormat:\n- Accept: {"status":"accept","reason":"ok","updated_at":"<iso>"}\n- Reject: {"status":"reject","reason":"still working","updated_at":"<iso>"}\n\nIf you accept, exit your session. If you reject, remain active for task work and mailbox instructions; do not exit because of this request.\n`;
             await writeWorkerInbox(sanitized, w.name, shutdownInbox, cwd);
         }
         catch (err) {
@@ -5108,7 +5484,12 @@ export async function shutdownTeamV2(teamName, cwd, options = {}) {
     const paneCleanupUnknown = [];
     for (const worker of config.workers) {
         if (!worker.pane_id) {
-            providerCleanupFailures.push(worker.name);
+            // Issue #4261: No pane_id recorded means this worker never got a pane.
+            // When --force is used, allow cleanup to proceed (nothing to verify).
+            // Otherwise, preserve state (pane may have been orphaned).
+            if (!options.force) {
+                providerCleanupFailures.push(worker.name);
+            }
             continue;
         }
         if (!worker.launch_attempt_id) {
@@ -5141,7 +5522,11 @@ export async function shutdownTeamV2(teamName, cwd, options = {}) {
                     : {}),
             });
             if (!ownership.ok) {
-                providerCleanupFailures.push(worker.name);
+                // Issue #4261: When ownership cannot be verified (pane doesn't exist),
+                // allow --force cleanup to proceed. Otherwise preserve state.
+                if (!options.force) {
+                    providerCleanupFailures.push(worker.name);
+                }
                 continue;
             }
             paneOwnership = ownership.ownership;
@@ -5177,7 +5562,8 @@ export async function shutdownTeamV2(teamName, cwd, options = {}) {
                     paneCleanupUnknown.push(worker.name);
                 return false;
             }
-            catch {
+            catch (err) {
+                process.stderr.write(`[team/runtime-v2] worker pane cleanup failed for ${worker.name}: ${err instanceof Error ? err.message : String(err)}\n`);
                 paneCleanupUnknown.push(worker.name);
                 return false;
             }
@@ -5190,9 +5576,10 @@ export async function shutdownTeamV2(teamName, cwd, options = {}) {
         return { outcome: 'preserved', reason: 'worker_panes_alive', workers: paneCleanupAlive };
     }
     if (paneCleanupUnknown.length > 0) {
+        // Identity-bound process reaping already succeeded. Unknown pane liveness still preserves state, including under --force.
         if (!await rollbackShutdownForRetry())
             await finalizeAutoMerge();
-        return { outcome: 'preserved', reason: 'worker_pane_liveness_unknown', workers: paneCleanupUnknown };
+        return { outcome: 'preserved', reason: 'worker_process_reaped_pane_unconfirmed', workers: paneCleanupUnknown };
     }
     if (providerCleanupFailures.length > 0) {
         process.stderr.write(`[team/runtime-v2] preserving panes/worktrees/state because provider cleanup is unverified: ${providerCleanupFailures.join(', ')}\n`);
@@ -5273,11 +5660,11 @@ export async function shutdownTeamV2(teamName, cwd, options = {}) {
             .filter(([, state]) => state === 'unknown')
             .map(([paneId]) => paneById.get(paneId) ?? paneId);
         if (unknownWorkers.length > 0) {
-            process.stderr.write(`[team/runtime-v2] preserving worktrees/state because worker pane liveness is unknown: ${unknownWorkers.join(', ')}
+            process.stderr.write(`[team/runtime-v2] preserving worktrees/state because worker process reaping is verified but pane liveness is unconfirmed: ${unknownWorkers.join(', ')}
 `);
             if (!await rollbackShutdownForRetry())
                 await finalizeAutoMerge();
-            return { outcome: 'preserved', reason: 'worker_pane_liveness_unknown', workers: unknownWorkers };
+            return { outcome: 'preserved', reason: 'worker_process_reaped_pane_unconfirmed', workers: unknownWorkers };
         }
     }
     catch (err) {
@@ -5405,20 +5792,22 @@ export async function resumeTeamV2(teamName, cwd) {
 // findActiveTeams — discover running teams
 // ---------------------------------------------------------------------------
 export async function findActiveTeamsV2(cwd) {
-    const root = join(getOmcRoot(cwd), 'state', 'team');
-    if (!existsSync(root))
-        return [];
-    const entries = await readdir(root, { withFileTypes: true });
-    const active = [];
-    for (const e of entries) {
-        if (!e.isDirectory())
-            continue;
-        const teamName = e.name;
-        const config = await readTeamConfig(teamName, cwd);
-        if (config) {
-            active.push(teamName);
+    return withTeamStatePathScope(cwd, async () => {
+        const root = absPath(cwd, '.omc/state/team');
+        if (!existsSync(root))
+            return [];
+        const entries = await readdir(root, { withFileTypes: true });
+        const active = [];
+        for (const e of entries) {
+            if (!e.isDirectory())
+                continue;
+            const teamName = e.name;
+            const config = await readTeamConfig(teamName, cwd);
+            if (config) {
+                active.push(teamName);
+            }
         }
-    }
-    return active;
+        return active;
+    });
 }
 //# sourceMappingURL=runtime-v2.js.map

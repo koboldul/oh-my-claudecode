@@ -11,6 +11,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
+import { stripLeadingUtf8Bom } from './utf8-bom.mjs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -31,7 +32,7 @@ function getConfigPaths(cwd) {
 }
 
 // Mirrors src/utils/jsonc.ts:stripJsoncComments
-export function stripJsoncComments(content) {
+function stripComments(content) {
   let result = '';
   let i = 0;
   while (i < content.length) {
@@ -42,7 +43,9 @@ export function stripJsoncComments(content) {
     if (content[i] === '/' && content[i + 1] === '*') {
       i += 2;
       while (i < content.length && !(content[i] === '*' && content[i + 1] === '/')) i++;
+      if (i >= content.length) throw new SyntaxError('Unterminated JSONC block comment');
       i += 2;
+      result += ' ';
       continue;
     }
     if (content[i] === '"') {
@@ -142,6 +145,59 @@ export function resolveConfiguredAgentModel(subagentType, cwd) {
     if (typeof model === 'string' && model.trim()) return model.trim();
   }
   return null;
+}
+
+// Keep BOM and trailing-comma support aligned with src/utils/jsonc.ts.
+export function stripJsoncComments(content) {
+  return stripTrailingCommas(stripComments(stripLeadingUtf8Bom(content)));
+}
+
+function stripTrailingCommas(content) {
+  let result = '';
+  let i = 0;
+
+  while (i < content.length) {
+    // Copy string literals verbatim so their contents are never altered.
+    if (content[i] === '"') {
+      result += content[i];
+      i++;
+      while (i < content.length && content[i] !== '"') {
+        if (content[i] === '\\') {
+          result += content[i];
+          i++;
+          if (i < content.length) {
+            result += content[i];
+            i++;
+          }
+          continue;
+        }
+        result += content[i];
+        i++;
+      }
+      if (i < content.length) {
+        result += content[i];
+        i++;
+      }
+      continue;
+    }
+
+    // Drop a comma followed only by whitespace before a closing brace/bracket.
+    if (content[i] === ',') {
+      let j = i + 1;
+      while (j < content.length && /\s/.test(content[j])) {
+        j++;
+      }
+      if (content[j] === '}' || content[j] === ']') {
+        i++; // skip the comma; whitespace is preserved by the next iteration
+        continue;
+      }
+    }
+
+    result += content[i];
+    i++;
+  }
+
+  return result;
 }
 
 /**

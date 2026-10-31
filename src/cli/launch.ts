@@ -3,7 +3,7 @@
  * Launches Claude Code with tmux session management
  */
 
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import {
   chmodSync,
   cpSync,
@@ -1282,7 +1282,7 @@ function buildTmuxClaudeLaunch(
         ? transport.prefix
         : `${buildEnvExportPrefix(forwardedEnvNames)}${transport.prefix}`;
     const missingBinaryGuard = nativeWindows
-      ? 'where claude >nul 2>nul || (echo [omc] Error: claude CLI not found in PATH. 1>&2 & exit /b 1) && '
+      ? '(where claude >nul 2>nul || (echo [omc] Error: claude CLI not found in PATH. 1>&2 & exit /b 1)) && '
       : "command -v claude >/dev/null 2>&1 || { echo '[omc] Error: claude CLI not found in PATH.' >&2; exit 127; }; ";
     const command = wrapWithLoginShell(
       `${envPrefix}${options.preflight}${missingBinaryGuard}${options.useExec ? 'exec ' : ''}${rawClaudeCmd}`,
@@ -1380,11 +1380,30 @@ function runClaudeOutsideTmux(
  */
 function runClaudeDirect(cwd: string, args: string[]): void {
   try {
-    execFileSync('claude', args, {
-      cwd,
-      stdio: 'inherit',
-      shell: process.platform === 'win32',
-    });
+    if (process.platform === 'win32') {
+      const comspec = process.env.COMSPEC || 'cmd.exe';
+      const commandLine = ['claude', ...args].map(quoteForCmd).join(' ');
+      const result = spawnSync(comspec, ['/d', '/s', '/c', commandLine], {
+        cwd,
+        stdio: 'inherit',
+        windowsVerbatimArguments: true,
+      });
+      // Handle cmd.exe not found (ENOENT) or command not recognized (exit 9009)
+      const spawnError = result.error as NodeJS.ErrnoException | undefined;
+      if (spawnError?.code === 'ENOENT' || result.status === 9009) {
+        console.error('[omc] Error: claude CLI not found in PATH.');
+        process.exit(1);
+      }
+      // Propagate Claude's exit code so omc does not swallow failures
+      if (result.status !== 0) {
+        process.exit(result.status ?? 1);
+      }
+    } else {
+      execFileSync('claude', args, {
+        cwd,
+        stdio: 'inherit',
+      });
+    }
   } catch (error) {
     const err = error as NodeJS.ErrnoException & { status?: number | null };
     if (err.code === 'ENOENT') {

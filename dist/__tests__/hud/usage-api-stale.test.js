@@ -165,6 +165,15 @@ function setupMocks(fsModule, httpStatus, httpBody) {
         },
     }));
 }
+async function loadUsageApiWithCredentialBoundCache(fsModule) {
+    const usageApi = await import('../../hud/usage-api.js');
+    const credentialIdentity = usageApi.getUsageCredentialIdentity();
+    if (!credentialIdentity)
+        throw new Error('expected z.ai test credentials');
+    const cache = JSON.parse(fsModule.readFileSync(CACHE_PATH));
+    fsModule.writeFileSync(CACHE_PATH, JSON.stringify({ ...cache, credentialIdentity }));
+    return usageApi;
+}
 describe('usage API stale data handling', () => {
     const originalEnv = { ...process.env };
     beforeEach(() => {
@@ -193,7 +202,7 @@ describe('usage API stale data handling', () => {
         });
         const { fsModule } = createFsMock({ [CACHE_PATH]: expiredCache });
         setupMocks(fsModule, 429, '');
-        const { getUsage } = await import('../../hud/usage-api.js');
+        const { getUsage } = await loadUsageApiWithCredentialBoundCache(fsModule);
         const result = await getUsage();
         expect(result.rateLimits).toBeDefined();
         expect(result.rateLimits?.fiveHourPercent).toBe(11);
@@ -214,7 +223,7 @@ describe('usage API stale data handling', () => {
                 ],
             },
         }));
-        const { getUsage } = await import('../../hud/usage-api.js');
+        const { getUsage } = await loadUsageApiWithCredentialBoundCache(fsModule);
         const result = await getUsage();
         expect(result.rateLimits).toBeDefined();
         expect(result.rateLimits?.fiveHourPercent).toBe(25);
@@ -230,7 +239,7 @@ describe('usage API stale data handling', () => {
         });
         const { files, fsModule } = createFsMock({ [CACHE_PATH]: expiredCache });
         setupMocks(fsModule, 429, '');
-        const { getUsage } = await import('../../hud/usage-api.js');
+        const { getUsage } = await loadUsageApiWithCredentialBoundCache(fsModule);
         await getUsage();
         // Cache should preserve the original lastSuccessAt
         const written = JSON.parse(files.get(CACHE_PATH));
@@ -251,7 +260,7 @@ describe('usage API stale data handling', () => {
             },
         }));
         const now = Date.now();
-        const { getUsage } = await import('../../hud/usage-api.js');
+        const { getUsage } = await loadUsageApiWithCredentialBoundCache(fsModule);
         await getUsage();
         const written = JSON.parse(files.get(CACHE_PATH));
         expect(written.lastSuccessAt).toBeGreaterThanOrEqual(now);
@@ -279,7 +288,7 @@ describe('usage API stale data handling', () => {
             execSync: vi.fn(),
         }));
         vi.doMock('fs', () => fsModule);
-        const { getUsage } = await import('../../hud/usage-api.js');
+        const { getUsage } = await loadUsageApiWithCredentialBoundCache(fsModule);
         const result = await getUsage();
         // Should discard the data and show error
         expect(result.rateLimits).toBeNull();
@@ -298,7 +307,7 @@ describe('usage API stale data handling', () => {
         });
         const { files, fsModule } = createFsMock({ [CACHE_PATH]: expiredCache });
         setupMocks(fsModule, 500, '');
-        const { getUsage } = await import('../../hud/usage-api.js');
+        const { getUsage } = await loadUsageApiWithCredentialBoundCache(fsModule);
         const result = await getUsage();
         expect(result).toEqual({
             rateLimits: {
@@ -330,7 +339,7 @@ describe('usage API stale data handling', () => {
         });
         const { files, fsModule } = createFsMock({ [CACHE_PATH]: expiredCache });
         setupMocks(fsModule, 500, '');
-        const { getUsage } = await import('../../hud/usage-api.js');
+        const { getUsage } = await loadUsageApiWithCredentialBoundCache(fsModule);
         const result = await getUsage();
         expect(result).toEqual({
             rateLimits: null,
@@ -356,7 +365,7 @@ describe('usage API stale data handling', () => {
         const { fsModule } = createFsMock({ [CACHE_PATH]: validTransientFailureCache });
         setupMocks(fsModule, 500, '');
         const httpsModule = await import('https');
-        const { getUsage } = await import('../../hud/usage-api.js');
+        const { getUsage } = await loadUsageApiWithCredentialBoundCache(fsModule);
         const result = await getUsage();
         expect(result.rateLimits?.fiveHourPercent).toBe(11);
         expect(result.error).toBe('network');

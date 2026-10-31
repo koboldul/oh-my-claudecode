@@ -60,7 +60,7 @@ function captureFetch(score: number): { fetchFn: typeof fetch; calls: CapturedCa
       ok: true,
       status: 200,
       json: async () => ({
-        answers: { staleness: { type: 'Score', score, confidence: 0.8 } },
+        answers: { staleness: { type: 'score', score, confidence: 0.8 } },
       }),
     } as unknown as Response;
   }) as unknown as typeof fetch;
@@ -109,14 +109,14 @@ describe('recordContextPruningShadow', () => {
       candidateCount: 1,
       candidates: [{ tool: 'read', tokens: 1200, excerpt: 'src/index.ts line one' }],
     });
-    expect(body.questions.staleness.type).toBe('Score');
+    expect(body.questions.staleness.type).toBe('score');
 
     const line = JSON.parse(await readLogLine());
     expect(line).toMatchObject({
       point: 'context-pruning',
       mode: 'shadow',
       heuristic: 'warn',
-      jev: { type: 'Score', score: 3 },
+      jev: { type: 'score', score: 3 },
       confidence: 0.8,
     });
   });
@@ -170,7 +170,7 @@ describe('recordContextPruningShadow', () => {
 });
 
 describe('hook wiring: createPreemptiveCompactionHook + context-pruning shadow', () => {
-  function postToolUseOnce(fetchFn: typeof fetch | undefined, sessionId: string): string | null {
+  async function postToolUseOnce(fetchFn: typeof fetch | undefined, sessionId: string): Promise<string | null> {
     clearRapidFireDebounce(sessionId);
     const hook = createPreemptiveCompactionHook(fetchFn
       ? { jevFetchFn: fetchFn, warningThreshold: 0.1 }
@@ -189,11 +189,11 @@ describe('hook wiring: createPreemptiveCompactionHook + context-pruning shadow',
     process.env.OMC_JEV = 'context-pruning';
     const { fetchFn } = captureFetch(4);
 
-    const withKey = postToolUseOnce(fetchFn, 'jev-wiring-with-key');
+    const withKey = await postToolUseOnce(fetchFn, 'jev-wiring-with-key');
     expect(withKey).toBe(CONTEXT_WARNING_MESSAGE);
 
     delete process.env.TYPESAFE_API_KEY;
-    const withoutKey = postToolUseOnce(undefined, 'jev-wiring-without-key');
+    const withoutKey = await postToolUseOnce(undefined, 'jev-wiring-without-key');
     expect(withoutKey).toBe(CONTEXT_WARNING_MESSAGE);
     expect(withoutKey).toBe(withKey);
 

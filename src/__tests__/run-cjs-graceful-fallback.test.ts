@@ -543,12 +543,14 @@ describe('run.cjs trusted hook Worker selection', () => {
     writeFileSync(join(root, 'scripts', 'run.cjs'), '// plugin-root marker');
     for (const [name, contents] of Object.entries(scripts)) writeFileSync(join(root, 'scripts', name), contents);
     for (const expectedScript of [
+      'git-guardrails.mjs',
       'keyword-detector.mjs',
       'skill-injector.mjs',
       'pre-tool-enforcer.mjs',
       'post-tool-verifier.mjs',
       'project-memory-posttool.mjs',
       'post-tool-rules-injector.mjs',
+      'post-tool-directory-context-injector.mjs',
     ]) {
       const expectedPath = join(root, 'scripts', expectedScript);
       if (!existsSync(expectedPath)) writeFileSync(expectedPath, 'process.exit(0);');
@@ -588,10 +590,12 @@ describe('run.cjs trusted hook Worker selection', () => {
   });
 
   it.each([
+    ['git-guardrails.mjs', 'PreToolUse'],
     ['pre-tool-enforcer.mjs', 'PreToolUse'],
     ['post-tool-verifier.mjs', 'PostToolUse'],
     ['project-memory-posttool.mjs', 'PostToolUse'],
     ['post-tool-rules-injector.mjs', 'PostToolUse'],
+    ['post-tool-directory-context-injector.mjs', 'PostToolUse'],
   ])('uses a Worker for exact trusted per-tool hook %s', (script, event) => {
     const root = join(tmpDir, `${script}-root`);
     const target = join(root, 'scripts', script);
@@ -1116,8 +1120,8 @@ describe('run.cjs trusted asynchronous SessionEnd resident publishing', () => {
  * hook manifest commands to absolute paths but does not reliably export
  * CLAUDE_PLUGIN_ROOT to hook children (unlike Claude Code). run.cjs must
  * infer the plugin root from the resolved target and set OMC_HOST=copilot
- * when a Copilot signal is present, without changing standalone/stale-target
- * behavior when no plugin markers exist near the target.
+ * when a Copilot signal or canonical installed-plugin path is present,
+ * without granting Worker trust or changing standalone/stale-target behavior.
  */
 describe('run.cjs — Copilot host normalization (CLAUDE_PLUGIN_ROOT + OMC_HOST)', () => {
   let tmpDir: string;
@@ -1130,7 +1134,7 @@ describe('run.cjs — Copilot host normalization (CLAUDE_PLUGIN_ROOT + OMC_HOST)
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  /** Create a fake plugin root with the markers run.cjs requires to trust an inferred root. */
+  /** Create a fake plugin root with the markers used for child-env inference. */
   function createFakePluginRoot(root: string): string {
     mkdirSync(join(root, 'scripts'), { recursive: true });
     mkdirSync(join(root, '.claude-plugin'), { recursive: true });
@@ -1241,6 +1245,21 @@ describe('run.cjs — Copilot host normalization (CLAUDE_PLUGIN_ROOT + OMC_HOST)
       target,
       `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify({ pluginRoot: process.env.CLAUDE_PLUGIN_ROOT || null, omcHost: process.env.OMC_HOST || null })); process.exit(0);`,
     );
+
+    const result = runCjsWithoutPluginRoot(target, {});
+
+    expect(result.status).toBe(0);
+    const written = JSON.parse(readFileSync(markerPath, 'utf-8'));
+    expect(written.pluginRoot).toBeNull();
+    expect(written.omcHost).toBeNull();
+  });
+
+  it('does not infer a marker-backed root outside a Copilot install without a host signal', () => {
+    const pluginRoot = createFakePluginRoot(
+      join(tmpDir, 'unconfigured-plugin-root'),
+    );
+    const markerPath = join(tmpDir, 'unconfigured-plugin-env.json');
+    const target = writeEnvEchoHook(pluginRoot, 'echo-env.cjs', markerPath);
 
     const result = runCjsWithoutPluginRoot(target, {});
 

@@ -8,7 +8,7 @@ import { homedir, tmpdir } from 'os';
 import { basename, dirname, join, resolve } from 'path';
 import { stateReadTool, stateWriteTool, stateClearTool, stateListActiveTool, stateGetStatusTool, } from '../state-tools.js';
 import { emergencyMutateStateFileIf } from '../../lib/mode-state-io.js';
-import { getOmcRoot, resolveSessionStatePaths } from '../../lib/worktree-paths.js';
+import { getOmcRoot, resolveSessionStatePaths, setGitShowToplevelProbeForTests, } from '../../lib/worktree-paths.js';
 import { withProcessIdentityFileLock } from '../../team/process-identity-lock.js';
 import { absPath, teamWorkspaceHash, TeamPaths } from '../../team/state-paths.js';
 let TEST_DIR;
@@ -306,6 +306,12 @@ describe('state-tools', () => {
     beforeEach(() => {
         previousOmcStateDir = process.env.OMC_STATE_DIR;
         delete process.env.OMC_STATE_DIR;
+        setGitShowToplevelProbeForTests(() => {
+            throw Object.assign(new Error('fatal: not a git repository'), {
+                status: 128,
+                stderr: 'fatal: not a git repository',
+            });
+        });
         TEST_DIR = mkdtempSync(join(homedir(), 'state-tools-test-'));
         previousHome = process.env.HOME;
         previousUserProfile = process.env.USERPROFILE;
@@ -314,6 +320,7 @@ describe('state-tools', () => {
         mkdirSync(join(TEST_DIR, '.omc', 'state'), { recursive: true });
     });
     afterEach(() => {
+        setGitShowToplevelProbeForTests();
         rmSync(TEST_DIR, { recursive: true, force: true });
         if (previousHome === undefined)
             delete process.env.HOME;
@@ -2778,6 +2785,7 @@ describe('state-tools', () => {
             execFileSync('git', ['init'], { cwd: gitRoot, stdio: 'pipe' });
             process.env.OMC_STATE_DIR = join(gitRoot, 'central-state-root');
             try {
+                setGitShowToplevelProbeForTests();
                 const state = JSON.stringify({ active: true, session_id: sessionId, current_phase: 'execution' });
                 const centralPath = join(getOmcRoot(gitRoot), 'state', 'sessions', sessionId, 'autopilot-state.json');
                 const localPath = join(gitRoot, '.omc', 'state', 'sessions', sessionId, 'autopilot-state.json');

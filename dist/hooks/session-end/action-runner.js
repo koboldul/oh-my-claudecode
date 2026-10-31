@@ -3,7 +3,7 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { atomicWriteJsonSync } from '../../lib/atomic-write.js';
-import { getProcessStartIdentitySync, terminateOwnedProcessTree } from '../../platform/process-utils.js';
+import { getProcessStartIdentitySync, terminateOwnedProcessTree, warmCurrentProcessStartIdentitySyncCache, } from '../../platform/process-utils.js';
 import { markSessionEndActionRunner, readSessionEndJob } from './cleanup-manifest.js';
 import { getOmcRoot } from '../../lib/worktree-paths.js';
 const RUNNER_ARG = '--omc-session-end-action-runner';
@@ -24,10 +24,24 @@ function openClawRoutingEnvironment(payload) {
     return Object.fromEntries(values.flatMap(([property, environment]) => typeof snapshot[property] === 'string' ? [[environment, snapshot[property]]] : []));
 }
 function runnerEnvironment(context) {
-    const baseKeys = ['PATH', 'HOME', 'USERPROFILE', 'TMPDIR', 'TEMP', 'TMP', 'SystemRoot', 'COMSPEC', 'LANG', 'LC_ALL', 'NODE_ENV', 'CLAUDE_CONFIG_DIR', 'OMC_STATE_DIR', 'OMC_HOOK_CONFIG', 'OMC_CONFIG_PATH', 'OMC_NOTIFY', 'OMC_NOTIFY_PROFILE', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE'];
+    // APPDATA/LOCALAPPDATA are required for gh keyring-free auth lookup on Windows
+    // (hosts.yml lives in %AppData%\GitHub CLI); spawn-next runners issue gh
+    // tracker commands, so without them every tracker update fails auth.
+    const baseKeys = ['PATH', 'HOME', 'USERPROFILE', ...(process.platform === 'win32' ? ['APPDATA', 'LOCALAPPDATA'] : []), 'TMPDIR', 'TEMP', 'TMP', 'SystemRoot', 'COMSPEC', 'LANG', 'LC_ALL', 'NODE_ENV', 'CLAUDE_CONFIG_DIR', 'OMC_STATE_DIR', 'OMC_HOOK_CONFIG', 'OMC_CONFIG_PATH', 'OMC_HOOK_BRIDGE', 'OMC_NOTIFY', 'OMC_NOTIFY_PROFILE', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE'];
     const notificationKeys = ['OMC_TELEGRAM', 'OMC_DISCORD', 'OMC_SLACK', 'OMC_WEBHOOK', 'OMC_DISCORD_MENTION', 'OMC_DISCORD_NOTIFIER_BOT_TOKEN', 'OMC_DISCORD_NOTIFIER_CHANNEL', 'OMC_DISCORD_WEBHOOK_URL', 'OMC_TELEGRAM_BOT_TOKEN', 'OMC_TELEGRAM_NOTIFIER_BOT_TOKEN', 'OMC_TELEGRAM_CHAT_ID', 'OMC_TELEGRAM_NOTIFIER_CHAT_ID', 'OMC_TELEGRAM_NOTIFIER_UID', 'OMC_SLACK_WEBHOOK_URL', 'OMC_SLACK_MENTION', 'OMC_SLACK_BOT_TOKEN', 'OMC_SLACK_APP_TOKEN', 'OMC_SLACK_BOT_CHANNEL'];
     const keys = context.actionName === 'callback' || context.actionName === 'notification' ? [...baseKeys, ...notificationKeys] : baseKeys;
-    const exact = Object.fromEntries(keys.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]]));
+    // ANTHROPIC_* carries model provider auth/routing (API key, base URL, token);
+    // the spawn-next runner launches claude chain links as its children, and
+    // without the passthrough every factory link exits "Not logged in"
+    // (dogfood: the chain's first real AFK spawn died exactly there while
+    // workerEnvironment() had already been fixed). Mirrors workerEnvironment().
+    // Scoped to spawn-next: callback/openclaw/cleanup children never need model
+    // credentials, so they must not inherit them (same least-privilege rule as
+    // notificationKeys above).
+    const authPassthrough = context.actionName === 'spawn-next'
+        ? Object.entries(process.env).filter(([key]) => key.startsWith('ANTHROPIC_'))
+        : [];
+    const exact = Object.fromEntries([...keys.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]]), ...authPassthrough]);
     if (context.actionName !== 'openclaw')
         return exact;
     const enabled = context.action.payload.openClawEnabled === true ? { OMC_OPENCLAW: '1' } : {};
@@ -99,7 +113,7 @@ export async function runSessionEndAction(context, _execute) {
         if (!markSessionEndActionRunner(context.directory, context.sessionId, context.ownerNonce, context.actionName, context.runnerNonce, 'armed')) {
             clearTimeout(timeout);
             await terminate();
-            return { code: 'runner-claim-lost', completed: false };
+            return { code: 'runner-claim-lost', completed: false, deliveryStarted: false };
         }
         const terminal = await Promise.race([
             childExit.then(code => ({ code, terminated: false })),
@@ -127,6 +141,10 @@ async function runActionRunnerEntrypoint() {
         return;
     try {
         const input = JSON.parse(process.argv[runnerIndex + 1] ?? '');
+        const selfIdentityWarm = warmCurrentProcessStartIdentitySyncCache({
+            deadlineAt: input.deadlineAt,
+        }).then((warmed) => warmed, () => false);
+        let selfIdentityReady = false;
         while (Date.now() < input.deadlineAt) {
             let armed = false;
             try {
@@ -136,8 +154,17 @@ async function runActionRunnerEntrypoint() {
                 armed = job?.jobId === input.jobId && job.owner?.nonce === input.ownerNonce && action?.status === 'claimed' && action.attempts === input.attempt && action.claimantNonce === input.ownerNonce && action.runner?.runnerNonce === input.runnerNonce && action.runner.phase === 'armed' && arm.runnerNonce === input.runnerNonce && arm.ownerNonce === input.ownerNonce;
             }
             catch { /* publication is not complete yet */ }
-            if (armed)
+            if (armed) {
+                if (!selfIdentityReady) {
+                    if (!await selfIdentityWarm)
+                        throw new Error('runner-identity-unavailable');
+                    selfIdentityReady = true;
+                    if (Date.now() >= input.deadlineAt)
+                        throw new Error('runner-identity-deadline');
+                    continue;
+                }
                 break;
+            }
             await new Promise(resolve => setTimeout(resolve, 10));
         }
         if (Date.now() >= input.deadlineAt)

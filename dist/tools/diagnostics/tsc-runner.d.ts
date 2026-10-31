@@ -16,6 +16,8 @@ export interface TscResult {
     diagnostics: TscDiagnostic[];
     errorCount: number;
     warningCount: number;
+    /** Raw compiler or invocation failure when no file-position diagnostic is available. */
+    error?: string;
 }
 /**
  * Hard upper bound for a single `tsc --noEmit` run.

@@ -1,9 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
-import { join } from 'path';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
+import { dirname, join } from 'path';
 import { tmpdir } from 'os';
-import { createWorkerWorktree } from '../git-worktree.js';
+import {
+  createWorkerWorktree,
+  getBranchName,
+  getWorktreePath,
+} from '../git-worktree.js';
 import {
   awaitWorkerLaunchAcknowledgement,
   awaitWorkerLaunchProviderStarted,
@@ -14,14 +27,26 @@ import {
   type WorkerLaunchAttempt,
 } from '../worker-launch-ack.js';
 import { currentProcessStartIdentity } from '../team-owner-epoch.js';
-import { createTeamInstanceBinding, reserveTeamInstance } from '../team-instance.js';
+import {
+  createTeamInstanceBinding,
+  listTeamScaleUpWorktreeRecoveryEvidence,
+  reserveTeamInstance,
+} from '../team-instance.js';
 import * as teamInstanceModule from '../team-instance.js';
+import * as processIdentityLockModule from '../process-identity-lock.js';
 import { resolveRuntimeCliPath } from '../runtime-owner-client.js';
 import { absPath, TeamPaths, teamStateRoot } from '../state-paths.js';
 import { getOmcRoot } from '../../lib/worktree-paths.js';
+import { readRevisionedTeamConfig, readShutdownAck } from '../monitor.js';
 
 const TEAM_INSTANCE_ID = '11111111-1111-4111-8111-111111111111';
 const REPLACEMENT_INSTANCE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const DISPOSAL_AUTHORIZATION = {
+  protocol: 'caller-owned-final-state-v1',
+  providers: 'disposed',
+  panes: 'disposed',
+  worktrees: 'disposed',
+} as const;
 type WorkerLivenessInput = Parameters<typeof import('../tmux-session.js').getWorkerLiveness>[0];
 type WorkerLiveness = Awaited<ReturnType<typeof import('../tmux-session.js').getWorkerLiveness>>;
 type OwnedWorkerLivenessInput = Parameters<typeof import('../tmux-session.js').getOwnedWorkerLiveness>[0];
@@ -79,6 +104,15 @@ const tmuxMocks = vi.hoisted(() => {
   };
 });
 
+vi.mock('../model-contract.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../model-contract.js')>();
+  return {
+    ...actual,
+    clearResolvedPathCache: vi.fn(),
+    resolveValidatedBinaryPath: vi.fn(() => process.execPath),
+  };
+});
+
 vi.mock('../tmux-session.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../tmux-session.js')>();
   return {
@@ -129,6 +163,57 @@ async function prepareAcceptedLaunch(cwd: string, teamName: string, workerName: 
   }
   return attempt;
 }
+
+describe('readShutdownAck validation', () => {
+  let cwd: string;
+  const requestedAt = '2026-01-01T00:00:00.000Z';
+
+  beforeEach(() => {
+    cwd = mkdtempSync(join(tmpdir(), 'omc-monitor-shutdown-ack-'));
+    vi.stubEnv('OMC_STATE_DIR', join(cwd, 'omc-state'));
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it.each([
+    ['missing file', undefined, undefined, false],
+    ['valid legacy', { status: 'accept' }, undefined, true],
+    ['valid legacy reject', { status: 'reject' }, undefined, true],
+    ['valid extra field', { status: 'accept', source: 'legacy' }, undefined, true],
+    ['valid timestamped', { status: 'reject', reason: 'still working', updated_at: requestedAt }, undefined, true],
+    ['malformed JSON', '{', undefined, false],
+    ['null', null, undefined, false],
+    ['array', [], undefined, false],
+    ['primitive', 1, undefined, false],
+    ['missing status', {}, undefined, false],
+    ['unknown status', { status: 'pending' }, undefined, false],
+    ['non-string reason', { status: 'accept', reason: 1 }, undefined, false],
+    ['null updated_at', { status: 'accept', updated_at: null }, undefined, false],
+    ['numeric updated_at', { status: 'accept', updated_at: 1 }, undefined, false],
+    ['empty updated_at', { status: 'accept', updated_at: '' }, undefined, false],
+    ['invalid updated_at', { status: 'accept', updated_at: 'not-a-date' }, undefined, false],
+    ['missing fresh timestamp', { status: 'reject' }, requestedAt, false],
+    ['stale timestamp', { status: 'reject', updated_at: '2025-12-31T23:59:59.999Z' }, requestedAt, false],
+    ['equal timestamp', { status: 'accept', updated_at: requestedAt }, requestedAt, true],
+    ['equal timezone timestamp', { status: 'accept', updated_at: '2025-12-31T19:00:00.000-05:00' }, requestedAt, true],
+    ['newer timestamp', { status: 'reject', updated_at: '2026-01-01T00:00:00.001Z' }, requestedAt, true],
+    ['stale timezone timestamp', { status: 'reject', updated_at: '2026-01-01T01:59:59.999+02:00' }, requestedAt, false],
+    ['invalid fresh timestamp', { status: 'accept', updated_at: 'not-a-date' }, requestedAt, false],
+    ['empty requestedAfter', { status: 'accept', updated_at: requestedAt }, '', false],
+    ['invalid requestedAfter', { status: 'accept', updated_at: requestedAt }, 'not-a-date', false],
+  ])('validates %s', async (_label, value, requestedAfter, accepted) => {
+    if (value !== undefined) {
+      const path = absPath(cwd, TeamPaths.shutdownAck('shutdown-ack-team', 'worker-1'));
+      mkdirSync(join(path, '..'), { recursive: true });
+      writeFileSync(path, typeof value === 'string' ? value : JSON.stringify(value), 'utf8');
+    }
+    await expect(readShutdownAck('shutdown-ack-team', 'worker-1', cwd, requestedAfter))
+      .resolves.toStrictEqual(accepted ? value : null);
+  });
+});
 
 describe('shutdownTeamV2 detached worktree cleanup', () => {
   let repoDir: string;
@@ -228,6 +313,388 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
     expect(existsSync(worktree.path)).toBe(false);
     expect(existsSync(teamRoot)).toBe(false);
   });
+
+  it('retries a durable pre-worker scale-up worktree cleanup through shutdown', async () => {
+    const teamName = 'shutdown-scale-up-recovery';
+    const workerName = 'worker-1';
+    await reserveFixtureInstance(teamName, repoDir);
+    const binding = createTeamInstanceBinding({
+      teamName,
+      cwd: repoDir,
+      instanceId: TEAM_INSTANCE_ID,
+    });
+    const teamRoot = fixtureTeamRoot(repoDir, teamName);
+    mkdirSync(teamRoot, { recursive: true });
+    writeFileSync(join(teamRoot, 'config.json'), JSON.stringify({
+      name: teamName,
+      instance_id: TEAM_INSTANCE_ID,
+      tmux_server_identity: tmuxMocks.tmuxServerIdentity,
+      task: 'demo',
+      agent_type: 'claude',
+      worker_launch_mode: 'interactive',
+      worker_count: 0,
+      max_workers: 20,
+      workers: [],
+      created_at: new Date().toISOString(),
+      tmux_session: `${teamName}:0`,
+      leader_cwd: repoDir,
+      team_state_root: teamRoot,
+      lifecycle_state: 'active',
+      state_revision: 0,
+      worktree_mode: 'named',
+      next_worker_index: 1,
+      leader_pane_id: null,
+      hud_pane_id: null,
+      resize_hook_name: null,
+      resize_hook_target: null,
+      next_task_id: 1,
+    }, null, 2), 'utf-8');
+
+    const worktreePath = getWorktreePath(repoDir, teamName, workerName);
+    const branch = getBranchName(teamName, workerName);
+    const metadataPath = join(absPath(repoDir, '.omc'), 'state', 'team', teamName, 'worktrees.json');
+    const gitDir = realpathSync.native(join(
+      repoDir,
+      execFileSync('git', ['rev-parse', '--git-dir'], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim(),
+    ));
+    const hookPath = join(gitDir, 'hooks', 'post-checkout');
+    const branchLockPath = join(gitDir, 'refs', 'heads', `${branch}.lock`);
+    writeFileSync(join(gitDir, 'info', 'exclude'), '\n.omc-state/\n', { flag: 'a' });
+    const shellQuote = (value: string): string =>
+      `'${value.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`;
+    mkdirSync(dirname(hookPath), { recursive: true });
+    writeFileSync(hookPath, [
+      '#!/bin/sh',
+      `mkdir -p ${shellQuote(dirname(branchLockPath))}`,
+      `printf locked > ${shellQuote(branchLockPath)}`,
+    ].join('\n'), 'utf-8');
+    chmodSync(hookPath, 0o755);
+    mkdirSync(metadataPath, { recursive: true });
+
+    const { scaleUp } = await import('../scaling.js');
+    const scaled = await scaleUp(
+      teamName,
+      1,
+      'claude',
+      [{ subject: 'demo', description: 'durable shutdown retry' }],
+      repoDir,
+      { OMC_TEAM_SCALING_ENABLED: '1', OMC_TEAM_SKIP_READY_WAIT: '1' } as NodeJS.ProcessEnv,
+    );
+
+    expect(scaled).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('rollback incomplete'),
+    });
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(execFileSync('git', ['branch', '--list', branch], {
+      cwd: repoDir,
+      encoding: 'utf-8',
+    }).trim()).toContain(branch);
+    expect(await listTeamScaleUpWorktreeRecoveryEvidence(binding)).toHaveLength(1);
+
+    rmSync(branchLockPath, { force: true });
+    rmSync(hookPath, { force: true });
+    rmSync(metadataPath, { recursive: true, force: true });
+
+    const { shutdownTeamV2 } = await import('../runtime-v2.js');
+    await expect(shutdownTeamV2(teamName, repoDir, { timeoutMs: 0, force: true }))
+      .resolves.toEqual({ outcome: 'cleaned' });
+
+    expect(execFileSync('git', ['branch', '--list', branch], {
+      cwd: repoDir,
+      encoding: 'utf-8',
+    }).trim()).toBe('');
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(await listTeamScaleUpWorktreeRecoveryEvidence(binding)).toEqual([]);
+    expect(existsSync(teamRoot)).toBe(false);
+  });
+
+  it('retries config-only scale-up cleanup after external evidence publication fails', async () => {
+    const teamName = 'shutdown-config-recovery';
+    const workerName = 'worker-1';
+    await reserveFixtureInstance(teamName, repoDir);
+    const binding = createTeamInstanceBinding({
+      teamName,
+      cwd: repoDir,
+      instanceId: TEAM_INSTANCE_ID,
+    });
+    const teamRoot = fixtureTeamRoot(repoDir, teamName);
+    mkdirSync(teamRoot, { recursive: true });
+    writeFileSync(join(teamRoot, 'config.json'), JSON.stringify({
+      name: teamName,
+      instance_id: TEAM_INSTANCE_ID,
+      tmux_server_identity: tmuxMocks.tmuxServerIdentity,
+      task: 'demo',
+      agent_type: 'claude',
+      worker_launch_mode: 'interactive',
+      worker_count: 0,
+      max_workers: 20,
+      workers: [],
+      created_at: new Date().toISOString(),
+      tmux_session: `${teamName}:0`,
+      leader_cwd: repoDir,
+      team_state_root: teamRoot,
+      lifecycle_state: 'active',
+      state_revision: 0,
+      worktree_mode: 'named',
+      next_worker_index: 1,
+      leader_pane_id: null,
+      hud_pane_id: null,
+      resize_hook_name: null,
+      resize_hook_target: null,
+      next_task_id: 1,
+    }, null, 2), 'utf-8');
+
+    const worktreePath = getWorktreePath(repoDir, teamName, workerName);
+    const branch = getBranchName(teamName, workerName);
+    const metadataPath = join(absPath(repoDir, '.omc'), 'state', 'team', teamName, 'worktrees.json');
+    const recoveryRoot = absPath(repoDir, TeamPaths.teamInstanceScaleUpRecoveryRoot(
+      binding.workspace_hash,
+      teamName,
+      TEAM_INSTANCE_ID,
+    ));
+    const gitDir = realpathSync.native(join(
+      repoDir,
+      execFileSync('git', ['rev-parse', '--git-dir'], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim(),
+    ));
+    const hookPath = join(gitDir, 'hooks', 'post-checkout');
+    const branchLockPath = join(gitDir, 'refs', 'heads', `${branch}.lock`);
+    writeFileSync(join(gitDir, 'info', 'exclude'), '\n.omc-state/\n', { flag: 'a' });
+    const shellQuote = (value: string): string =>
+      `'${value.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`;
+    mkdirSync(dirname(hookPath), { recursive: true });
+    writeFileSync(hookPath, [
+      '#!/bin/sh',
+      `mkdir -p ${shellQuote(dirname(branchLockPath))}`,
+      `printf locked > ${shellQuote(branchLockPath)}`,
+      `mkdir -p ${shellQuote(dirname(recoveryRoot))}`,
+      `printf blocked > ${shellQuote(recoveryRoot)}`,
+    ].join('\n'), 'utf-8');
+    chmodSync(hookPath, 0o755);
+    mkdirSync(metadataPath, { recursive: true });
+
+    const { scaleUp } = await import('../scaling.js');
+    const scaled = await scaleUp(
+      teamName,
+      1,
+      'claude',
+      [{ subject: 'demo', description: 'config-only durable shutdown retry' }],
+      repoDir,
+      { OMC_TEAM_SCALING_ENABLED: '1', OMC_TEAM_SKIP_READY_WAIT: '1' } as NodeJS.ProcessEnv,
+    );
+
+    expect(scaled).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('scale_up_recovery_evidence_publish_failed'),
+    });
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(execFileSync('git', ['branch', '--list', branch], {
+      cwd: repoDir,
+      encoding: 'utf-8',
+    }).trim()).toContain(branch);
+    const failed = await readRevisionedTeamConfig(teamName, repoDir);
+    expect(failed?.config.active_scale_up).toMatchObject({
+      phase: 'failed',
+      failure_reason: expect.stringContaining('worktree_metadata_publication'),
+      cleanup_failures: [`${workerName}:pending-worktree:${worktreePath}`],
+      worktree_cleanup_receipts: [{
+        worker_name: workerName,
+        path: worktreePath,
+        branch,
+        mode: 'named',
+        created: true,
+        reused: false,
+        effect_scope: 'created_before_worker_persist',
+      }],
+    });
+
+    rmSync(recoveryRoot, { force: true });
+    expect(await listTeamScaleUpWorktreeRecoveryEvidence(binding)).toEqual([]);
+    const operationId = failed?.config.active_scale_up?.operation_id;
+    if (!operationId) throw new Error('missing failed scale-up operation');
+    await expect(teamInstanceModule.disposeTeamInstance(binding, DISPOSAL_AUTHORIZATION))
+      .rejects.toThrow(`scale_up_config_recovery_pending:${operationId}`);
+    expect(existsSync(teamRoot)).toBe(true);
+    expect(await listTeamScaleUpWorktreeRecoveryEvidence(binding)).toEqual([]);
+    expect(() => execFileSync('git', ['rev-parse', '--verify', branch], {
+      cwd: repoDir,
+      stdio: 'ignore',
+    })).not.toThrow();
+    expect(await readRevisionedTeamConfig(teamName, repoDir)).toMatchObject({
+      config: {
+        active_scale_up: {
+          operation_id: operationId,
+          phase: 'failed',
+          worktree_cleanup_receipts: [{
+            worker_name: workerName,
+            path: worktreePath,
+            branch,
+            mode: 'named',
+            created: true,
+            reused: false,
+            effect_scope: 'created_before_worker_persist',
+          }],
+        },
+      },
+    });
+    rmSync(branchLockPath, { force: true });
+    rmSync(hookPath, { force: true });
+    rmSync(metadataPath, { recursive: true, force: true });
+
+    const { shutdownTeamV2 } = await import('../runtime-v2.js');
+    await expect(shutdownTeamV2(teamName, repoDir, { timeoutMs: 0, force: true }))
+      .resolves.toEqual({ outcome: 'cleaned' });
+
+    expect(execFileSync('git', ['branch', '--list', branch], {
+      cwd: repoDir,
+      encoding: 'utf-8',
+    }).trim()).toBe('');
+    expect(existsSync(worktreePath)).toBe(false);
+    expect(existsSync(teamRoot)).toBe(false);
+  });
+
+  it('fails closed without retiring malformed config cleanup evidence', async () => {
+    const teamName = 'disposal-malformed-receipt';
+    const workerName = 'worker-2';
+    await reserveFixtureInstance(teamName, repoDir);
+    const binding = createTeamInstanceBinding({
+      teamName,
+      cwd: repoDir,
+      instanceId: TEAM_INSTANCE_ID,
+    });
+    mkdirSync(binding.state_root, { recursive: true });
+    const configPath = join(binding.state_root, 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      name: teamName,
+      instance_id: TEAM_INSTANCE_ID,
+      leader_cwd: repoDir,
+      team_state_root: binding.state_root,
+      active_scale_up: {
+        instance_id: TEAM_INSTANCE_ID,
+        operation_id: 'malformed-receipt-disposal',
+        phase: 'failed',
+        baseline_worker_names: ['worker-1'],
+        worktree_cleanup_receipts: [{
+          worker_name: workerName,
+          path: getWorktreePath(repoDir, teamName, workerName),
+          branch: getBranchName(teamName, workerName),
+          mode: 'named',
+          created: false,
+          reused: false,
+          effect_scope: 'created_before_worker_persist',
+        }],
+      },
+    }, null, 2), 'utf-8');
+    const configBefore = readFileSync(configPath);
+
+    await expect(teamInstanceModule.disposeTeamInstance(binding, DISPOSAL_AUTHORIZATION))
+      .rejects.toThrow('scale_up_recovery_config_receipt_invalid');
+
+    expect(readFileSync(configPath)).toEqual(configBefore);
+    expect(existsSync(binding.state_root)).toBe(true);
+    expect(existsSync(absPath(repoDir, TeamPaths.teamInstanceReservation(
+      binding.workspace_hash,
+      teamName,
+    )))).toBe(true);
+    expect(await listTeamScaleUpWorktreeRecoveryEvidence(binding)).toEqual([]);
+  });
+
+  it('preserves detached cleanup evidence and a named replacement instance', async () => {
+    const teamName = 'disposal-detached-config-receipt';
+    const workerName = 'worker-2';
+    const old = await reserveTeamInstance({
+      teamName,
+      cwd: repoDir,
+      instanceId: TEAM_INSTANCE_ID,
+    });
+    mkdirSync(old.state_root, { recursive: true });
+    writeFileSync(join(old.state_root, 'config.json'), JSON.stringify({
+      name: teamName,
+      instance_id: TEAM_INSTANCE_ID,
+      leader_cwd: repoDir,
+      team_state_root: old.state_root,
+    }), 'utf-8');
+    await teamInstanceModule.withTeamInstanceLifecycleLock(repoDir, teamName, () =>
+      teamInstanceModule.activateTeamInstanceUnderLock(old));
+    await expect(teamInstanceModule.disposeTeamInstance(old, DISPOSAL_AUTHORIZATION, {
+      io: {
+        removeTree: async () => {
+          throw new Error('injected_detached_remove_failure');
+        },
+      },
+    })).rejects.toMatchObject({ code: 'team_instance_remove_failed' });
+
+    const detachedRoot = absPath(repoDir, TeamPaths.teamInstanceDetachedRoot(
+      old.workspace_hash,
+      teamName,
+      TEAM_INSTANCE_ID,
+    ));
+    const detachedConfigPath = join(detachedRoot, 'config.json');
+    writeFileSync(detachedConfigPath, JSON.stringify({
+      name: teamName,
+      instance_id: TEAM_INSTANCE_ID,
+      leader_cwd: repoDir,
+      team_state_root: old.state_root,
+      active_scale_up: {
+        instance_id: TEAM_INSTANCE_ID,
+        operation_id: 'detached-config-receipt',
+        phase: 'failed',
+        baseline_worker_names: ['worker-1'],
+        worktree_cleanup_receipts: [{
+          worker_name: workerName,
+          path: getWorktreePath(repoDir, teamName, workerName),
+          branch: getBranchName(teamName, workerName),
+          mode: 'named',
+          created: true,
+          reused: false,
+          effect_scope: 'created_before_worker_persist',
+        }],
+      },
+    }, null, 2), 'utf-8');
+    const detachedConfigBefore = readFileSync(detachedConfigPath);
+    const cleanupReceiptPath = absPath(repoDir, TeamPaths.teamInstanceCleanupReceipt(
+      old.workspace_hash,
+      teamName,
+      TEAM_INSTANCE_ID,
+    ));
+
+    const replacement = await reserveTeamInstance({
+      teamName,
+      cwd: repoDir,
+      instanceId: REPLACEMENT_INSTANCE_ID,
+    });
+    mkdirSync(replacement.state_root, { recursive: true });
+    const replacementConfigPath = join(replacement.state_root, 'config.json');
+    writeFileSync(replacementConfigPath, JSON.stringify({
+      name: teamName,
+      instance_id: REPLACEMENT_INSTANCE_ID,
+      leader_cwd: repoDir,
+      team_state_root: replacement.state_root,
+    }), 'utf-8');
+    await teamInstanceModule.withTeamInstanceLifecycleLock(repoDir, teamName, () =>
+      teamInstanceModule.activateTeamInstanceUnderLock(replacement));
+    const replacementConfigBefore = readFileSync(replacementConfigPath);
+
+    await expect(teamInstanceModule.retryTeamInstanceDisposal(old, DISPOSAL_AUTHORIZATION))
+      .rejects.toThrow('scale_up_config_recovery_pending:detached-config-receipt');
+
+    expect(readFileSync(detachedConfigPath)).toEqual(detachedConfigBefore);
+    expect(readFileSync(replacementConfigPath)).toEqual(replacementConfigBefore);
+    expect(existsSync(detachedRoot)).toBe(true);
+    expect(existsSync(replacement.state_root)).toBe(true);
+    expect(existsSync(cleanupReceiptPath)).toBe(true);
+    expect(existsSync(absPath(repoDir, TeamPaths.teamInstanceReservation(
+      replacement.workspace_hash,
+      teamName,
+    )))).toBe(true);
+  });
+
   it('keeps team state when dirty worktrees are preserved during shutdown', async () => {
     const teamName = 'shutdown-dirty-team';
     await reserveFixtureInstance(teamName, repoDir);
@@ -458,9 +925,81 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
       instanceId: TEAM_INSTANCE_ID,
     });
     const { shutdownTeamV2 } = await import('../runtime-v2.js');
-    await expect(shutdownTeamV2(teamName, repoDir, { timeoutMs: 0 })).resolves.toEqual({
-      outcome: 'preserved', reason: 'worker_pane_liveness_unknown', workers: ['worker-unknown'],
+    await expect(shutdownTeamV2(teamName, repoDir, { timeoutMs: 0, force: true })).resolves.toEqual({
+      outcome: 'preserved', reason: 'worker_process_reaped_pane_unconfirmed', workers: ['worker-unknown'],
     });
+
+    expect(tmuxMocks.killTeamSession).not.toHaveBeenCalled();
+    expect(existsSync(worktree.path)).toBe(true);
+    expect(existsSync(teamRoot)).toBe(true);
+    expect(existsSync(absPath(repoDir, TeamPaths.teamInstanceReservation(
+      binding.workspace_hash,
+      teamName,
+    )))).toBe(true);
+    expect(existsSync(absPath(repoDir, TeamPaths.teamInstanceCleanupReceipt(
+      binding.workspace_hash,
+      teamName,
+      TEAM_INSTANCE_ID,
+    )))).toBe(false);
+  });
+
+  it('logs pane cleanup errors while keeping worktrees and team state', async () => {
+    const teamName = 'shutdown-kill-error-team';
+    await reserveFixtureInstance(teamName, repoDir);
+    const teamRoot = fixtureTeamRoot(repoDir, teamName);
+    mkdirSync(teamRoot, { recursive: true });
+    const worktree = createWorkerWorktree(teamName, 'worker-kill-error', repoDir);
+    const launchAttempt = await prepareAcceptedLaunch(repoDir, teamName, 'worker-kill-error', '%45');
+    writeFileSync(join(teamRoot, 'config.json'), JSON.stringify({
+      name: teamName,
+      instance_id: TEAM_INSTANCE_ID,
+      tmux_server_identity: tmuxMocks.tmuxServerIdentity,
+      task: 'demo',
+      agent_type: 'claude',
+      worker_launch_mode: 'interactive',
+      worker_count: 1,
+      max_workers: 20,
+      workers: [{
+        name: 'worker-kill-error',
+        index: 1,
+        role: 'executor',
+        assigned_tasks: [],
+        pane_id: '%45',
+        worker_cli: 'claude',
+        launch_attempt_id: launchAttempt.attempt_id,
+        launch_descriptor: { schema_version: 1, provider: 'claude', model: null, binary: '/bin/echo', args: [] },
+        working_dir: worktree.path,
+        team_state_root: teamRoot,
+        worktree_path: worktree.path,
+        worktree_created: true,
+      }],
+      created_at: new Date().toISOString(),
+      tmux_session: `${teamName}:0`,
+      leader_pane_id: null,
+      hud_pane_id: null,
+      resize_hook_name: null,
+      resize_hook_target: null,
+      next_task_id: 1,
+    }, null, 2), 'utf-8');
+    tmuxMocks.getWorkerLiveness.mockResolvedValue('alive');
+    tmuxMocks.killOwnedWorkerPane.mockRejectedValueOnce(new Error('pane kill failed'));
+
+    const binding = createTeamInstanceBinding({
+      teamName,
+      cwd: repoDir,
+      instanceId: TEAM_INSTANCE_ID,
+    });
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const { shutdownTeamV2 } = await import('../runtime-v2.js');
+    try {
+      await expect(shutdownTeamV2(teamName, repoDir, { timeoutMs: 0, force: true })).resolves.toEqual({
+        outcome: 'preserved', reason: 'worker_process_reaped_pane_unconfirmed', workers: ['worker-kill-error'],
+      });
+      expect(stderr.mock.calls.map(([chunk]) => String(chunk)).join(''))
+        .toContain('worker pane cleanup failed for worker-kill-error: pane kill failed');
+    } finally {
+      stderr.mockRestore();
+    }
 
     expect(tmuxMocks.killTeamSession).not.toHaveBeenCalled();
     expect(existsSync(worktree.path)).toBe(true);
@@ -701,7 +1240,61 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
     expect(JSON.parse(readFileSync(configPath, 'utf8')).lifecycle_state).toBe('active');
   });
 
+  it('does not promise survival to a rejecting worker when forced shutdown proceeds with cleanup', async () => {
+    tmuxMocks.killOwnedWorkerPane.mockClear();
+    const teamName = 'shutdown-worker-rejected-force';
+    await reserveFixtureInstance(teamName, repoDir);
+    const teamRoot = fixtureTeamRoot(repoDir, teamName);
+    const workerRoot = join(teamRoot, 'workers', 'worker-1');
+    mkdirSync(workerRoot, { recursive: true });
+    const launchAttempt = await prepareAcceptedLaunch(repoDir, teamName, 'worker-1', '%77');
+    writeFileSync(join(teamRoot, 'config.json'), JSON.stringify({
+      name: teamName, instance_id: TEAM_INSTANCE_ID, tmux_server_identity: tmuxMocks.tmuxServerIdentity,
+      task: 'demo', agent_type: 'claude', worker_launch_mode: 'interactive',
+      worker_count: 1, max_workers: 20,
+      workers: [{
+        name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [], pane_id: '%77',
+        worker_cli: 'claude', launch_attempt_id: launchAttempt.attempt_id,
+        launch_descriptor: { schema_version: 1, provider: 'claude', model: null, binary: '/bin/echo', args: [] },
+      }],
+      created_at: new Date().toISOString(), tmux_session: `${teamName}:0`, lifecycle_state: 'active', state_revision: 4,
+      next_task_id: 1,
+    }));
+    writeFileSync(join(workerRoot, 'shutdown-ack.json'), JSON.stringify({
+      status: 'reject', reason: 'still working', updated_at: '2099-01-01T00:00:00.000Z',
+    }));
+    let inbox = '';
+    let events = '';
+    tmuxMocks.getWorkerLiveness.mockResolvedValue('alive');
+    tmuxMocks.killOwnedWorkerPane.mockImplementationOnce(async () => {
+      inbox = readFileSync(join(workerRoot, 'inbox.md'), 'utf8');
+      events = readFileSync(join(teamRoot, 'events.jsonl'), 'utf8');
+      tmuxMocks.getWorkerLiveness.mockResolvedValue('dead');
+    });
+
+    const { shutdownTeamV2 } = await import('../runtime-v2.js');
+    await expect(shutdownTeamV2(teamName, repoDir, { timeoutMs: 1_000, force: true }))
+      .resolves.toEqual({ outcome: 'cleaned' });
+
+    expect(tmuxMocks.killOwnedWorkerPane).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      paneId: '%77', provider: 'tmux', tmuxServerIdentity: tmuxMocks.tmuxServerIdentity,
+    }));
+    expect(events.trim().split('\n').map(line => JSON.parse(line))).toContainEqual(expect.objectContaining({
+      type: 'shutdown_ack', worker: 'worker-1', reason: 'reject:still working',
+    }));
+    expect(existsSync(teamRoot)).toBe(false);
+    const shutdownRoot = process.platform === 'win32' ? teamRoot : '$OMC_TEAM_STATE_ROOT';
+    expect(inbox).toContain(`Write your ack to: ${shutdownRoot}/workers/worker-1/shutdown-ack.json`);
+    expect(inbox).toContain('Accept: {"status":"accept","reason":"ok","updated_at":"<iso>"}');
+    expect(inbox).not.toContain('remain active for task work and mailbox instructions');
+    expect(inbox).not.toContain('do not exit because of this request');
+    expect(inbox).toContain('forced shutdown');
+    expect(inbox).toContain('rejection does not veto termination');
+    expect(inbox).toContain('do not resume task work');
+  });
+
   it('restores active lifecycle when a worker rejects normal shutdown before pane cleanup', async () => {
+    tmuxMocks.killOwnedWorkerPane.mockClear();
     const teamName = 'shutdown-worker-rejected';
     await reserveFixtureInstance(teamName, repoDir);
     const teamRoot = fixtureTeamRoot(repoDir, teamName);
@@ -724,6 +1317,14 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
     await expect(shutdownTeamV2(teamName, repoDir, { timeoutMs: 25 }))
       .rejects.toThrow('shutdown_rejected:worker-1:still working');
 
+    const inbox = readFileSync(join(workerRoot, 'inbox.md'), 'utf8');
+    expect(inbox).toContain('Accept: {"status":"accept","reason":"ok","updated_at":"<iso>"}');
+    expect(inbox).toContain('Reject: {"status":"reject","reason":"still working","updated_at":"<iso>"}');
+    expect(inbox).toContain('If you accept, exit your session');
+    expect(inbox).toContain('If you reject, remain active for task work and mailbox instructions; do not exit because of this request');
+    expect(inbox).not.toContain('Then exit your session.');
+    expect(inbox).not.toContain('All tasks are complete.');
+    expect(tmuxMocks.killOwnedWorkerPane).not.toHaveBeenCalled();
     expect(tmuxMocks.killWorkerPanes).not.toHaveBeenCalled();
     expect(tmuxMocks.killTeamSession).not.toHaveBeenCalled();
     const persisted = JSON.parse(readFileSync(configPath, 'utf8'));
@@ -990,36 +1591,82 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
     const disposeGate = new Promise<void>(resolveGate => { releaseDispose = resolveGate; });
     let disposeReleased = false;
     let firstCompletion: Promise<unknown> | undefined;
+    let secondCompletion: Promise<unknown> | undefined;
     const disposeSpy = vi.spyOn(teamInstanceModule, 'disposeTeamInstanceUnderLock')
       .mockImplementation(async (...args) => {
         enteredDispose();
         await disposeGate;
         return originalDispose(...args);
       });
+    // Transparent spy: the real lock still runs; it only signals once the
+    // second shutdown has actually attempted the shared lifecycle lock.
+    const lifecycleLockPath = teamInstanceModule.teamInstanceLifecycleLockPath(repoDir, teamName);
+    const originalLock = processIdentityLockModule.withProcessIdentityFileLock;
+    let signalLockAttempt: (() => void) | undefined;
+    let secondCallbackEntered = false;
+    const lockSpy = vi.spyOn(processIdentityLockModule, 'withProcessIdentityFileLock')
+      .mockImplementation((path, fn, timeoutMs) => {
+        const notify = path === lifecycleLockPath ? signalLockAttempt : undefined;
+        if (!notify) return originalLock(path, fn, timeoutMs);
+        signalLockAttempt = undefined;
+        const pending = originalLock(path, () => {
+          secondCallbackEntered = true;
+          return fn();
+        }, timeoutMs);
+        notify();
+        return pending;
+      });
+    // Share one 20s race budget and reserve 5s for teardown under the suite's
+    // 30s timeout, so a failing gate still reports its specific error.
+    const raceDeadline = Date.now() + 20_000;
+    const withinDeadline = async <T,>(promise: Promise<T>, label: string, deadline: number): Promise<T> => {
+      const remainingMs = Math.max(0, deadline - Date.now());
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`${label} not reached within ${Math.ceil(remainingMs / 1000)}s`)), remainingMs);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    };
     try {
       const { shutdownTeamV2 } = await import('../runtime-v2.js');
       const first = shutdownTeamV2(teamName, repoDir, { force: true, timeoutMs: 0, instanceId: TEAM_INSTANCE_ID });
+      let firstDone = false;
       const firstSettled = first.then(
         value => ({ status: 'resolved' as const, value }),
         error => ({ status: 'rejected' as const, error }),
-      );
+      ).finally(() => { firstDone = true; });
       firstCompletion = firstSettled;
-      const gateOrEarlyExit = await Promise.race([
+      const gateOrEarlyExit = await withinDeadline(Promise.race([
         disposeEntered.then(() => ({ status: 'entered' as const })),
         firstSettled,
-        new Promise<{ status: 'timeout' }>(resolve => setTimeout(() => resolve({ status: 'timeout' }), 2_000)),
-      ]);
+      ]), 'final disposal gate', raceDeadline);
       if (gateOrEarlyExit.status === 'resolved') {
         throw new Error(`first shutdown completed before final disposal: ${JSON.stringify(gateOrEarlyExit.value)}`);
       }
       if (gateOrEarlyExit.status === 'rejected') throw gateOrEarlyExit.error;
-      if (gateOrEarlyExit.status === 'timeout') throw new Error('final disposal gate was not reached');
 
+      const secondLockAttempted = new Promise<void>(resolveAttempt => { signalLockAttempt = resolveAttempt; });
       let secondSettled = false;
       const second = shutdownTeamV2(teamName, repoDir, { force: true, timeoutMs: 0, instanceId: TEAM_INSTANCE_ID })
         .finally(() => { secondSettled = true; });
-      await new Promise(resolveTick => setTimeout(resolveTick, 10));
+      secondCompletion = second.catch(() => undefined);
+      await withinDeadline(Promise.race([
+        secondLockAttempted,
+        second.then(value => {
+          throw new Error(`second shutdown settled before lifecycle lock attempt: ${JSON.stringify(value)}`);
+        }),
+      ]), 'second lifecycle lock attempt', raceDeadline);
+      expect(secondCallbackEntered).toBe(false);
+      expect(firstDone).toBe(false);
       expect(secondSettled).toBe(false);
+      expect(existsSync(configPath)).toBe(true);
+      expect(disposeSpy).toHaveBeenCalledTimes(1);
 
       disposeReleased = true;
       releaseDispose();
@@ -1032,8 +1679,12 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
         disposeReleased = true;
         releaseDispose();
       }
-      await firstCompletion?.catch(() => undefined);
+      lockSpy.mockRestore();
       disposeSpy.mockRestore();
+      await withinDeadline(Promise.all([
+        firstCompletion?.catch(() => undefined),
+        secondCompletion,
+      ]), 'shutdown drain', Date.now() + 5_000).catch(() => undefined);
     }
   });
 });

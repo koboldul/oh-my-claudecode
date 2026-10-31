@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -605,7 +605,10 @@ pump();
 
   it('fail-opens a drain-aware noisy stderr hook when the consumer closes early', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'omc-stdio-drain-err-'));
+    const receiptDir = join(directory, 'process-receipts');
+    const reaperPids: number[] = [];
     try {
+      mkdirSync(receiptDir);
       const pluginRoot = join(directory, 'plugin');
       const target = writePluginHook(pluginRoot, 'drain-err.cjs', `
 process.stdout.write('OUT-KEEP\\n');
@@ -627,7 +630,12 @@ pump();
       const startedAt = Date.now();
       const runner = spawn(process.execPath, [RUN_CJS_PATH, target], {
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, CLAUDE_PLUGIN_ROOT: pluginRoot },
+        env: {
+          ...process.env,
+          CLAUDE_PLUGIN_ROOT: pluginRoot,
+          NODE_ENV: 'test',
+          OMC_RUNNER_TEST_PROCESS_RECEIPT_DIR: receiptDir,
+        },
         windowsHide: true,
       });
       let stdout = '';
@@ -644,7 +652,28 @@ pump();
       expect(code).toBe(0);
       expect(Date.now() - startedAt).toBeLessThan(1500);
       expect(stdout).toContain('OUT-KEEP');
+      if (process.platform === 'win32') {
+        for (const name of readdirSync(receiptDir)) {
+          const receipt = JSON.parse(
+            readFileSync(join(receiptDir, name), 'utf8'),
+          ) as { role?: unknown; pid?: unknown };
+          if (receipt.role === 'tree-reaper' && typeof receipt.pid === 'number') {
+            reaperPids.push(receipt.pid);
+          }
+        }
+        expect(reaperPids.length).toBeGreaterThan(0);
+        expect(reaperPids.filter((pid) => {
+          try {
+            process.kill(pid, 0);
+            return true;
+          } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+            throw error;
+          }
+        })).toEqual([]);
+      }
     } finally {
+      for (const pid of reaperPids) killIfAlive(pid);
       rmSync(directory, { recursive: true, force: true });
     }
   });

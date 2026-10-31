@@ -1,10 +1,11 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
-import { resolveToWorktreeRoot, getOmcRoot, validateSessionId, isValidTranscriptPath, resolveSessionStatePath, withProjectIdentifierScope } from '../../lib/worktree-paths.js';
+import { resolveToWorktreeRoot, getOmcRoot, validateSessionId, isValidTranscriptPath, resolveSessionStatePaths, withProjectIdentifierScope, } from '../../lib/worktree-paths.js';
 import { SESSION_END_MODE_STATE_FILES, SESSION_METRICS_MODE_FILES } from '../../lib/mode-names.js';
 import { canClearStateForSession, clearModeStateFile, clearStateFileLockedIf, readModeStateWithMeta, } from '../../lib/mode-state-io.js';
 import { completeForegroundCleanup, completeForegroundCleanupAndSealCore, prepareCoreManifest, readSessionEndJob, sealWikiManifest, } from './cleanup-manifest.js';
+import { planChainEnqueue } from './chain-enqueuer.js';
 import { getSessionEndStalePrdWarning } from '../ralph/stale-prd.js';
 import { isValidTeamInstanceId, isValidLeaderSessionId } from '../../team/types.js';
 const SESSION_STARTED_MARKER_FILE = 'session-started.json';
@@ -424,8 +425,9 @@ export function cleanupModeStates(directory, sessionId) {
         { file: 'ultrawork-state.json', mode: 'ultrawork' },
     ];
     for (const { file, mode } of cleanupStateFiles) {
-        const localPath = path.join(stateDir, file);
-        const sessionPath = sessionId ? resolveSessionStatePath(mode, sessionId, directory) : undefined;
+        const statePaths = resolveSessionStatePaths(mode, sessionId, directory, { fileName: file });
+        const localPath = statePaths.legacy;
+        const sessionPath = sessionId ? statePaths.sessionScoped : undefined;
         const hasSessionState = Boolean(sessionPath && fs.existsSync(sessionPath));
         try {
             // For JSON files, check if active before removing
@@ -854,7 +856,9 @@ export async function admitSessionEnd(input, event) {
         }
         const metrics = recordSessionMetrics(directory, input);
         const payload = buildDurableSessionEndPayload(directory, input, metrics);
-        const manifest = prepareCoreManifest(directory, input.session_id, payload, event);
+        const chain = planChainEnqueue(directory, input.session_id, input.reason);
+        const durablePayload = chain ? { ...payload, chain } : payload;
+        const manifest = prepareCoreManifest(directory, input.session_id, durablePayload, event);
         if (!manifest) {
             return {
                 output: { continue: true },
@@ -864,24 +868,31 @@ export async function admitSessionEnd(input, event) {
             };
         }
         exportSessionSummary(directory, metrics);
+        // Once the manifest is durable, the worker owns recovery. Admission stays
+        // successful even if inline cleanup or sealing loses a race, so resident
+        // and detached paths both continue the chain after producer grace.
         let foregroundOutcome;
         try {
             foregroundOutcome = await runForegroundSessionEndCleanup(directory, input.session_id, false);
         }
-        catch {
-            return {
-                output: { continue: true },
-                directory,
-                sessionId: input.session_id,
-                admitted: false,
-            };
+        catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            console.error(`[session-end] Foreground cleanup deferred to the worker: ${detail.slice(0, 256)}`);
         }
-        const sealed = completeForegroundCleanupAndSealCore(directory, input.session_id, foregroundOutcome);
+        if (foregroundOutcome !== undefined) {
+            try {
+                completeForegroundCleanupAndSealCore(directory, input.session_id, foregroundOutcome);
+            }
+            catch (error) {
+                const detail = error instanceof Error ? error.message : String(error);
+                console.error(`[session-end] Foreground result sealing deferred to the worker: ${detail.slice(0, 256)}`);
+            }
+        }
         return {
             output: { continue: true },
             directory,
             sessionId: input.session_id,
-            admitted: Boolean(sealed),
+            admitted: true,
         };
     });
 }
@@ -923,17 +934,7 @@ export async function admitWikiSessionEnd(input, event) {
         admitted: Boolean(sealed),
     };
 }
-export async function processWikiSessionEnd(input) {
-    const admission = await admitWikiSessionEnd(input);
-    if (admission.admitted) {
-        const { spawnSessionEndWorker } = await import('./worker.js');
-        spawnSessionEndWorker({
-            directory: admission.directory,
-            sessionId: admission.sessionId,
-        });
-    }
-    return admission.output;
-}
+export { publishWikiSessionEndBootstrap as processWikiSessionEnd } from './wiki-foreground-bootstrap.js';
 export async function handleSessionEnd(input) {
     return processSessionEnd(input);
 }

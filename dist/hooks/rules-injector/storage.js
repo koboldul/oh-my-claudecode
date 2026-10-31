@@ -9,10 +9,18 @@ import { randomUUID } from 'crypto';
 import { join } from 'path';
 import { atomicWriteFileSync } from '../../lib/atomic-write.js';
 import { lockPathFor, withFileLockSync, } from '../../lib/file-lock.js';
+import { warmCurrentProcessStartIdentitySyncCache, } from '../../platform/process-utils.js';
 import { RULES_INJECTOR_STORAGE } from './constants.js';
 const RULES_LOCK_TIMEOUT_MS = 500;
 const RULES_LOCK_RETRY_DELAY_MS = 25;
 const RULES_RESERVATION_TTL_MS = 30_000;
+export function initializeRulesStorage(options = {}) {
+    return warmCurrentProcessStartIdentitySyncCache({
+        deadlineAt: options.deadlineAt,
+        signal: options.signal,
+        onProbeSpawn: options.onIdentityProbeSpawn,
+    });
+}
 function getStoragePath(sessionId) {
     return join(RULES_INJECTOR_STORAGE, `${sessionId}.json`);
 }

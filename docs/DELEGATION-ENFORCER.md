@@ -95,8 +95,8 @@ Get the default model for an agent type.
 import { getModelForAgent } from 'oh-my-claudecode';
 
 getModelForAgent('executor'); // 'sonnet'
-getModelForAgent('executor-low'); // 'haiku'
-getModelForAgent('executor-high'); // 'opus'
+getModelForAgent('architect'); // 'opus'
+getModelForAgent('designer'); // 'sonnet'
 ```
 
 #### `isAgentCall(toolName: string, toolInput: unknown): boolean`
@@ -134,16 +134,13 @@ console.log(result.modifiedInput.model); // 'sonnet'
 
 | Agent Type | Default Model | Use Case |
 |------------|---------------|----------|
-| `architect` | opus | Complex analysis, debugging |
-| `architect-medium` | sonnet | Standard analysis |
-| `architect-low` | haiku | Quick questions |
-| `executor` | sonnet | Standard implementation |
-| `executor-high` | opus | Complex refactoring |
-| `executor-low` | haiku | Simple changes |
+| `architect` | opus | Complex analysis, debugging (use model="haiku" for simple) |
+| `executor` | sonnet | Standard implementation (use model="haiku" for simple, model="opus" for complex) |
 | `explore` | haiku | Fast code search |
-| `designer` | sonnet | UI implementation |
-| `designer-high` | opus | Complex UI architecture |
-| `designer-low` | haiku | Simple styling |
+| `designer` | sonnet | UI implementation (use model="haiku" for simple, model="opus" for complex) |
+| `planner` | opus | Strategic planning |
+| `critic` | opus | Plan/design review |
+| `analyst` | opus | Requirements analysis |
 | `document-specialist` | sonnet | Documentation lookup |
 | `writer` | haiku | Documentation writing |
 | `vision` | sonnet | Image analysis |
@@ -152,14 +149,13 @@ console.log(result.modifiedInput.model); // 'sonnet'
 | `analyst` | opus | Pre-planning analysis |
 | `qa-tester` | sonnet | CLI testing |
 | `scientist` | sonnet | Data analysis |
-| `scientist-high` | opus | Complex research |
 
 ## Debug Mode
 
 Enable debug logging to see when models are auto-injected:
 
 ```bash
-export OMC_DEBUG=true
+export OMC_DEBUG=1        # or OMC_DEBUG=true, or OMC_DEBUG=delegation-enforcer
 ```
 
 When enabled, you'll see warnings like:
@@ -168,7 +164,9 @@ When enabled, you'll see warnings like:
 [OMC] Auto-injecting model: sonnet for executor
 ```
 
-**Important:** Warnings are ONLY shown when `OMC_DEBUG=true`. Without this flag, enforcement happens silently.
+**Important:** Warnings are ONLY shown when `OMC_DEBUG` is enabled -- `1`, `true`, or a
+comma-separated list containing `delegation-enforcer`. Without it, enforcement happens
+silently.
 
 ## Usage Examples
 
@@ -183,7 +181,7 @@ Task(
 )
 
 Task(
-  subagent_type="oh-my-claudecode:executor-low",
+  subagent_type="oh-my-claudecode:executor",
   model="haiku",
   prompt="Quick lookup"
 )
@@ -199,7 +197,8 @@ Task(
 )
 
 Task(
-  subagent_type="oh-my-claudecode:executor-low",
+  subagent_type="oh-my-claudecode:executor",
+  model="haiku",  // Use haiku for quick tasks
   prompt="Quick lookup"
 )
 ```

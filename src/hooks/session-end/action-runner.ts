@@ -4,13 +4,17 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { atomicWriteJsonSync } from '../../lib/atomic-write.js';
 import type { OpenClawRoutingSnapshot, SessionEndActionName, SessionEndActionState, SessionEndJobV1 } from './cleanup-manifest.js';
-import { getProcessStartIdentitySync, terminateOwnedProcessTree } from '../../platform/process-utils.js';
+import {
+  getProcessStartIdentitySync,
+  terminateOwnedProcessTree,
+  warmCurrentProcessStartIdentitySyncCache,
+} from '../../platform/process-utils.js';
 import { markSessionEndActionRunner, readSessionEndJob } from './cleanup-manifest.js';
 import { getOmcRoot } from '../../lib/worktree-paths.js';
 
 const RUNNER_ARG = '--omc-session-end-action-runner';
 export interface ActionRunContext { directory: string; sessionId: string; job: SessionEndJobV1; actionName: SessionEndActionName; action: SessionEndActionState; ownerNonce: string; runnerNonce: string; deadlineAt: number; }
-export interface ActionRunResult { code: string; completed: boolean; }
+export interface ActionRunResult { code: string; completed: boolean; deliveryStarted?: boolean; }
 function runDirectory(context: ActionRunContext): string { return path.join(getOmcRoot(context.directory), 'state', 'session-end-jobs', 'runs', context.job.jobId, context.actionName, String(context.action.attempts), context.runnerNonce); }
 function openClawRoutingEnvironment(payload: Record<string, unknown>): NodeJS.ProcessEnv {
   const routing = payload.openClawRouting;
@@ -28,10 +32,24 @@ function openClawRoutingEnvironment(payload: Record<string, unknown>): NodeJS.Pr
 }
 
 function runnerEnvironment(context: ActionRunContext): NodeJS.ProcessEnv {
-  const baseKeys = ['PATH', 'HOME', 'USERPROFILE', 'TMPDIR', 'TEMP', 'TMP', 'SystemRoot', 'COMSPEC', 'LANG', 'LC_ALL', 'NODE_ENV', 'CLAUDE_CONFIG_DIR', 'OMC_STATE_DIR', 'OMC_HOOK_CONFIG', 'OMC_CONFIG_PATH', 'OMC_NOTIFY', 'OMC_NOTIFY_PROFILE', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE'];
+  // APPDATA/LOCALAPPDATA are required for gh keyring-free auth lookup on Windows
+  // (hosts.yml lives in %AppData%\GitHub CLI); spawn-next runners issue gh
+  // tracker commands, so without them every tracker update fails auth.
+  const baseKeys = ['PATH', 'HOME', 'USERPROFILE', ...(process.platform === 'win32' ? ['APPDATA', 'LOCALAPPDATA'] : []), 'TMPDIR', 'TEMP', 'TMP', 'SystemRoot', 'COMSPEC', 'LANG', 'LC_ALL', 'NODE_ENV', 'CLAUDE_CONFIG_DIR', 'OMC_STATE_DIR', 'OMC_HOOK_CONFIG', 'OMC_CONFIG_PATH', 'OMC_HOOK_BRIDGE', 'OMC_NOTIFY', 'OMC_NOTIFY_PROFILE', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE'];
   const notificationKeys = ['OMC_TELEGRAM', 'OMC_DISCORD', 'OMC_SLACK', 'OMC_WEBHOOK', 'OMC_DISCORD_MENTION', 'OMC_DISCORD_NOTIFIER_BOT_TOKEN', 'OMC_DISCORD_NOTIFIER_CHANNEL', 'OMC_DISCORD_WEBHOOK_URL', 'OMC_TELEGRAM_BOT_TOKEN', 'OMC_TELEGRAM_NOTIFIER_BOT_TOKEN', 'OMC_TELEGRAM_CHAT_ID', 'OMC_TELEGRAM_NOTIFIER_CHAT_ID', 'OMC_TELEGRAM_NOTIFIER_UID', 'OMC_SLACK_WEBHOOK_URL', 'OMC_SLACK_MENTION', 'OMC_SLACK_BOT_TOKEN', 'OMC_SLACK_APP_TOKEN', 'OMC_SLACK_BOT_CHANNEL'];
   const keys = context.actionName === 'callback' || context.actionName === 'notification' ? [...baseKeys, ...notificationKeys] : baseKeys;
-  const exact = Object.fromEntries(keys.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]]));
+  // ANTHROPIC_* carries model provider auth/routing (API key, base URL, token);
+  // the spawn-next runner launches claude chain links as its children, and
+  // without the passthrough every factory link exits "Not logged in"
+  // (dogfood: the chain's first real AFK spawn died exactly there while
+  // workerEnvironment() had already been fixed). Mirrors workerEnvironment().
+  // Scoped to spawn-next: callback/openclaw/cleanup children never need model
+  // credentials, so they must not inherit them (same least-privilege rule as
+  // notificationKeys above).
+  const authPassthrough = context.actionName === 'spawn-next'
+    ? Object.entries(process.env).filter(([key]) => key.startsWith('ANTHROPIC_'))
+    : [];
+  const exact = Object.fromEntries([...keys.flatMap((key) => process.env[key] === undefined ? [] : [[key, process.env[key]]]), ...authPassthrough]);
   if (context.actionName !== 'openclaw') return exact;
   const enabled = context.action.payload.openClawEnabled === true ? { OMC_OPENCLAW: '1' } : {};
   return { ...exact, ...enabled, ...openClawRoutingEnvironment(context.action.payload) };
@@ -97,7 +115,7 @@ export async function runSessionEndAction(context: ActionRunContext, _execute: (
     if (settled) { clearTimeout(timeout); return { code: exitCode === null ? 'runner-deadline' : `runner-exit-${exitCode}`, completed: false }; }
     atomicWriteJsonSync(path.join(runPath, 'control.json'), { jobId: context.job.jobId, action: context.actionName, attempt: context.action.attempts, runnerNonce: context.runnerNonce, ownerNonce: context.ownerNonce, runner: { pid: child.pid, processStartIdentity: identity }, deadlineAt: new Date(context.deadlineAt).toISOString(), idempotencyKey: context.action.idempotencyKey });
     atomicWriteJsonSync(path.join(runPath, 'arm.json'), { runnerNonce: context.runnerNonce, ownerNonce: context.ownerNonce, armedAt: new Date().toISOString() });
-    if (!markSessionEndActionRunner(context.directory, context.sessionId, context.ownerNonce, context.actionName, context.runnerNonce, 'armed')) { clearTimeout(timeout); await terminate(); return { code: 'runner-claim-lost', completed: false }; }
+    if (!markSessionEndActionRunner(context.directory, context.sessionId, context.ownerNonce, context.actionName, context.runnerNonce, 'armed')) { clearTimeout(timeout); await terminate(); return { code: 'runner-claim-lost', completed: false, deliveryStarted: false }; }
     const terminal = await Promise.race([
       childExit.then(code => ({ code, terminated: false })),
       terminationFinished.then(() => ({ code: null, terminated: true })),
@@ -120,6 +138,13 @@ async function runActionRunnerEntrypoint(): Promise<void> {
   if (runnerIndex < 0) return;
   try {
     const input = JSON.parse(process.argv[runnerIndex + 1] ?? '') as { directory: string; sessionId: string; jobId: string; actionName: SessionEndActionName; attempt: number; ownerNonce: string; runnerNonce: string; runPath: string; deadlineAt: number };
+    const selfIdentityWarm = warmCurrentProcessStartIdentitySyncCache({
+      deadlineAt: input.deadlineAt,
+    }).then(
+      (warmed) => warmed,
+      () => false,
+    );
+    let selfIdentityReady = false;
     while (Date.now() < input.deadlineAt) {
       let armed = false;
       try {
@@ -128,7 +153,15 @@ async function runActionRunnerEntrypoint(): Promise<void> {
         const action = job?.actions[input.actionName];
         armed = job?.jobId === input.jobId && job.owner?.nonce === input.ownerNonce && action?.status === 'claimed' && action.attempts === input.attempt && action.claimantNonce === input.ownerNonce && action.runner?.runnerNonce === input.runnerNonce && action.runner.phase === 'armed' && arm.runnerNonce === input.runnerNonce && arm.ownerNonce === input.ownerNonce;
       } catch { /* publication is not complete yet */ }
-      if (armed) break;
+      if (armed) {
+        if (!selfIdentityReady) {
+          if (!await selfIdentityWarm) throw new Error('runner-identity-unavailable');
+          selfIdentityReady = true;
+          if (Date.now() >= input.deadlineAt) throw new Error('runner-identity-deadline');
+          continue;
+        }
+        break;
+      }
       await new Promise(resolve => setTimeout(resolve, 10));
     }
     if (Date.now() >= input.deadlineAt) throw new Error('runner-arm-deadline');

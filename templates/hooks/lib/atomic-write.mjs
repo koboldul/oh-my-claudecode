@@ -7,8 +7,8 @@ import { openSync, writeSync, fsyncSync, closeSync, renameSync, unlinkSync, mkdi
 import { dirname, basename, join } from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { decodeProcessStartFromFilename, encodeProcessStartForFilename, normalizeProcessStartIdentity } from './process-start-identity.mjs';
-import { processStartIdentity, acquireStateFileLockSync, releaseStateFileLockSync, withStateFileLockSync, isStateFileLockingSupported, isExclusiveStateLockingAvailable, getStateFileLockDiagnostic, getStateFileLockFailureMessage, acquireRecoveryClaim, readRecoveryClaim, releaseRecoveryClaim, sameRecoveryClaim, isEmergencyOwnerLive } from './state-lock.mjs';
-export { acquireStateFileLockSync, releaseStateFileLockSync, withStateFileLockSync, isStateFileLockingSupported, isExclusiveStateLockingAvailable, getStateFileLockDiagnostic, getStateFileLockFailureMessage };
+import { processStartIdentity, acquireStateFileLockSync, acquireStateFileLockAtPathSync, releaseStateFileLockSync, withStateFileLockSync, withStateFileLockAtPathSync, isStateFileLockingSupported, isExclusiveStateLockingAvailable, getStateFileLockDiagnostic, getStateFileLockFailureMessage, getStateFileLockFailureKind, acquireRecoveryClaim, readRecoveryClaim, releaseRecoveryClaim, sameRecoveryClaim, isEmergencyOwnerLive } from './state-lock.mjs';
+export { acquireStateFileLockSync, acquireStateFileLockAtPathSync, releaseStateFileLockSync, withStateFileLockSync, withStateFileLockAtPathSync, isStateFileLockingSupported, isExclusiveStateLockingAvailable, getStateFileLockDiagnostic, getStateFileLockFailureMessage, getStateFileLockFailureKind };
 function journalIsOwned(path, transactionId, owner) { const current = readEmergencyJournal(path); return current !== null && current.transactionId === transactionId && isSameEmergencyOwner(current.owner, owner); }
 function isSameEmergencyOwner(left, right) { return left && right && left.pid === right.pid && left.processStart === right.processStart && left.nonce === right.nonce; }
 function emergencyJournalPath(path) { return `${path}.emergency-journal.json`; }
@@ -129,16 +129,37 @@ function readEmergencyJournal(path) {
   } catch { return null; }
 }
 
+// BigInt ids: NTFS file IDs exceed 2^53 once the MFT sequence number reaches
+// 32, and a Number ino rounds distinct files onto the same value.
 function fileIdentity(path) {
   try {
-    const stat = statSync(path);
+    const stat = statSync(path, { bigint: true });
     return { dev: stat.dev, ino: stat.ino };
   } catch { return null; }
 }
 
+/**
+ * Compare two file identities for equality.
+ * On Windows, Node returns real volume serial from fstat but 0 from lstat/stat,
+ * so we compare dev only when NOT on Windows OR both dev values are non-zero.
+ * Inode comparison is always performed.
+ */
+function sameFileIdentity(a, b) {
+  if (a.ino !== b.ino) return false;
+
+  // Windows can report a volume serial for fstat but 0 for pathname stat.
+  // A zero device requires a known inode; only Windows may ignore a mismatch.
+  if (a.dev === 0n || b.dev === 0n) {
+    return a.ino !== 0n &&
+      (process.platform === 'win32' || a.dev === b.dev);
+  }
+
+  return a.dev === b.dev;
+}
+
 function sameFile(path, expected) {
   const actual = fileIdentity(path);
-  return actual !== null && actual.dev === expected.dev && actual.ino === expected.ino;
+  return actual !== null && sameFileIdentity(actual, expected);
 }
 
 function reconcileEmergencyPublicationTemps(filePath, authorizeState) {

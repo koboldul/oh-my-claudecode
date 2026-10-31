@@ -201,7 +201,7 @@ export function isTmuxAvailable(): boolean {
     }
 
     if (process.platform === 'win32') {
-      const result = spawnSync(resolvedBinary, ['-V'], { timeout: 5000, shell: true });
+      const result = spawnSync(resolvedBinary, ['-V'], { timeout: 5000, shell: false });
       return result.status === 0;
     }
 
@@ -217,10 +217,19 @@ export function isTmuxAvailable(): boolean {
  */
 export function isClaudeAvailable(): boolean {
   try {
-    execFileSync('claude', ['--version'], {
-      stdio: 'ignore',
-      shell: process.platform === 'win32',
-    });
+    if (process.platform === 'win32') {
+      const comspec = process.env.COMSPEC || 'cmd.exe';
+      const commandLine = ['claude', '--version'].map(quoteForCmd).join(' ');
+      const result = spawnSync(comspec, ['/d', '/s', '/c', commandLine], {
+        stdio: 'ignore',
+        windowsVerbatimArguments: true,
+      });
+      return result.status === 0;
+    } else {
+      execFileSync('claude', ['--version'], {
+        stdio: 'ignore',
+      });
+    }
     return true;
   } catch {
     return false;

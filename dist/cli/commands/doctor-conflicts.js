@@ -7,6 +7,7 @@ import { basename, dirname, join } from 'path';
 import { getClaudeConfigDir } from '../../utils/config-dir.js';
 import { isOmcHook } from '../../installer/index.js';
 import { analyzeLegacyClaudeMd, decodeClaudeMdUtf8 } from '../../installer/claude-md-analysis.js';
+import { isClaudeMdEnabledInConfig } from '../../installer/claude-md-transaction.js';
 import { colors } from '../utils/formatting.js';
 import { getSkillsDir, listBuiltinSkillNames } from '../../features/builtin-skills/skills.js';
 import { inspectUnifiedMcpRegistrySync } from '../../installer/mcp-registry.js';
@@ -255,8 +256,13 @@ export function checkClaudeMdStatus() {
     const activePath = join(configDir, 'CLAUDE-omc.md');
     const genericPaths = genericClaudeMdFiles(configDir);
     const mainExists = pathExistsWithoutFollowingSymlinks(claudeMdPath);
-    if (!mainExists && !pathExistsWithoutFollowingSymlinks(activePath) && genericPaths.length === 0)
-        return null;
+    const managementDisabled = !isClaudeMdEnabledInConfig(configDir);
+    if (!mainExists && !pathExistsWithoutFollowingSymlinks(activePath) && genericPaths.length === 0) {
+        // No guide on disk: stay silent unless the user deliberately opted out, so the opt-out stays visible.
+        return managementDisabled
+            ? { hasMarkers: false, hasUserContent: false, path: claudeMdPath, files: [], dirtyFiles: [], exactLegacyPaths: [], manualReviewPaths: [], managementDisabled }
+            : null;
+    }
     const main = mainExists ? inspectClaudeMdFile(claudeMdPath, configDir, true) : null;
     const candidatePaths = [...(mainExists ? [claudeMdPath] : []), activePath, ...(main?.references ?? []), ...genericPaths];
     const seen = new Set();
@@ -281,7 +287,8 @@ export function checkClaudeMdStatus() {
         files,
         dirtyFiles: files.filter(file => file.hasUserContent).map(file => file.path),
         exactLegacyPaths: files.filter(file => file.exactLegacy).map(file => file.path),
-        manualReviewPaths: files.filter(file => file.manualReview || file.markerState === 'symlink' || file.markerState === 'unreadable' || file.markerState === 'invalid-utf8').map(file => file.path)
+        manualReviewPaths: files.filter(file => file.manualReview || file.markerState === 'symlink' || file.markerState === 'unreadable' || file.markerState === 'invalid-utf8').map(file => file.path),
+        managementDisabled
     };
 }
 /**
@@ -291,7 +298,7 @@ export function checkEnvFlags() {
     const disableOmc = process.env.DISABLE_OMC === 'true' || process.env.DISABLE_OMC === '1';
     const skipHooks = [];
     if (process.env.OMC_SKIP_HOOKS) {
-        skipHooks.push(...process.env.OMC_SKIP_HOOKS.split(',').map(h => h.trim()));
+        skipHooks.push(...process.env.OMC_SKIP_HOOKS.split(',').map(h => h.trim()).filter(Boolean));
     }
     return { disableOmc, skipHooks };
 }
@@ -391,17 +398,13 @@ function getSetupFallbackCanonicalSkillPaths(baseName) {
     });
 }
 function isSupportedSetupFallbackSkill(legacySkillsDir, entry, baseName) {
-    if (hasActiveOmcPluginForDiagnostics()) {
-        return false;
-    }
     if (!SETUP_FALLBACK_SKILL_NAMES.has(baseName)) {
         return false;
     }
-    // scripts/setup-claude-md.sh intentionally syncs the raw bundled
-    // skills/wiki/SKILL.md file into ~/.claude/skills/wiki/SKILL.md. Keep the
-    // retired omc-reference fallback for already-installed 4.x upgrades.
-    // as a Claude CLI fallback. Suppress only that exact, unmodified sync so real
-    // legacy collisions and user-edited fallback copies still surface.
+    // setup-claude-md.sh may sync the raw bundled wiki skill as a CLI fallback.
+    // Keep the retired omc-reference fallback for already-installed 4.x upgrades.
+    // Suppress only an exact byte-for-byte copy so real legacy collisions and
+    // user-edited fallback copies still surface, even with the plugin active.
     if (entry.toLowerCase() !== baseName) {
         return false;
     }
@@ -410,9 +413,9 @@ function isSupportedSetupFallbackSkill(legacySkillsDir, entry, baseName) {
         return false;
     }
     try {
-        const installedContent = readFileSync(installedSkillPath, 'utf-8');
+        const installedContent = readFileSync(installedSkillPath);
         return getSetupFallbackCanonicalSkillPaths(baseName).some(canonicalSkillPath => (existsSync(canonicalSkillPath)
-            && installedContent === readFileSync(canonicalSkillPath, 'utf-8')));
+            && installedContent.equals(readFileSync(canonicalSkillPath))));
     }
     catch {
         return false;
@@ -520,6 +523,7 @@ export function checkConfigIssues() {
             'notifications',
             'notificationProfiles',
             'hudEnabled',
+            'claudeMdEnabled',
             'autoUpgradePrompt',
             'nodeBinary',
             // Direct config readers / writers outside OMCConfig
@@ -630,6 +634,9 @@ export function formatReport(report, json) {
         lines.push(colors.bold('📄 CLAUDE.md Status'));
         lines.push('');
         if (report.claudeMdStatus.hasMarkers) {
+            if (report.claudeMdStatus.managementDisabled) {
+                lines.push(`  ${colors.blue('ℹ')} Global CLAUDE.md management is disabled (claudeMdEnabled is false in .omc-config.json)`);
+            }
             if (report.claudeMdStatus.companionFile) {
                 lines.push(`  ${colors.green('✓')} OMC markers found in companion file`);
                 lines.push(`    ${colors.gray(`Companion: ${report.claudeMdStatus.companionFile}`)}`);
@@ -641,6 +648,9 @@ export function formatReport(report, json) {
                 lines.push(`  ${colors.green('✓')} User content outside managed ranges: ${report.claudeMdStatus.dirtyFiles.join(', ')}`);
             }
         }
+        else if (report.claudeMdStatus.managementDisabled) {
+            lines.push(`  ${colors.blue('ℹ')} No OMC markers found (claudeMdEnabled is false in .omc-config.json; OMC does not manage CLAUDE.md)`);
+        }
         else {
             lines.push(`  ${colors.yellow('⚠')} No OMC markers found`);
             lines.push(`    ${colors.gray('Run /oh-my-claudecode:omc-setup to add markers to the selected guide')}`);
@@ -651,7 +661,12 @@ export function formatReport(report, json) {
         lines.push(`  ${colors.gray(`Path: ${report.claudeMdStatus.path}`)}`);
         if (report.claudeMdStatus.exactLegacyPaths.length > 0) {
             lines.push(`  ${colors.yellow('⚠')} Exact legacy guide content: ${report.claudeMdStatus.exactLegacyPaths.join(', ')}`);
-            lines.push(`    ${colors.gray('Run /oh-my-claudecode:omc-setup for coordinator-backed cleanup with a verified backup.')}`);
+            if (report.claudeMdStatus.managementDisabled) {
+                lines.push(`    ${colors.gray('Setup cleanup is skipped while claudeMdEnabled is false: re-enable claudeMdEnabled in .omc-config.json, or remove the legacy content manually.')}`);
+            }
+            else {
+                lines.push(`    ${colors.gray('Run /oh-my-claudecode:omc-setup for coordinator-backed cleanup with a verified backup.')}`);
+            }
         }
         if (report.claudeMdStatus.manualReviewPaths.length > 0) {
             lines.push(`  ${colors.yellow('⚠')} Inspection-only review required: ${report.claudeMdStatus.manualReviewPaths.join(', ')}`);

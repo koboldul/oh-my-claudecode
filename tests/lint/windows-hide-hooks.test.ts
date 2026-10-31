@@ -92,7 +92,7 @@ function propertyName(property: ts.ObjectLiteralElementLike): string | undefined
 function isGitCondition(expression: ts.Expression, commandParameter?: string): boolean {
   if (!commandParameter) return false;
   const text = expression.getText();
-  return new RegExp(`\\b${commandParameter}\\s*={2,3}\\s*['\"]git['\"]|['\"]git['\"]\\s*={2,3}\\s*${commandParameter}\\b`).test(text);
+  return new RegExp(`\\b${commandParameter}\\s*={2,3}\\s*['"]git['"]|['"]git['"]\\s*={2,3}\\s*${commandParameter}\\b`).test(text);
 }
 
 function optionValue(
@@ -327,7 +327,8 @@ const OWNED_NESTED_GIT_FILES = [
   'scripts/code-simplifier.mjs',
   'templates/hooks/code-simplifier.mjs',
 ];
-const OWNED_NESTED_GIT_CALL_COUNT = 8;
+// pre-tool-enforcer no longer spawns Git; the remaining owned sites are 3 + 1 + 1.
+const OWNED_NESTED_GIT_CALL_COUNT = 5;
 
 // Tier 2 (ownership): the owned #3493 sites must use the shared BOUNDED_GIT_TIMEOUT_MS
 // constant specifically — not merely "some positive timeout" (tier 1). This resolves the

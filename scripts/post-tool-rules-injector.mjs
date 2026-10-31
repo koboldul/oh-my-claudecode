@@ -16,10 +16,17 @@
  */
 
 import { isAbsolute, join, dirname } from 'path';
-import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { readStdin } from './lib/stdin.mjs';
+import hostStdoutWriter from './lib/host-stdout-writer.cjs';
 import {
+  awaitHostStdoutDelivery,
+  HOST_DELIVERY_ACK_ENV,
+  HOST_DELIVERY_DEADLINE_ENV,
+  observeHostDeliveryAbort,
+} from './lib/host-delivery-ack.mjs';
+import {
+  encodeLegacyCompatibleHookOutput,
   loadHookRuntime,
   surfaceOptionalHookFailure,
 } from './lib/hook-runtime-loader.mjs';
@@ -29,6 +36,7 @@ const __dirname = dirname(__filename);
 const DEFAULT_STDOUT_FLUSH_TIMEOUT_MS = 1_500;
 const STDOUT_WRITE_CHUNK_BYTES = 16 * 1024;
 const STDOUT_STREAM_THRESHOLD_BYTES = 64 * 1024;
+const { writeHostStdoutAndWait } = hostStdoutWriter;
 
 function stdoutFlushTimeoutMs() {
   const parsed = Number.parseInt(
@@ -38,6 +46,11 @@ function stdoutFlushTimeoutMs() {
   return Number.isFinite(parsed) && parsed > 0
     ? parsed
     : DEFAULT_STDOUT_FLUSH_TIMEOUT_MS;
+}
+
+function hostDeliveryDeadlineAt() {
+  const value = Number(process.env[HOST_DELIVERY_DEADLINE_ENV]);
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
 function errorDetail(error) {
@@ -53,111 +66,7 @@ function errorDetail(error) {
   }
 }
 
-function writeLargeStdoutAndWait(payload) {
-  const writer = spawn(
-    process.execPath,
-    ['-e',
-    `
-      const { writeSync } = require('node:fs');
-      const chunks = [];
-      process.stdin.on('data', (chunk) => chunks.push(chunk));
-      process.stdin.on('end', () => {
-        const payload = Buffer.concat(chunks);
-        try {
-          let offset = 0;
-          while (offset < payload.length) {
-            const written = writeSync(
-              1,
-              payload,
-              offset,
-              Math.min(${STDOUT_WRITE_CHUNK_BYTES}, payload.length - offset),
-            );
-            if (written <= 0) {
-              throw new Error('stdout write completed without delivering bytes');
-            }
-            offset += written;
-          }
-          process.send({ ok: true }, () => process.exit(0));
-        } catch (error) {
-          process.send({
-            ok: false,
-            error: error instanceof Error ? error.message : String(error),
-          }, () => process.exit(0));
-        }
-      });
-    `,
-    ],
-    {
-      stdio: ['pipe', 1, 'ignore', 'ipc'],
-      windowsHide: true,
-    },
-  );
-
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let result;
-    let pendingFailure;
-
-    const cleanup = () => {
-      clearTimeout(timeout);
-      writer.removeAllListeners();
-      writer.stdin.removeAllListeners();
-    };
-    const succeed = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolve();
-    };
-    const rejectFailure = (error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(error instanceof Error ? error : new Error(String(error)));
-    };
-    const fail = (error) => {
-      if (settled || pendingFailure) return;
-      pendingFailure = error instanceof Error ? error : new Error(String(error));
-      if (writer.exitCode === null && writer.signalCode === null) {
-        writer.kill();
-        return;
-      }
-      rejectFailure(pendingFailure);
-    };
-    const timeoutMs = stdoutFlushTimeoutMs();
-    const timeout = setTimeout(() => {
-      fail(new Error(
-        `stdout flush timed out after ${timeoutMs}ms`,
-      ));
-    }, timeoutMs);
-
-    writer.once('error', fail);
-    writer.stdin.once('error', fail);
-    writer.on('message', (message) => {
-      result = message;
-    });
-    writer.once('exit', (code, signal) => {
-      if (pendingFailure) {
-        rejectFailure(pendingFailure);
-      } else if (result?.ok === true && code === 0) {
-        succeed();
-      } else {
-        rejectFailure(new Error(
-          result?.error
-          || `stdout writer exited before flush completed (${code ?? signal})`,
-        ));
-      }
-    });
-    writer.stdin.end(payload);
-  });
-}
-
-function writeStdoutAndWait(output) {
-  const payload = Buffer.from(`${JSON.stringify(output)}\n`, 'utf8');
-  if (payload.length > STDOUT_STREAM_THRESHOLD_BYTES) {
-    return writeLargeStdoutAndWait(payload);
-  }
-
+function writeStreamStdoutAndWait(payload) {
   return new Promise((resolve, reject) => {
     const stdout = process.stdout;
     let settled = false;
@@ -254,6 +163,19 @@ function writeStdoutAndWait(output) {
   });
 }
 
+async function writeStdoutAndWait(output) {
+  const serialized = `${JSON.stringify(output)}\n`;
+  const payload = Buffer.from(serialized, 'utf8');
+  if (process.env[HOST_DELIVERY_ACK_ENV] === '1') {
+    await awaitHostStdoutDelivery(serialized, stdoutFlushTimeoutMs());
+  } else if (payload.length > STDOUT_STREAM_THRESHOLD_BYTES) {
+    await writeHostStdoutAndWait(payload, stdoutFlushTimeoutMs());
+  } else {
+    await writeStreamStdoutAndWait(payload);
+  }
+  return payload.length;
+}
+
 /**
  * Extract the primary file path from tool input.
  * All tracked tools (read, write, edit, multiedit) expose file_path at the
@@ -292,13 +214,21 @@ function describeCanonicalFailure(result) {
   return failures.length > 0 ? [...new Set(failures)].join('; ') : undefined;
 }
 
-function isCompleteBoundedContext(runtime, context) {
+function appendCompleteBoundedContext(runtime, contexts, context) {
   if (typeof runtime.boundHookContexts !== 'function') {
     throw new TypeError('Canonical context bounds export is unavailable.');
   }
 
-  const bounded = runtime.boundHookContexts([context]);
-  return bounded.length === 1 && bounded[0] === context;
+  const candidate = [...contexts, context];
+  const bounded = runtime.boundHookContexts(candidate);
+  if (
+    bounded.length !== candidate.length
+    || bounded.some((value, index) => value !== candidate[index])
+  ) {
+    return false;
+  }
+  contexts.push(context);
+  return true;
 }
 
 function processRulesInjector(
@@ -307,7 +237,8 @@ function processRulesInjector(
   runtime,
   hook,
   activeReservations,
-  stagedDeliveries,
+  emittedDeliveries,
+  emittedContexts,
   stagedKeys,
 ) {
   const toolName = data.toolName || '';
@@ -344,39 +275,23 @@ function processRulesInjector(
 
     const context = hook.formatRuleForInjection(rule).trim();
     const legacyContext = hook.formatRulesForInjection([rule]);
-    stagedDeliveries.push({
-      hook,
-      sessionId,
-      reservationId: reservation.reservationId,
-      rule,
-      context,
-      legacyContext,
-    });
-
     if (
       envelope.host === 'claude'
-      || isCompleteBoundedContext(runtime, context)
+      || appendCompleteBoundedContext(runtime, emittedContexts, context)
     ) {
       contexts.push(context);
+      emittedDeliveries.push({
+        hook,
+        sessionId,
+        reservationId: reservation.reservationId,
+        rule,
+        context,
+        legacyContext,
+      });
     }
   }
 
   return { decision: 'pass', contexts };
-}
-
-function encodedAdditionalContext(envelope, output) {
-  if (envelope.host === 'copilot') {
-    return typeof output.additionalContext === 'string'
-      ? output.additionalContext
-      : undefined;
-  }
-
-  const hookSpecificOutput = output.hookSpecificOutput;
-  return hookSpecificOutput
-    && typeof hookSpecificOutput === 'object'
-    && typeof hookSpecificOutput.additionalContext === 'string'
-      ? hookSpecificOutput.additionalContext
-      : undefined;
 }
 
 function reportPersistenceFailure(error) {
@@ -454,9 +369,15 @@ async function main() {
     return;
   }
 
+  let deliveryAbort = {
+    signal: undefined,
+    async throwIfAborted() {},
+    reportChildProcess() {},
+    close() {},
+  };
   const activeReservations = [];
   try {
-    const runtime = loadHookRuntime();
+    deliveryAbort = await observeHostDeliveryAbort();
     const runtimeBase = join(__dirname, '..');
     const mod = await import(
       pathToFileURL(join(runtimeBase, 'dist', 'hooks', 'rules-injector', 'index.js')).href
@@ -466,7 +387,91 @@ async function main() {
       throw new TypeError('Rules injector processor export is unavailable.');
     }
 
+    const deadlineAt = hostDeliveryDeadlineAt();
+    const requiresStorageInitialization =
+      process.env[HOST_DELIVERY_ACK_ENV] === '1';
+    const storageInitializationPromise = (
+      requiresStorageInitialization
+      && typeof mod.initializeRulesStorage === 'function'
+    )
+      ? mod.initializeRulesStorage({
+          deadlineAt,
+          signal: deliveryAbort.signal,
+          onIdentityProbeSpawn(pid) {
+            deliveryAbort.reportChildProcess('identity-probe', pid);
+          },
+        })
+      : Promise.resolve(false);
+    const storageInitialization = Promise.resolve(
+      storageInitializationPromise,
+    ).then(
+      (initialized) => ({ error: undefined, initialized }),
+      (error) => ({ error, initialized: false }),
+    );
+    const runtime = loadHookRuntime();
     const input = await readStdin();
+    const initialized = await storageInitialization;
+    if (initialized.error !== undefined) throw initialized.error;
+    if (
+      requiresStorageInitialization
+      && initialized.initialized !== true
+    ) {
+      throw new Error(
+        'rules storage process identity initialization was unavailable',
+      );
+    }
+    await deliveryAbort.throwIfAborted();
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+      throw new Error('runner host-delivery deadline elapsed during rules initialization');
+    }
+    const emittedDeliveries = [];
+    const emittedContexts = [];
+    const stagedKeys = new Set();
+    const result = await runtime.runHookJson(
+      'post-tool-use',
+      input,
+      (unit, envelope) => {
+        const data = runtime.buildLegacyProcessorInput(envelope, unit);
+        const hook = createRulesInjectorHook(data.directory || process.cwd());
+        return processRulesInjector(
+          data,
+          envelope,
+          runtime,
+          hook,
+          activeReservations,
+          emittedDeliveries,
+          emittedContexts,
+          stagedKeys,
+        );
+      },
+    );
+    const failure = describeCanonicalFailure(result);
+    if (failure) throw new Error(failure);
+
+    const legacyContext = emittedDeliveries
+      .map((delivery) => delivery.legacyContext)
+      .join('');
+    const legacyOutput = legacyContext
+      ? {
+          continue: true,
+          hookSpecificOutput: {
+            hookEventName: 'PostToolUse',
+            additionalContext: legacyContext,
+          },
+        }
+      : { continue: true };
+    const output = encodeLegacyCompatibleHookOutput(runtime, result, legacyOutput);
+    const deliveredRecords = emittedDeliveries;
+
+    try {
+      await deliveryAbort.throwIfAborted();
+      await writeStdoutAndWait(output);
+    } catch (error) {
+      releaseReservations(activeReservations);
+      await reportStdoutFailure(error);
+      return;
+    }
+
     for (const reservation of activeReservations) {
       const rules = deliveredRecords
         .filter(
@@ -488,6 +493,8 @@ async function main() {
   } catch (error) {
     releaseReservations(activeReservations);
     surfaceOptionalHookFailure(error, { hookName: 'post-tool-rules-injector' });
+  } finally {
+    deliveryAbort.close();
   }
 }
 

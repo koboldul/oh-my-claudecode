@@ -5,6 +5,12 @@
  * delivery reservations.
  */
 import type { PlannedRuleToInject, RulesInjectionReservation } from './types.js';
+export interface RulesStorageInitializationOptions {
+    deadlineAt?: number;
+    signal?: AbortSignal;
+    onIdentityProbeSpawn?: (pid: number) => void;
+}
+export declare function initializeRulesStorage(options?: RulesStorageInitializationOptions): Promise<boolean>;
 export declare function reserveInjectedRules(sessionId: string, candidates: readonly PlannedRuleToInject[]): RulesInjectionReservation;
 export declare function commitInjectedRuleReservation(sessionId: string, reservationId: string, deliveredRules: readonly PlannedRuleToInject[]): void;
 export declare function releaseInjectedRuleReservation(sessionId: string, reservationId: string): void;

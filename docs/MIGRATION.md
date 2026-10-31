@@ -6,6 +6,11 @@ This guide covers all migration paths for oh-my-claudecode. Find your current ve
 
 ## Table of Contents
 
+- [Unreleased: Host Load Gate Threshold Values](#unreleased-host-load-gate-threshold-values)
+- [Unreleased: Rule Glob Brace Alternation](#unreleased-rule-glob-brace-alternation)
+- [Unreleased: Glossary File Rename (CONTEXT.md → GLOSSARY.md)](#unreleased-glossary-file-rename-contextmd--glossarymd)
+- [Unreleased: Shipyard Tracker Artifacts and Audit Contract v2](#unreleased-shipyard-tracker-artifacts-and-audit-contract-v2)
+- [Unreleased: SSRF Guard for IPv6 Literals](#unreleased-ssrf-guard-for-ipv6-literals)
 - [Unreleased: Team Instance Ownership](#unreleased-team-instance-ownership)
 - [Unreleased: Cancellation Scope](#unreleased-cancellation-scope)
 - [v4.x → v5.0: Workflow Retirement](#v4x--v50-workflow-retirement)
@@ -17,6 +22,80 @@ This guide covers all migration paths for oh-my-claudecode. Find your current ve
 - [v2.x → v3.0: Package Rename & Auto-Activation](#v2x--v30-package-rename--auto-activation)
 - [v3.0 → v3.1: Notepad Wisdom & Enhanced Features](#v30--v31-notepad-wisdom--enhanced-features)
 - [v3.x → v4.0: Major Architecture Overhaul](#v3x--v40-major-architecture-overhaul)
+
+---
+
+## Unreleased: Host Load Gate Threshold Values
+
+Negative values for `OMC_HOST_LOAD_THRESHOLD`, `OMC_FREE_MEMORY_THRESHOLD`, and
+`OMC_MAX_SIBLING_SESSIONS` now fall back to their documented defaults instead of
+disabling individual checks. Existing environment configurations that use `-1`
+can therefore re-enable a check after upgrading.
+
+### Migration
+
+- Remove a negative threshold variable to use its default value.
+- Set `OMC_HOST_LOAD_GATE_DISABLED=1` to disable the entire host load gate.
+- To disable an individual check from code, pass a negative value through a
+  `HostLoadGateConfig` override; negative environment values no longer disable
+  individual checks.
+
+## Unreleased: Rule Glob Brace Alternation
+
+Rule frontmatter `globs` and Claude Code `paths` now treat unescaped `{a,b}`
+as alternation. Existing patterns that used comma-bearing braces to match a
+literal path must escape both braces and keep the pattern as one array item:
+
+```yaml
+globs:
+  - 'fixtures/\{a,b\}.json'
+```
+
+Use a quoted inline or block array item as shown; an unquoted comma-separated
+scalar still treats commas outside brace groups as pattern separators.
+
+## Unreleased: Glossary File Rename (CONTEXT.md → GLOSSARY.md)
+
+The shipyard glossary surface is now `GLOSSARY.md` at the repository root. It holds the yard's terms and the `documentLanguage` frontmatter tag.
+
+### What changes for existing yards
+
+- **Only `CONTEXT.md` exists:** the yard keeps working. The audit accepts `CONTEXT.md` as the glossary, and the skills read it until it is migrated. The next full `/oh-my-claudecode:drydock` run (not `--check`) renames it to `GLOSSARY.md` with its content and frontmatter unchanged, and rewrites `CONTEXT.md` references in `CLAUDE.md` (for example `Glossary: CONTEXT.md`) to `GLOSSARY.md`. Commit the result.
+- **Both files exist:** `node scripts/shipyard-audit.mjs` reports a high-confidence `shipyard.glossary.duplicate-authority` finding and exits 1, so Launch stays blocked. Drydock does not merge the files for you. Move any terms that exist only in `CONTEXT.md` into `GLOSSARY.md`, delete `CONTEXT.md`, replace remaining `CONTEXT.md` references in `CLAUDE.md` with `GLOSSARY.md`, then commit.
+- **Fresh yards:** no action. Drydock creates `GLOSSARY.md`.
+
+A `CONTEXT.md` counts as a legacy glossary only when its frontmatter has a `documentLanguage` key, or its first visible non-blank line (after the frontmatter, ignoring a BOM and HTML comments) is a drydock glossary seed heading (`# Glossary`, `# 术语表`, `# 詞彙表`) for yards laid before the language tag existed. Any other `CONTEXT.md` (for example an agent-context file) is ignored by the audit and never renamed.
+
+## Unreleased: Shipyard Tracker Artifacts and Audit Contract v2
+
+New navigator maps and Launch specs/tickets are tracker-only. For an existing `.omc/wayfinder/<slug>/map.md`, use ask-navigator's one-time migration: create the tracker map issue and child issues, carry over decisions, frontier, dependencies, and mission brief, then verify the import before treating the tracker as canonical. Keep local files unchanged until that verification is complete; do not create new local maps.
+
+Launch recovery uses the parent spec issue, its native child issues, and the latest handoff comment on the parent. Put settled decisions in their child issues and progress pointers, open questions, next watch, and warning lines in a tracker comment. Do not create local spec, ticket, or handoff files.
+
+### Audit contract v2
+
+The `node scripts/shipyard-audit.mjs` JSON report now includes `contractVersion: 2`. This version retires the `shipyard.surface.missing.*` finding family: absence of an optional surface means it is not adopted, not that the yard is incomplete. Consumers that keyed on those IDs must stop treating absent optional paths as findings. The required base faces are handled separately by `shipyard.yard.unlaid`: `CLAUDE.md` and `GLOSSARY.md` must exist, or a recognizable legacy glossary `CONTEXT.md` may stand in until a full drydock run migrates it. Integrity checks still run on adopted surfaces.
+
+## Unreleased: SSRF Guard for IPv6 Literals
+
+OMC's URL guard now rejects literal IPv6 unique-local (`FC00::/7`), link-local
+(`FE80::/10`), unspecified (`::`), and multicast (`FF00::/8`) addresses. This
+affects `GITEA_URL` when OMC uses its direct REST fallback. A blocked Gitea URL
+disables that fallback. This change does not alter HUD usage routing for an
+IPv6-literal `ANTHROPIC_BASE_URL`: provider selection checks the supported DNS
+hostnames, and other endpoints follow the existing Anthropic OAuth usage path.
+The guard does not override Claude Code's own model requests.
+
+### Migration
+
+- For self-hosted Gitea on a unique-local address, configure the `tea` CLI for
+  that host; OMC can continue to use the CLI path, while its direct REST fallback
+  intentionally fails closed for blocked literals. If you rely on the REST
+  fallback, expose Gitea through a trusted routable endpoint outside the blocked
+  ranges.
+- There is no SSRF-guard opt-out. Do not use a hostname that resolves to the same
+  private address as a workaround; DNS resolution and redirect validation are
+  separate protections not provided by this guard.
 
 ---
 
@@ -139,7 +218,7 @@ names no longer resolve. Use the replacement in the table below.
 | `swarm`                | `/oh-my-claudecode:team`                 | Declared-only                                                 |
 | `pipeline`             | `/oh-my-claudecode:execute`              | Declared-only                                                 |
 | `ultraqa`              | `/oh-my-claudecode:verify`               |                                                               |
-| `merge-readiness`      | `/oh-my-claudecode:review`               | Advisory review; release hard checks are unchanged            |
+| `merge-readiness`      | `/oh-my-claudecode:review`               | MCP tools and runtime are removed; review stays advisory; release hard checks are unchanged |
 | `deep-dive`            | `/oh-my-claudecode:research`             |                                                               |
 | `sciomc`               | `/oh-my-claudecode:research`             |                                                               |
 | `ccg`                  | `/oh-my-claudecode:ask` + `/team`        | Run `/ask codex` and `/ask antigravity`, then synthesize      |
@@ -788,8 +867,8 @@ Chain agents with data passing between stages:
 - `implement` - planner → executor → tdd-guide
 - `debug` - explore → architect → debugger
 - `research` - parallel(document-specialist, explore) → architect → writer
-- `refactor` - explore → architect-medium → executor-high → qa-tester
-- `security` - explore → security-reviewer → executor → security-reviewer-low
+- `refactor` - explore → architect → executor (with model="opus") → qa-tester
+- `security` - explore → security-reviewer → executor
 
 #### 4. Unified Cancel Command
 
@@ -818,7 +897,7 @@ Opus-powered architectural search for complex codebase exploration:
 
 ```typescript
 Task(
-  (subagent_type = "oh-my-claudecode:explore-high"),
+  (subagent_type = "oh-my-claudecode:explore"),
   (model = "opus"),
   (prompt = "Find all authentication-related code patterns..."),
 );

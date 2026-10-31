@@ -4,6 +4,9 @@ import { currentStrictProcessStartIdentity } from '../team-owner-epoch.js';
 type ExecFileCallback = (error: Error | null, stdout: string, stderr: string) => void;
 
 const mockedCalls = vi.hoisted(() => ({
+  strictIdentityUnavailable: false,
+  forceWindowsStrictIdentity: false,
+  omitGuardMarkerForCreationOutput: false,
   execFileArgs: [] as string[][],
   identitySocketPath: '/tmp/omc-create-team.sock',
   splitCount: 0,
@@ -19,6 +22,20 @@ const mockedCalls = vi.hoisted(() => ({
   nativeWindowInventoryReads: [] as string[][],
   nativeWindowKillCount: 0,
 }));
+
+vi.mock('../team-owner-epoch.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../team-owner-epoch.js')>();
+  return {
+    ...actual,
+    currentStrictProcessStartIdentity: (pid?: number) => {
+      if (mockedCalls.strictIdentityUnavailable) return null;
+      if (mockedCalls.forceWindowsStrictIdentity) return 'win32:638878752000000000';
+      return actual.currentStrictProcessStartIdentity(pid);
+    },
+    observeProcessIdentity: (record: Parameters<typeof actual.observeProcessIdentity>[0]) =>
+      mockedCalls.forceWindowsStrictIdentity ? 'matching' : actual.observeProcessIdentity(record),
+  };
+});
 
 const strictProcessStartedAt = currentStrictProcessStartIdentity();
 const supportsStrictTmuxFixture = (process.platform === 'darwin' || process.platform === 'linux')
@@ -37,6 +54,7 @@ vi.mock('child_process', async (importOriginal) => {
       const commandText = tmuxArgs.join(' ');
       const marker = commandText.match(/OMC_TMUX_GUARD_OK_[A-Za-z0-9_]+/)?.[0];
       if (!marker) return { stdout: '', stderr: '' };
+      const creationMarker = mockedCalls.omitGuardMarkerForCreationOutput ? '' : `${marker}\n`;
       if (commandText.includes('split-window')) {
         mockedCalls.splitCount += 1;
         if (mockedCalls.tmuxSplitError) {
@@ -50,14 +68,18 @@ vi.mock('child_process', async (importOriginal) => {
         const paneLine = paneOutput.trim() === '' || !/^%\d+$/.test(paneOutput.trim())
           ? paneOutput
           : `${paneOutput.trim()}\t${socket ?? mockedCalls.identitySocketPath}\t${process.pid}\n`;
-        return { stdout: `${paneLine}${marker}\n`, stderr: '' };
+        return { stdout: `${paneLine}${creationMarker}`, stderr: '' };
       }
       if (commandText.includes('new-session')) {
         mockedCalls.freshServerAlive = true;
         const session = commandText.match(/'-s'\s+'([^']+)'/)?.[1] ?? 'omc-team-race-team-detached';
         mockedCalls.freshSessionInventory = [session];
+        // Real tmux prints an escaped (`##`) -F format literally instead of expanding it.
+        if (commandText.includes('##S:')) {
+          return { stdout: `#S:#{window_index}\t#{pane_id}\t#{socket_path}\t#{pid}\n${marker}\n`, stderr: '' };
+        }
         return {
-          stdout: `${session}:0\t%91\t${socket ?? mockedCalls.identitySocketPath}\t${process.pid}\n${marker}\n`,
+          stdout: `${session}:0\t%91\t${socket ?? mockedCalls.identitySocketPath}\t${process.pid}\n${creationMarker}`,
           stderr: '',
         };
       }
@@ -82,7 +104,7 @@ vi.mock('child_process', async (importOriginal) => {
           }
         }
         return {
-          stdout: `${windowOutput}${marker}\n`,
+          stdout: `${windowOutput}${creationMarker}`,
           stderr: '',
         };
       }
@@ -233,6 +255,7 @@ import {
   detectTeamMultiplexerContext,
   splitTeamWorkerPane,
   splitTeamWorkerPaneWithEvidence,
+  strictIdentityUnavailableError,
   TeamSessionCreationError,
 } from '../tmux-session.js';
 
@@ -271,6 +294,9 @@ describe('detectTeamMultiplexerContext', () => {
 
 describe('createTeamSession context resolution', () => {
   beforeEach(() => {
+    mockedCalls.strictIdentityUnavailable = false;
+    mockedCalls.forceWindowsStrictIdentity = false;
+    mockedCalls.omitGuardMarkerForCreationOutput = false;
     mockedCalls.execFileArgs = [];
     mockedCalls.splitCount = 0;
     mockedCalls.newSplitStdouts = [];
@@ -287,6 +313,8 @@ describe('createTeamSession context resolution', () => {
   });
 
   afterEach(() => {
+    mockedCalls.strictIdentityUnavailable = false;
+    mockedCalls.forceWindowsStrictIdentity = false;
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
@@ -314,6 +342,9 @@ describe('createTeamSession context resolution', () => {
       '-S', keepaliveCall?.[1],
     ]));
     expect(detachedCreateCall?.find(arg => arg.includes('new-session'))).toContain('OMC_TMUX_GUARD_OK_');
+    const detachedNativeCommand = detachedCreateCall?.find(arg => arg.includes('new-session'));
+    expect(detachedNativeCommand).toContain('#S:#{window_index}\t#{pane_id}\t#{socket_path}\t#{pid}');
+    expect(detachedNativeCommand).not.toContain('##S:');
     expect(mockedCalls.execFileArgs.some((args) =>
       args.includes('if-shell') && args.join(' ').includes('set-clipboard'),
     )).toBe(true);
@@ -337,6 +368,51 @@ describe('createTeamSession context resolution', () => {
       process_started_at: strictProcessStartedAt,
     });
     expect(session.tmuxServerIdentity?.socket_path).toBe(keepaliveCall?.[1]);
+  });
+
+  it.skipIf(!supportsStrictTmuxFixture)('accepts matching creation records when psmux omits trailing guard markers', async () => {
+    vi.stubEnv('TMUX', '');
+    vi.stubEnv('TMUX_PANE', '');
+    vi.stubEnv('CMUX_SURFACE_ID', '');
+    mockedCalls.omitGuardMarkerForCreationOutput = true;
+
+    const session = await createTeamSession('race-team', 1, '/tmp');
+
+    expect(session.sessionMode).toBe('detached-session');
+    expect(session.workerPaneIds).toEqual(['%501']);
+    expect(mockedCalls.execFileArgs.filter(args =>
+      args.includes('if-shell')
+      && (args.join(' ').includes('new-session') || args.join(' ').includes('split-window')),
+    )).toHaveLength(2);
+  });
+
+  it.skipIf(!supportsStrictTmuxFixture)('filters ambient environment from tmux pane shells', async () => {
+    vi.stubEnv('TMUX', '');
+    vi.stubEnv('TMUX_PANE', '');
+    vi.stubEnv('CMUX_SURFACE_ID', '');
+    vi.stubEnv('SHELL', '/bin/bash');
+    vi.stubEnv('ORCA_HOOK_TOKEN', 'issue-4128-secret-sentinel');
+
+    await createTeamSession('race-team', 1, '/tmp');
+
+    const paneCreationCalls = mockedCalls.execFileArgs.filter((args) => {
+      const command = args.join(' ');
+      return args.includes('if-shell')
+        && (command.includes('new-session') || command.includes('split-window'));
+    });
+    expect(paneCreationCalls).toHaveLength(2);
+    for (const args of paneCreationCalls) {
+      const command = args.join(' ');
+      expect(command).toContain('/usr/bin/env -i');
+      expect(command).toContain('PATH=');
+      expect(command).toContain('HOME=');
+      expect(command).toContain('TERM="$TERM"');
+      expect(command).toContain('COLORTERM="$COLORTERM"');
+      expect(command).toContain('TMUX="$TMUX"');
+      expect(command).toContain('TMUX_PANE="$TMUX_PANE"');
+      expect(command).not.toContain('ORCA_HOOK_TOKEN');
+      expect(command).not.toContain('issue-4128-secret-sentinel');
+    }
   });
 
   it('uses native cmux splits instead of a detached tmux session when running inside cmux', async () => {
@@ -429,6 +505,7 @@ describe('createTeamSession context resolution', () => {
 
     const newWindowCall = mockedCalls.execFileArgs.find((args) => args.join(' ').includes('new-window'));
     expect(newWindowCall?.join(' ')).toContain('new-window');
+    expect(newWindowCall?.join(' ')).toContain('/usr/bin/env -i');
     expect(newWindowCall).toEqual(expect.arrayContaining(['-S', strictSocketPath]));
     expect(newWindowCall?.join(' ')).toContain('-t');
     expect(newWindowCall?.join(' ')).toContain('omx');
@@ -666,8 +743,30 @@ describe('createTeamSession context resolution', () => {
     expect(destructiveProviderCalls()).toEqual([]);
   });
 
-  it('rejects native Windows psmux detached team sessions without strict tmux authority', async () => {
+  it('creates native Windows psmux detached team sessions when strict identity is available', async () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    mockedCalls.forceWindowsStrictIdentity = true;
+    vi.stubEnv('TMUX', '');
+    vi.stubEnv('TMUX_PANE', '');
+    vi.stubEnv('CMUX_SURFACE_ID', '');
+    vi.stubEnv('PSMUX_SESSION', 'psmux-session-1');
+    vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
+
+    const session = await createTeamSession('race-team', 0, 'C:\\repo');
+
+    expect(session.sessionMode).toBe('detached-session');
+    expect(session.tmuxServerIdentity).toMatchObject({
+      server_pid: process.pid,
+      process_started_at: 'win32:638878752000000000',
+    });
+    expect(mockedCalls.execFileArgs.some((args) =>
+      /\bnew-session\b/.test(args.join(' ')),
+    )).toBe(true);
+  });
+
+  it('rejects native Windows psmux detached team sessions when strict identity is unavailable', async () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    mockedCalls.strictIdentityUnavailable = true;
     vi.stubEnv('TMUX', '');
     vi.stubEnv('TMUX_PANE', '');
     vi.stubEnv('CMUX_SURFACE_ID', '');
@@ -683,6 +782,7 @@ describe('createTeamSession context resolution', () => {
 
   it('rejects native Windows psmux worker creation without strict tmux authority', async () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    mockedCalls.strictIdentityUnavailable = true;
     vi.stubEnv('TMUX', '/tmp/tmux-1000/default,1,1');
     vi.stubEnv('TMUX_PANE', '%732');
     vi.stubEnv('PSMUX_SESSION', 'psmux-session-1');
@@ -697,6 +797,7 @@ describe('createTeamSession context resolution', () => {
 
   it('rejects MSYS psmux team creation without strict tmux authority', async () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
+    mockedCalls.strictIdentityUnavailable = true;
     vi.stubEnv('TMUX', '/tmp/tmux-1000/default,1,1');
     vi.stubEnv('TMUX_PANE', '%732');
     vi.stubEnv('PSMUX_SESSION', 'psmux-session-1');
@@ -861,5 +962,27 @@ describe('splitTeamWorkerPane multiplexer routing (#3267)', () => {
       stderr: '',
       paneId: null,
     });
+  });
+});
+
+describe('strictIdentityUnavailableError (issue #4192)', () => {
+  it('names the missing darwin contained-fs addon and its build command', () => {
+    const missing = new Error('The contained filesystem backend is unavailable at /pkg/native/contained-fs-darwin-arm64.node. Build it with node scripts/build-contained-fs.mjs (from the installed package directory) before running graph or team commands.');
+    const error = strictIdentityUnavailableError('darwin', () => { throw missing; });
+    expect(error.message).toMatch(/^tmux_server_identity_probe_unavailable: /);
+    expect(error.message).toContain('contained-fs-darwin-arm64.node');
+    expect(error.message).toContain('scripts/build-contained-fs.mjs');
+    expect(error.cause).toBe(missing);
+  });
+
+  it('keeps the bare code when the darwin addon loads but the probe still fails', () => {
+    const error = strictIdentityUnavailableError('darwin', () => ({}));
+    expect(error.message).toBe('tmux_server_identity_probe_unavailable');
+  });
+
+  it('does not consult the addon on other platforms', () => {
+    const loadNative = vi.fn(() => { throw new Error('should not load'); });
+    expect(strictIdentityUnavailableError('win32', loadNative).message).toBe('tmux_server_identity_probe_unavailable');
+    expect(loadNative).not.toHaveBeenCalled();
   });
 });

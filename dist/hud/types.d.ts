@@ -41,10 +41,16 @@ export interface StatuslineStdin {
     version?: string;
     /** Current working directory */
     cwd?: string;
+    /** Host-normalized session identifier for HUD cache scoping */
+    session_id?: string;
     /** Host-normalized model information from statusline stdin */
     model?: {
         id?: string;
         display_name?: string;
+    };
+    /** Host-normalized effort level from statusline stdin */
+    effort?: {
+        level?: string;
     };
     /** Host-normalized context window metrics from statusline stdin */
     context_window?: {
@@ -307,6 +313,8 @@ export interface HudRenderContext {
     modelName: string | null;
     /** Host-provided raw model id; used when full model format is requested */
     modelId?: string | null;
+    /** Effort level from Claude Code statusline stdin; null when unavailable */
+    effortLevel?: string | null;
     /** Ralph loop state */
     ralph: RalphStateForHud | null;
     /** Ultrawork state */
@@ -446,6 +454,7 @@ export interface HudElementConfig {
     gitInfoPosition: 'above' | 'below';
     model: boolean;
     modelFormat: ModelFormat;
+    effort: boolean;
     omcLabel: boolean;
     updateNotification?: boolean;
     rateLimits: boolean;

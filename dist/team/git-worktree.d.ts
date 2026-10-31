@@ -6,6 +6,7 @@ export interface WorktreeInfo {
     teamName: string;
     createdAt: string;
     repoRoot?: string;
+    mode?: Exclude<TeamWorktreeMode, 'disabled'>;
     detached?: boolean;
     created?: boolean;
     reused?: boolean;
@@ -16,14 +17,22 @@ export interface EnsureWorkerWorktreeOptions {
     requireCleanLeader?: boolean;
 }
 export interface EnsureWorkerWorktreeResult extends WorktreeInfo {
-    mode: TeamWorktreeMode;
+    mode: Exclude<TeamWorktreeMode, 'disabled'>;
     repoRoot: string;
     detached: boolean;
     created: boolean;
     reused: boolean;
 }
+export interface WorktreeRemovalReceipt {
+    path: string;
+    branch: string;
+    mode: Exclude<TeamWorktreeMode, 'disabled'>;
+    created: boolean;
+    reused: boolean;
+}
 export interface CleanupTeamWorktreesResult {
     removed: string[];
+    retired?: string[];
     preserved: Array<{
         workerName: string;
         path: string;
@@ -39,6 +48,17 @@ export interface TeamWorktreeCleanupSafety {
         reason: string;
     }>;
 }
+export interface WorktreeMetadataPublicationFailure extends Error {
+    code: 'worktree_metadata_publication_failed' | 'worktree_metadata_publication_cleanup_failed';
+    teamName: string;
+    workerName: string;
+    worktreePath: string;
+    worktreeBranch: string;
+    worktreeMode: Exclude<TeamWorktreeMode, 'disabled'>;
+    cleanupVerified: boolean;
+    cleanupError?: unknown;
+}
+export declare function isWorktreeMetadataPublicationFailure(error: unknown): error is WorktreeMetadataPublicationFailure;
 export interface WorktreeRootAgentsRestoreResult {
     restored: boolean;
     reason?: string;
@@ -47,6 +67,7 @@ export interface WorktreeRootAgentsRestoreResult {
 export declare function getWorktreePath(repoRoot: string, teamName: string, workerName: string): string;
 /** Get branch name for a worker. */
 export declare function getBranchName(teamName: string, workerName: string): string;
+export declare function assertWorkerWorktreeRemovalReceiptBinding(teamName: string, workerName: string, repoRoot: string, receipt: WorktreeRemovalReceipt): void;
 /**
  * Install the generated worker overlay into the root of a native worker worktree.
  * Existing root AGENTS.md content is backed up under leader-owned state so cleanup
@@ -63,8 +84,10 @@ export declare function restoreWorktreeRootAgents(teamName: string, workerName: 
 export declare function normalizeTeamWorktreeMode(value: unknown): TeamWorktreeMode;
 /**
  * Ensure a worker worktree exists according to the selected opt-in mode.
- * Disabled mode is a no-op. Existing clean compatible worktrees are reused;
- * dirty or mismatched existing worktrees throw without deleting files.
+ * Disabled/default mode returns null without validating the worker name or
+ * touching state. Enabled modes require a canonical worker name. Existing
+ * clean compatible worktrees are reused; dirty or mismatched existing
+ * worktrees throw without deleting files.
  */
 export declare function ensureWorkerWorktree(teamName: string, workerName: string, repoRoot: string, options?: EnsureWorkerWorktreeOptions): EnsureWorkerWorktreeResult | null;
 /** Legacy creation helper: create or reuse a named-branch worker worktree. */
@@ -84,11 +107,11 @@ export declare function checkWorkerWorktreeRemovalSafety(teamName: string, worke
  * intact with the managed overlay and backup still available for a later retry.
  */
 export declare function prepareWorkerWorktreeForRemoval(teamName: string, workerName: string, repoRoot: string, worktreePath?: string): void;
-/** Remove a worker's worktree and branch, preserving dirty worktrees. */
-export declare function removeWorkerWorktree(teamName: string, workerName: string, repoRoot: string): void;
+/** Remove an owned worker worktree or restore a borrowed worktree's managed overlay. */
+export declare function removeWorkerWorktree(teamName: string, workerName: string, repoRoot: string, authority?: string | WorktreeRemovalReceipt): void;
 /** List all worktrees for a team. */
 export declare function listTeamWorktrees(teamName: string, repoRoot: string): WorktreeInfo[];
 export declare function inspectTeamWorktreeCleanupSafety(teamName: string, repoRoot: string): TeamWorktreeCleanupSafety;
-/** Remove all clean worktrees for a team, preserving dirty worktrees. */
+/** Remove owned clean worktrees and retire restored borrowed worktree receipts. */
 export declare function cleanupTeamWorktrees(teamName: string, repoRoot: string): CleanupTeamWorktreesResult;
 //# sourceMappingURL=git-worktree.d.ts.map

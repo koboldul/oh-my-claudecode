@@ -131,7 +131,7 @@ Strategie multiple per diversi casi d'uso — dall'orchestrazione basata su Team
 
 ### Esperienza sviluppatore
 
-- **Parole chiave magiche** — `ralph`, `ulw`, `eco`, `plan` per un controllo esplicito
+- **Parole chiave magiche** — `ralph`, `ulw`, `plan` per un controllo esplicito
 - **HUD statusline** — Metriche di orchestrazione in tempo reale nella barra di stato
 - **Apprendimento delle competenze** — Estrazione di pattern riutilizzabili dalle sessioni
 - **Analisi e tracciamento dei costi** — Comprensione dell'utilizzo dei token su tutte le sessioni
@@ -175,7 +175,7 @@ Scorciatoie opzionali per utenti avanzati. Il linguaggio naturale funziona bene 
 | `autopilot`   | Esecuzione completamente autonoma         | `autopilot: build a todo app`                                   |
 | `ralph`       | Modalità persistente                      | `ralph: refactor auth`                                          |
 | `ulw`         | Parallelismo massimo                      | `ulw fix all errors`                                            |
-| `eco`         | Esecuzione efficiente in termini di token | `eco: migrate database`                                         |
+
 | `plan`        | Intervista di pianificazione              | `plan the API`                                                  |
 | `ralplan`     | Consenso di pianificazione iterativo      | `ralplan this feature`                                          |
 | `swarm`       | Parola chiave legacy (instrada a Team)    | `swarm 5 agents: fix lint errors`                               |

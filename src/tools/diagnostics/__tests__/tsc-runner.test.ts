@@ -4,10 +4,14 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import type { ExecFileException } from 'child_process';
 
-const { execFileMock } = vi.hoisted(() => ({ execFileMock: vi.fn() }));
+const { execFileMock, execFileSyncMock } = vi.hoisted(() => ({
+  execFileMock: vi.fn(),
+  execFileSyncMock: vi.fn(),
+}));
 
 vi.mock('child_process', () => ({
-  execFile: execFileMock
+  execFile: execFileMock,
+  execFileSync: execFileSyncMock,
 }));
 
 type ExecFileCallback = (error: ExecFileException | null, stdout: string, stderr: string) => void;
@@ -26,15 +30,19 @@ function execFileError(fields: ExecFileErrorFields): ExecFileException {
 }
 
 describe('runTscDiagnostics (async, bounded)', () => {
+  const originalPlatform = process.platform;
   let projectDir: string;
 
   beforeEach(() => {
+    Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
     projectDir = mkdtempSync(join(tmpdir(), 'omc-tsc-runner-'));
     writeFileSync(join(projectDir, 'tsconfig.json'), '{}');
     execFileMock.mockReset();
+    execFileSyncMock.mockReset();
   });
 
   afterEach(() => {
+    Object.defineProperty(process, 'platform', { configurable: true, value: originalPlatform });
     rmSync(projectDir, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
@@ -136,14 +144,26 @@ describe('runTscDiagnostics (async, bounded)', () => {
     ]);
   });
 
-  it('reports an execution failure instead of passing when tsc cannot start', async () => {
+  it('reports tsc as unavailable when the executable cannot be found', async () => {
     execFileMock.mockImplementation(
       (_file: string, _args: string[], _options: unknown, callback: ExecFileCallback) => {
-        callback(
-          execFileError({ code: 'ENOENT', killed: false, signal: null }),
-          '',
-          ''
-        );
+        callback(execFileError({ code: 'ENOENT', killed: false, signal: null }), '', '');
+      }
+    );
+
+    const { runTscDiagnostics } = await import('../tsc-runner.js');
+    const result = await runTscDiagnostics(projectDir);
+
+    expect(result.success).toBe(false);
+    expect(result.errorCount).toBe(1);
+    expect(result.diagnostics).toEqual([]);
+    expect(result.error).toContain('tsc not found');
+  });
+
+  it('reports a synthetic execution failure for an unparseable spawn error', async () => {
+    execFileMock.mockImplementation(
+      (_file: string, _args: string[], _options: unknown, callback: ExecFileCallback) => {
+        callback(execFileError({ code: 'EACCES', killed: false, signal: null }), '', '');
       }
     );
 
@@ -193,5 +213,6 @@ describe('runTscDiagnostics (async, bounded)', () => {
 
     expect(result).toEqual({ success: true, diagnostics: [], errorCount: 0, warningCount: 0 });
     expect(execFileMock).not.toHaveBeenCalled();
+    expect(execFileSyncMock).not.toHaveBeenCalled();
   });
 });

@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, unlinkSync, mkdirSync, writeFileSync, renameSync } from 'fs';
+import { existsSync, readdirSync, lstatSync, readFileSync, unlinkSync, mkdirSync, writeFileSync, renameSync } from 'fs';
 import { join, resolve } from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { spawnSync } from 'child_process';
@@ -11,7 +11,26 @@ export function pathIdentity(path) {
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
-function identity(pid) {
+function windowsIdentityOutput(command, probeTimeoutMs) {
+  const startedAt = process.hrtime.bigint();
+  for (const executable of ['pwsh', 'powershell']) {
+    const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+    const remainingMs = Math.floor(Math.min(3000, probeTimeoutMs - elapsedMs));
+    if (remainingMs <= 0) break;
+    try {
+      const result = spawnSync(executable, [
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command,
+      ], { encoding: 'utf8', timeout: remainingMs, windowsHide: true });
+      if (result.status === 0) return result.stdout?.trim() || '';
+      if (result.error?.code !== 'ENOENT') return null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function identity(pid, probeTimeoutMs = 3000) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   if (process.platform === 'linux') {
     try {
@@ -22,7 +41,9 @@ function identity(pid) {
   }
   if (process.platform === 'darwin') {
     try {
-      const result = spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8', timeout: 2000 });
+      if (probeTimeoutMs <= 0) return null;
+      const timeout = Math.max(1, Math.min(2000, Math.floor(probeTimeoutMs)));
+      const result = spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8', timeout });
       if (result.status !== 0) return null;
       const value = new Date(result.stdout.trim()).getTime();
       return Number.isFinite(value) ? String(value) : null;
@@ -30,30 +51,64 @@ function identity(pid) {
   }
   if (process.platform === 'win32') {
     try {
-      const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', `$p=Get-Process -Id ${pid} -ErrorAction Stop; $p.StartTime.ToUniversalTime().Ticks`], { encoding: 'utf8', timeout: 3000, windowsHide: true });
-      const ticks = result.stdout?.trim().match(/^\d+$/)?.[0];
+      if (probeTimeoutMs <= 0) return null;
+      const output = windowsIdentityOutput(
+        `$p = [System.Diagnostics.Process]::GetProcessById(${pid}); if ($p) { [string]($p.StartTime.ToUniversalTime().Ticks) }`,
+        probeTimeoutMs,
+      );
+      const ticks = output?.match(/^\d+$/)?.[0];
       return ticks ? `ticks:${ticks}` : null;
     } catch { return null; }
   }
   return null;
 }
 
-function identities(pids) {
-  if (process.platform !== 'win32') return new Map();
+function identities(pids, probeTimeoutMs = 3000) {
   const validPids = [...new Set(pids.filter(pid => Number.isSafeInteger(pid) && pid > 0))];
-  if (validPids.length === 0) return new Map();
-  try {
-    const filter = validPids.join(',');
-    const command = `$items=Get-Process -Id ${filter} -ErrorAction SilentlyContinue | Select-Object Id,@{Name='StartTicks';Expression={[string]$_.StartTime.ToUniversalTime().Ticks}}; $items | ConvertTo-Json -Compress`;
-    const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', command], { encoding: 'utf8', timeout: 3000, windowsHide: true });
-    if (result.status !== 0) return new Map();
-    const parsed = JSON.parse(result.stdout?.trim() || 'null');
-    const items = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
-    return new Map(items
-      .map(item => [Number(item?.Id), item?.StartTicks])
-      .filter(([pid, ticks]) => validPids.includes(pid) && typeof ticks === 'string' && /^\d+$/.test(ticks))
-      .map(([pid, ticks]) => [pid, `ticks:${ticks}`]));
-  } catch { return new Map(); }
+  if (validPids.length === 0 || probeTimeoutMs <= 0) return new Map();
+  if (process.platform === 'win32') {
+    try {
+      const filter = validPids.join(',');
+      const command = `$items = foreach ($processId in @(${filter})) { try { $p = [System.Diagnostics.Process]::GetProcessById([int]$processId); [pscustomobject]@{ Id = $p.Id; StartTicks = [string]($p.StartTime.ToUniversalTime().Ticks) } } catch {} }; $items | ConvertTo-Json -Compress`;
+      const output = windowsIdentityOutput(command, probeTimeoutMs);
+      if (output === null) return new Map();
+      const parsed = JSON.parse(output || 'null');
+      const items = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+      return new Map(items
+        .map(item => [Number(item?.Id), item?.StartTicks])
+        .filter(([pid, ticks]) => validPids.includes(pid) && typeof ticks === 'string' && /^\d+$/.test(ticks))
+        .map(([pid, ticks]) => [pid, `ticks:${ticks}`]));
+    } catch { return new Map(); }
+  }
+
+  if (process.platform === 'darwin') {
+    // One `ps` for every pid instead of one spawn per registry record. ps prints
+    // the live pids and exits 1 when none of them exist (some BSD builds also
+    // when only some are gone), so a missing pid is simply absent from the map.
+    try {
+      const timeout = Math.max(1, Math.min(2000, Math.floor(probeTimeoutMs)));
+      const result = spawnSync('ps', ['-p', validPids.join(','), '-o', 'pid=,lstart='], { encoding: 'utf8', timeout });
+      if (result.error || (result.status !== 0 && result.status !== 1)) return new Map();
+      const found = new Map();
+      for (const line of (result.stdout ?? '').split('\n')) {
+        const match = line.match(/^\s*(\d+)\s+(.+?)\s*$/);
+        const pid = Number(match?.[1]);
+        const value = match ? new Date(match[2]).getTime() : NaN;
+        if (validPids.includes(pid) && Number.isFinite(value)) found.set(pid, String(value));
+      }
+      return found;
+    } catch { return new Map(); }
+  }
+
+  const deadline = Date.now() + probeTimeoutMs;
+  const result = new Map();
+  for (const pid of validPids) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const start = identity(pid, remaining);
+    if (start) result.set(pid, start);
+  }
+  return result;
 }
 function alive(pid) {
   try { process.kill(pid, 0); return true; }
@@ -63,18 +118,18 @@ function alive(pid) {
 function registryDir(configDir) { return join(configDir, '.omc', 'cache-occupancy'); }
 function fileName(root, pid, start) { return `${createHash('sha256').update(`${root}\0${pid}\0${start}`).digest('hex')}.json`; }
 
-// Issue #3995: on win32 every identity probe is a PowerShell host (~1.6-2.0s),
+// Issue #3995: on win32 every identity probe is a PowerShell host,
 // so SessionStart must not need two. publishCacheOccupancy() accepts an
 // explicit precomputed identity for `pid` (resolved by the caller in the ONE
 // batched readOccupiedPluginRoots() host) and skips its own probe entirely;
 // readOccupiedPluginRoots() accepts a previously returned identities map to
 // verify records without spawning a second host (pids absent from the map are
 // kept conservatively — the record survives unless proven stale otherwise).
-export function publishCacheOccupancy(pluginRoot, configDir, pid = process.ppid, precomputedIdentity) {
+export function publishCacheOccupancy(pluginRoot, configDir, pid = process.ppid, precomputedIdentity, probeTimeoutMs = 3000) {
   const root = pathIdentity(pluginRoot || '');
   const start = typeof precomputedIdentity === 'string' && precomputedIdentity.length > 0
     ? precomputedIdentity
-    : identity(pid);
+    : precomputedIdentity === null ? null : identity(pid, probeTimeoutMs);
   if (!root || !start) return false;
   const dir = registryDir(configDir);
   const target = join(dir, fileName(root, pid, start));
@@ -88,16 +143,33 @@ export function publishCacheOccupancy(pluginRoot, configDir, pid = process.ppid,
 }
 
 export function readOccupiedPluginRoots(configDir, options = {}) {
+  const probeBudget = Number.isFinite(options.probeTimeoutMs) ? Math.max(0, options.probeTimeoutMs) : undefined;
+  const probeDeadline = probeBudget === undefined ? Infinity : Date.now() + probeBudget;
+  const remainingProbeMs = () => probeBudget === undefined ? 3000 : Math.max(0, probeDeadline - Date.now());
   const dir = registryDir(configDir);
-  let names;
+  let names = [];
+  let unavailable = false;
   try { names = readdirSync(dir).filter(name => NAME.test(name)); }
-  catch (error) { return { roots: new Set(), unavailable: error?.code !== 'ENOENT', identities: new Map() }; }
+  catch (error) { if (error?.code !== 'ENOENT') unavailable = true; }
   const roots = new Set();
   const records = [];
   for (const name of names) {
     const path = join(dir, name);
+    let regularFile;
+    try { regularFile = lstatSync(path).isFile(); }
+    catch (error) {
+      if (error?.code !== 'ENOENT') unavailable = true;
+      continue;
+    }
+    if (!regularFile) continue;
     let record;
-    try { record = JSON.parse(readFileSync(path, 'utf8')); } catch { try { unlinkSync(path); } catch {} continue; }
+    let content;
+    try { content = readFileSync(path, 'utf8'); }
+    catch (error) {
+      if (error?.code !== 'ENOENT') unavailable = true;
+      continue;
+    }
+    try { record = JSON.parse(content); } catch { try { unlinkSync(path); } catch { /* best effort */ } continue; }
     const age = Date.now() - Date.parse(record?.updatedAt);
     if (record?.version !== 1 || !Number.isSafeInteger(record?.pid) || !record?.processStartIdentity || !record?.pluginRoot || !Number.isFinite(Date.parse(record?.updatedAt)) || age < -300000 || !alive(record.pid)) {
       try { unlinkSync(path); } catch {}
@@ -111,14 +183,17 @@ export function readOccupiedPluginRoots(configDir, options = {}) {
     ? new Map(options.identities)
     : (options.identities instanceof Map
       ? options.identities
-      : identities([...records.map(({ record }) => record.pid), ...(Array.isArray(options.includePids) ? options.includePids : [])]));
+      : identities(
+        [...(Array.isArray(options.includePids) ? options.includePids : []), ...records.map(({ record }) => record.pid)],
+        remainingProbeMs(),
+      ));
   for (const { path, record } of records) {
-    const current = process.platform === 'win32' ? currentIdentities.get(record.pid) : identity(record.pid);
+    const current = currentIdentities.get(record.pid);
     if (current && current !== record.processStartIdentity) {
       try { unlinkSync(path); } catch {}
       continue;
     }
     roots.add(pathIdentity(record.pluginRoot));
   }
-  return { roots, unavailable: false, identities: currentIdentities };
+  return { roots, unavailable, identities: currentIdentities };
 }

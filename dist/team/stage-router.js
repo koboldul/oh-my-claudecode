@@ -155,10 +155,11 @@ export function resolveRoleAssignment(role, cfg) {
     const model = provider === 'claude'
         ? resolveClaudeModel(canonical, spec?.model, cfg)
         : resolveExternalModel(provider, spec?.model, cfg);
-    const reasoningEffort = provider === 'copilot'
-        ? resolveCopilotReasoningEffort(cfg.externalModels?.defaults?.copilotReasoningEffort)
-        : undefined;
     const agent = spec?.agent ?? ROLE_TO_AGENT[canonical];
+    const reasoningEffort = spec?.reasoningEffort
+        ?? (provider === 'copilot'
+            ? resolveCopilotReasoningEffort(cfg.externalModels?.defaults?.copilotReasoningEffort)
+            : undefined);
     return {
         provider,
         model,
@@ -197,6 +198,7 @@ export function buildResolvedRoutingSnapshot(cfg) {
             provider: 'claude',
             model: resolveClaudeModel(role, fallbackModelInput, cfg),
             agent: primary.agent,
+            reasoningEffort: spec?.reasoningEffort,
         };
         out[role] = { primary, fallback };
     }

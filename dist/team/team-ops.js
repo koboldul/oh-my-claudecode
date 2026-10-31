@@ -12,7 +12,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { appendFile, lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { TeamPaths, absPath } from './state-paths.js';
+import { TeamPaths, absPath, withTeamStatePathScope } from './state-paths.js';
 import { normalizeTeamManifest, resolveMaxWorkers } from './governance.js';
 import { normalizeTeamGovernance } from './governance.js';
 import { isValidPersistedMaxWorkers, migrateTeamConfigRevision, readRevisionedTeamConfig, saveTeamConfigAtRevision } from './monitor.js';
@@ -356,78 +356,80 @@ export async function teamWriteWorkerInbox(teamName, workerName, prompt, cwd) {
 // ---------------------------------------------------------------------------
 // Task operations
 // ---------------------------------------------------------------------------
-export async function teamCreateTask(teamName, task, cwd) {
-    // Reject malformed dependency fields before entering the config/task
-    // transaction. The assigned task id is checked again below for self-links.
-    const requestedDependencies = {
-        depends_on: task.depends_on,
-        blocked_by: task.blocked_by,
-    };
-    validateTaskDependencies(requestedDependencies, 'invalid_task_dependencies');
-    const preflightConfig = await teamReadConfig(teamName, cwd);
-    if (preflightConfig?.next_task_id !== undefined) {
-        validateTaskDependencies({
-            ...requestedDependencies,
-            id: String(preflightConfig.next_task_id),
-        }, 'invalid_task_dependencies');
-    }
-    const lockDir = join(teamDir(teamName, cwd), '.lock-create-task');
-    const timeoutMs = 5_000;
-    const deadline = Date.now() + timeoutMs;
-    let delayMs = 20;
-    while (Date.now() < deadline) {
-        const result = await withLock(lockDir, async () => {
-            const revisioned = await migrateTeamConfigRevision(teamName, cwd);
-            if (!revisioned)
-                throw new Error(`Team ${teamName} not found`);
-            if (revisioned.config.lifecycle_state === 'shutting_down' || revisioned.config.lifecycle_state === 'stopped') {
-                throw new Error('team_mutation_busy');
-            }
-            const nextId = String(revisioned.config.next_task_id ?? 1);
+export function teamCreateTask(teamName, task, cwd) {
+    return withTeamStatePathScope(cwd, async () => {
+        // Reject malformed dependency fields before entering the config/task
+        // transaction. The assigned task id is checked again below for self-links.
+        const requestedDependencies = {
+            depends_on: task.depends_on,
+            blocked_by: task.blocked_by,
+        };
+        validateTaskDependencies(requestedDependencies, 'invalid_task_dependencies');
+        const preflightConfig = await teamReadConfig(teamName, cwd);
+        if (preflightConfig?.next_task_id !== undefined) {
             validateTaskDependencies({
-                id: nextId,
                 ...requestedDependencies,
+                id: String(preflightConfig.next_task_id),
             }, 'invalid_task_dependencies');
-            const created = createTaskRecord(nextId, task);
-            const normalized = normalizeTaskRecord(created);
-            const serializedTask = JSON.stringify(normalized, null, 2);
-            const createdTaskPath = canonicalTaskFilePath(teamName, nextId, cwd);
-            const taskLock = await withTaskClaimLock(teamName, nextId, cwd, async () => {
-                await mkdir(dirname(createdTaskPath), { recursive: true });
-                await writeAtomic(createdTaskPath, serializedTask);
-                const nextConfig = {
-                    ...revisioned.config,
-                    next_task_id: Number(nextId) + 1,
-                    state_revision: revisioned.stateRevision + 1,
-                };
-                try {
-                    if (!await saveTeamConfigAtRevision(nextConfig, revisioned.stateRevision, cwd)) {
-                        throw new Error('stale_state_revision');
-                    }
+        }
+        const lockDir = join(teamDir(teamName, cwd), '.lock-create-task');
+        const timeoutMs = 5_000;
+        const deadline = Date.now() + timeoutMs;
+        let delayMs = 20;
+        while (Date.now() < deadline) {
+            const result = await withLock(lockDir, async () => {
+                const revisioned = await migrateTeamConfigRevision(teamName, cwd);
+                if (!revisioned)
+                    throw new Error(`Team ${teamName} not found`);
+                if (revisioned.config.lifecycle_state === 'shutting_down' || revisioned.config.lifecycle_state === 'stopped') {
+                    throw new Error('team_mutation_busy');
                 }
-                catch (error) {
-                    // A manifest projection can fail after config.json commits. Preserve a task
-                    // that the authoritative counter/revision already admits.
-                    const persisted = await readRevisionedTeamConfig(teamName, cwd).catch(() => null);
-                    const configCommitted = persisted?.stateRevision === nextConfig.state_revision
-                        && persisted?.config.next_task_id === nextConfig.next_task_id;
-                    if (!configCommitted && await readFile(createdTaskPath, 'utf8').catch(() => null) === serializedTask) {
-                        await rm(createdTaskPath, { force: true });
+                const nextId = String(revisioned.config.next_task_id ?? 1);
+                validateTaskDependencies({
+                    id: nextId,
+                    ...requestedDependencies,
+                }, 'invalid_task_dependencies');
+                const created = createTaskRecord(nextId, task);
+                const normalized = normalizeTaskRecord(created);
+                const serializedTask = JSON.stringify(normalized, null, 2);
+                const createdTaskPath = canonicalTaskFilePath(teamName, nextId, cwd);
+                const taskLock = await withTaskClaimLock(teamName, nextId, cwd, async () => {
+                    await mkdir(dirname(createdTaskPath), { recursive: true });
+                    await writeAtomic(createdTaskPath, serializedTask);
+                    const nextConfig = {
+                        ...revisioned.config,
+                        next_task_id: Number(nextId) + 1,
+                        state_revision: revisioned.stateRevision + 1,
+                    };
+                    try {
+                        if (!await saveTeamConfigAtRevision(nextConfig, revisioned.stateRevision, cwd)) {
+                            throw new Error('stale_state_revision');
+                        }
                     }
-                    throw error;
-                }
-                return normalized;
+                    catch (error) {
+                        // A manifest projection can fail after config.json commits. Preserve a task
+                        // that the authoritative counter/revision already admits.
+                        const persisted = await readRevisionedTeamConfig(teamName, cwd).catch(() => null);
+                        const configCommitted = persisted?.stateRevision === nextConfig.state_revision
+                            && persisted?.config.next_task_id === nextConfig.next_task_id;
+                        if (!configCommitted && await readFile(createdTaskPath, 'utf8').catch(() => null) === serializedTask) {
+                            await rm(createdTaskPath, { force: true });
+                        }
+                        throw error;
+                    }
+                    return normalized;
+                });
+                if (!taskLock.ok)
+                    throw new Error(`Failed to acquire task claim lock for task ${nextId}`);
+                return taskLock.value;
             });
-            if (!taskLock.ok)
-                throw new Error(`Failed to acquire task claim lock for task ${nextId}`);
-            return taskLock.value;
-        });
-        if (result.ok)
-            return result.value;
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-        delayMs = Math.min(delayMs * 2, 200);
-    }
-    throw new Error(`Failed to acquire task creation lock for team ${teamName} after ${timeoutMs}ms`);
+            if (result.ok)
+                return result.value;
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+            delayMs = Math.min(delayMs * 2, 200);
+        }
+        throw new Error(`Failed to acquire task creation lock for team ${teamName} after ${timeoutMs}ms`);
+    });
 }
 export async function teamReadTask(teamName, taskId, cwd) {
     const normalizedId = normalizeTaskId(taskId);
@@ -452,98 +454,102 @@ export async function teamListTasks(teamName, cwd) {
         stateError: persistedStateError,
     });
 }
-export async function teamUpdateTask(teamName, taskId, updates, cwd) {
-    const timeoutMs = 5_000;
-    const deadline = Date.now() + timeoutMs;
-    let delayMs = 20;
-    while (Date.now() < deadline) {
-        const result = await withTaskClaimLock(teamName, taskId, cwd, async () => {
-            const existing = await teamReadTask(teamName, taskId, cwd);
-            if (!existing)
-                return null;
-            const hasDependsOn = Object.prototype.hasOwnProperty.call(updates, 'depends_on');
-            const hasBlockedBy = Object.prototype.hasOwnProperty.call(updates, 'blocked_by');
-            if ((hasDependsOn && updates.depends_on === undefined)
-                || (hasBlockedBy && updates.blocked_by === undefined)) {
-                throw new Error('invalid_task_dependencies');
-            }
-            let dependencyUpdates = {};
-            if (hasDependsOn || hasBlockedBy) {
-                const dependencyIds = validateTaskDependencies({
+export function teamUpdateTask(teamName, taskId, updates, cwd) {
+    return withTeamStatePathScope(cwd, async () => {
+        const timeoutMs = 5_000;
+        const deadline = Date.now() + timeoutMs;
+        let delayMs = 20;
+        while (Date.now() < deadline) {
+            const result = await withTaskClaimLock(teamName, taskId, cwd, async () => {
+                const existing = await teamReadTask(teamName, taskId, cwd);
+                if (!existing)
+                    return null;
+                const hasDependsOn = Object.prototype.hasOwnProperty.call(updates, 'depends_on');
+                const hasBlockedBy = Object.prototype.hasOwnProperty.call(updates, 'blocked_by');
+                if ((hasDependsOn && updates.depends_on === undefined)
+                    || (hasBlockedBy && updates.blocked_by === undefined)) {
+                    throw new Error('invalid_task_dependencies');
+                }
+                let dependencyUpdates = {};
+                if (hasDependsOn || hasBlockedBy) {
+                    const dependencyIds = validateTaskDependencies({
+                        id: existing.id,
+                        ...(hasDependsOn ? { depends_on: updates.depends_on } : {}),
+                        ...(hasBlockedBy ? { blocked_by: updates.blocked_by } : {}),
+                    }, 'invalid_task_dependencies');
+                    dependencyUpdates = {
+                        depends_on: [...dependencyIds],
+                        blocked_by: [...dependencyIds],
+                    };
+                }
+                const merged = {
+                    ...normalizeTask(existing),
+                    ...updates,
+                    ...dependencyUpdates,
                     id: existing.id,
-                    ...(hasDependsOn ? { depends_on: updates.depends_on } : {}),
-                    ...(hasBlockedBy ? { blocked_by: updates.blocked_by } : {}),
-                }, 'invalid_task_dependencies');
-                dependencyUpdates = {
-                    depends_on: [...dependencyIds],
-                    blocked_by: [...dependencyIds],
+                    created_at: existing.created_at,
+                    version: Math.max(1, existing.version ?? 1) + 1,
                 };
-            }
-            const merged = {
-                ...normalizeTask(existing),
-                ...updates,
-                ...dependencyUpdates,
-                id: existing.id,
-                created_at: existing.created_at,
-                version: Math.max(1, existing.version ?? 1) + 1,
-            };
-            validateTaskDependencies(merged, 'invalid_task_dependencies');
-            const normalized = normalizeTaskRecord(merged);
-            const p = canonicalTaskFilePath(teamName, taskId, cwd);
-            await writeAtomic(p, JSON.stringify(normalized, null, 2));
-            return normalized;
-        });
-        if (result.ok)
-            return result.value;
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-        delayMs = Math.min(delayMs * 2, 200);
-    }
-    throw new Error(`Failed to acquire task update lock for task ${taskId} in team ${teamName} after ${timeoutMs}ms`);
+                validateTaskDependencies(merged, 'invalid_task_dependencies');
+                const normalized = normalizeTaskRecord(merged);
+                const p = canonicalTaskFilePath(teamName, taskId, cwd);
+                await writeAtomic(p, JSON.stringify(normalized, null, 2));
+                return normalized;
+            });
+            if (result.ok)
+                return result.value;
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+            delayMs = Math.min(delayMs * 2, 200);
+        }
+        throw new Error(`Failed to acquire task update lock for task ${taskId} in team ${teamName} after ${timeoutMs}ms`);
+    });
 }
-export async function teamClaimTask(teamName, taskId, workerName, expectedVersion, cwd) {
-    const config = await teamReadConfig(teamName, cwd);
-    const governance = normalizeTeamGovernance(config?.governance, config?.policy);
-    if (governance.plan_approval_required) {
-        const task = await teamReadTask(teamName, taskId, cwd);
-        if (task?.requires_code_change) {
-            const approval = await teamReadTaskApproval(teamName, taskId, cwd);
-            if (!approval || approval.status !== 'approved') {
-                return { ok: false, error: 'blocked_dependency', dependencies: ['approval-required'] };
+export function teamClaimTask(teamName, taskId, workerName, expectedVersion, cwd) {
+    return withTeamStatePathScope(cwd, async () => {
+        const config = await teamReadConfig(teamName, cwd);
+        const governance = normalizeTeamGovernance(config?.governance, config?.policy);
+        if (governance.plan_approval_required) {
+            const task = await teamReadTask(teamName, taskId, cwd);
+            if (task?.requires_code_change) {
+                const approval = await teamReadTaskApproval(teamName, taskId, cwd);
+                if (!approval || approval.status !== 'approved') {
+                    return { ok: false, error: 'blocked_dependency', dependencies: ['approval-required'] };
+                }
             }
         }
-    }
-    return claimTaskImpl(taskId, workerName, expectedVersion, {
-        teamName,
-        cwd,
-        readTask: teamReadTask,
-        readTeamConfig: async (tn, c) => {
-            const cfg = await teamReadConfig(tn, c);
-            if (!cfg)
-                return null;
-            if (cfg.workers.length > 0)
+        return claimTaskImpl(taskId, workerName, expectedVersion, {
+            teamName,
+            cwd,
+            readTask: teamReadTask,
+            readTeamConfig: async (tn, c) => {
+                const cfg = await teamReadConfig(tn, c);
+                if (!cfg)
+                    return null;
+                if (cfg.workers.length > 0)
+                    return cfg;
+                const match = /^worker-(\d+)$/.exec(workerName);
+                const workerIndex = match ? Number.parseInt(match[1], 10) : 0;
+                if (workerIndex >= 1 && workerIndex <= (cfg.worker_count ?? 0)) {
+                    return {
+                        ...cfg,
+                        workers: Array.from({ length: cfg.worker_count ?? 0 }, (_, index) => ({
+                            name: `worker-${index + 1}`,
+                        })),
+                    };
+                }
                 return cfg;
-            const match = /^worker-(\d+)$/.exec(workerName);
-            const workerIndex = match ? Number.parseInt(match[1], 10) : 0;
-            if (workerIndex >= 1 && workerIndex <= (cfg.worker_count ?? 0)) {
-                return {
-                    ...cfg,
-                    workers: Array.from({ length: cfg.worker_count ?? 0 }, (_, index) => ({
-                        name: `worker-${index + 1}`,
-                    })),
-                };
-            }
-            return cfg;
-        },
-        withTaskClaimLock,
-        normalizeTask,
-        isTerminalTaskStatus: isTerminalTeamTaskStatus,
-        taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
-        writeAtomic,
-        launchAttemptId: process.env.OMC_WORKER_LAUNCH_ATTEMPT_ID,
+            },
+            withTaskClaimLock,
+            normalizeTask,
+            isTerminalTaskStatus: isTerminalTeamTaskStatus,
+            taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
+            writeAtomic,
+            launchAttemptId: process.env.OMC_WORKER_LAUNCH_ATTEMPT_ID,
+        });
     });
 }
 export async function teamTransitionTaskStatus(teamName, taskId, from, to, claimToken, cwd, terminalData) {
-    return transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
+    return withTeamStatePathScope(cwd, () => transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
         teamName,
         cwd,
         readTask: teamReadTask,
@@ -556,10 +562,10 @@ export async function teamTransitionTaskStatus(teamName, taskId, from, to, claim
         writeAtomic,
         appendTeamEvent: teamAppendEvent,
         markTaskCompleted: teamMarkTaskCompleted,
-    });
+    }));
 }
 export async function teamReleaseTaskClaim(teamName, taskId, claimToken, workerName, cwd) {
-    return releaseTaskClaimImpl(taskId, claimToken, workerName, {
+    return withTeamStatePathScope(cwd, () => releaseTaskClaimImpl(taskId, claimToken, workerName, {
         teamName,
         cwd,
         readTask: teamReadTask,
@@ -569,7 +575,7 @@ export async function teamReleaseTaskClaim(teamName, taskId, claimToken, workerN
         isTerminalTaskStatus: isTerminalTeamTaskStatus,
         taskFilePath: (tn, tid, c) => canonicalTaskFilePath(tn, tid, c),
         writeAtomic,
-    });
+    }));
 }
 function recoveryTransitionDeps(teamName, cwd, launchAttemptId) {
     return {

@@ -10,7 +10,7 @@
  * - 'draining' worker status for graceful transitions during scale_down
  */
 import { type WorkerInfo } from './team-ops.js';
-import { type TeamConfig } from './types.js';
+import { type TeamConfig, type TeamInstanceBinding } from './types.js';
 export declare function isScalingEnabled(env?: NodeJS.ProcessEnv): boolean;
 export interface ScaleUpResult {
     ok: true;
@@ -37,6 +37,18 @@ export interface ScaleError {
  * represents ambiguous partial state that requires explicit repair.
  */
 export declare function scaleUpFenceBlocks(config: TeamConfig): boolean;
+/**
+ * Retry one instance-bound pre-worker-persistence worktree rollback while the
+ * caller holds the team lifecycle lock. No other partial scale-up effect is
+ * inferred or cleaned by this recovery path.
+ */
+export declare function recoverFailedScaleUpWorktreeUnderLock(instance: TeamInstanceBinding, current: {
+    config: TeamConfig;
+    stateRevision: number;
+}): Promise<{
+    config: TeamConfig;
+    stateRevision: number;
+}>;
 /**
  * Add workers to a running team mid-session.
  *
@@ -77,4 +89,5 @@ export declare function scaleUp(teamName: string, count: number, agentType: stri
 }>, cwd: string, env?: NodeJS.ProcessEnv): Promise<ScaleUpResult | ScaleError>;
 /** Public scale-down facade; force and drain behavior are delegated unchanged. */
 export declare function scaleDown(teamName: string, cwd: string, options?: ScaleDownOptions, env?: NodeJS.ProcessEnv): Promise<ScaleDownResult | ScaleError>;
+export declare function resolveWorkerReadyTimeoutMs(env: NodeJS.ProcessEnv): number;
 //# sourceMappingURL=scaling.d.ts.map

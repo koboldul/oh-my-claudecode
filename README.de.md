@@ -131,7 +131,7 @@ Mehrere Strategien für verschiedene Anwendungsfälle — von Team-gestützter O
 
 ### Entwicklererfahrung
 
-- **Magische Schlüsselwörter** — `ralph`, `ulw`, `eco`, `plan` für explizite Steuerung
+- **Magische Schlüsselwörter** — `ralph`, `ulw`, `plan` für explizite Steuerung
 - **HUD statusline** — Echtzeit-Orchestrierungsmetriken in Ihrer Statusleiste
   - Wenn Sie Claude Code direkt mit `claude --plugin-dir <path>` starten (Umgehen des `omc` Shim), exportieren Sie `OMC_PLUGIN_ROOT=<path>` in Ihrer Shell, damit die HUD-Sammlung zu demselben Checkout wie der Plugin-Loader aufgelöst wird. Siehe [Plugin directory flags Abschnitt in REFERENCE.md](./docs/REFERENCE.md#plugin-directory-flags) für Details.
 
@@ -184,7 +184,7 @@ Optionale Abkürzungen für Power-User. Natürliche Sprache funktioniert auch oh
 | `autopilot`   | Vollständig autonome Ausführung                  | `autopilot: build a todo app`                                   |
 | `ralph`       | Beharrlichkeitsmodus                             | `ralph: refactor auth`                                          |
 | `ulw`         | Maximale Parallelität                            | `ulw fix all errors`                                            |
-| `eco`         | Token-effiziente Ausführung                      | `eco: migrate database`                                         |
+
 | `plan`        | Planungsinterview                                | `plan the API`                                                  |
 | `ralplan`     | Iterativer Planungskonsens                       | `ralplan this feature`                                          |
 | `swarm`       | Veraltetes Schlüsselwort (leitet an Team weiter) | `swarm 5 agents: fix lint errors`                               |

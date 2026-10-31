@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { claimSessionEndAction, claimSessionEndJob, finishSessionEndAction, isManifestTerminal, markSessionEndActionRunner, mutateSessionEndJob, prepareCoreManifest, readSessionEndJob, reapStaleSessionEndOwner, releaseSessionEndJob, renewSessionEndLease, sealCoreManifest, sealWikiManifest, sessionEndJobPath, sessionEndJobsDirectory, sessionEndScopeKey, takeSessionEndDiscoveryPage, updateSessionEndActionPayload, } from '../cleanup-manifest.js';
 const directories = [];
 beforeEach(() => {
@@ -48,7 +48,7 @@ describe('durable SessionEnd cleanup manifest', () => {
         const sessionId = 'matching-v1';
         expect(prepareCoreManifest(directory, sessionId, { legacy: true })).not.toBeNull();
         const created = readSessionEndJob(directory, sessionId);
-        const legacyRoot = join(directory, '.omc', 'state', 'session-end-jobs');
+        const legacyRoot = dirname(dirname(sessionEndJobsDirectory(directory)));
         const legacyPath = join(legacyRoot, `${sessionId}.json`);
         const legacyScopeKey = createHash('sha256')
             .update(JSON.stringify(directory))
@@ -69,7 +69,7 @@ describe('durable SessionEnd cleanup manifest', () => {
         const sessionId = 'foreign-v1';
         expect(prepareCoreManifest(directory, sessionId, { legacy: true })).not.toBeNull();
         const created = readSessionEndJob(directory, sessionId);
-        const legacyRoot = join(directory, '.omc', 'state', 'session-end-jobs');
+        const legacyRoot = dirname(dirname(sessionEndJobsDirectory(directory)));
         const legacyPath = join(legacyRoot, `${sessionId}.json`);
         mkdirSync(legacyRoot, { recursive: true });
         writeFileSync(legacyPath, JSON.stringify({
@@ -101,6 +101,29 @@ describe('durable SessionEnd cleanup manifest', () => {
         expect(manifest.actions.callback.payload).toMatchObject({ source: 'first' });
         expect(manifest.actions['wiki-capture'].payload).toMatchObject({
             source: 'wiki-first',
+        });
+    });
+    it('seeds actions missing from an older-build manifest (plugin/standalone coexistence)', () => {
+        const directory = project();
+        const sessionId = 'stale-action-list';
+        const jobPath = join(sessionEndJobsDirectory(directory), `${sessionId}.json`);
+        // prepared-core manifest written by an older build that lacks spawn-next
+        expect(prepareCoreManifest(directory, sessionId, { source: 'core' })).not.toBeNull();
+        const stale = JSON.parse(readFileSync(jobPath, 'utf8'));
+        delete stale.actions['spawn-next'];
+        writeFileSync(jobPath, JSON.stringify(stale));
+        expect(prepareCoreManifest(directory, sessionId, { source: 'core', chain: { intentId: 'i-1', includeUserSettings: true } })).not.toBeNull();
+        expect(readSessionEndJob(directory, sessionId)?.actions['spawn-next']?.payload).toMatchObject({ chain: { intentId: 'i-1', includeUserSettings: true } });
+        // absent-core manifest from an older build: seed + durable payload merge
+        const absent = JSON.parse(readFileSync(jobPath, 'utf8'));
+        delete absent.actions['spawn-next'];
+        absent.producers.core.state = 'absent';
+        writeFileSync(jobPath, JSON.stringify(absent));
+        expect(prepareCoreManifest(directory, sessionId, { source: 'core-2', chain: { intentId: 'i-2' } })).not.toBeNull();
+        const job = readSessionEndJob(directory, sessionId);
+        expect(job?.producers.core.state).toBe('prepared');
+        expect(job?.actions['spawn-next']?.payload).toMatchObject({
+            chain: { intentId: 'i-2' },
         });
     });
     it('serializes concurrent core/wiki producers and rejects a second worker claim', async () => {
@@ -255,6 +278,45 @@ describe('durable SessionEnd cleanup manifest', () => {
             reason: 'worker-released',
             ownerNonce: 'next-owner',
         });
+    });
+    it('releases never-started claims for retry and records a known action result atomically', () => {
+        const directory = project();
+        const sessionId = preparedAndSealed(directory, 'release-action-result');
+        let owner = claimSessionEndJob(directory, sessionId, 'owner', 'identity', Date.now() + 5_000);
+        expect(claimSessionEndAction(directory, sessionId, 'owner', 'python-cleanup', Date.now() + 5_000)).not.toBeNull();
+        expect(releaseSessionEndJob(directory, sessionId, 'owner', owner.owner.leaseGeneration, 'runner-start-rejected-python-cleanup')?.actions['python-cleanup']).toMatchObject({
+            status: 'pending',
+            attempts: 0,
+            lastOutcomeCode: 'runner-not-started',
+            runner: { phase: 'terminal' },
+        });
+        owner = claimSessionEndJob(directory, sessionId, 'next-owner', 'identity', Date.now() + 5_000);
+        const callback = claimSessionEndAction(directory, sessionId, 'next-owner', 'callback', Date.now() + 5_000);
+        const runnerNonce = callback.actions.callback.runner.runnerNonce;
+        expect(markSessionEndActionRunner(directory, sessionId, 'next-owner', 'callback', runnerNonce, 'started')).not.toBeNull();
+        expect(markSessionEndActionRunner(directory, sessionId, 'next-owner', 'callback', runnerNonce, 'armed')).not.toBeNull();
+        expect(releaseSessionEndJob(directory, sessionId, 'next-owner', owner.owner.leaseGeneration, 'action-result-rejected-callback', { name: 'callback', runnerNonce, completed: true, code: 'completed' })?.actions.callback).toMatchObject({
+            status: 'completed',
+            attempts: 1,
+            lastOutcomeCode: 'completed',
+            runner: { phase: 'terminal' },
+        });
+        expect(readSessionEndJob(directory, sessionId)?.owner).toBeNull();
+    });
+    it('retries a best-effort action when its runner never reached the durable arm', () => {
+        const directory = project();
+        const sessionId = preparedAndSealed(directory, 'runner-not-armed');
+        const owner = claimSessionEndJob(directory, sessionId, 'owner', 'identity', Date.now() + 5_000);
+        const claimed = claimSessionEndAction(directory, sessionId, 'owner', 'callback', Date.now() + 5_000);
+        const runnerNonce = claimed.actions.callback.runner.runnerNonce;
+        expect(markSessionEndActionRunner(directory, sessionId, 'owner', 'callback', runnerNonce, 'started')).not.toBeNull();
+        expect(finishSessionEndAction(directory, sessionId, 'owner', 'callback', runnerNonce, false, 'runner-claim-lost', false)?.actions.callback).toMatchObject({
+            status: 'pending',
+            attempts: 0,
+            lastOutcomeCode: 'runner-claim-lost',
+            runner: { phase: 'terminal' },
+        });
+        expect(releaseSessionEndJob(directory, sessionId, 'owner', owner.owner.leaseGeneration)).not.toBeNull();
     });
     it('bounds required failures and never retries a failed remote delivery attempt', () => {
         const directory = project();

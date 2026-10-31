@@ -13,16 +13,17 @@ import { createHash, randomUUID } from 'crypto';
 import { join, dirname, resolve, isAbsolute, basename, relative, sep } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
+import { compareVersions } from '../utils/semver-compare.js';
 import { execSync } from 'child_process';
 import {
   isWindows,
-  MIN_NODE_VERSION,
   getHooksSettingsConfig,
 } from './hooks.js';
 import { getRuntimePackageVersion } from '../lib/version.js';
 import { getClaudeConfigDir } from '../utils/config-dir.js';
+import { MIN_NODE_VERSION } from '../utils/node-version.js';
 import { resolveNodeBinary } from '../utils/resolve-node.js';
-import { parseFrontmatter } from '../utils/frontmatter.js';
+import { parseFrontmatter, stripLeadingUtf8Bom } from '../utils/frontmatter.js';
 import { isSkininthegamebrosUser } from '../utils/skininthegamebros-user.js';
 import { syncUnifiedMcpRegistryTargets } from './mcp-registry.js';
 import { OMC_CONFIG_FILE_REL } from '../lib/paths.js';
@@ -31,7 +32,7 @@ import { getOmcRoot } from '../lib/worktree-paths.js';
 import { syncOmcLearnedUserSkillsForClaudeCode } from '../utils/user-skill-compat.js';
 import { OMC_PLUGIN_ROOT_ENV } from '../lib/env-vars.js';
 import { analyzeLegacyClaudeMd, OMC_END_MARKER, OMC_START_MARKER, parseClaudeMdMarkers, removeClaudeMdRanges } from './claude-md-analysis.js';
-import { executeClaudeMdTransaction } from './claude-md-transaction.js';
+import { executeClaudeMdTransaction, isClaudeMdEnabledInConfig } from './claude-md-transaction.js';
 import { HISTORICAL_AGENT_OWNERSHIP, type HistoricalAgentOwnership } from './historical-agent-ownership.js';
 import entitlementManifest from '../config/builtin-skill-entitlements.json' with { type: 'json' };
 
@@ -146,21 +147,6 @@ function currentSkillsDir(): string {
  */
 function isComparableVersion(version: string | null | undefined): version is string {
   return !!version && /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(version);
-}
-
-function compareVersions(a: string, b: string): number {
-  const partsA = a.replace(/^v/, '').split('.').map(part => parseInt(part, 10) || 0);
-  const partsB = b.replace(/^v/, '').split('.').map(part => parseInt(part, 10) || 0);
-  const maxLength = Math.max(partsA.length, partsB.length);
-
-  for (let i = 0; i < maxLength; i++) {
-    const valueA = partsA[i] || 0;
-    const valueB = partsB[i] || 0;
-    if (valueA < valueB) return -1;
-    if (valueA > valueB) return 1;
-  }
-
-  return 0;
 }
 
 function extractOmcVersionMarker(content: string): string | null {
@@ -301,6 +287,8 @@ export interface InstallOptions {
   refreshHooksInPlugin?: boolean;
   skipHud?: boolean;
   noPlugin?: boolean;
+  /** Skip payload repair only when update reconciliation already copied it. */
+  skipPluginPayloadSync?: boolean;
   /**
    * Dev plugin-dir mode: skip copying agents and bundled skills into
    * `<configDir>` because the user is launching OMC via
@@ -364,6 +352,7 @@ export function isOmcStatusLine(statusLine: unknown): boolean {
 const OMC_HOOK_FILENAMES = new Set([
   'keyword-detector.mjs',
   'session-start.mjs',
+  'session-end.mjs',
   'pre-tool-use.mjs',
   'post-tool-use.mjs',
   'post-tool-use-failure.mjs',
@@ -590,8 +579,8 @@ export function isProjectScopedPlugin(): boolean {
   return !normalizedPluginRoot.startsWith(normalizedGlobalBase);
 }
 
-type HookEntry = { type: string; command: string };
-type HookGroup = { hooks: HookEntry[] };
+export type HookEntry = { type: string; command: string };
+export type HookGroup = { hooks: HookEntry[] };
 
 type SettingsHookEntry = { type?: unknown; command?: unknown; [key: string]: unknown };
 type SettingsHookGroup = { hooks?: unknown; [key: string]: unknown };
@@ -884,6 +873,7 @@ function configureInstallerSettings(
 const STANDALONE_HOOK_TEMPLATE_FILES = [
   'keyword-detector.mjs',
   'session-start.mjs',
+  'session-end.mjs',
   'pre-tool-use.mjs',
   'post-tool-use.mjs',
   'post-tool-use-failure.mjs',
@@ -916,16 +906,19 @@ function readStandalonePackageIdentity(packageDir: string): { root: string; name
 function standaloneStateLockBridge(packageDir: string): string {
   const identity = readStandalonePackageIdentity(packageDir);
   return `import { lstatSync, readFileSync, realpathSync } from 'node:fs';
-import { join, relative, isAbsolute, sep } from 'node:path';
+import { join, relative, resolve, isAbsolute, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 const PACKAGE_ROOT = ${JSON.stringify(identity.root)};
 const EXPECTED_PACKAGE_NAME = ${JSON.stringify(identity.name)};
 const EXPECTED_PACKAGE_VERSION = ${JSON.stringify(identity.version)};
 const PACKAGE_JSON = join(PACKAGE_ROOT, 'package.json');
 const HELPER_PATH = join(PACKAGE_ROOT, 'scripts', 'lib', 'state-lock.mjs');
+function samePath(left, right) {
+  return resolve(left) === resolve(right);
+}
 function validatePackageOwnedHelper() {
-  if (!lstatSync(PACKAGE_ROOT).isDirectory() || realpathSync(PACKAGE_ROOT) !== PACKAGE_ROOT || !lstatSync(PACKAGE_JSON).isFile() || !lstatSync(HELPER_PATH).isFile()) throw new Error('OMC state-lock bridge package root is unavailable');
-  if (realpathSync(PACKAGE_JSON) !== PACKAGE_JSON) throw new Error('OMC state-lock bridge manifest identity changed');
+  if (!lstatSync(PACKAGE_ROOT).isDirectory() || !samePath(realpathSync(PACKAGE_ROOT), PACKAGE_ROOT) || !lstatSync(PACKAGE_JSON).isFile() || !lstatSync(HELPER_PATH).isFile()) throw new Error('OMC state-lock bridge package root is unavailable');
+  if (!samePath(realpathSync(PACKAGE_JSON), PACKAGE_JSON)) throw new Error('OMC state-lock bridge manifest identity changed');
   const helperReal = realpathSync(HELPER_PATH);
   const helperRelative = relative(PACKAGE_ROOT, helperReal);
   if (isAbsolute(helperRelative) || helperRelative === '..' || helperRelative.startsWith('..' + sep)) throw new Error('OMC state-lock bridge helper escapes package root');
@@ -940,9 +933,12 @@ export const isStateFileLockingSupported = canonical.isStateFileLockingSupported
 export const isExclusiveStateLockingAvailable = canonical.isExclusiveStateLockingAvailable;
 export const getStateFileLockDiagnostic = canonical.getStateFileLockDiagnostic;
 export const getStateFileLockFailureMessage = canonical.getStateFileLockFailureMessage;
+export const getStateFileLockFailureKind = canonical.getStateFileLockFailureKind;
 export const acquireStateFileLockSync = canonical.acquireStateFileLockSync;
+export const acquireStateFileLockAtPathSync = canonical.acquireStateFileLockAtPathSync;
 export const releaseStateFileLockSync = canonical.releaseStateFileLockSync;
 export const withStateFileLockSync = canonical.withStateFileLockSync;
+export const withStateFileLockAtPathSync = canonical.withStateFileLockAtPathSync;
 export const acquireRecoveryClaim = canonical.acquireRecoveryClaim;
 export const readRecoveryClaim = canonical.readRecoveryClaim;
 export const releaseRecoveryClaim = canonical.releaseRecoveryClaim;
@@ -1001,6 +997,11 @@ function ensureStandaloneHookScripts(log: (msg: string) => void): void {
       }
 
       const targetPath = join(hooksLibDir, filename);
+      // The plugin setup hook links stdin.mjs into a versioned plugin cache that
+      // later disappears; copying through that link fails or mutates the cache.
+      if (lstatSync(targetPath, { throwIfNoEntry: false })?.isSymbolicLink()) {
+        unlinkSync(targetPath);
+      }
       copyFileSync(sourcePath, targetPath);
       if (!isWindows()) {
         chmodSync(targetPath, 0o755);
@@ -1038,7 +1039,7 @@ function ensureStandaloneHookScripts(log: (msg: string) => void): void {
   log('  Installed standalone hook scripts');
 }
 
-function mergeHookGroups(
+export function mergeHookGroups(
   eventType: string,
   existingGroups: HookGroup[],
   newOmcGroups: HookGroup[],
@@ -1878,7 +1879,7 @@ function resolveBestPluginSyncSource(targetRoots: string[]): { sourceRoot: strin
 
 
 function extractFrontmatterBlock(content: string): string | null {
-  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  const match = stripLeadingUtf8Bom(content).match(/^---\r?\n([\s\S]*?)\r?\n---/);
   return match?.[1] ?? null;
 }
 
@@ -2299,6 +2300,22 @@ function syncBundledSkillDefinitions(log: (msg: string) => void, options?: { saf
 
     const relativePath = join(targetDirName, 'SKILL.md');
     const targetDir = join(SKILLS_DIR, targetDirName);
+
+    let targetStat: ReturnType<typeof lstatSync> | null = null;
+    try {
+      targetStat = lstatSync(targetDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log(`  Warning: Could not safely inspect ${targetDir}; treating it as a user-managed entry, so the bundled skill was not installed. Remove or rename it to enable OMC's version.`);
+        continue;
+      }
+    }
+
+    if (targetStat && (targetStat.isSymbolicLink() || !targetStat.isDirectory())) {
+      log(`  Warning: ${targetDir} is a user-managed entry; the bundled skill was not installed. Remove or rename it to enable OMC's version.`);
+      continue;
+    }
+
     cpSync(sourceDir, targetDir, { recursive: true, force: true });
     markSkillAsOmcManaged(targetDir);
     installedSkills.push(relativePath.replace(/\\/g, '/'));
@@ -2486,23 +2503,25 @@ export function install(options: InstallOptions = {}): InstallResult {
   const runningAsPlugin = isRunningAsPlugin();
   const projectScoped = isProjectScopedPlugin();
 
-  const pluginPayloadSync = syncInstalledPluginPayload();
-  if (pluginPayloadSync.errors.length > 0) {
-    for (const error of pluginPayloadSync.errors) {
-      log(`Plugin cache sync error: ${error}`);
+  if (!options.skipPluginPayloadSync) {
+    const pluginPayloadSync = syncInstalledPluginPayload();
+    if (pluginPayloadSync.errors.length > 0) {
+      for (const error of pluginPayloadSync.errors) {
+        log(`Plugin cache sync error: ${error}`);
+      }
+      if (pluginPayloadSync.targetRoots.length > 0) {
+        result.errors.push(...pluginPayloadSync.errors.map(error => `Plugin cache sync failed: ${error}`));
+        result.message = 'Installation failed: OMC plugin cache is incomplete and could not be repaired';
+        return result;
+      }
     }
-    if (pluginPayloadSync.targetRoots.length > 0) {
-      result.errors.push(...pluginPayloadSync.errors.map(error => `Plugin cache sync failed: ${error}`));
-      result.message = 'Installation failed: OMC plugin cache is incomplete and could not be repaired';
-      return result;
+    if (pluginPayloadSync.synced) {
+      const targetSummary = pluginPayloadSync.targetRoots.length > 0
+        ? pluginPayloadSync.targetRoots.join(', ')
+        : 'installed plugin roots';
+      const sourceSummary = pluginPayloadSync.sourceRoot ?? 'unknown source';
+      log(`Repaired installed OMC plugin payload from ${sourceSummary} -> ${targetSummary}`);
     }
-  }
-  if (pluginPayloadSync.synced) {
-    const targetSummary = pluginPayloadSync.targetRoots.length > 0
-      ? pluginPayloadSync.targetRoots.join(', ')
-      : 'installed plugin roots';
-    const sourceSummary = pluginPayloadSync.sourceRoot ?? 'unknown source';
-    log(`Repaired installed OMC plugin payload from ${sourceSummary} -> ${targetSummary}`);
   }
 
   const pluginProvidesAgentFiles = hasPluginProvidedAgentFiles();
@@ -2699,7 +2718,12 @@ export function install(options: InstallOptions = {}): InstallResult {
 
     // Keep the public installer on the same raw-byte transaction path as setup.
     // The public string merger remains exported for callers that use it directly.
-    if (!projectScoped) {
+    // claudeMdEnabled=false in .omc-config.json opts out of every global CLAUDE.md write.
+    const claudeMdDisabledByConfig = !projectScoped && !isClaudeMdEnabledInConfig(CLAUDE_CONFIG_DIR);
+    if (claudeMdDisabledByConfig) {
+      log('Skipping CLAUDE.md (claudeMdEnabled is false in .omc-config.json)');
+    }
+    if (!projectScoped && !claudeMdDisabledByConfig) {
       const transaction = executeClaudeMdTransaction({
         mode: 'global-overwrite',
         root: CLAUDE_CONFIG_DIR,
@@ -2709,9 +2733,14 @@ export function install(options: InstallOptions = {}): InstallResult {
       });
       if (!transaction.ok) throw new Error(transaction.error ?? 'CLAUDE.md transaction failed');
       for (const backupPath of transaction.backups) log(`Backed up existing CLAUDE.md to ${backupPath}`);
-      log(transaction.operations.some(operation => operation.type === 'write' && operation.existedBefore && basename(operation.path) === 'CLAUDE.md')
-        ? 'Updated CLAUDE.md (merged with existing content)'
-        : 'Created CLAUDE.md');
+      // The transaction drops writes whose bytes already match, so a missing
+      // CLAUDE.md write op means the existing file was left untouched.
+      const claudeMdWrite = transaction.operations.find(operation => operation.type === 'write' && basename(operation.path) === 'CLAUDE.md');
+      log(!claudeMdWrite
+        ? 'CLAUDE.md already up to date'
+        : claudeMdWrite.existedBefore
+          ? 'Updated CLAUDE.md (merged with existing content)'
+          : 'Created CLAUDE.md');
     }
 
     // Install HUD statusline (skip for project-scoped plugins, skipHud option, or hudEnabled config)

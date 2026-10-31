@@ -27,22 +27,10 @@ import {
   acquireFileLockSync,
   releaseFileLockSync,
 } from '../lib/file-lock.js';
+import { stageHookRuntimeSupport } from './helpers/staged-hook-runtime.js';
 
 const REPO_ROOT = process.cwd();
 const SCRIPT_PATH = join(REPO_ROOT, 'scripts', 'pre-tool-enforcer.mjs');
-const LOADER_PATH = join(
-  REPO_ROOT,
-  'scripts',
-  'lib',
-  'hook-runtime-loader.mjs',
-);
-const STDIN_PATH = join(REPO_ROOT, 'scripts', 'lib', 'stdin.mjs');
-const NOTIFICATION_CHILD_PATH = join(
-  REPO_ROOT,
-  'scripts',
-  'lib',
-  'notification-child.cjs',
-);
 const BUILD_RUNTIME_PATH = join(
   REPO_ROOT,
   'scripts',
@@ -200,26 +188,10 @@ function stagePlugin(options: {
   const root = mkdtempSync(join(tmpdir(), 'omc-pretool-entrypoint-'));
   tempRoots.push(root);
   const scriptPath = join(root, 'scripts', 'pre-tool-enforcer.mjs');
-  const loaderPath = join(
-    root,
-    'scripts',
-    'lib',
-    'hook-runtime-loader.mjs',
-  );
-  const stdinPath = join(root, 'scripts', 'lib', 'stdin.mjs');
-  const notificationChildPath = join(
-    root,
-    'scripts',
-    'lib',
-    'notification-child.cjs',
-  );
   const runtimePath = join(root, 'bridge', 'hook-runtime.cjs');
 
-  mkdirSync(dirname(loaderPath), { recursive: true });
+  stageHookRuntimeSupport(root, REPO_ROOT);
   copyFileSync(SCRIPT_PATH, scriptPath);
-  copyFileSync(LOADER_PATH, loaderPath);
-  copyFileSync(STDIN_PATH, stdinPath);
-  copyFileSync(NOTIFICATION_CHILD_PATH, notificationChildPath);
   mkdirSync(join(root, 'agents-copilot'), { recursive: true });
   copyFileSync(
     join(REPO_ROOT, 'agents-copilot', 'executor.agent.md'),
@@ -301,6 +273,7 @@ function runHook(
       OMC_SKIP_HOOKS: '',
       OMC_STATE_DIR: '',
       OMC_SUBAGENT_MODEL: '',
+      PLUGIN_ROOT: '',
       USERPROFILE: home,
       XDG_CONFIG_HOME: join(home, '.config'),
       ...options.env,
@@ -332,6 +305,34 @@ describe('shipped PreToolUse canonical runtime entrypoint', () => {
       { continue: true },
     );
   });
+
+  it.each([
+    ['DISABLE_OMC', '1'],
+    ['OMC_SKIP_HOOKS', 'pre-tool-use'],
+  ] as const)(
+    'emits only the native pass object for %s without loading a runtime',
+    (key, value) => {
+      const staged = stagePlugin({ runtime: 'missing' });
+      const cwd = makeWorktree(`copilot-${key}`);
+      expectExactOutput(
+        runHook(
+          staged,
+          copilotPayload(cwd, [
+            { id: 'read-call', name: 'view', args: { path: 'README.md' } },
+          ]),
+          cwd,
+          {
+            env: {
+              [key]: value,
+              OMC_HOST: 'copilot',
+              PLUGIN_ROOT: staged.root,
+            },
+          },
+        ),
+        {},
+      );
+    },
+  );
 
   it('preserves the exact Claude suppressed output', () => {
     const staged = stagePlugin();
@@ -601,6 +602,34 @@ describe('shipped PreToolUse canonical runtime entrypoint', () => {
       exactClaudeDeny('Hook input must be a JSON object.'),
     );
   });
+
+  it.each(['turn_id', 'turnId'])(
+    'preserves Codex presentation from a canonicalized %s marker',
+    (turnIdKey) => {
+      const staged = stagePlugin();
+      const cwd = makeWorktree(`codex-${turnIdKey}`);
+
+      expectExactOutput(
+        runHook(
+          staged,
+          claudePayload(
+            cwd,
+            'Read',
+            { file_path: 'README.md' },
+            { [turnIdKey]: 'codex-turn' },
+          ),
+          cwd,
+        ),
+        {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            additionalContext:
+              'Read multiple files in parallel when possible for faster analysis.',
+          },
+        },
+      );
+    },
+  );
 
   it('denies from an owned legacy ultragoal ghost state', () => {
     const staged = stagePlugin();

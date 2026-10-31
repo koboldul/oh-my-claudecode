@@ -20,6 +20,7 @@ export declare function shouldBlockStandaloneUpdateInCurrentSession(): boolean;
 export declare function syncPluginCache(verbose?: boolean): {
     synced: boolean;
     skipped: boolean;
+    activeRootsSynced: boolean;
     errors: string[];
 };
 /** Installation paths (respects CLAUDE_CONFIG_DIR env var) */
@@ -108,6 +109,9 @@ export interface OMCConfig {
     notificationProfiles?: Record<string, NotificationConfig>;
     /** Whether HUD statusline is enabled (default: true). Set to false to skip HUD installation. */
     hudEnabled?: boolean;
+    /** Whether OMC may write/merge the global ~/.claude/CLAUDE.md on install, update and setup (default: true).
+     *  Set to false to leave the global CLAUDE.md untouched. */
+    claudeMdEnabled?: boolean;
     /** Whether to prompt for upgrade at session start when a new version is available (default: true).
      *  Set to false to show a passive notification instead of an interactive prompt. */
     autoUpgradePrompt?: boolean;
@@ -220,6 +224,7 @@ export declare function checkForUpdates(): Promise<UpdateCheckResult>;
 export declare function reconcileUpdateRuntime(options?: {
     verbose?: boolean;
     skipGracePeriod?: boolean;
+    pluginCacheAlreadySynced?: boolean;
 }): UpdateReconcileResult;
 /**
  * Download and execute the install script to perform an update
@@ -229,6 +234,7 @@ export declare function performUpdate(options?: {
     verbose?: boolean;
     standalone?: boolean;
     clean?: boolean;
+    unattended?: boolean;
 }): Promise<UpdateResult>;
 /**
  * Get a formatted update notification message

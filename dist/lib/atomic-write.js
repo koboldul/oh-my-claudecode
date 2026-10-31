@@ -6,7 +6,8 @@ import * as fs from "fs/promises";
 import * as fsSync from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { identitiesEqual } from "./file-identity.js";
+import { fileIdentityOf, identitiesEqual, sameFileIdentity, } from "./file-identity.js";
+export { fileIdentityOf, sameFileIdentity };
 /**
  * Create directory recursively (inline implementation).
  * Ensures parent directories exist before creating the target directory.
@@ -50,18 +51,18 @@ function writeAllSync(fd, content, label) {
  * attacker that replaced the temporary pathname after creation.
  */
 function verifyPrivateTempFile(fd, tempPath, label, operations) {
-    const fdStats = fsSync.fstatSync(fd);
+    const fdStats = descriptorStats(fd, operations);
     let pathStats;
     try {
-        pathStats = (operations?.lstat ?? fsSync.lstatSync)(tempPath);
+        pathStats = pathnameStats(tempPath, operations);
     }
     catch {
         throw new Error(`${label} temporary file was replaced before rename`);
     }
     const isWindows = process.platform === "win32";
     const isPrivateRegularSingleLink = (stats) => stats.isFile() &&
-        (isWindows ? stats.nlink <= 1 : stats.nlink === 1) &&
-        (isWindows || (stats.mode & 0o777) === 0o600);
+        (isWindows ? Number(stats.nlink) <= 1 : Number(stats.nlink) === 1) &&
+        (isWindows || (Number(stats.mode) & 0o777) === 0o600);
     if (!isPrivateRegularSingleLink(fdStats) ||
         !isPrivateRegularSingleLink(pathStats)) {
         throw new Error(`${label} temporary file must be a private regular single-link file`);
@@ -72,10 +73,10 @@ function verifyPrivateTempFile(fd, tempPath, label, operations) {
 }
 /** Verify that publication installed the exact inode we opened and wrote. */
 function verifyPublishedFile(fd, filePath, label, operations) {
-    const fdStats = fsSync.fstatSync(fd);
+    const fdStats = descriptorStats(fd, operations);
     let pathStats;
     try {
-        pathStats = (operations?.lstat ?? fsSync.lstatSync)(filePath);
+        pathStats = pathnameStats(filePath, operations);
     }
     catch {
         throw new Error(`${label} target was replaced at publication`);
@@ -110,19 +111,28 @@ function preservePriorTarget(filePath, operations) {
         return null;
     }
 }
+/**
+ * Stat with BigInt ids. A contained backend (`operations`, Linux/macOS only)
+ * reports Number stats, so the descriptor side then uses Number stats too and
+ * both sides of a comparison always carry the same precision.
+ */
+function descriptorStats(fd, operations) {
+    return operations ? fsSync.fstatSync(fd) : fsSync.fstatSync(fd, { bigint: true });
+}
+function pathnameStats(filePath, operations) {
+    return operations ? operations.lstat(filePath) : fsSync.lstatSync(filePath, { bigint: true });
+}
 function currentFileIdentity(filePath, operations) {
     try {
-        const stats = (operations?.lstat ?? fsSync.lstatSync)(filePath);
-        return { dev: stats.dev, ino: stats.ino };
+        return fileIdentityOf(pathnameStats(filePath, operations));
     }
     catch {
         return null;
     }
 }
-function descriptorIdentity(fd) {
+function descriptorIdentity(fd, operations) {
     try {
-        const stats = fsSync.fstatSync(fd);
-        return { dev: stats.dev, ino: stats.ino };
+        return fileIdentityOf(descriptorStats(fd, operations));
     }
     catch {
         return null;
@@ -305,7 +315,7 @@ export function atomicWriteFileSync(filePath, content, hooks, operations) {
         let publishedIdentity = null;
         try {
             verifyPublishedFile(fd, filePath, "atomic write", operations);
-            publishedIdentity = descriptorIdentity(fd);
+            publishedIdentity = descriptorIdentity(fd, operations);
             hooks?.afterRename?.();
             verifyPublishedFile(fd, filePath, "atomic write", operations);
         }

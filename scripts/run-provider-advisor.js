@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { spawnSync } from 'child_process';
-import { existsSync } from 'fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { mkdir, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import process from 'process';
 import { resolveOmcStateRoot } from './lib/state-root.mjs';
@@ -14,7 +15,15 @@ const PROVIDER_BINARIES = {
   grok: 'grok',
   cursor: 'cursor-agent',
   copilot: 'copilot',
+  muse: 'muse',
 };
+
+// muse and grok parse a prompt value that begins with `-` (e.g. the YAML
+// frontmatter `---` that every `--agent-prompt` role file starts with) as an
+// option and abort before calling the model, and grok reserves stdin for ACP
+// JSON-RPC. Both accept `--prompt-file`, so hand them the prompt in a private
+// temp file instead of argv or stdin.
+const PROMPT_FILE_PROVIDERS = new Set(['muse', 'grok']);
 const SHOULD_USE_WINDOWS_SHELL = process.platform === 'win32';
 const COPILOT_DEFAULT_MODEL = 'gpt-5.6-sol';
 const COPILOT_DEFAULT_REASONING_EFFORT = 'max';
@@ -27,10 +36,6 @@ const COPILOT_REASONING_EFFORTS = new Set([
   'xhigh',
   'max',
 ]);
-
-function shouldUseWindowsShell(provider) {
-  return SHOULD_USE_WINDOWS_SHELL && provider !== 'copilot';
-}
 
 function nonEmpty(value) {
   const trimmed = value?.trim();
@@ -86,13 +91,15 @@ const ANTIGRAVITY_TIMEOUT_MS = (() => {
  * - gemini: `gemini -p <prompt> --yolo`
  * - antigravity: `agy --dangerously-skip-permissions -p <prompt>` (Antigravity CLI;
  *   `-p` takes the prompt as its value and cannot read it from stdin, so the
- *   prompt is always passed as an arg with approval flags first, like grok)
- * - grok: `grok -p <prompt> --always-approve` (headless mode takes the prompt
- *   as an arg; grok's stdin is reserved for ACP JSON-RPC, never the prompt)
+ *   prompt is always passed as an arg with approval flags first)
+ * - grok: `grok --prompt-file <file> --always-approve` (single-turn headless
+ *   mode; grok's stdin is reserved for ACP JSON-RPC, never the prompt)
  * - cursor: `cursor-agent --print --force --trust --sandbox disabled <prompt>`
  * - copilot: deterministic, autonomous prompt mode with configurable model and effort defaults
+ * - muse: `muse exec --prompt-file <file> --approval-mode never --user-input-auto-resolve`
+ *   (headless; preserves Muse's configured sandbox behavior)
  */
-function buildProviderArgs(provider, prompt, { pipePromptViaStdin = false } = {}) {
+function buildProviderArgs(provider, prompt, { pipePromptViaStdin = false, promptFile } = {}) {
   if (provider === 'codex') {
     return ['exec', '--dangerously-bypass-approvals-and-sandbox', pipePromptViaStdin ? '-' : prompt];
   }
@@ -103,14 +110,17 @@ function buildProviderArgs(provider, prompt, { pipePromptViaStdin = false } = {}
     // Antigravity (`agy`): `-p`/`--print` takes the prompt as its VALUE (next
     // token), not as a boolean, and it does NOT read the prompt from stdin
     // (`agy -p` with no value errors "flag needs an argument"). So always pass
-    // the prompt as the `-p` value with approval flags first, like grok.
+    // the prompt as the `-p` value with approval flags first.
     // Verified on agy 1.0.10.
     return ['--dangerously-skip-permissions', '-p', prompt];
   }
   if (provider === 'grok') {
-    // Grok's headless mode always takes the prompt as a `-p` arg; its stdin is
-    // for ACP JSON-RPC, not the prompt, so it never uses the stdin pipe path.
-    return ['-p', prompt, '--always-approve'];
+    // Grok's stdin is for ACP JSON-RPC, not the prompt, and `-p <prompt>` rejects
+    // a dash-leading prompt, so the prompt always arrives via --prompt-file.
+    return ['--prompt-file', promptFile, '--always-approve'];
+  }
+  if (provider === 'muse') {
+    return ['exec', '--prompt-file', promptFile, '--approval-mode', 'never', '--user-input-auto-resolve'];
   }
   if (provider === 'cursor') {
     // Cursor Agent's print mode takes the prompt as a positional arg. Keep stdin
@@ -158,9 +168,8 @@ function shouldPipePromptViaStdin(provider, prompt) {
     return prompt.includes('\n') || prompt.length > 500 || /^\s*-/.test(prompt);
   }
 
-  // grok (ACP stdin), cursor-agent (interactive stdin), Copilot (`-p` argv), and
-  // any other provider
-  // never pipe the prompt.
+  // grok and muse (prompt file), cursor-agent (interactive stdin), Copilot
+  // (`-p` argv), and any other provider never pipe the prompt.
   return false;
 }
 
@@ -168,8 +177,8 @@ const ASK_ORIGINAL_TASK_ENV = 'OMC_ASK_ORIGINAL_TASK';
 const ASK_ORIGINAL_TASK_ENV_ALIAS = 'OMX_ASK_ORIGINAL_TASK';
 
 function usage() {
-  console.error('Usage: omc ask <claude|codex|gemini|antigravity|grok|cursor|copilot> "<prompt>"');
-  console.error('Legacy direct usage: node scripts/run-provider-advisor.js <claude|codex|gemini|antigravity|grok|cursor|copilot> <prompt...>');
+  console.error('Usage: omc ask <claude|codex|gemini|antigravity|grok|cursor|copilot|muse> "<prompt>"');
+  console.error('Legacy direct usage: node scripts/run-provider-advisor.js <claude|codex|gemini|antigravity|grok|cursor|copilot|muse> <prompt...>');
   console.error('                 or: node scripts/run-provider-advisor.js claude --print "<prompt>"');
   console.error('                 or: node scripts/run-provider-advisor.js gemini --prompt "<prompt>"');
 }
@@ -244,22 +253,21 @@ function resolveWindowsBinary(binary, env) {
     ?.split(/\r?\n/)
     .map(line => line.trim())
     .filter(Boolean) ?? [];
-  return candidates.find(candidate => /\.(exe|com)$/i.test(candidate))
-    ?? candidates.find(candidate => /\.(cmd|bat)$/i.test(candidate));
+  return candidates.find(candidate => /\.(exe|com|cmd|bat)$/i.test(candidate));
 }
 
 function spawnProvider(provider, binary, args, options) {
-  if (provider === 'copilot' && SHOULD_USE_WINDOWS_SHELL && /\.(cmd|bat)$/i.test(binary)) {
+  if (SHOULD_USE_WINDOWS_SHELL && /\.(cmd|bat)$/i.test(binary)) {
     const ps1Shim = binary.replace(/\.(cmd|bat)$/i, '.ps1');
     if (!existsSync(ps1Shim)) {
       throw new Error(
-        `[ask-copilot] Cannot safely launch ${binary}: sibling PowerShell shim not found at ${ps1Shim}. Reinstall the current Copilot CLI.`,
+        `ENOENT: Cannot safely launch ${provider} CLI at ${binary}: sibling PowerShell shim not found at ${ps1Shim}. Reinstall the current ${provider} CLI.`,
       );
     }
 
     const run = spawnSync(
       'pwsh.exe',
-      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ps1Shim, ...args],
+      ['-NoProfile', '-NonInteractive', '-File', ps1Shim, ...args],
       {
         ...options,
         shell: false,
@@ -267,28 +275,12 @@ function spawnProvider(provider, binary, args, options) {
     );
     if (run.error?.code === 'ENOENT') {
       throw new Error(
-        '[ask-copilot] PowerShell 7 (pwsh.exe) is required to safely launch an npm-installed Copilot CLI on Windows.',
+        `PowerShell 7 (pwsh.exe) is required to safely launch an npm-installed ${provider} CLI on Windows.`,
       );
     }
     return run;
   }
   return spawnSync(binary, args, options);
-}
-
-// Antigravity (`agy`) headless print mode requires the prompt as an argv value
-// (it cannot read the prompt from stdin) and has known upstream `-p`/`--print`
-// stdout issues on Windows. The stdin-pipe path that keeps codex/gemini safe on
-// Windows is therefore unavailable here, and passing a multiline/spaced prompt
-// as argv through cmd.exe (spawn `shell: true`) is not reliably quoted. Rather
-// than emit silently-broken output, guard Windows with a clear, actionable error.
-function guardProviderPlatform(provider) {
-  if (provider === 'antigravity' && SHOULD_USE_WINDOWS_SHELL) {
-    console.error('[ask-antigravity] Antigravity CLI (agy) headless mode is not supported on Windows yet:');
-    console.error('[ask-antigravity]   agy --print takes the prompt as an argv value (it cannot read stdin),');
-    console.error('[ask-antigravity]   and agy has known Windows -p/--print stdout limitations upstream.');
-    console.error('[ask-antigravity] Run `omc ask antigravity` on macOS/Linux, or use `omc ask gemini` on Windows.');
-    process.exit(1);
-  }
 }
 
 function ensureBinary(provider, binary) {
@@ -297,29 +289,24 @@ function ensureBinary(provider, binary) {
     stdio: 'ignore',
     encoding: 'utf8',
     env: providerEnv,
-    shell: shouldUseWindowsShell(provider),
+    shell: false,
   };
   let resolvedBinary = binary;
   let probe = spawnProvider(provider, resolvedBinary, ['--version'], probeOptions);
+  let resolvedWindowsBinary;
 
-  if (provider === 'copilot' && SHOULD_USE_WINDOWS_SHELL && probe.error?.code === 'ENOENT') {
-    resolvedBinary = resolveWindowsBinary(binary, providerEnv) ?? binary;
-    if (resolvedBinary !== binary) {
+  if (SHOULD_USE_WINDOWS_SHELL && (probe.error || probe.status !== 0)) {
+    resolvedWindowsBinary = resolveWindowsBinary(binary, providerEnv);
+    if (resolvedWindowsBinary) {
+      resolvedBinary = resolvedWindowsBinary;
       probe = spawnProvider(provider, resolvedBinary, ['--version'], probeOptions);
     }
   }
 
-  const isMissingOnWindowsShell = shouldUseWindowsShell(provider)
-    && probe.status !== 0
-    && (() => {
-      const whereResult = spawnSync('where', [binary], {
-        encoding: 'utf8',
-        env: providerEnv,
-      });
-      return whereResult.status !== 0 || !whereResult.stdout?.trim();
-    })();
-
-  if ((probe.error && probe.error.code === 'ENOENT') || isMissingOnWindowsShell) {
+  const isMissing = probe.error?.code === 'ENOENT'
+    || probe.error?.code === 'EINVAL'
+    || (SHOULD_USE_WINDOWS_SHELL && probe.status !== 0 && !resolvedWindowsBinary);
+  if (isMissing) {
     const verify = `${binary} --version`;
     console.error(`[ask-${binary}] Missing required local CLI binary: ${binary}`);
     console.error(`[ask-${binary}] Install/configure ${binary} CLI, then verify with: ${verify}`);
@@ -422,22 +409,44 @@ async function main() {
   const { provider, prompt } = parseArgs(process.argv.slice(2));
   const binaryName = PROVIDER_BINARIES[provider];
 
-  guardProviderPlatform(provider);
   const binary = ensureBinary(provider, binaryName);
 
   const pipePromptViaStdin = shouldPipePromptViaStdin(provider, prompt);
-  const providerArgs = buildProviderArgs(provider, prompt, { pipePromptViaStdin });
-  const run = spawnProvider(provider, binary, providerArgs, {
-    encoding: 'utf8',
-    maxBuffer: 10 * 1024 * 1024,
-    env: buildProviderEnv(provider),
-    shell: shouldUseWindowsShell(provider),
-    // Bound antigravity so an upstream non-TTY hang (#76) fails cleanly instead of
-    // blocking forever; agy's own --print-timeout does not work. SIGKILL (not a
-    // catchable SIGTERM) guarantees spawnSync returns even if agy traps signals.
-    ...(provider === 'antigravity' ? { timeout: ANTIGRAVITY_TIMEOUT_MS, killSignal: ANTIGRAVITY_TIMEOUT_KILL_SIGNAL } : {}),
-    ...(pipePromptViaStdin ? { input: prompt } : { stdio: ['ignore', 'pipe', 'pipe'] }),
-  });
+  const promptDir = PROMPT_FILE_PROVIDERS.has(provider) ? mkdtempSync(join(tmpdir(), 'omc-ask-')) : null;
+  let run;
+  try {
+    let promptFile;
+    if (promptDir) {
+      promptFile = join(promptDir, 'prompt.md');
+      writeFileSync(promptFile, prompt, { encoding: 'utf8', mode: 0o600 });
+    }
+    const providerArgs = buildProviderArgs(provider, prompt, { pipePromptViaStdin, promptFile });
+    try {
+      run = spawnProvider(provider, binary, providerArgs, {
+        encoding: 'utf8',
+        maxBuffer: 10 * 1024 * 1024,
+        env: buildProviderEnv(provider),
+        shell: false,
+        // Bound antigravity so an upstream non-TTY hang (#76) fails cleanly instead of
+        // blocking forever; agy's own --print-timeout does not work. SIGKILL (not a
+        // catchable SIGTERM) guarantees spawnSync returns even if agy traps signals.
+        ...(provider === 'antigravity' ? { timeout: ANTIGRAVITY_TIMEOUT_MS, killSignal: ANTIGRAVITY_TIMEOUT_KILL_SIGNAL } : {}),
+        ...(pipePromptViaStdin ? { input: prompt } : { stdio: ['ignore', 'pipe', 'pipe'] }),
+      });
+    } catch (error) {
+      run = {
+        status: null,
+        signal: null,
+        stdout: '',
+        stderr: '',
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
+  } finally {
+    if (promptDir) {
+      rmSync(promptDir, { recursive: true, force: true });
+    }
+  }
 
   const stdout = run.stdout || '';
   const stderr = run.stderr || '';

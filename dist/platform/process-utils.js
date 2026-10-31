@@ -6,6 +6,7 @@ import { execFileSync, execFile, spawnSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { promisify } from 'util';
 import * as fsPromises from 'fs/promises';
+import { normalizeProcessStartIdentity, } from '../../templates/hooks/lib/process-start-identity.mjs';
 const execFileAsync = promisify(execFile);
 function processGroupIdSync(pid) {
     if (!Number.isInteger(pid) || pid <= 0)
@@ -162,6 +163,8 @@ export function isProcessAlive(pid) {
     }
 }
 let currentProcessStartIdentitySync;
+const WINDOWS_EPOCH_TICKS = 621355968000000000n;
+const WINDOWS_MAX_TICKS = 3155378975999999999n;
 function parseWindowsDmtfTimestamp(value) {
     const match = value.match(/(\d{14})\.(\d{6})([+-])(\d{3})/);
     if (!match)
@@ -464,56 +467,258 @@ export function dmtfCreationDateToTicks(dmtf) {
     const ticks = BigInt(wholeUtcMs) * 10000n + BigInt(micros) * 10n + 621355968000000000n;
     return `ticks:${ticks.toString()}`;
 }
-async function getProcessStartIdentityWindows(pid, deadlineAt) {
-    for (const command of [
-        `$p = Get-Process -Id ${pid} -ErrorAction Stop; if ($p -and $p.StartTime) { $p.StartTime.ToUniversalTime().Ticks }`,
-        `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction Stop; if ($p -and $p.CreationDate) { ([DateTime]$p.CreationDate).ToUniversalTime().Ticks }`,
-    ]) {
-        try {
-            const { stdout } = await execFileAsync('powershell', ['-NoProfile', '-NonInteractive', '-Command', command], {
-                timeout: Math.max(1, Math.min(5000, remainingDeadlineMs(deadlineAt) ?? 5000)), windowsHide: true,
-            });
-            const ticks = stdout.trim().match(/^\d+$/)?.[0];
-            if (ticks)
-                return `ticks:${ticks}`;
+function windowsProcessStartAuthority(identity) {
+    const exactTicksText = /^ticks:(\d{1,19})$/.exec(identity)?.[1];
+    const legacyDmtf = /^dmtf:(.+)$/.exec(identity)?.[1];
+    const source = legacyDmtf
+        ? dmtfCreationDateToTicks(legacyDmtf)
+        : identity;
+    if (!source)
+        return undefined;
+    const normalized = normalizeProcessStartIdentity(source);
+    const epochMicrosecondsText = /^windows-dmtf-us:(\d{1,18})$/.exec(normalized)?.[1];
+    if (!epochMicrosecondsText)
+        return undefined;
+    const epochMicroseconds = BigInt(epochMicrosecondsText);
+    const minimum = WINDOWS_EPOCH_TICKS + epochMicroseconds * 10n;
+    const maximum = minimum + 9n;
+    if (minimum <= WINDOWS_EPOCH_TICKS
+        || maximum > WINDOWS_MAX_TICKS) {
+        return undefined;
+    }
+    if (exactTicksText) {
+        const exactTicks = BigInt(exactTicksText);
+        if (exactTicks < minimum
+            || exactTicks > maximum
+            || exactTicks > WINDOWS_MAX_TICKS) {
+            return undefined;
         }
-        catch { /* try the next exact Windows identity source */ }
-        if (isDeadlineExceeded(deadlineAt))
-            return null;
+        return {
+            normalized: `windows-dmtf-us:${epochMicroseconds}`,
+            minimum: exactTicks,
+            maximum: exactTicks,
+            exact: true,
+        };
+    }
+    if (!legacyDmtf
+        && !/^windows-dmtf-us:\d{1,18}$/.test(identity)) {
+        return undefined;
+    }
+    return {
+        normalized: `windows-dmtf-us:${epochMicroseconds}`,
+        minimum,
+        maximum,
+        exact: false,
+    };
+}
+function windowsProcessStartIdentitiesMatch(actual, expected) {
+    const actualAuthority = windowsProcessStartAuthority(actual);
+    const expectedAuthority = windowsProcessStartAuthority(expected);
+    if (!actualAuthority || !expectedAuthority)
+        return undefined;
+    return actualAuthority.exact && expectedAuthority.exact
+        ? actualAuthority.minimum === expectedAuthority.minimum
+        : actualAuthority.normalized === expectedAuthority.normalized;
+}
+function currentProcessIdentityProbeDisabled() {
+    return (process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(process.pid)
+        || process.env.OMC_TEST_FILE_LOCK_PROCESS_START_UNKNOWN_PID === String(process.pid));
+}
+function canonicalSyncIdentityFromTicks(identity) {
+    const authority = windowsProcessStartAuthority(identity);
+    return authority?.exact ? authority.normalized : undefined;
+}
+async function queryCurrentProcessStartIdentityFromRunner() {
+    // The host helper constructs its request from process.pid; callers cannot
+    // provide either the target PID or the returned identity.
+    const moduleUrl = new URL('../../scripts/lib/host-delivery-ack.mjs', import.meta.url).href;
+    const hostModule = await import(moduleUrl);
+    if (typeof hostModule !== 'object' || hostModule === null)
+        return null;
+    const observeHostDeliveryAbort = Reflect.get(hostModule, 'observeHostDeliveryAbort');
+    if (typeof observeHostDeliveryAbort !== 'function')
+        return null;
+    const observer = await Reflect.apply(observeHostDeliveryAbort, hostModule, []);
+    if (typeof observer !== 'object' || observer === null)
+        return null;
+    const queryCurrentProcessStartIdentity = Reflect.get(observer, 'queryCurrentProcessStartIdentity');
+    const close = Reflect.get(observer, 'close');
+    if (typeof queryCurrentProcessStartIdentity !== 'function') {
+        if (typeof close === 'function')
+            Reflect.apply(close, observer, []);
+        return null;
     }
     try {
-        const { stdout } = await execFileAsync('wmic', [
-            'process', 'where', `ProcessId=${pid}`, 'get', 'CreationDate', '/format:csv',
-        ], { timeout: Math.max(1, Math.min(5000, remainingDeadlineMs(deadlineAt) ?? 5000)), windowsHide: true });
+        const identity = await Reflect.apply(queryCurrentProcessStartIdentity, observer, []);
+        return typeof identity === 'string' ? identity : null;
+    }
+    finally {
+        if (typeof close === 'function')
+            Reflect.apply(close, observer, []);
+    }
+}
+function abortReason(signal) {
+    return signal.reason instanceof Error
+        ? signal.reason
+        : new Error('process identity warm-up aborted');
+}
+function execFileForIdentity(command, args, timeoutMs, signal, onProbeSpawn) {
+    return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+            reject(abortReason(signal));
+            return;
+        }
+        let child;
+        try {
+            child = execFile(command, [...args], {
+                encoding: 'utf8',
+                signal,
+                timeout: Math.max(1, Math.floor(timeoutMs)),
+                windowsHide: true,
+            }, (error, stdout) => {
+                if (error) {
+                    reject(error);
+                    return;
+                }
+                resolve(stdout);
+            });
+        }
+        catch (error) {
+            reject(error);
+            return;
+        }
+        if (Number.isInteger(child.pid) && child.pid > 0) {
+            try {
+                onProbeSpawn?.(child.pid);
+            }
+            catch {
+                // Observability must not affect the authoritative identity probe.
+            }
+        }
+    });
+}
+async function getProcessStartIdentityWindows(pid, deadlineAt, signal, onProbeSpawn) {
+    for (const executable of ['pwsh', 'powershell']) {
+        let executableMissing = false;
+        for (const command of [
+            `$p = [System.Diagnostics.Process]::GetProcessById(${pid}); if ($p) { $p.StartTime.ToUniversalTime().Ticks }`,
+            `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction Stop; if ($p -and $p.CreationDate) { ([DateTime]$p.CreationDate).ToUniversalTime().Ticks }`,
+        ]) {
+            if (signal?.aborted)
+                throw abortReason(signal);
+            const timeoutMs = Math.min(5000, remainingDeadlineMs(deadlineAt) ?? 5000);
+            if (timeoutMs <= 0)
+                return null;
+            try {
+                const stdout = await execFileForIdentity(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], timeoutMs, signal, onProbeSpawn);
+                const ticks = stdout.trim().match(/^\d+$/)?.[0];
+                if (ticks)
+                    return `ticks:${ticks}`;
+            }
+            catch (error) {
+                if (signal?.aborted)
+                    throw abortReason(signal);
+                executableMissing =
+                    error.code === 'ENOENT';
+                if (executableMissing)
+                    break;
+                // Try the next exact Windows identity source.
+            }
+            if (isDeadlineExceeded(deadlineAt))
+                return null;
+        }
+        if (!executableMissing && isDeadlineExceeded(deadlineAt))
+            return null;
+    }
+    if (signal?.aborted)
+        throw abortReason(signal);
+    const timeoutMs = Math.min(5000, remainingDeadlineMs(deadlineAt) ?? 5000);
+    if (timeoutMs <= 0)
+        return null;
+    try {
+        const stdout = await execFileForIdentity('wmic', ['process', 'where', `ProcessId=${pid}`, 'get', 'CreationDate', '/format:csv'], timeoutMs, signal, onProbeSpawn);
         const match = stdout.match(/(\d{14}\.\d{6}[+-]\d{3})/);
         return match ? dmtfCreationDateToTicks(match[1]) : null;
     }
     catch {
+        if (signal?.aborted)
+            throw abortReason(signal);
         return null;
     }
+}
+/**
+ * Warm the exact current-process identity used by synchronous file locking.
+ * Foreign PIDs are intentionally unsupported so no caller can seed authority.
+ */
+export async function warmCurrentProcessStartIdentitySyncCache(options = {}) {
+    if (currentProcessIdentityProbeDisabled())
+        return false;
+    if (options.signal?.aborted)
+        throw abortReason(options.signal);
+    if (currentProcessStartIdentitySync !== undefined)
+        return true;
+    if (isDeadlineExceeded(options.deadlineAt))
+        return false;
+    if (process.platform !== 'win32') {
+        const identity = getProcessStartIdentitySync(process.pid);
+        return identity !== null && identity !== 'absent';
+    }
+    const identity = process.env.OMC_RUNNER_HOST_DELIVERY_ACK === '1'
+        ? await queryCurrentProcessStartIdentityFromRunner()
+        : await getProcessStartIdentityWindows(process.pid, options.deadlineAt, options.signal, options.onProbeSpawn);
+    if (options.signal?.aborted)
+        throw abortReason(options.signal);
+    if (currentProcessIdentityProbeDisabled())
+        return false;
+    if (!identity)
+        return false;
+    const canonicalIdentity = canonicalSyncIdentityFromTicks(identity);
+    if (!canonicalIdentity)
+        return false;
+    currentProcessStartIdentitySync = canonicalIdentity;
+    return true;
 }
 /** Stable PID-reuse identity suitable for a durable worker manifest. */
 export async function getProcessStartIdentity(pid, deadlineAt) {
     if (!Number.isInteger(pid) || pid <= 0 || isDeadlineExceeded(deadlineAt))
         return null;
+    // The durable Windows API is ticks-based. The current-process sync cache has
+    // a distinct microsecond lease encoding and must never escape through it.
+    if (process.platform === 'win32')
+        return getProcessStartIdentityWindows(pid, deadlineAt);
     const synchronousIdentity = getProcessStartIdentitySync(pid);
     if (synchronousIdentity === 'absent')
         return null;
     if (synchronousIdentity !== null)
         return synchronousIdentity;
-    if (process.platform === 'win32')
-        return getProcessStartIdentityWindows(pid, deadlineAt);
     const startTime = await getProcessStartTime(pid, deadlineAt);
     return startTime === undefined || isDeadlineExceeded(deadlineAt) ? null : String(startTime);
 }
 export async function isProcessIdentityLive(pid, expectedStartIdentity, deadlineAt) {
-    if (!Number.isInteger(pid) || pid <= 0 || !expectedStartIdentity || isDeadlineExceeded(deadlineAt)) {
-        return isDeadlineExceeded(deadlineAt) ? 'unknown' : 'dead';
-    }
+    if (isDeadlineExceeded(deadlineAt))
+        return 'unknown';
+    if (!Number.isInteger(pid) || pid <= 0)
+        return 'dead';
     if (!isProcessAlive(pid))
         return 'dead';
-    // Normalize legacy dmtf: identities to ticks: BEFORE comparison so Windows
-    // lookup (which returns ticks:) can match persisted pre-normalization records.
+    if (typeof expectedStartIdentity !== 'string'
+        || !expectedStartIdentity.trim())
+        return 'unknown';
+    if (process.platform === 'win32') {
+        if (!windowsProcessStartAuthority(expectedStartIdentity))
+            return 'unknown';
+        const identity = await getProcessStartIdentity(pid, deadlineAt);
+        if (identity === null)
+            return isProcessAlive(pid) ? 'unknown' : 'dead';
+        const matches = windowsProcessStartIdentitiesMatch(identity, expectedStartIdentity);
+        return matches === undefined
+            ? 'unknown'
+            : matches
+                ? 'live'
+                : 'mismatch';
+    }
+    // Preserve pre-normalization behavior for non-Windows callers. Windows
+    // identities were already compared through the shared canonical form above.
     let expected = expectedStartIdentity;
     if (expected.startsWith('dmtf:')) {
         const converted = dmtfCreationDateToTicks(expected.slice('dmtf:'.length));
@@ -537,33 +742,29 @@ export async function terminateOwnedProcessTree(options) {
     const deadline = parseDeadline(options.deadlineAt);
     if (deadline === undefined || isDeadlineExceeded(deadline))
         return 'deadline-exceeded';
-    const liveness = await isProcessIdentityLive(options.pid, options.expectedStartIdentity, deadline);
-    if (liveness === 'dead')
-        return 'already-dead';
-    if (liveness === 'mismatch')
-        return 'identity-mismatch';
-    if (liveness === 'unknown') {
-        return isDeadlineExceeded(deadline) ? 'deadline-exceeded' : 'unknown';
-    }
-    if (isDeadlineExceeded(deadline))
-        return 'deadline-exceeded';
     if (process.platform !== 'win32') {
+        const liveness = await isProcessIdentityLive(options.pid, options.expectedStartIdentity, deadline);
+        if (liveness === 'dead')
+            return 'already-dead';
+        if (liveness === 'mismatch')
+            return 'identity-mismatch';
+        if (liveness === 'unknown') {
+            return isDeadlineExceeded(deadline) ? 'deadline-exceeded' : 'unknown';
+        }
+        if (isDeadlineExceeded(deadline))
+            return 'deadline-exceeded';
         return killProcessTreeUnix(options.pid, options.force ? 'SIGKILL' : 'SIGTERM')
             ? 'terminated'
             : (isProcessAlive(options.pid) ? 'unknown' : 'already-dead');
     }
+    if (!isProcessAlive(options.pid))
+        return 'already-dead';
+    const expectedAuthority = windowsProcessStartAuthority(options.expectedStartIdentity);
+    if (!expectedAuthority)
+        return 'unknown';
     const timeout = remainingDeadlineMs(deadline);
     if (!timeout)
         return 'deadline-exceeded';
-    let expectedTicks = options.expectedStartIdentity.match(/^ticks:(\d+)$/)?.[1];
-    if (!expectedTicks) {
-        // Legacy manifests may still carry dmtf: identities from pre-normalization builds.
-        const dmtf = options.expectedStartIdentity.match(/^dmtf:(.+)$/)?.[1];
-        const converted = dmtf ? dmtfCreationDateToTicks(dmtf) : null;
-        expectedTicks = converted?.match(/^ticks:(\d+)$/)?.[1];
-    }
-    if (!expectedTicks)
-        return 'unknown';
     const waitMs = Math.max(1, timeout);
     const script = [
         'Add-Type -TypeDefinition @"',
@@ -575,7 +776,8 @@ export async function terminateOwnedProcessTree(options) {
         '}',
         '"@',
         `$root = [System.Diagnostics.Process]::GetProcessById(${options.pid})`,
-        `if ($root.StartTime.ToUniversalTime().Ticks -ne ${expectedTicks}) { exit 3 }`,
+        '$rootTicks = $root.StartTime.ToUniversalTime().Ticks',
+        `if ($rootTicks -lt ${expectedAuthority.minimum} -or $rootTicks -gt ${expectedAuthority.maximum}) { exit 3 }`,
         '$owned = @{}',
         '$owned[$root.Id] = @{ Process = $root; Depth = 0; Suspended = $true }',
         '[void][OmcNative]::NtSuspendProcess($root.Handle)',
@@ -588,7 +790,8 @@ export async function terminateOwnedProcessTree(options) {
         '      try {',
         '        $process = [System.Diagnostics.Process]::GetProcessById($id)',
         '        $created = ([DateTime]$row.CreationDate).ToUniversalTime().Ticks',
-        '        if ($process.StartTime.ToUniversalTime().Ticks -ne $created) { continue }',
+        '        $processTicks = $process.StartTime.ToUniversalTime().Ticks',
+        '        if ($processTicks -lt $created -or $processTicks -gt ($created + 9)) { continue }',
         '        [void][OmcNative]::NtSuspendProcess($process.Handle)',
         '        $owned[$id] = @{ Process = $process; Depth = ([int]$owned[$parent].Depth + 1); Suspended = $true }',
         '        $added = $true',

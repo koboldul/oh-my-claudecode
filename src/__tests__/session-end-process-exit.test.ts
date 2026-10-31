@@ -1,7 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process';
 import {
   copyFileSync,
-  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -26,6 +25,7 @@ import {
   vi,
 } from 'vitest';
 import { sessionEndJobPath } from '../hooks/session-end/cleanup-manifest.js';
+import { stageHookRuntimeSupport } from './helpers/staged-hook-runtime.js';
 
 const REPO_ROOT = process.cwd();
 const requireFromTest = createRequire(import.meta.url);
@@ -136,13 +136,25 @@ function emitSessionEndClosure(outDir: string): void {
 
   const processUtilsPath = join(outDir, 'platform', 'process-utils.js');
   const processUtils = readFileSync(processUtilsPath, 'utf8');
-  const patched = processUtils.replace(
-    /export function getProcessStartIdentitySync\(pid\) \{\r?\n/,
-    "export function getProcessStartIdentitySync(pid) {\n    return `session-end-test:${pid}`;\n",
-  );
-  if (patched === processUtils) {
-    throw new Error('fresh SessionEnd closure did not expose process identity');
+  const syncIdentityPattern =
+    /export function getProcessStartIdentitySync\(pid\) \{\r?\n/;
+  const asyncIdentityPattern =
+    /export async function getProcessStartIdentity\(pid, deadlineAt\) \{\r?\n/;
+  if (
+    !syncIdentityPattern.test(processUtils)
+    || !asyncIdentityPattern.test(processUtils)
+  ) {
+    throw new Error('fresh SessionEnd closure did not expose process identities');
   }
+  const patched = processUtils
+    .replace(
+      syncIdentityPattern,
+      "export function getProcessStartIdentitySync(pid) {\n    return `session-end-test-sync:${pid}`;\n",
+    )
+    .replace(
+      asyncIdentityPattern,
+      "export async function getProcessStartIdentity(pid, deadlineAt) {\n    return `session-end-test-async:${pid}`;\n",
+    );
   writeFileSync(processUtilsPath, patched, 'utf8');
 }
 
@@ -150,10 +162,7 @@ beforeAll(() => {
   stagedCleanupRoot = mkdtempSync(join(tmpdir(), 'omc-session-end-staged-'));
   stagedPluginRoot = join(stagedCleanupRoot, 'plugin');
   const scriptsDir = join(stagedPluginRoot, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  cpSync(join(REPO_ROOT, 'scripts', 'lib'), join(scriptsDir, 'lib'), {
-    recursive: true,
-  });
+  stageHookRuntimeSupport(stagedPluginRoot, REPO_ROOT);
   for (const filename of [
     'run.cjs',
     'session-end.mjs',
@@ -416,6 +425,17 @@ async function waitForTerminalManifest(
 }> {
   const manifestPath = sessionEndJobPath(cwd, sessionId);
   const deadline = Date.now() + DETACHED_WORKER_CEILING_MS;
+  let lastManifest: {
+    actions?: Record<string, {
+      attempts?: number;
+      lastOutcomeCode?: string;
+      runner?: { phase?: string };
+      status?: string;
+    }>;
+    owner?: unknown;
+    phase?: string;
+    recoverableFailure?: { reason?: string };
+  } | null = null;
   while (Date.now() < deadline) {
     if (existsSync(manifestPath)) {
       try {
@@ -424,6 +444,7 @@ async function waitForTerminalManifest(
           owner: unknown;
           phase: string;
         };
+        lastManifest = manifest;
         if (manifest.phase === 'complete' && manifest.owner === null) {
           return manifest;
         }
@@ -433,7 +454,20 @@ async function waitForTerminalManifest(
     }
     await new Promise<void>(resolve => setTimeout(resolve, 10));
   }
-  throw new Error(`detached SessionEnd job ${sessionId} did not complete`);
+  const actionSummary = Object.entries(lastManifest?.actions ?? {})
+    .map(([name, action]) => (
+      `${name}:${action.status ?? 'missing'}/${action.attempts ?? 0}`
+      + `/${action.runner?.phase ?? 'no-runner'}`
+      + `/${action.lastOutcomeCode ?? 'no-outcome'}`
+    ))
+    .join(',');
+  throw new Error(
+    `detached SessionEnd job ${sessionId} did not complete: `
+    + `phase=${lastManifest?.phase ?? 'missing'} `
+    + `owner=${lastManifest?.owner === null ? 'none' : typeof lastManifest?.owner} `
+    + `release=${lastManifest?.recoverableFailure?.reason ?? 'unrecorded'} `
+    + `actions=${actionSummary || 'missing'}`,
+  );
 }
 
 async function waitForTerminalCallback(
@@ -467,7 +501,18 @@ async function waitForTerminalCallback(
     }
     await new Promise<void>(resolve => setTimeout(resolve, 10));
   }
-  let manifest: { phase?: string; owner?: unknown; recoverableFailure?: { reason?: string }; actions?: Record<string, { status?: string; error?: string }> } | null = null;
+  let manifest: {
+    phase?: string;
+    owner?: unknown;
+    recoverableFailure?: { reason?: string };
+    actions?: Record<string, {
+      attempts?: number;
+      error?: string;
+      lastOutcomeCode?: string;
+      runner?: { phase?: string };
+      status?: string;
+    }>;
+  } | null = null;
   try {
     if (existsSync(manifestPath)) {
       manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
@@ -476,9 +521,17 @@ async function waitForTerminalCallback(
     manifest = null;
   }
   const callback = manifest?.actions?.callback;
+  const actionSummary = Object.entries(manifest?.actions ?? {})
+    .map(([name, action]) => (
+      `${name}:${action.status ?? 'missing'}`
+      + `/${action.attempts ?? 0}`
+      + `/${action.runner?.phase ?? 'no-runner'}`
+      + `/${action.lastOutcomeCode ?? 'no-outcome'}`
+    ))
+    .join(',');
   // recoverableFailure.reason is the only record of why a non-terminal release
   // happened, so a CI-only failure must print it (issue #4076).
-  throw new Error(`detached SessionEnd worker did not complete its callback: phase=${manifest?.phase ?? 'missing'} owner=${manifest?.owner === null ? 'none' : typeof manifest?.owner} callback=${callback?.status ?? 'missing'} error=${callback?.error ?? 'none'} release=${manifest?.recoverableFailure?.reason ?? 'unrecorded'} file=${existsSync(callbackPath)}`);
+  throw new Error(`detached SessionEnd worker did not complete its callback: phase=${manifest?.phase ?? 'missing'} owner=${manifest?.owner === null ? 'none' : typeof manifest?.owner} callback=${callback?.status ?? 'missing'} error=${callback?.error ?? 'none'} release=${manifest?.recoverableFailure?.reason ?? 'unrecorded'} file=${existsSync(callbackPath)} actions=${actionSummary || 'missing'}`);
 }
 
 async function waitForDeath(pid: number): Promise<void> {
@@ -561,6 +614,8 @@ describe('SessionEnd run.cjs runner/admission latency and detached completion', 
     vi.stubEnv('HOME', cwd);
     vi.stubEnv('USERPROFILE', cwd);
     vi.stubEnv('OMC_STATE_DIR', '');
+    // Create a workspace marker so getOmcRoot uses this directory as the root
+    writeFileSync(join(cwd, '.omc-workspace'), '');
     writeFileSync(join(cwd, 'transcript.jsonl'), '');
     mkdirSync(getOmcRoot(cwd), { recursive: true });
     return cwd;
@@ -905,6 +960,76 @@ describe('SessionEnd run.cjs runner/admission latency and detached completion', 
       { ...residentEnv, ...tracking.env },
       timingPluginRoot,
     ));
+    const pid = Number(await readTextEventually(tracking.pidFile));
+    workerPids.add(pid);
+    expect(await readJsonEventually(tracking.completionFile)).toMatchObject({
+      pid,
+      status: 'completed',
+    });
+  }, 75_000);
+
+  it('keeps wiki-session-end on the canonical runtime and exposes the lean wiki bootstrap', () => {
+    const script = readFileSync(join(REPO_ROOT, 'scripts', 'wiki-session-end.mjs'), 'utf-8');
+    expect(script).toContain("import { runSessionEndEntrypoint } from './lib/session-end-runner.mjs'");
+    expect(script).toContain("processorExport: 'processWikiSessionEnd'");
+    expect(script).not.toContain('../dist/');
+
+    const index = readFileSync(
+      join(REPO_ROOT, 'src', 'hooks', 'session-end', 'index.ts'),
+      'utf-8',
+    );
+    expect(index).toContain(
+      "export { publishWikiSessionEndBootstrap as processWikiSessionEnd } from './wiki-foreground-bootstrap.js';",
+    );
+
+    const bootstrap = readFileSync(join(REPO_ROOT, 'src', 'hooks', 'session-end', 'wiki-foreground-bootstrap.ts'), 'utf-8');
+    expect(bootstrap).not.toMatch(/from '\.\/index\.js'|import\('\.\/index\.js'\)/);
+    expect(bootstrap.indexOf('sealWikiManifest('))
+      .toBeLessThan(bootstrap.indexOf("import('./worker.js')"));
+  });
+
+  it('seals wiki capture and writes the session-log page through resident processing', async () => {
+    const cwd = createProject('wiki-capture');
+    const wikiDir = join(getOmcRoot(cwd), 'wiki');
+    const sessionId = 'wiki-resident-capture';
+    const tracking = workerTracking(cwd, 'wiki-capture');
+    mkdirSync(wikiDir, { recursive: true });
+    writeFileSync(
+      join(getOmcRoot(cwd), '.omc-config.json'),
+      JSON.stringify({ wiki: { autoCapture: true } }),
+    );
+    const residentEnv = await ensureResident(cwd, sessionId);
+
+    expectPromptExit(await runUntilClose(
+      timingWikiSessionEnd,
+      cwd,
+      validSessionEndInput(cwd, sessionId),
+      HOST_PROCESS_WATCHDOG_MS,
+      { ...residentEnv, ...tracking.env },
+      timingPluginRoot,
+    ));
+    await waitForTerminalManifest(cwd, sessionId);
+
+    const manifest = JSON.parse(
+      readFileSync(sessionEndJobPath(cwd, sessionId), 'utf-8'),
+    ) as {
+      producers: { wiki: { state: string; sealedBy?: string } };
+      actions: {
+        'wiki-capture': {
+          status: string;
+          payload: { filename?: string };
+        };
+      };
+    };
+    expect(manifest.producers.wiki).toMatchObject({
+      state: 'sealed',
+      sealedBy: 'wiki-producer',
+    });
+    expect(manifest.actions['wiki-capture'].status).toBe('completed');
+    const filename = manifest.actions['wiki-capture'].payload.filename;
+    expect(filename).toMatch(/^session-log-.*\.md$/);
+    expect(existsSync(join(wikiDir, filename!))).toBe(true);
+
     const pid = Number(await readTextEventually(tracking.pidFile));
     workerPids.add(pid);
     expect(await readJsonEventually(tracking.completionFile)).toMatchObject({

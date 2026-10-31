@@ -14,7 +14,7 @@ import { existsSync } from 'node:fs';
 import { appendFile, lstat, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
-import { TeamPaths, absPath } from './state-paths.js';
+import { TeamPaths, absPath, withTeamStatePathScope } from './state-paths.js';
 import { normalizeTeamManifest, resolveMaxWorkers } from './governance.js';
 import { normalizeTeamGovernance } from './governance.js';
 import { isValidPersistedMaxWorkers, migrateTeamConfigRevision, readRevisionedTeamConfig, saveTeamConfigAtRevision } from './monitor.js';
@@ -493,11 +493,12 @@ export async function teamWriteWorkerInbox(
 // Task operations
 // ---------------------------------------------------------------------------
 
-export async function teamCreateTask(
+export function teamCreateTask(
   teamName: string,
   task: Omit<TeamTask, 'id' | 'created_at'>,
   cwd: string,
 ): Promise<TeamTaskV2> {
+  return withTeamStatePathScope(cwd, async () => {
   // Reject malformed dependency fields before entering the config/task
   // transaction. The assigned task id is checked again below for self-links.
   const requestedDependencies = {
@@ -569,6 +570,7 @@ export async function teamCreateTask(
   }
 
   throw new Error(`Failed to acquire task creation lock for team ${teamName} after ${timeoutMs}ms`);
+  });
 }
 
 export async function teamReadTask(teamName: string, taskId: string, cwd: string): Promise<TeamTask | null> {
@@ -594,12 +596,13 @@ export async function teamListTasks(teamName: string, cwd: string): Promise<Team
   });
 }
 
-export async function teamUpdateTask(
+export function teamUpdateTask(
   teamName: string,
   taskId: string,
   updates: Record<string, unknown>,
   cwd: string,
 ): Promise<TeamTask | null> {
+  return withTeamStatePathScope(cwd, async () => {
   const timeoutMs = 5_000;
   const deadline = Date.now() + timeoutMs;
   let delayMs = 20;
@@ -650,54 +653,57 @@ export async function teamUpdateTask(
   }
 
   throw new Error(`Failed to acquire task update lock for task ${taskId} in team ${teamName} after ${timeoutMs}ms`);
+  });
 }
 
-export async function teamClaimTask(
+export function teamClaimTask(
   teamName: string,
   taskId: string,
   workerName: string,
   expectedVersion: number | null,
   cwd: string,
 ): Promise<ClaimTaskResult> {
-  const config = await teamReadConfig(teamName, cwd);
-  const governance = normalizeTeamGovernance(config?.governance, config?.policy);
-  if (governance.plan_approval_required) {
-    const task = await teamReadTask(teamName, taskId, cwd);
-    if (task?.requires_code_change) {
-      const approval = await teamReadTaskApproval(teamName, taskId, cwd);
-      if (!approval || approval.status !== 'approved') {
-        return { ok: false, error: 'blocked_dependency', dependencies: ['approval-required'] };
+  return withTeamStatePathScope(cwd, async (): Promise<ClaimTaskResult> => {
+    const config = await teamReadConfig(teamName, cwd);
+    const governance = normalizeTeamGovernance(config?.governance, config?.policy);
+    if (governance.plan_approval_required) {
+      const task = await teamReadTask(teamName, taskId, cwd);
+      if (task?.requires_code_change) {
+        const approval = await teamReadTaskApproval(teamName, taskId, cwd);
+        if (!approval || approval.status !== 'approved') {
+          return { ok: false, error: 'blocked_dependency', dependencies: ['approval-required'] };
+        }
       }
     }
-  }
 
-  return claimTaskImpl(taskId, workerName, expectedVersion, {
-    teamName,
-    cwd,
-    readTask: teamReadTask,
-    readTeamConfig: async (tn: string, c: string) => {
-      const cfg = await teamReadConfig(tn, c);
-      if (!cfg) return null;
-      if (cfg.workers.length > 0) return cfg;
+    return claimTaskImpl(taskId, workerName, expectedVersion, {
+      teamName,
+      cwd,
+      readTask: teamReadTask,
+      readTeamConfig: async (tn: string, c: string) => {
+        const cfg = await teamReadConfig(tn, c);
+        if (!cfg) return null;
+        if (cfg.workers.length > 0) return cfg;
 
-      const match = /^worker-(\d+)$/.exec(workerName);
-      const workerIndex = match ? Number.parseInt(match[1], 10) : 0;
-      if (workerIndex >= 1 && workerIndex <= (cfg.worker_count ?? 0)) {
-        return {
-          ...cfg,
-          workers: Array.from({ length: cfg.worker_count ?? 0 }, (_, index) => ({
-            name: `worker-${index + 1}`,
-          })),
-        };
-      }
-      return cfg;
-    },
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus: isTerminalTeamTaskStatus,
-    taskFilePath: (tn: string, tid: string, c: string) => canonicalTaskFilePath(tn, tid, c),
-    writeAtomic,
-    launchAttemptId: process.env.OMC_WORKER_LAUNCH_ATTEMPT_ID,
+        const match = /^worker-(\d+)$/.exec(workerName);
+        const workerIndex = match ? Number.parseInt(match[1], 10) : 0;
+        if (workerIndex >= 1 && workerIndex <= (cfg.worker_count ?? 0)) {
+          return {
+            ...cfg,
+            workers: Array.from({ length: cfg.worker_count ?? 0 }, (_, index) => ({
+              name: `worker-${index + 1}`,
+            })),
+          };
+        }
+        return cfg;
+      },
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus: isTerminalTeamTaskStatus,
+      taskFilePath: (tn: string, tid: string, c: string) => canonicalTaskFilePath(tn, tid, c),
+      writeAtomic,
+      launchAttemptId: process.env.OMC_WORKER_LAUNCH_ATTEMPT_ID,
+    });
   });
 }
 
@@ -710,20 +716,21 @@ export async function teamTransitionTaskStatus(
   cwd: string,
   terminalData?: { result?: string; error?: string; metadata?: Record<string, unknown> },
 ): Promise<TransitionTaskResult> {
-  return transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
-    teamName,
-    cwd,
-    readTask: teamReadTask,
-    readTeamConfig: teamReadConfig as (tn: string, c: string) => Promise<{ workers: Array<{ name: string }> } | null>,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus: isTerminalTeamTaskStatus,
-    canTransitionTaskStatus: canTransitionTeamTaskStatus,
-    taskFilePath: (tn: string, tid: string, c: string) => canonicalTaskFilePath(tn, tid, c),
-    writeAtomic,
-    appendTeamEvent: teamAppendEvent,
-    markTaskCompleted: teamMarkTaskCompleted,
-  });
+  return withTeamStatePathScope(cwd, () =>
+    transitionTaskStatusImpl(taskId, from, to, claimToken, terminalData, {
+      teamName,
+      cwd,
+      readTask: teamReadTask,
+      readTeamConfig: teamReadConfig as (tn: string, c: string) => Promise<{ workers: Array<{ name: string }> } | null>,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus: isTerminalTeamTaskStatus,
+      canTransitionTaskStatus: canTransitionTeamTaskStatus,
+      taskFilePath: (tn: string, tid: string, c: string) => canonicalTaskFilePath(tn, tid, c),
+      writeAtomic,
+      appendTeamEvent: teamAppendEvent,
+      markTaskCompleted: teamMarkTaskCompleted,
+    }));
 }
 
 export async function teamReleaseTaskClaim(
@@ -733,17 +740,18 @@ export async function teamReleaseTaskClaim(
   workerName: string,
   cwd: string,
 ): Promise<ReleaseTaskClaimResult> {
-  return releaseTaskClaimImpl(taskId, claimToken, workerName, {
-    teamName,
-    cwd,
-    readTask: teamReadTask,
-    readTeamConfig: teamReadConfig as (tn: string, c: string) => Promise<{ workers: Array<{ name: string }> } | null>,
-    withTaskClaimLock,
-    normalizeTask,
-    isTerminalTaskStatus: isTerminalTeamTaskStatus,
-    taskFilePath: (tn: string, tid: string, c: string) => canonicalTaskFilePath(tn, tid, c),
-    writeAtomic,
-  });
+  return withTeamStatePathScope(cwd, () =>
+    releaseTaskClaimImpl(taskId, claimToken, workerName, {
+      teamName,
+      cwd,
+      readTask: teamReadTask,
+      readTeamConfig: teamReadConfig as (tn: string, c: string) => Promise<{ workers: Array<{ name: string }> } | null>,
+      withTaskClaimLock,
+      normalizeTask,
+      isTerminalTaskStatus: isTerminalTeamTaskStatus,
+      taskFilePath: (tn: string, tid: string, c: string) => canonicalTaskFilePath(tn, tid, c),
+      writeAtomic,
+    }));
 }
 
 function recoveryTransitionDeps(teamName: string, cwd: string, launchAttemptId?: string) {

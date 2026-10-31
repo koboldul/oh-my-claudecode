@@ -4,9 +4,12 @@
  * Executes `tsc --noEmit` to get project-level type checking diagnostics.
  */
 
-import { execFile, type ExecFileException } from 'child_process';
+import { execFile, execFileSync, type ExecFileException } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
+import { findTypeScriptPackageRoot } from '../lsp/servers.js';
+
+const TSC_ARGS = ['--noEmit', '--pretty', 'false'];
 
 export interface TscDiagnostic {
   file: string;
@@ -22,7 +25,11 @@ export interface TscResult {
   diagnostics: TscDiagnostic[];
   errorCount: number;
   warningCount: number;
+  /** Raw compiler or invocation failure when no file-position diagnostic is available. */
+  error?: string;
 }
+
+
 
 /**
  * Hard upper bound for a single `tsc --noEmit` run.
@@ -68,11 +75,32 @@ export async function runTscDiagnostics(directory: string): Promise<TscResult> {
     };
   }
 
-  const outcome = await execTsc(directory);
+  // Prefer the project's own TypeScript, run with node: no PATH lookup, no shell.
+  // Otherwise use a PATH `tsc`; on win32 that is the tsc.cmd shim, which Node can
+  // only start through cmd.exe, so it gets a fixed command line.
+  const typescriptRoot = findTypeScriptPackageRoot(directory);
+  const localTscPath = typescriptRoot ? join(typescriptRoot, 'bin', 'tsc') : null;
+  const localTsc = localTscPath && existsSync(localTscPath) ? localTscPath : null;
+  const viaCmd = !localTsc && process.platform === 'win32';
+  // cmd.exe exits 1 for an unknown command as for a failing one; ask where.exe instead.
+  if (viaCmd && !isOnWindowsPath('tsc')) {
+    return tscNotFound(directory, "where.exe found no 'tsc'");
+  }
+  const [file, args]: [string, string[]] = localTsc
+    ? [process.execPath, [localTsc, ...TSC_ARGS]]
+    : viaCmd
+      ? [process.env.COMSPEC || 'cmd.exe', ['/d', '/s', '/c', ['tsc', ...TSC_ARGS].join(' ')]]
+      : ['tsc', TSC_ARGS];
+
+  const outcome = await execTsc(directory, file, args, viaCmd);
   const output = combineOutput(outcome.stdout, outcome.stderr);
 
   if (isTimedOut(outcome.error)) {
     return timeoutResult(directory);
+  }
+
+  if (outcome.error?.code === 'ENOENT') {
+    return tscNotFound(directory, outcome.error.message);
   }
 
   const parsed = parseTscOutput(output, directory);
@@ -83,18 +111,24 @@ export async function runTscDiagnostics(directory: string): Promise<TscResult> {
   return executionFailureResult(directory, outcome.error, output);
 }
 
-function execTsc(directory: string): Promise<TscExecOutcome> {
+function execTsc(
+  directory: string,
+  file: string,
+  args: string[],
+  viaCmd: boolean,
+): Promise<TscExecOutcome> {
   return new Promise<TscExecOutcome>(settle => {
     execFile(
-      'tsc',
-      ['--noEmit', '--pretty', 'false'],
+      file,
+      args,
       {
         cwd: directory,
         encoding: 'utf-8',
         timeout: TSC_TIMEOUT_MS,
         killSignal: 'SIGKILL',
         maxBuffer: TSC_MAX_BUFFER_BYTES,
-        windowsHide: true
+        windowsHide: true,
+        ...(viaCmd ? { windowsVerbatimArguments: true } : {}),
       },
       (error, stdout, stderr) => {
         settle({
@@ -160,7 +194,32 @@ function executionFailureResult(
       }
     ],
     errorCount: 1,
-    warningCount: 0
+    warningCount: 0,
+    error: detail,
+  };
+}
+
+function isOnWindowsPath(command: string): boolean {
+  try {
+    execFileSync('where.exe', [command], {
+      stdio: 'ignore',
+      timeout: 5000,
+      windowsHide: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function tscNotFound(directory: string, detail: string): TscResult {
+  return {
+    success: false,
+    diagnostics: [],
+    errorCount: 1,
+    warningCount: 0,
+    error: `tsc not found: no typescript package in ${directory} or its parent directories and no tsc on PATH (${detail}). `
+      + 'Install typescript in the project to enable TypeScript directory diagnostics.',
   };
 }
 

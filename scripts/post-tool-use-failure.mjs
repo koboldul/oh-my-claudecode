@@ -2,13 +2,16 @@
 // OMC Post-Tool-Use-Failure Hook (Node.js)
 // Tracks tool failures for retry guidance in Stop hook
 // Writes last-tool-error-state.json (session-scoped) or last-tool-error.json (legacy)
-// with tool name, input preview, error, and retry count
+// with privacy-safe tool metadata and retry count
 
-import { existsSync, readFileSync, mkdirSync, openSync, closeSync, unlinkSync, writeSync, statSync, constants as fsConstants } from 'fs';
-import { join, sep, resolve, dirname } from 'path';
+import { existsSync, readFileSync, mkdirSync } from 'fs';
+import { dirname, join, sep, resolve } from 'path';
 import { readStdin } from './lib/stdin.mjs';
-import { atomicWriteFileSync, ensureDirSync } from './lib/atomic-write.mjs';
-import { resolveOmcStateRoot } from './lib/state-root.mjs';
+import { atomicWriteFileSync, withStateFileLockAtPathSync } from './lib/atomic-write.mjs';
+import {
+  resolveOmcStateRoot,
+  resolveSessionStatePathsForHook,
+} from './lib/state-root.mjs';
 import {
   loadHookRuntime,
   surfaceOptionalHookFailure,
@@ -63,167 +66,33 @@ function validateSessionId(sessionId) {
   return sessionId;
 }
 
-// ============================================================================
-// Inline file lock (mirrors src/lib/file-lock.ts — O_CREAT|O_EXCL pattern)
-// No TS import available in .mjs; implement the same algorithm inline.
-// NOTE: This block is intentionally duplicated in templates/hooks/post-tool-use-failure.mjs.
-// No shared .mjs helper exists for hooks; do not factor out without first creating one.
-// ============================================================================
+// Use the same process-identity-aware state lock as the cleanup hook.
+// run.cjs gives 3s hooks a 2.5s inner budget; share a 1.8s monotonic deadline
+// across acquisition and release, with bounded SQLite and process-probe waits.
+const POST_TOOL_FAILURE_LOCK_ATTEMPTS = 50;
+const POST_TOOL_FAILURE_SQLITE_TIMEOUT_MS = 600;
+const POST_TOOL_FAILURE_TOTAL_TIMEOUT_MS = 1800;
+// A cold Windows process-identity probe can consume most of the existing
+// total budget; let the shared monotonic deadline remain the actual bound.
+const POST_TOOL_FAILURE_PROCESS_PROBE_TIMEOUT_MS = POST_TOOL_FAILURE_TOTAL_TIMEOUT_MS;
 
-const LOCK_STALE_MS = 30_000;
-const LOCK_RETRY_DELAY_MS = 50;
-const LOCK_TIMEOUT_MS = 2_000;
-
-/**
- * Derive lock file path for a given data file.
- * @param {string} filePath
- * @returns {string}
- */
-function lockPathFor(filePath) {
-  return filePath + '.lock';
-}
-
-/**
- * Check whether an existing lock file is stale (old + dead PID).
- * @param {string} lockPath
- * @returns {boolean}
- */
-function isLockStale(lockPath) {
-  try {
-    const stat = statSync(lockPath);
-    const ageMs = Date.now() - stat.mtimeMs;
-    if (ageMs < LOCK_STALE_MS) return false;
-    try {
-      const raw = readFileSync(lockPath, 'utf-8');
-      const payload = JSON.parse(raw);
-      if (payload.pid) {
-        // Check if process is alive: sending signal 0 throws if dead
-        try { process.kill(payload.pid, 0); return false; } catch { /* dead */ }
-      }
-    } catch { /* malformed — stale if old enough */ }
-    return true;
-  } catch {
-    return false; // disappeared
-  }
-}
-
-/**
- * Try to acquire the lock once (single O_CREAT|O_EXCL attempt).
- * @param {string} lockPath
- * @returns {{fd: number, path: string}|null}
- */
-function tryAcquireLockSync(lockPath) {
-  ensureDirSync(dirname(lockPath));
-  try {
-    const fd = openSync(lockPath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
-    try {
-      writeSync(fd, JSON.stringify({ pid: process.pid, timestamp: Date.now() }), null, 'utf-8');
-    } catch (writeErr) {
-      try { closeSync(fd); } catch { /* ignore */ }
-      try { unlinkSync(lockPath); } catch { /* ignore */ }
-      throw writeErr;
-    }
-    return { fd, path: lockPath };
-  } catch (err) {
-    if (err && err.code === 'EEXIST') {
-      if (isLockStale(lockPath)) {
-        try { unlinkSync(lockPath); } catch { /* another process reaped it */ }
-        // One retry after reaping
-        try {
-          const fd = openSync(lockPath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
-          try {
-            writeSync(fd, JSON.stringify({ pid: process.pid, timestamp: Date.now() }), null, 'utf-8');
-          } catch (writeErr) {
-            try { closeSync(fd); } catch { /* ignore */ }
-            try { unlinkSync(lockPath); } catch { /* ignore */ }
-            throw writeErr;
-          }
-          return { fd, path: lockPath };
-        } catch {
-          return null;
-        }
-      }
-      return null;
-    }
-    throw err;
-  }
-}
-
-/**
- * Release a previously acquired lock handle.
- * @param {{fd: number, path: string}} handle
- */
-function releaseLockSync(handle) {
-  try { closeSync(handle.fd); } catch { /* ignore */ }
-  try { unlinkSync(handle.path); } catch { /* ignore */ }
-}
-
-/**
- * Execute fn while holding an exclusive file lock.
- * Falls back to executing fn without a lock if lock cannot be acquired
- * (hook must never fail silently).
- *
- * @param {string} lockPath
- * @param {() => void} fn
- */
-function withFileLockSync(lockPath, fn) {
-  const deadline = Date.now() + LOCK_TIMEOUT_MS;
-  let handle = tryAcquireLockSync(lockPath);
-
-  if (!handle) {
-    // Retry loop using synchronous spin (main thread — Atomics.wait not available)
-    while (!handle && Date.now() < deadline) {
-      const waitUntil = Math.min(Date.now() + LOCK_RETRY_DELAY_MS, deadline);
-      while (Date.now() < waitUntil) { /* spin */ }
-      handle = tryAcquireLockSync(lockPath);
-    }
-  }
-
-  if (!handle) {
-    // Could not acquire lock — proceed without lock rather than dropping the write
-    fn();
-    return;
-  }
-
-  try {
-    fn();
-  } finally {
-    releaseLockSync(handle);
-  }
-}
-
-// ============================================================================
-// State path resolution (mirrors resolveSessionStatePaths logic)
-// ============================================================================
-
-/**
- * Resolve state file paths for a given omc root and optional session id.
- * Session-scoped: <omcRoot>/state/sessions/<sid>/last-tool-error-state.json
- * Legacy:         <omcRoot>/state/last-tool-error.json
- *
- * @param {string} omcRoot
- * @param {string|undefined} sessionId
- * @returns {{ statePath: string, stateDir: string }}
- */
-function resolveErrorStatePaths(omcRoot, sessionId) {
-  if (sessionId) {
-    const sessionDir = join(omcRoot, 'state', 'sessions', sessionId);
-    return {
-      stateDir: sessionDir,
-      statePath: join(sessionDir, 'last-tool-error-state.json'),
-    };
-  }
-  const stateDir = join(omcRoot, 'state');
-  return {
-    stateDir,
-    statePath: join(stateDir, 'last-tool-error.json'),
-  };
+function withFileLockSync(filePath, fn) {
+  const result = withStateFileLockAtPathSync(
+    `${filePath}.lock`,
+    fn,
+    true,
+    POST_TOOL_FAILURE_LOCK_ATTEMPTS,
+    POST_TOOL_FAILURE_SQLITE_TIMEOUT_MS,
+    POST_TOOL_FAILURE_PROCESS_PROBE_TIMEOUT_MS,
+    POST_TOOL_FAILURE_TOTAL_TIMEOUT_MS,
+  );
+  return result.acquired || result.callbackRan;
 }
 
 // Constants
 const RETRY_WINDOW_MS = 60000; // 60 seconds
-const MAX_ERROR_LENGTH = 500;
-const MAX_INPUT_PREVIEW_LENGTH = 200;
+// Do not persist tool input or raw errors: either can contain credentials.
+const GENERIC_ERROR_CLASS = 'Tool execution failed (details omitted for privacy).';
 const OPTIONAL_STARTUP_READ_TOOL_NAMES = new Set([
   'mcp__omx_state__state_read',
   'mcp__omx_state__state_get_status',
@@ -320,27 +189,6 @@ async function initOmcDir(directory) {
   return omcDir;
 }
 
-// Truncate string to max length
-function truncate(str, maxLength) {
-  if (!str) return '';
-  const text = String(str);
-  if (text.length <= maxLength) return text;
-  return text.slice(0, maxLength) + '...';
-}
-
-// Create input preview from tool_input
-function createInputPreview(toolInput) {
-  if (!toolInput) return '';
-
-  try {
-    // If it's an object, stringify it
-    const inputStr = typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput);
-    return truncate(inputStr, MAX_INPUT_PREVIEW_LENGTH);
-  } catch {
-    return truncate(String(toolInput), MAX_INPUT_PREVIEW_LENGTH);
-  }
-}
-
 // Read existing error state
 function readErrorState(statePath) {
   try {
@@ -373,13 +221,12 @@ function calculateRetryCount(existingState, toolName, currentTime) {
 }
 
 // Write error state to a pre-resolved statePath (session-scoped or legacy)
-function writeErrorState(stateDir, toolName, toolInputPreview, error, retryCount, statePath) {
+function writeErrorState(stateDir, toolName, retryCount, statePath) {
   const resolvedPath = statePath || join(stateDir, 'last-tool-error.json');
 
   const errorState = {
     tool_name: toolName,
-    tool_input_preview: toolInputPreview,
-    error: truncate(error, MAX_ERROR_LENGTH),
+    error: GENERIC_ERROR_CLASS,
     timestamp: new Date().toISOString(),
     retry_count: retryCount,
   };
@@ -457,32 +304,38 @@ async function processPostToolUseFailure(data) {
   // Initialize .omc root directory
   const omcRoot = await initOmcDir(directory);
 
-  // Resolve state paths (session-scoped or legacy)
-  const { stateDir, statePath } = resolveErrorStatePaths(omcRoot, sessionId);
+  // Session-scoped writes use the canonical resolver. The legacy filename is
+  // intentionally preserved for installs without a session id.
+  const statePath = sessionId
+    ? (await resolveSessionStatePathsForHook(
+        directory,
+        'last-tool-error',
+        sessionId,
+      )).writePath
+    : join(omcRoot, 'state', 'last-tool-error.json');
+  const stateDir = dirname(statePath);
 
   // Ensure session state dir exists when session-scoped
   if (sessionId) {
     try { mkdirSync(stateDir, { recursive: true }); } catch {}
   }
 
-  const lockPath = lockPathFor(statePath);
-
   // Hoist retryCount so it is accessible for guidance generation after the lock
   let retryCount = 1;
 
   // Read-compute-write under lock to prevent concurrent retryCount corruption
-  withFileLockSync(lockPath, () => {
+  const stateWriteCompleted = withFileLockSync(statePath, () => {
     // Read existing state and calculate retry count
     const existingState = readErrorState(statePath);
     const currentTime = Date.now();
     retryCount = calculateRetryCount(existingState, toolName, currentTime);
 
-    // Create input preview
-    const inputPreview = createInputPreview(toolInput);
-
     // Write error state
-    writeErrorState(stateDir, toolName, inputPreview, error, retryCount, statePath);
+    writeErrorState(stateDir, toolName, retryCount, statePath);
   });
+  if (!stateWriteCompleted) {
+    console.error('[omc-tool-failure] state write skipped because the exclusive lock was unavailable');
+  }
 
   // Inject continuation guidance so the model analyzes the error instead of stopping.
   // Without this, PostToolUseFailure returns silently and the model may end its turn.
@@ -523,12 +376,16 @@ async function main() {
   try {
     const runtime = loadHookRuntime();
     const input = await readStdin();
+    let legacyOutput;
     const result = await runtime.runHookJson(
       'post-tool-use-failure',
       input,
-      (unit, envelope) => processPostToolUseFailure(
-        runtime.buildLegacyProcessorInput(envelope, unit),
-      ),
+      async (unit, envelope) => {
+        legacyOutput = await processPostToolUseFailure(
+          runtime.buildLegacyProcessorInput(envelope, unit),
+        );
+        return legacyOutput;
+      },
     );
 
     const canonicalFailure = describeCanonicalFailure(result);
@@ -540,12 +397,13 @@ async function main() {
       return;
     }
 
-    const encoded = runtime.encodeHookOutput(result.envelope, result.reduction);
-    const output =
-      result.envelope.host === 'claude' && Object.keys(encoded).length === 0
-        ? { continue: true, suppressOutput: true }
-        : encoded;
-    console.log(JSON.stringify(output));
+    console.log(JSON.stringify(
+      runtime.encodeLegacyCompatibleHookOutput(
+        result.envelope,
+        result.reduction,
+        legacyOutput,
+      ),
+    ));
   } catch (error) {
     surfaceOptionalHookFailure(error, { hookName: 'post-tool-use-failure' });
   }

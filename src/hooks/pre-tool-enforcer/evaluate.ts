@@ -23,6 +23,10 @@ import {
   type PreToolBatchSnapshot,
   type PreToolCallPlan,
   type PreToolHookEffect,
+  type PreToolJevModelRoutingObservation,
+  type PreToolJevModelTier,
+  type PreToolJevObservations,
+  type PreToolModelRoutingOverrides,
   type ReadBudgetWarningEffectPayload,
   type ReadBudgetWarningEntry,
   type SupportSkillUpsertEffectPayload,
@@ -45,6 +49,11 @@ const FORCE_DELEGATION_DEFAULT_WINDOW_SECONDS = 120;
 const AWAITING_CONFIRMATION_TTL_MS = 2 * 60 * 1000;
 const STATE_STALE_MS = 2 * 60 * 60 * 1000;
 const TIER_ALIASES = new Set(['sonnet', 'opus', 'haiku', 'fable']);
+const JEV_MODEL_TIERS = new Set<PreToolJevModelTier>([
+  'haiku',
+  'sonnet',
+  'opus',
+]);
 const TIER_TO_DEFAULT_ENV_KEYS: Readonly<Record<string, readonly string[]>> = {
   haiku: [
     'OMC_SUBAGENT_MODEL',
@@ -548,6 +557,83 @@ export function evaluateModelRouting(
   return { warning: '' };
 }
 
+function asJevModelTier(model: string | null): PreToolJevModelTier | null {
+  return model === 'haiku' || model === 'sonnet' || model === 'opus'
+    ? model
+    : null;
+}
+
+function modelRoutingJevObservation(
+  call: CanonicalToolCall,
+  snapshot: PreToolBatchSnapshot,
+  evaluation: ModelRoutingEvaluation,
+): PreToolJevModelRoutingObservation | undefined {
+  if (
+    evaluation.denyReason
+    || !AGENT_HEAVY_TOOLS.has(call.canonicalName)
+    || !isRecord(call.input)
+  ) {
+    return undefined;
+  }
+
+  const originalInput = call.input;
+  const modifiedInput = evaluation.updatedInput ?? originalInput;
+  let selectedModel = nonEmptyString(modifiedInput.model);
+  if (!selectedModel) {
+    const agentType = getAgentType(originalInput);
+    if (agentType) {
+      selectedModel =
+        snapshot.modelRouting.agentDefinitionModels[
+          normalizeAgentType(agentType)
+        ] ?? '';
+    }
+  }
+  const normalized = isTierAlias(selectedModel)
+    ? selectedModel.toLowerCase()
+    : normalizeToCcAlias(selectedModel);
+  const model = asJevModelTier(normalized);
+  if (!model) return undefined;
+
+  return {
+    originalInput,
+    modifiedInput,
+    injected: evaluation.updatedInput !== undefined,
+    model,
+  };
+}
+
+function applyJevModelRoutingOverride(
+  call: CanonicalToolCall,
+  envelope: CanonicalHookEnvelope,
+  evaluation: ModelRoutingEvaluation,
+  observation: PreToolJevModelRoutingObservation | undefined,
+  overrides: PreToolModelRoutingOverrides,
+): ModelRoutingEvaluation {
+  const choice = overrides[call.id];
+  if (
+    envelope.host !== 'claude'
+    || evaluation.denyReason
+    || !observation
+    || !choice
+    || !JEV_MODEL_TIERS.has(choice)
+    || !isRecord(call.input)
+  ) {
+    return evaluation;
+  }
+
+  const updatedInput = evaluation.updatedInput ?? call.input;
+  if (nonEmptyString(updatedInput.model).toLowerCase() === choice) {
+    return evaluation;
+  }
+  return {
+    ...evaluation,
+    updatedInput: {
+      ...updatedInput,
+      model: choice,
+    },
+  };
+}
+
 function normalizeText(value: unknown): string {
   return nonEmptyString(value).replace(/\s+/g, ' ').toLowerCase();
 }
@@ -914,8 +1000,10 @@ function removeBenignSlopSpans(text: string): string {
 function generateSlopWarning(
   call: CanonicalToolCall,
   envelope: CanonicalHookEnvelope,
-): string {
-  if (!SLOP_RISK_TOOL_NAMES.has(call.canonicalName)) return '';
+): { readonly warned: boolean; readonly message: string } {
+  if (!SLOP_RISK_TOOL_NAMES.has(call.canonicalName)) {
+    return { warned: false, message: '' };
+  }
   const promptValues = [
     ...(envelope.eventPayload.promptAliases ?? []),
     envelope.eventPayload.message,
@@ -924,12 +1012,16 @@ function generateSlopWarning(
     ...collectStringValues(call.input),
     ...collectStringValues(promptValues),
   ].join('\n');
-  if (!SLOP_FALLBACK_LANGUAGE_PATTERN.test(inspectedText)) return '';
+  if (!SLOP_FALLBACK_LANGUAGE_PATTERN.test(inspectedText)) {
+    return { warned: false, message: '' };
+  }
   const paths = collectLikelyPathValues(call.input);
   if (paths.some((value) => SLOP_SELF_REFERENCE_PATH_PATTERN.test(value))) {
-    return '';
+    return { warned: false, message: '' };
   }
-  if (paths.some((value) => SLOP_DOC_CONTEXT_PATTERN.test(value))) return '';
+  if (paths.some((value) => SLOP_DOC_CONTEXT_PATTERN.test(value))) {
+    return { warned: false, message: '' };
+  }
 
   const hasAction = stripSlopQuotedAndCodeContexts(inspectedText)
     .split(/[\r\n!?;]+/)
@@ -940,11 +1032,15 @@ function generateSlopWarning(
         pattern.test(removeBenignSlopSpans(segment)),
       ),
     );
-  if (!hasAction) return '';
-  return '[SLOP WARNING] Detected fallback/workaround language in this tool input. '
-    + 'Do not make potential slop: avoid ad-hoc fallback layers, workaround shims, or environment-specific patches unless explicitly justified. '
-    + 'For architecture concerns, consult the architect for a concrete design first. '
-    + 'If this seems environment-specific, ask the user to confirm constraints before proceeding.';
+  if (!hasAction) return { warned: false, message: '' };
+  return {
+    warned: true,
+    message:
+      '[SLOP WARNING] Detected fallback/workaround language in this tool input. '
+      + 'Do not make potential slop: avoid ad-hoc fallback layers, workaround shims, or environment-specific patches unless explicitly justified. '
+      + 'For architecture concerns, consult the architect for a concrete design first. '
+      + 'If this seems environment-specific, ask the user to confirm constraints before proceeding.',
+  };
 }
 
 function generateAgentMessage(
@@ -1085,6 +1181,7 @@ function deniedCallPlan(
   nextLedger: VirtualForceDelegationLedger,
   presentationKind: 'hook-deny' | 'raw-block' = 'hook-deny',
   mutation?: HookMutation,
+  jevObservations?: PreToolJevObservations,
 ): PreToolCallPlan {
   const evaluation: HookEvaluation = {
     callId: call.id,
@@ -1105,6 +1202,7 @@ function deniedCallPlan(
     evaluation,
     legacyPresentation,
     nextForceDelegationLedger: nextLedger,
+    ...(jevObservations ? { jevObservations } : {}),
   };
 }
 
@@ -1119,6 +1217,7 @@ export function evaluatePreToolCall(
   ledger: VirtualForceDelegationLedger,
   readBudgetWarnings: Readonly<Record<string, ReadBudgetWarningEntry>> =
     snapshot.readBudget.warnings,
+  modelRoutingOverrides: PreToolModelRoutingOverrides = {},
 ): PreToolCallPlan {
   if (snapshot.disabled) {
     return {
@@ -1311,10 +1410,26 @@ export function evaluatePreToolCall(
     return deniedCallPlan(call, ultragoalReason, effects, ledger);
   }
 
-  const modelRouting = evaluateModelRouting(call, envelope, snapshot);
-  if (modelRouting.denyReason) {
-    return deniedCallPlan(call, modelRouting.denyReason, effects, ledger);
+  const baseModelRouting = evaluateModelRouting(call, envelope, snapshot);
+  if (baseModelRouting.denyReason) {
+    return deniedCallPlan(call, baseModelRouting.denyReason, effects, ledger);
   }
+  const modelRoutingObservation = modelRoutingJevObservation(
+    call,
+    snapshot,
+    baseModelRouting,
+  );
+  const modelRouting = applyJevModelRoutingOverride(
+    call,
+    envelope,
+    baseModelRouting,
+    modelRoutingObservation,
+    modelRoutingOverrides,
+  );
+  const routingObservations: PreToolJevObservations | undefined =
+    modelRoutingObservation
+      ? { modelRouting: modelRoutingObservation }
+      : undefined;
   const mutation = modelRouting.updatedInput
     ? requiredMutation(
         call,
@@ -1366,6 +1481,7 @@ export function evaluatePreToolCall(
       forceDelegation.nextLedger,
       'hook-deny',
       mutation,
+      routingObservations,
     );
   }
 
@@ -1381,9 +1497,15 @@ export function evaluatePreToolCall(
       forceDelegation.nextLedger,
       'raw-block',
       mutation,
+      routingObservations,
     );
   }
 
+  const slopWarning = generateSlopWarning(call, envelope);
+  const jevObservations: PreToolJevObservations = {
+    ...(routingObservations ?? {}),
+    slopWarning: slopWarning.warned,
+  };
   let advisoryCandidate: AdvisoryCandidate | undefined;
   if (!BUILT_IN_TASK_LIST_TOOL_NAMES.has(call.canonicalName)) {
     const effectiveInput = modelRouting.updatedInput
@@ -1394,7 +1516,7 @@ export function evaluatePreToolCall(
         : generateToolMessage(call.canonicalName, snapshot);
     const message = combineMessages(
       modelRouting.warning,
-      generateSlopWarning(call, envelope),
+      slopWarning.message,
       baseMessage,
     );
     advisoryCandidate = buildAdvisoryCandidate(call, snapshot, message);
@@ -1448,6 +1570,7 @@ export function evaluatePreToolCall(
     legacyPresentation,
     nextForceDelegationLedger: forceDelegation.nextLedger,
     ...(advisoryCandidate ? { advisoryCandidate } : {}),
+    jevObservations,
   };
 }
 
@@ -1466,6 +1589,7 @@ function hasBatchSafetyIssue(envelope: CanonicalHookEnvelope): boolean {
 export function planPreToolBatch(
   envelope: CanonicalHookEnvelope,
   snapshot: PreToolBatchSnapshot,
+  modelRoutingOverrides: PreToolModelRoutingOverrides = {},
 ): PreToolBatchPlan {
   if (hasBatchSafetyIssue(envelope)) {
     return {
@@ -1493,6 +1617,7 @@ export function planPreToolBatch(
       snapshot,
       ledger,
       readBudgetWarnings,
+      modelRoutingOverrides,
     );
     ledger = plan.nextForceDelegationLedger;
     if (

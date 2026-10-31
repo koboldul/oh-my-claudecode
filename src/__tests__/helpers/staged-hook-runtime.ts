@@ -29,6 +29,26 @@ function stagedRuntime(root: string, cleanupRoot: string): StagedHookRuntime {
   };
 }
 
+export function stageHookRuntimeSupport(
+  pluginRoot: string,
+  repoRoot = process.cwd(),
+): void {
+  const scriptsDir = join(pluginRoot, 'scripts');
+  mkdirSync(scriptsDir, { recursive: true });
+  cpSync(join(repoRoot, 'scripts', 'lib'), join(scriptsDir, 'lib'), {
+    recursive: true,
+  });
+  cpSync(
+    join(repoRoot, 'templates', 'hooks', 'lib'),
+    join(pluginRoot, 'templates', 'hooks', 'lib'),
+    { recursive: true },
+  );
+  copyFileSync(
+    join(repoRoot, 'scripts', 'jev-resolve.mjs'),
+    join(scriptsDir, 'jev-resolve.mjs'),
+  );
+}
+
 export function stageHookRuntime(
   scriptNames: readonly string[],
   repoRoot = process.cwd(),
@@ -37,10 +57,7 @@ export function stageHookRuntime(
   const root = join(cleanupRoot, 'plugin');
   const scriptsDir = join(root, 'scripts');
 
-  mkdirSync(scriptsDir, { recursive: true });
-  cpSync(join(repoRoot, 'scripts', 'lib'), join(scriptsDir, 'lib'), {
-    recursive: true,
-  });
+  stageHookRuntimeSupport(root, repoRoot);
 
   for (const filename of scriptNames) {
     if (basename(filename) !== filename) {

@@ -2,9 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'fs/promises';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'path';
-import { tmpdir } from 'os';
-import { activateTeamInstanceUnderLock, createTeamInstanceBinding, reserveTeamInstanceUnderLock, withTeamInstanceLifecycleLock, } from '../team-instance.js';
-import { absPath, teamStateRoot, TeamPaths } from '../state-paths.js';
+import { activateTeamInstanceUnderLock, createTeamInstanceBinding, listTeamScaleUpWorktreeRecoveryEvidence, reserveTeamInstanceUnderLock, withTeamInstanceLifecycleLock, } from '../team-instance.js';
+import { absPath, TeamPaths } from '../state-paths.js';
 const tmuxUtilsMocks = vi.hoisted(() => ({
     tmuxExec: vi.fn(),
     tmuxSpawn: vi.fn(),
@@ -56,9 +55,11 @@ const tmuxSessionMocks = vi.hoisted(() => {
     const tmuxServerIdentity = {
         socket_path: '/tmp/omc-test-tmux.sock',
         server_pid: 4242,
-        process_started_at: process.platform === 'darwin'
-            ? 'darwin:1700000000:123456'
-            : 'linux:01234567-89ab-cdef-0123-456789abcdef:424242',
+        process_started_at: process.platform === 'win32'
+            ? 'win32:1'
+            : process.platform === 'darwin'
+                ? 'darwin:1700000000:123456'
+                : 'linux:01234567-89ab-cdef-0123-456789abcdef:424242',
     };
     const getWorkerLiveness = vi.fn(async (_paneId) => 'dead');
     return {
@@ -139,6 +140,7 @@ const tmuxSessionMocks = vi.hoisted(() => {
     };
 });
 const gitWorktreeMocks = vi.hoisted(() => ({
+    assertWorkerWorktreeRemovalReceiptBinding: vi.fn(),
     ensureWorkerWorktree: vi.fn(),
     installWorktreeRootAgents: vi.fn(),
     removeWorkerWorktree: vi.fn(),
@@ -197,7 +199,18 @@ vi.mock('../tmux-session.js', () => ({
     waitForPaneReady: tmuxSessionMocks.waitForPaneReady,
 }));
 vi.mock('../git-worktree.js', () => ({
+    assertWorkerWorktreeRemovalReceiptBinding: gitWorktreeMocks.assertWorkerWorktreeRemovalReceiptBinding,
     ensureWorkerWorktree: gitWorktreeMocks.ensureWorkerWorktree,
+    isWorktreeMetadataPublicationFailure: (error) => (error instanceof Error
+        && 'code' in error
+        && (error.code === 'worktree_metadata_publication_failed'
+            || error.code === 'worktree_metadata_publication_cleanup_failed')
+        && 'teamName' in error && typeof error.teamName === 'string'
+        && 'workerName' in error && typeof error.workerName === 'string'
+        && 'worktreePath' in error && typeof error.worktreePath === 'string'
+        && 'worktreeBranch' in error && typeof error.worktreeBranch === 'string'
+        && 'worktreeMode' in error && (error.worktreeMode === 'named' || error.worktreeMode === 'detached')
+        && 'cleanupVerified' in error && typeof error.cleanupVerified === 'boolean'),
     installWorktreeRootAgents: gitWorktreeMocks.installWorktreeRootAgents,
     removeWorkerWorktree: gitWorktreeMocks.removeWorkerWorktree,
     restoreWorktreeRootAgents: gitWorktreeMocks.restoreWorktreeRootAgents,
@@ -230,10 +243,12 @@ async function activateFixtureInstance(teamName, cwd, instanceId = TEAM_INSTANCE
         }));
         await activateTeamInstanceUnderLock(binding);
     });
+    return binding.state_root;
 }
 describe('scaleUp duplicate worker guard', () => {
     let cwd;
     let config;
+    let fixtureStateRoot;
     let previousStateDir;
     function makeConfig(overrides = {}) {
         const base = {
@@ -263,7 +278,7 @@ describe('scaleUp duplicate worker guard', () => {
             hud_pane_id: null,
             resize_hook_name: null,
             resize_hook_target: null,
-            team_state_root: teamStateRoot(cwd, 'demo-team'),
+            team_state_root: fixtureStateRoot,
         };
         return { ...base, ...overrides };
     }
@@ -274,7 +289,7 @@ describe('scaleUp duplicate worker guard', () => {
         };
     }
     beforeEach(async () => {
-        cwd = await mkdtemp(join(tmpdir(), 'omc-scaling-duplicate-'));
+        cwd = await mkdtemp(join(process.cwd(), '.omc-scaling-duplicate-'));
         previousStateDir = process.env.OMC_STATE_DIR;
         process.env.OMC_STATE_DIR = join(await realpath(cwd), '.omc-state');
         vi.clearAllMocks();
@@ -381,8 +396,8 @@ describe('scaleUp duplicate worker guard', () => {
             },
         }));
         tmuxSessionMocks.waitForPaneReady.mockResolvedValue(undefined);
+        fixtureStateRoot = await activateFixtureInstance('demo-team', cwd);
         config = makeConfig();
-        await activateFixtureInstance('demo-team', cwd);
     });
     afterEach(async () => {
         if (cwd)
@@ -771,9 +786,15 @@ describe('scaleUp duplicate worker guard', () => {
     });
     it('rolls back spawned effects when shutdown wins the config revision', async () => {
         config = makeConfig({ state_revision: 4, next_worker_index: 2, worktree_mode: 'named' });
-        const worktreePath = join(cwd, '.omc', 'team', 'demo-team', 'worktrees', 'worker-2');
-        gitWorktreeMocks.ensureWorkerWorktree.mockReturnValue({ path: worktreePath, branch: 'worker-2',
-            detached: false, created: true });
+        const worktreePath = join(absPath(cwd, '.omc'), 'team', 'demo-team', 'worktrees', 'worker-2');
+        gitWorktreeMocks.ensureWorkerWorktree.mockReturnValue({
+            path: worktreePath,
+            branch: 'omc-team/demo-team/worker-2',
+            mode: 'named',
+            detached: false,
+            created: true,
+            reused: false,
+        });
         gitWorktreeMocks.installWorktreeRootAgents.mockReturnValue(undefined);
         teamOpsMocks.teamWriteWorkerIdentity.mockImplementation(async (teamName, workerName) => {
             const workerDir = absPath(cwd, TeamPaths.workerDir(teamName, workerName));
@@ -795,7 +816,13 @@ describe('scaleUp duplicate worker guard', () => {
         if (!result.ok)
             expect(result.error).toContain('config commit lost its revision');
         expect(tmuxUtilsMocks.tmuxExec).not.toHaveBeenCalledWith(['kill-pane', '-t', '%12'], { stdio: 'pipe' });
-        expect(gitWorktreeMocks.removeWorkerWorktree).toHaveBeenCalledWith('demo-team', 'worker-2', resolve(cwd));
+        expect(gitWorktreeMocks.removeWorkerWorktree).toHaveBeenCalledWith('demo-team', 'worker-2', resolve(cwd), {
+            path: worktreePath,
+            branch: 'omc-team/demo-team/worker-2',
+            mode: 'named',
+            created: true,
+            reused: false,
+        });
         expect(existsSync(absPath(cwd, TeamPaths.workerDir('demo-team', 'worker-2')))).toBe(false);
         expect(config.workers.map(worker => worker.name)).toEqual(['worker-1']);
         expect(config.lifecycle_state).toBe('shutting_down');
@@ -805,9 +832,15 @@ describe('scaleUp duplicate worker guard', () => {
     });
     it('rolls back every spawned effect when worker identity publication fails', async () => {
         config = makeConfig({ state_revision: 4, next_worker_index: 2, worktree_mode: 'named' });
-        const worktreePath = join(cwd, '.omc', 'team', 'demo-team', 'worktrees', 'worker-2');
-        gitWorktreeMocks.ensureWorkerWorktree.mockReturnValue({ path: worktreePath, branch: 'worker-2',
-            detached: false, created: true });
+        const worktreePath = join(absPath(cwd, '.omc'), 'team', 'demo-team', 'worktrees', 'worker-2');
+        gitWorktreeMocks.ensureWorkerWorktree.mockReturnValue({
+            path: worktreePath,
+            branch: 'omc-team/demo-team/worker-2',
+            mode: 'named',
+            detached: false,
+            created: true,
+            reused: false,
+        });
         gitWorktreeMocks.installWorktreeRootAgents.mockReturnValue(undefined);
         teamOpsMocks.teamWriteWorkerIdentity.mockRejectedValue(new Error('identity write failed'));
         tmuxSessionMocks.getWorkerLiveness.mockResolvedValue('dead');
@@ -818,23 +851,221 @@ describe('scaleUp duplicate worker guard', () => {
         expect(tmuxUtilsMocks.tmuxExec).not.toHaveBeenCalledWith(['kill-pane', '-t', '%12'], { stdio: 'pipe' });
         expect(workerLaunchMocks.retireAndCleanupCurrentWorkerLaunchAttempt).toHaveBeenCalledWith(expect.objectContaining({ attempt_id: 'attempt-%12' }), 'scale_up_rollback', expect.any(Function));
         expect(tmuxSessionMocks.killOwnedWorkerPane).not.toHaveBeenCalled();
-        expect(gitWorktreeMocks.removeWorkerWorktree).toHaveBeenCalledWith('demo-team', 'worker-2', resolve(cwd));
+        expect(gitWorktreeMocks.removeWorkerWorktree).toHaveBeenCalledWith('demo-team', 'worker-2', resolve(cwd), {
+            path: worktreePath,
+            branch: 'omc-team/demo-team/worker-2',
+            mode: 'named',
+            created: true,
+            reused: false,
+        });
         expect(config.workers.map(worker => worker.name)).toEqual(['worker-1']);
+    });
+    it('retains worker state when branch cleanup is unverified during rollback', async () => {
+        config = makeConfig({ state_revision: 4, next_worker_index: 2, worktree_mode: 'named' });
+        const worktreePath = join(absPath(cwd, '.omc'), 'team', 'demo-team', 'worktrees', 'worker-2');
+        gitWorktreeMocks.ensureWorkerWorktree.mockReturnValue({
+            path: worktreePath,
+            branch: 'omc-team/demo-team/worker-2',
+            mode: 'named',
+            detached: false,
+            created: true,
+            reused: false,
+        });
+        gitWorktreeMocks.installWorktreeRootAgents.mockReturnValue(undefined);
+        gitWorktreeMocks.removeWorkerWorktree.mockImplementation(() => {
+            throw new Error('worktree_branch_remove_failed:omc-team/demo-team/worker-2');
+        });
+        teamOpsMocks.teamWriteWorkerIdentity.mockRejectedValue(new Error('identity write failed'));
+        tmuxSessionMocks.getWorkerLiveness.mockResolvedValue('dead');
+        const result = await scaleUp('demo-team', 1, 'claude', [{ subject: 'demo', description: 'demo task' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1', OMC_TEAM_SKIP_READY_WAIT: '1' });
+        expect(result).toMatchObject({ ok: false, error: expect.stringContaining('rollback incomplete') });
+        expect(gitWorktreeMocks.removeWorkerWorktree).toHaveBeenCalledTimes(2);
+        expect(config.workers).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                name: 'worker-2',
+                worktree_path: worktreePath,
+                worktree_branch: 'omc-team/demo-team/worker-2',
+                worktree_created: true,
+            }),
+        ]));
+        expect(config.active_scale_up).toMatchObject({
+            phase: 'failed',
+            failure_reason: expect.stringContaining('identity write failed'),
+        });
+        expect(existsSync(absPath(cwd, TeamPaths.workerDir('demo-team', 'worker-2')))).toBe(true);
+        const rollbackEvidenceCall = teamOpsMocks.writeAtomic.mock.calls.find(([path]) => String(path).includes('scaling-rollback'));
+        expect(rollbackEvidenceCall).toBeDefined();
+        expect(JSON.parse(String(rollbackEvidenceCall[1]))).toMatchObject({
+            cleanup_failures: expect.arrayContaining([
+                `worker-2:worktree:${worktreePath}`,
+                'scale_up_reservation_preserved:worker-2',
+            ]),
+        });
     });
     it('cleans the exact partial worktree and worker directory when worktree creation throws', async () => {
         config = makeConfig({ state_revision: 4, next_worker_index: 2, worktree_mode: 'named' });
-        const worktreePath = join(cwd, '.omc', 'team', 'demo-team', 'worktrees', 'worker-2');
+        const worktreePath = join(absPath(cwd, '.omc'), 'team', 'demo-team', 'worktrees', 'worker-2');
         gitWorktreeMocks.ensureWorkerWorktree.mockImplementation(() => {
             rmSync(worktreePath, { recursive: true, force: true });
             mkdirSync(worktreePath, { recursive: true });
-            throw new Error('metadata publication failed');
+            throw Object.assign(new Error('metadata publication cleanup failed'), {
+                code: 'worktree_metadata_publication_cleanup_failed',
+                teamName: 'demo-team',
+                workerName: 'worker-2',
+                worktreePath,
+                worktreeBranch: 'omc-team/demo-team/worker-2',
+                worktreeMode: 'named',
+                cleanupVerified: false,
+            });
         });
-        gitWorktreeMocks.removeWorkerWorktree.mockImplementation(() => rmSync(worktreePath, { recursive: true, force: true }));
+        gitWorktreeMocks.removeWorkerWorktree.mockImplementation((_teamName, _workerName, _repoRoot, receipt) => {
+            if (receipt)
+                rmSync(receipt.path, { recursive: true, force: true });
+        });
         const result = await scaleUp('demo-team', 1, 'claude', [{ subject: 'demo', description: 'demo task' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1', OMC_TEAM_SKIP_READY_WAIT: '1' });
         expect(result).toMatchObject({ ok: false });
-        expect(gitWorktreeMocks.removeWorkerWorktree).toHaveBeenCalledWith('demo-team', 'worker-2', resolve(cwd));
+        expect(gitWorktreeMocks.removeWorkerWorktree).toHaveBeenCalledWith('demo-team', 'worker-2', resolve(cwd), {
+            path: worktreePath,
+            branch: 'omc-team/demo-team/worker-2',
+            mode: 'named',
+            created: true,
+            reused: false,
+        });
         expect(existsSync(worktreePath)).toBe(false);
         expect(existsSync(absPath(cwd, TeamPaths.workerDir('demo-team', 'worker-2')))).toBe(false);
+    });
+    it('persists exact retry authority when metadata publication and rollback cleanup both fail', async () => {
+        config = makeConfig({ state_revision: 4, next_worker_index: 2, worktree_mode: 'named' });
+        const worktreePath = join(absPath(cwd, '.omc'), 'team', 'demo-team', 'worktrees', 'worker-2');
+        const receipt = {
+            worker_name: 'worker-2',
+            path: worktreePath,
+            branch: 'omc-team/demo-team/worker-2',
+            mode: 'named',
+            created: true,
+            reused: false,
+            effect_scope: 'created_before_worker_persist',
+        };
+        mkdirSync(worktreePath, { recursive: true });
+        gitWorktreeMocks.ensureWorkerWorktree.mockImplementation(() => {
+            throw Object.assign(new Error('metadata publication cleanup failed'), {
+                code: 'worktree_metadata_publication_cleanup_failed',
+                teamName: 'demo-team',
+                workerName: 'worker-2',
+                worktreePath,
+                worktreeBranch: receipt.branch,
+                worktreeMode: receipt.mode,
+                cleanupVerified: false,
+                cleanupError: new Error('worktree_branch_remove_failed'),
+            });
+        });
+        gitWorktreeMocks.removeWorkerWorktree.mockImplementation(() => {
+            throw new Error('worktree_branch_remove_failed:omc-team/demo-team/worker-2');
+        });
+        const result = await scaleUp('demo-team', 1, 'claude', [{ subject: 'demo', description: 'durable partial worktree receipt' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1', OMC_TEAM_SKIP_READY_WAIT: '1' });
+        expect(result).toMatchObject({ ok: false, error: expect.stringContaining('rollback incomplete') });
+        expect(gitWorktreeMocks.removeWorkerWorktree).toHaveBeenCalledTimes(2);
+        const receiptPersistenceCall = monitorMocks.saveTeamConfigAtRevision.mock.calls.findIndex(([nextConfig]) => nextConfig.active_scale_up?.phase === 'effects'
+            && nextConfig.active_scale_up.worktree_cleanup_receipts?.[0]?.worker_name === 'worker-2');
+        expect(receiptPersistenceCall).toBeGreaterThanOrEqual(0);
+        expect(monitorMocks.saveTeamConfigAtRevision.mock.invocationCallOrder[receiptPersistenceCall]).toBeLessThan(gitWorktreeMocks.removeWorkerWorktree.mock.invocationCallOrder[0]);
+        expect(config.workers.map(worker => worker.name)).toEqual(['worker-1']);
+        expect(config.active_scale_up).toMatchObject({
+            phase: 'failed',
+            failure_reason: expect.stringContaining('metadata publication cleanup failed'),
+            cleanup_failures: expect.arrayContaining([
+                `worker-2:pending-worktree:${worktreePath}`,
+            ]),
+            worktree_cleanup_receipts: [receipt],
+        });
+        const rollbackEvidenceCall = teamOpsMocks.writeAtomic.mock.calls.find(([path]) => String(path).includes('scaling-rollback'));
+        expect(rollbackEvidenceCall).toBeDefined();
+        expect(JSON.parse(String(rollbackEvidenceCall[1]))).toMatchObject({
+            cleanup_failures: expect.arrayContaining([
+                `worker-2:pending-worktree:${worktreePath}`,
+            ]),
+            worktree_cleanup_receipts: [receipt],
+        });
+        expect(existsSync(worktreePath)).toBe(true);
+    });
+    it('retains exact external retry authority when config persistence fails before authority loss', async () => {
+        config = makeConfig({ state_revision: 4, next_worker_index: 2, worktree_mode: 'named' });
+        const originalBinding = createTeamInstanceBinding({
+            teamName: 'demo-team',
+            cwd,
+            instanceId: TEAM_INSTANCE_ID,
+        });
+        const replacementInstanceId = '22222222-2222-4222-8222-222222222222';
+        const worktreePath = join(absPath(cwd, '.omc'), 'team', 'demo-team', 'worktrees', 'worker-2');
+        mkdirSync(worktreePath, { recursive: true });
+        gitWorktreeMocks.ensureWorkerWorktree.mockImplementation(() => {
+            throw Object.assign(new Error('metadata publication cleanup failed'), {
+                code: 'worktree_metadata_publication_cleanup_failed',
+                teamName: 'demo-team',
+                workerName: 'worker-2',
+                worktreePath,
+                worktreeBranch: 'omc-team/demo-team/worker-2',
+                worktreeMode: 'named',
+                cleanupVerified: false,
+                cleanupError: new Error('worktree_branch_remove_failed'),
+            });
+        });
+        monitorMocks.saveTeamConfigAtRevision.mockImplementation(async (nextConfig, expectedRevision) => {
+            if ((config.state_revision ?? 0) !== expectedRevision)
+                return false;
+            if (nextConfig.active_scale_up?.worktree_cleanup_receipts?.length) {
+                config = makeConfig({
+                    instance_id: replacementInstanceId,
+                    state_revision: expectedRevision,
+                    next_worker_index: 2,
+                    worktree_mode: 'named',
+                });
+                return false;
+            }
+            config = nextConfig;
+            return true;
+        });
+        const result = await scaleUp('demo-team', 1, 'claude', [{ subject: 'demo', description: 'retain old-instance retry authority' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1', OMC_TEAM_SKIP_READY_WAIT: '1' });
+        expect(result).toMatchObject({
+            ok: false,
+            error: expect.stringContaining('instance_authority_unverified'),
+        });
+        expect(gitWorktreeMocks.removeWorkerWorktree).not.toHaveBeenCalled();
+        expect(config.instance_id).toBe(replacementInstanceId);
+        expect(config.active_scale_up).toBeUndefined();
+        const evidence = await listTeamScaleUpWorktreeRecoveryEvidence(originalBinding);
+        expect(evidence).toHaveLength(1);
+        expect(evidence[0]).toMatchObject({
+            instance_id: TEAM_INSTANCE_ID,
+            receipt: {
+                worker_name: 'worker-2',
+                path: worktreePath,
+                branch: 'omc-team/demo-team/worker-2',
+                mode: 'named',
+                created: true,
+                reused: false,
+                effect_scope: 'created_before_worker_persist',
+            },
+            original_error: 'metadata publication cleanup failed',
+            cleanup_error: 'worktree_branch_remove_failed',
+        });
+        expect(existsSync(worktreePath)).toBe(true);
+    });
+    it('does not remove a same-named worktree when creation fails without an ownership receipt', async () => {
+        config = makeConfig({ state_revision: 4, next_worker_index: 2, worktree_mode: 'named' });
+        const worktreePath = join(absPath(cwd, '.omc'), 'team', 'demo-team', 'worktrees', 'worker-2');
+        const sentinelPath = join(worktreePath, 'unowned.txt');
+        mkdirSync(worktreePath, { recursive: true });
+        await writeFile(sentinelPath, 'unowned');
+        gitWorktreeMocks.ensureWorkerWorktree.mockImplementation(() => {
+            throw new Error('leader_worktree_dirty');
+        });
+        const result = await scaleUp('demo-team', 1, 'claude', [{ subject: 'demo', description: 'demo task' }], cwd, { OMC_TEAM_SCALING_ENABLED: '1', OMC_TEAM_SKIP_READY_WAIT: '1' });
+        expect(result).toMatchObject({ ok: false });
+        expect(gitWorktreeMocks.removeWorkerWorktree).not.toHaveBeenCalled();
+        expect(await readFile(sentinelPath, 'utf-8')).toBe('unowned');
+        expect(existsSync(absPath(cwd, TeamPaths.workerDir('demo-team', 'worker-2')))).toBe(false);
+        expect(config.active_scale_up).toBeUndefined();
     });
     it('records durable orphan evidence when split succeeds without an addressable pane id', async () => {
         config = makeConfig({ state_revision: 4, next_worker_index: 2, worktree_mode: 'disabled' });
@@ -854,10 +1085,16 @@ describe('scaleUp duplicate worker guard', () => {
     });
     it('publishes durable orphan evidence when pane and worktree cleanup cannot be verified', async () => {
         config = makeConfig({ state_revision: 4, next_worker_index: 2, worktree_mode: 'named' });
-        const worktreePath = join(cwd, '.omc', 'team', 'demo-team', 'worktrees', 'worker-2');
+        const worktreePath = join(absPath(cwd, '.omc'), 'team', 'demo-team', 'worktrees', 'worker-2');
         await mkdir(worktreePath, { recursive: true });
-        gitWorktreeMocks.ensureWorkerWorktree.mockReturnValue({ path: worktreePath, branch: 'worker-2',
-            detached: false, created: true });
+        gitWorktreeMocks.ensureWorkerWorktree.mockReturnValue({
+            path: worktreePath,
+            branch: 'omc-team/demo-team/worker-2',
+            mode: 'named',
+            detached: false,
+            created: true,
+            reused: false,
+        });
         gitWorktreeMocks.installWorktreeRootAgents.mockReturnValue(undefined);
         gitWorktreeMocks.removeWorkerWorktree.mockImplementation(() => { throw new Error('worktree busy'); });
         tmuxUtilsMocks.tmuxExec.mockImplementation(() => { throw new Error('pane still alive'); });

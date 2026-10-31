@@ -12,9 +12,10 @@
 import { openSync, closeSync, fstatSync, fsyncSync, linkSync, lstatSync, readdirSync, readSync, unlinkSync, writeSync, readFileSync, constants as fsConstants, } from "fs";
 import { randomUUID } from "crypto";
 import * as path from "path";
+import { normalizeProcessStartIdentity, } from "../../templates/hooks/lib/process-start-identity.mjs";
 import { ensureDirSync } from "./atomic-write.js";
 import { identitiesEqual } from "./file-identity.js";
-import { getProcessStartIdentitySync, isProcessAlive, } from "../platform/index.js";
+import { dmtfCreationDateToTicks, getProcessStartIdentitySync, isProcessAlive, } from "../platform/index.js";
 // ============================================================================
 // Constants
 // ============================================================================
@@ -27,6 +28,7 @@ const RECLAMATION_GUARD_STALE_MS = 30_000;
 const RECLAMATION_RECOVERY_STALE_MS = 30_000;
 const MAX_LOCK_MTIME_FUTURE_SKEW_MS = 5 * 60_000;
 const RELEASE_GUARD_TIMEOUT_MS = 2_000;
+const WINDOWS_MAX_EPOCH_MICROSECONDS = 253402300799999999n;
 function identityForFd(fd) {
     const stat = fstatSync(fd);
     return { dev: stat.dev, ino: stat.ino };
@@ -75,6 +77,43 @@ function isAuthenticatedOwner(owner) {
         && owner.nonce.length > 0
         && Number.isFinite(owner.timestamp);
 }
+function processStartIdentitiesMatch(current, expected) {
+    if (current === expected)
+        return true;
+    const normalize = (identity) => {
+        const legacyDmtf = /^dmtf:(.+)$/.exec(identity)?.[1];
+        const source = legacyDmtf
+            ? dmtfCreationDateToTicks(legacyDmtf)
+            : identity;
+        if (!source)
+            return null;
+        const normalized = normalizeProcessStartIdentity(source);
+        const epochMicroseconds = /^windows-dmtf-us:(\d{1,18})$/.exec(normalized)?.[1];
+        if (epochMicroseconds) {
+            const value = BigInt(epochMicroseconds);
+            return value > 0n && value <= WINDOWS_MAX_EPOCH_MICROSECONDS
+                ? `windows-dmtf-us:${value}`
+                : null;
+        }
+        return /^(?:ticks:|windows-dmtf-us:|dmtf:)/.test(identity)
+            ? null
+            : identity;
+    };
+    const normalizedCurrent = normalize(current);
+    const normalizedExpected = normalize(expected);
+    if (normalizedCurrent === null || normalizedExpected === null)
+        return null;
+    const currentIsWindows = normalizedCurrent.startsWith('windows-dmtf-us:');
+    const expectedIsWindows = normalizedExpected.startsWith('windows-dmtf-us:');
+    if (currentIsWindows !== expectedIsWindows)
+        return null;
+    const currentExactTicks = /^ticks:(\d{1,19})$/.exec(current)?.[1];
+    const expectedExactTicks = /^ticks:(\d{1,19})$/.exec(expected)?.[1];
+    if (currentExactTicks && expectedExactTicks) {
+        return BigInt(currentExactTicks) === BigInt(expectedExactTicks);
+    }
+    return normalizedCurrent === normalizedExpected;
+}
 function staleLockObservation(lockPath, staleLockMs, requireAuthenticatedOwner = false) {
     try {
         const stat = lstatSync(lockPath);
@@ -110,7 +149,8 @@ function staleLockObservation(lockPath, staleLockMs, requireAuthenticatedOwner =
             return observation;
         if (currentStart === null)
             return null;
-        return currentStart === expectedStart ? null : observation;
+        const matches = processStartIdentitiesMatch(currentStart, expectedStart);
+        return matches === null || matches ? null : observation;
     }
     catch {
         return null;

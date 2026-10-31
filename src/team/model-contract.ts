@@ -1,5 +1,5 @@
 import { spawnSync } from 'child_process';
-import { isAbsolute, normalize, sep, win32 as win32Path } from 'path';
+import { isAbsolute, posix as posixPath, win32 as win32Path } from 'path';
 import { validateTeamName } from './team-name.js';
 import { normalizeToCcAlias } from '../features/delegation-enforcer.js';
 import {
@@ -12,7 +12,7 @@ import {
 } from '../config/models.js';
 import { isExternalLLMDisabled } from '../lib/security-config.js';
 import type { WorkerLaunchDescriptor } from './types.js';
-import type { CopilotReasoningEffort, ExternalModelsDefaults } from '../shared/types.js';
+import type { ExternalModelsDefaults } from '../shared/types.js';
 
 export type CliAgentType = 'claude' | 'codex' | 'gemini' | 'cursor' | 'grok' | 'antigravity' | 'copilot';
 
@@ -20,7 +20,7 @@ export interface CliAgentContract {
   agentType: CliAgentType;
   binary: string;
   installInstructions: string;
-  buildLaunchArgs(model?: string, extraFlags?: string[], reasoningEffort?: CopilotReasoningEffort): string[];
+  buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags?: string[]): string[];
   parseOutput(rawOutput: string): string;
   /** Whether this agent supports a prompt/headless mode that bypasses TUI input */
   supportsPromptMode?: boolean;
@@ -32,7 +32,7 @@ export interface WorkerLaunchConfig {
   teamName: string;
   workerName: string;
   model?: string;
-  reasoningEffort?: CopilotReasoningEffort;
+  reasoningEffort?: string;
   cwd: string;
   extraFlags?: string[];
   /**
@@ -61,8 +61,11 @@ const resolvedPathCache = new Map<string, string>();
 function selectResolvedBinaryPath(stdout: string): string | undefined {
   const candidates = stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (process.platform !== 'win32') return candidates[0];
-  return candidates.find(candidate => /\.(exe|com)$/i.test(candidate))
-    ?? candidates.find(candidate => /\.(cmd|bat)$/i.test(candidate));
+  return candidates.find(candidate => /\.(exe|com|cmd|bat)$/i.test(candidate));
+}
+
+function platformPath(): typeof posixPath {
+  return process.platform === 'win32' ? win32Path : posixPath;
 }
 
 const UNTRUSTED_PATH_PATTERNS: RegExp[] = [
@@ -97,16 +100,17 @@ function getTrustedPrefixes(): string[] {
 }
 
 function isTrustedPrefix(resolvedPath: string): boolean {
-  const normalized = normalize(resolvedPath);
+  const path = platformPath();
+  const normalized = path.normalize(resolvedPath);
   return getTrustedPrefixes().some(prefix => {
     // `normalize` strips trailing separators, so a plain `startsWith` would treat
     // a sibling whose name merely begins with the prefix as trusted — e.g.
     // `/usr/bin` would match `/usr/bin-malicious/grok`, and `~/.local/bin` would
     // match `~/.local/bin-evil/x`. Enforce a directory boundary: the resolved
     // path must be the trusted dir itself or a true descendant (prefix + sep).
-    const p = normalize(prefix);
+    const p = path.normalize(prefix);
     if (normalized === p) return true;
-    const withSep = p.endsWith(sep) ? p : p + sep;
+    const withSep = p.endsWith(path.sep) ? p : p + path.sep;
     return normalized.startsWith(withSep);
   });
 }
@@ -144,13 +148,9 @@ export function resolveCliBinaryPath(binary: string): string {
     throw new Error(`CLI binary '${binary}' not found in PATH`);
   }
 
-  const resolvedPath = process.platform === 'win32'
-    ? win32Path.normalize(firstLine)
-    : normalize(firstLine);
-  const isResolvedAbsolute = process.platform === 'win32'
-    ? win32Path.isAbsolute(resolvedPath)
-    : isAbsolute(resolvedPath);
-  if (!isResolvedAbsolute) {
+  const path = platformPath();
+  const resolvedPath = path.normalize(firstLine);
+  if (!path.isAbsolute(resolvedPath)) {
     throw new Error(`Resolved CLI binary '${binary}' to relative path`);
   }
 
@@ -207,7 +207,7 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     agentType: 'claude',
     binary: 'claude',
     installInstructions: 'Install Claude CLI: https://claude.ai/download',
-    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
       const args = ['--dangerously-skip-permissions'];
       if (shouldUseClaudeBareMode() && !extraFlags.includes('--bare')) {
         args.push('--bare');
@@ -219,6 +219,9 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
         // these providers. (issue #1695)
         const resolved = isProviderSpecificModelId(model) ? model : normalizeToCcAlias(model);
         args.push('--model', resolved);
+      }
+      if (reasoningEffort) {
+        args.push('--effort', reasoningEffort);
       }
       return [...args, ...extraFlags];
     },
@@ -234,9 +237,12 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     // or positional prompt mode here; runtime dispatch writes inbox.md and nudges
     // the live Codex TUI with `codex` as the worker process.
     supportsPromptMode: false,
-    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
       const args = ['--dangerously-bypass-approvals-and-sandbox'];
       if (model) args.push('--model', model);
+      if (reasoningEffort) {
+        args.push('-c', `model_reasoning_effort="${reasoningEffort}"`);
+      }
       return [...args, ...extraFlags];
     },
     parseOutput(rawOutput: string): string {
@@ -264,7 +270,7 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     installInstructions: 'Install Gemini CLI: npm install -g @google/gemini-cli',
     supportsPromptMode: true,
     promptModeFlag: '-p',
-    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
       const args = ['--approval-mode', 'yolo'];
       if (model) args.push('--model', model);
       return [...args, ...extraFlags];
@@ -279,7 +285,7 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     installInstructions: 'Install Grok Build: https://build.grok.com',
     supportsPromptMode: true,
     promptModeFlag: '-p',
-    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
       const args = ['--always-approve'];
       if (model) args.push('--model', model);
       return [...args, ...extraFlags];
@@ -294,7 +300,7 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     installInstructions: 'Install the Antigravity CLI (agy) per the official instructions at https://antigravity.google, then verify with `agy --version`.',
     supportsPromptMode: true,
     promptModeFlag: '-p',
-    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
       // agy's `-p`/`--print` is appended by getPromptModeArgs as `-p <instruction>`,
       // where the prompt is the VALUE of `-p` (not a boolean). All other flags
       // MUST precede that `-p`, so buildLaunchArgs returns only the leading flags
@@ -302,6 +308,9 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
       // so no trust-confirm send-keys is needed (unlike gemini). Verified agy 1.0.10.
       const args = ['--dangerously-skip-permissions'];
       if (model) args.push('--model', model);
+      if (reasoningEffort) {
+        args.push('--effort', reasoningEffort);
+      }
       return [...args, ...extraFlags];
     },
     parseOutput(rawOutput: string): string {
@@ -316,8 +325,8 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     promptModeFlag: '-p',
     buildLaunchArgs(
       model?: string,
+      reasoningEffort?: string,
       extraFlags: string[] = [],
-      reasoningEffort?: CopilotReasoningEffort,
     ): string[] {
       return [
         '--model', model?.trim() || resolveCopilotModel(),
@@ -342,7 +351,7 @@ const CONTRACTS: Record<CliAgentType, CliAgentContract> = {
     // Team workers must be persistent interactive panes, so the one-shot
     // `-p/--print` path is deliberately unused here (same stance as codex).
     supportsPromptMode: false,
-    buildLaunchArgs(model?: string, extraFlags: string[] = []): string[] {
+    buildLaunchArgs(model?: string, reasoningEffort?: string, extraFlags: string[] = []): string[] {
       // `--force` suppresses per-command approval prompts and `--trust` accepts
       // the workspace, which together are cursor-agent's equivalent of the
       // approval bypass every other provider already passes. Without them a
@@ -412,7 +421,7 @@ export function isCliAvailable(agentType: CliAgentType): boolean {
 
     const result = spawnSync(resolvedBinary, ['--version'], {
       timeout: 5000,
-      shell: process.platform === 'win32' && agentType !== 'copilot',
+      shell: false,
     });
     return result.status === 0;
   } catch {
@@ -439,11 +448,7 @@ export function resolveValidatedBinaryPath(agentType: CliAgentType): string {
 }
 
 export function buildLaunchArgs(agentType: CliAgentType, config: WorkerLaunchConfig): string[] {
-  return getContract(agentType).buildLaunchArgs(
-    config.model,
-    config.extraFlags,
-    config.reasoningEffort,
-  );
+  return getContract(agentType).buildLaunchArgs(config.model, config.reasoningEffort, config.extraFlags);
 }
 
 export function buildWorkerArgv(agentType: CliAgentType, config: WorkerLaunchConfig): string[] {
@@ -511,6 +516,7 @@ export function buildWorkerCommand(agentType: CliAgentType, config: WorkerLaunch
 }
 
 const WORKER_MODEL_ENV_ALLOWLIST = [
+  'OMC_STATE_DIR',
   'ANTHROPIC_MODEL',
   'CLAUDE_MODEL',
   'ANTHROPIC_BASE_URL',
@@ -538,11 +544,18 @@ const WORKER_MODEL_ENV_ALLOWLIST = [
   'OMC_COPILOT_REASONING_EFFORT',
 ] as const;
 
+const CLAUDE_WORKER_ENV_ALLOWLIST = [
+  'CLAUDE_CONFIG_DIR',
+  'CLAUDE_SECURESTORAGE_CONFIG_DIR',
+  'CLAUDE_CODE_EFFORT_LEVEL',
+] as const;
+
 export function getWorkerEnv(
   teamName: string,
   workerName: string,
   agentType: CliAgentType,
   env: NodeJS.ProcessEnv = process.env,
+  role?: string,
 ): Record<string, string> {
   validateTeamName(teamName);
   const workerEnv: Record<string, string> = {
@@ -550,6 +563,9 @@ export function getWorkerEnv(
     OMC_TEAM_NAME: teamName,
     OMC_WORKER_AGENT_TYPE: agentType,
   };
+  if (role) {
+    workerEnv.OMC_TEAM_ROLE = role;
+  }
 
   if (agentType === 'copilot') {
     Object.assign(workerEnv, {
@@ -567,6 +583,15 @@ export function getWorkerEnv(
     const value = env[key];
     if (typeof value === 'string' && value.length > 0) {
       workerEnv[key] = value;
+    }
+  }
+
+  if (agentType === 'claude') {
+    for (const key of CLAUDE_WORKER_ENV_ALLOWLIST) {
+      const value = env[key];
+      if (typeof value === 'string' && value.length > 0) {
+        workerEnv[key] = value;
+      }
     }
   }
 
@@ -716,17 +741,15 @@ export function resolveExternalModelsDefaults(
 /**
  * Whether a CLI agent's headless/prompt mode is supported on the given platform.
  * Antigravity (`agy`) `-p`/`--print` takes the prompt as an argv value and cannot
- * read it from stdin; on Windows that argv path is unreliable and `agy` has known
- * upstream Windows `-p` limitations. This centralizes the same platform support
- * decision the advisor (`scripts/run-provider-advisor.js`) enforces for `omc ask`.
+ * read it from stdin. The upstream bug (google-antigravity/antigravity-cli#76) was
+ * fixed in agy 1.0.15/1.1.1, enabling headless mode on Windows as of agy 1.3.0+.
+ * The team path spawns agy without a shell to avoid cmd.exe parsing issues.
  */
 export function isHeadlessSupportedOnPlatform(
   agentType: CliAgentType,
-  platform: NodeJS.Platform = process.platform,
+  _platform: NodeJS.Platform = process.platform,
 ): boolean {
-  if (agentType === 'antigravity' && platform === 'win32') {
-    return false;
-  }
+  // All prompt-mode agents support headless on all platforms (agy 1.3.0+)
   return true;
 }
 

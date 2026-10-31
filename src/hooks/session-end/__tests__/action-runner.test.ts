@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,19 +9,31 @@ const processUtils = vi.hoisted(() => ({
   getProcessStartIdentity: vi.fn(),
   getProcessStartIdentitySync: vi.fn(() => 'sync-identity'),
   terminateOwnedProcessTree: vi.fn(async (): Promise<'terminated' | 'unknown'> => 'terminated'),
+  warmCurrentProcessStartIdentitySyncCache: vi.fn(async () => true),
 }));
-const manifest = vi.hoisted(() => ({ markSessionEndActionRunner: vi.fn(() => ({})) }));
+const manifest = vi.hoisted(() => ({
+  markSessionEndActionRunner: vi.fn(() => ({})),
+  readSessionEndJob: vi.fn(),
+}));
+const worker = vi.hoisted(() => ({ executeSessionEndAction: vi.fn(async () => undefined) }));
 
 vi.mock('child_process', () => childProcess);
 vi.mock('../../../platform/process-utils.js', () => processUtils);
 vi.mock('../cleanup-manifest.js', async () => {
   const actual = await vi.importActual<typeof import('../cleanup-manifest.js')>('../cleanup-manifest.js');
-  return { ...actual, markSessionEndActionRunner: manifest.markSessionEndActionRunner };
+  return {
+    ...actual,
+    markSessionEndActionRunner: manifest.markSessionEndActionRunner,
+    readSessionEndJob: manifest.readSessionEndJob,
+  };
 });
+vi.mock('../worker.js', () => worker);
 
 import { runSessionEndAction } from '../action-runner.js';
 
 const directories: string[] = [];
+let originalArgv: string[];
+let originalExitCode: typeof process.exitCode;
 
 function context(directory: string, actionName: 'foreground-cleanup' | 'notification' | 'openclaw' = 'foreground-cleanup') {
   return {
@@ -36,7 +48,50 @@ function context(directory: string, actionName: 'foreground-cleanup' | 'notifica
   } as Parameters<typeof runSessionEndAction>[0];
 }
 
+function entrypointInput(directory: string, deadlineAt: number) {
+  const runPath = join(directory, 'run');
+  mkdirSync(runPath, { recursive: true });
+  return {
+    directory,
+    sessionId: 'session-id',
+    jobId: 'job-id',
+    actionName: 'foreground-cleanup' as const,
+    attempt: 1,
+    ownerNonce: 'owner',
+    runnerNonce: 'runner',
+    runPath,
+    deadlineAt,
+  };
+}
+
+function publishArm(input: ReturnType<typeof entrypointInput>): void {
+  writeFileSync(join(input.runPath, 'arm.json'), JSON.stringify({
+    runnerNonce: input.runnerNonce,
+    ownerNonce: input.ownerNonce,
+  }));
+  manifest.readSessionEndJob.mockReturnValue({
+    jobId: input.jobId,
+    owner: { nonce: input.ownerNonce },
+    actions: {
+      [input.actionName]: {
+        status: 'claimed',
+        attempts: input.attempt,
+        claimantNonce: input.ownerNonce,
+        runner: { runnerNonce: input.runnerNonce, phase: 'armed' },
+      },
+    },
+  });
+}
+
+function loadActionRunnerEntrypoint(input: ReturnType<typeof entrypointInput>) {
+  process.argv = [process.execPath, 'action-runner.js', '--omc-session-end-action-runner', JSON.stringify(input)];
+  vi.resetModules();
+  return import('../action-runner.js');
+}
+
 afterEach(() => {
+  process.argv = originalArgv;
+  process.exitCode = originalExitCode;
   vi.clearAllMocks();
   vi.useRealTimers();
   vi.unstubAllEnvs();
@@ -44,8 +99,14 @@ afterEach(() => {
 });
 
 beforeEach(() => {
+  originalArgv = process.argv;
+  originalExitCode = process.exitCode;
+  process.exitCode = undefined;
   processUtils.getProcessStartIdentitySync.mockReturnValue('sync-identity');
+  processUtils.warmCurrentProcessStartIdentitySyncCache.mockResolvedValue(true);
   manifest.markSessionEndActionRunner.mockReturnValue({});
+  manifest.readSessionEndJob.mockReturnValue(null);
+  worker.executeSessionEndAction.mockResolvedValue(undefined);
 });
 
 describe('SessionEnd action runner', () => {
@@ -109,6 +170,62 @@ describe('SessionEnd action runner', () => {
       pid: 12348, expectedStartIdentity: 'sync-identity', force: true,
     }));
     expect(child.unref).toHaveBeenCalledOnce();
+  });
+
+  it('passes model-provider auth and gh auth context to spawn-next without forwarding ambient AFK settings', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'omc-action-runner-auth-'));
+    directories.push(directory);
+    const child = Object.assign(new EventEmitter(), { pid: 12350, unref: vi.fn() });
+    childProcess.spawn.mockImplementation(() => {
+      queueMicrotask(() => child.emit('exit', 0));
+      return child;
+    });
+
+    vi.stubEnv('ANTHROPIC_API_KEY', 'test-key');
+    vi.stubEnv('ANTHROPIC_BASE_URL', 'https://example.invalid');
+    vi.stubEnv('OMC_HOOK_BRIDGE', '/tmp/bridge.js');
+    vi.stubEnv('OMC_AFK_INCLUDE_USER_SETTINGS', '1');
+
+    // The spawn-next action launches claude chain links from its runner; the
+    // passthrough must reach it or every link exits "Not logged in".
+    const spawnNextContext = context(directory, 'foreground-cleanup');
+    spawnNextContext.actionName = 'spawn-next';
+    await runSessionEndAction(spawnNextContext, async () => undefined);
+    const environment = childProcess.spawn.mock.calls[0][2].env as NodeJS.ProcessEnv;
+    expect(environment).toMatchObject({
+      ANTHROPIC_API_KEY: 'test-key',
+      ANTHROPIC_BASE_URL: 'https://example.invalid',
+      OMC_HOOK_BRIDGE: '/tmp/bridge.js',
+    });
+    // The opt-in is stored in the durable chain ledger, not copied from the
+    // process that happens to recover this action.
+    expect(environment).not.toHaveProperty('OMC_AFK_INCLUDE_USER_SETTINGS');
+    if (process.platform === 'win32') {
+      expect(environment).toHaveProperty('APPDATA', process.env.APPDATA);
+      expect(environment).toHaveProperty('LOCALAPPDATA', process.env.LOCALAPPDATA);
+    }
+  });
+
+  it('does not pass model-provider auth to non spawn-next action children', async () => {
+    vi.stubEnv('ANTHROPIC_API_KEY', 'test-key');
+    vi.stubEnv('OMC_AFK_INCLUDE_USER_SETTINGS', '1');
+    for (const name of ['callback', 'openclaw', 'foreground-cleanup'] as const) {
+      const directory = mkdtempSync(join(tmpdir(), 'omc-action-runner-noauth-'));
+      directories.push(directory);
+      const child = Object.assign(new EventEmitter(), { pid: 12351, unref: vi.fn() });
+      childProcess.spawn.mockReset();
+      childProcess.spawn.mockImplementation(() => {
+        queueMicrotask(() => child.emit('exit', 0));
+        return child;
+      });
+      const ctx = context(directory, 'foreground-cleanup');
+      ctx.actionName = name;
+      ctx.action = { ...ctx.action, payload: {} } as typeof ctx.action;
+      await runSessionEndAction(ctx, async () => undefined);
+      const environment = childProcess.spawn.mock.calls[0][2].env as NodeJS.ProcessEnv;
+      expect(environment).not.toHaveProperty('ANTHROPIC_API_KEY');
+      expect(environment).not.toHaveProperty('OMC_AFK_INCLUDE_USER_SETTINGS');
+    }
   });
 
   it('passes notification credentials only to notification action children', async () => {
@@ -250,5 +367,109 @@ describe('SessionEnd action runner', () => {
       expect(typeof identity).toBe('string');
       expect(identity!.length).toBeGreaterThan(0);
     }
+  });
+
+  it('warms the action child exact-self identity while waiting for arm authority', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'omc-action-runner-self-warm-'));
+    directories.push(directory);
+    const deadlineAt = Date.now() + 5_000;
+    const input = entrypointInput(directory, deadlineAt);
+    let finishWarm!: (warmed: boolean) => void;
+    processUtils.warmCurrentProcessStartIdentitySyncCache.mockImplementation(
+      () => new Promise<boolean>((resolve) => { finishWarm = resolve; }),
+    );
+
+    const moduleLoad = loadActionRunnerEntrypoint(input);
+
+    await vi.waitFor(() => {
+      expect(processUtils.warmCurrentProcessStartIdentitySyncCache).toHaveBeenCalledWith({ deadlineAt });
+    });
+    expect(processUtils.warmCurrentProcessStartIdentitySyncCache.mock.calls[0]).toEqual([{ deadlineAt }]);
+    expect(manifest.readSessionEndJob).not.toHaveBeenCalled();
+    expect(worker.executeSessionEndAction).not.toHaveBeenCalled();
+
+    publishArm(input);
+
+    await vi.waitFor(() => expect(manifest.readSessionEndJob).toHaveBeenCalled());
+    expect(worker.executeSessionEndAction).not.toHaveBeenCalled();
+
+    finishWarm(true);
+    await vi.waitFor(() => {
+      expect(worker.executeSessionEndAction).toHaveBeenCalledWith(
+        input.actionName,
+        { directory: input.directory, sessionId: input.sessionId },
+        deadlineAt,
+        expect.objectContaining({
+          jobId: input.jobId,
+          ownerNonce: input.ownerNonce,
+          runnerNonce: input.runnerNonce,
+        }),
+      );
+      expect(process.exitCode).toBe(0);
+    });
+    await moduleLoad;
+  });
+
+  it('fails closed when action authority changes while exact-self warming is pending', async () => {
+    vi.useFakeTimers();
+    const directory = mkdtempSync(join(tmpdir(), 'omc-action-runner-self-warm-authority-'));
+    directories.push(directory);
+    const deadlineAt = Date.now() + 1_000;
+    const input = entrypointInput(directory, deadlineAt);
+    let finishWarm!: (warmed: boolean) => void;
+    processUtils.warmCurrentProcessStartIdentitySyncCache.mockImplementation(
+      () => new Promise<boolean>((resolve) => { finishWarm = resolve; }),
+    );
+    publishArm(input);
+
+    const moduleLoad = loadActionRunnerEntrypoint(input);
+
+    await vi.waitFor(() => {
+      expect(processUtils.warmCurrentProcessStartIdentitySyncCache).toHaveBeenCalledWith({ deadlineAt });
+      expect(manifest.readSessionEndJob).toHaveBeenCalled();
+    });
+    expect(worker.executeSessionEndAction).not.toHaveBeenCalled();
+
+    manifest.readSessionEndJob.mockReturnValue({
+      jobId: input.jobId,
+      owner: { nonce: 'replacement-owner' },
+      actions: {
+        [input.actionName]: {
+          status: 'claimed',
+          attempts: input.attempt,
+          claimantNonce: 'replacement-owner',
+          runner: { runnerNonce: 'replacement-runner', phase: 'armed' },
+        },
+      },
+    });
+    finishWarm(true);
+
+    await vi.advanceTimersByTimeAsync(1_001);
+    await vi.waitFor(() => expect(process.exitCode).toBe(1));
+    expect(manifest.readSessionEndJob.mock.calls.length).toBeGreaterThan(1);
+    expect(worker.executeSessionEndAction).not.toHaveBeenCalled();
+    await moduleLoad;
+  });
+
+  it.each([
+    ['returns false', false],
+    ['rejects', new Error('identity probe failed')],
+  ])('fails closed when exact-self identity warming %s', async (_case, outcome) => {
+    const directory = mkdtempSync(join(tmpdir(), 'omc-action-runner-self-warm-failure-'));
+    directories.push(directory);
+    const deadlineAt = Date.now() + 5_000;
+    const input = entrypointInput(directory, deadlineAt);
+    publishArm(input);
+    if (outcome instanceof Error) {
+      processUtils.warmCurrentProcessStartIdentitySyncCache.mockRejectedValue(outcome);
+    } else {
+      processUtils.warmCurrentProcessStartIdentitySyncCache.mockResolvedValue(outcome);
+    }
+
+    await loadActionRunnerEntrypoint(input);
+
+    await vi.waitFor(() => expect(process.exitCode).toBe(1));
+    expect(processUtils.warmCurrentProcessStartIdentitySyncCache).toHaveBeenCalledWith({ deadlineAt });
+    expect(worker.executeSessionEndAction).not.toHaveBeenCalled();
   });
 });

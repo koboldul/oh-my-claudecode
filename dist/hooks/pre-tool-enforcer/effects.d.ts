@@ -1,11 +1,11 @@
 import type { CanonicalHookEnvelope, HookEffect, HookReduction } from '../hook-protocol.js';
-import { type AdvisoryClaimDisposition, type AdvisoryClaimEffectPayload, type ForceDelegationAttemptEffectPayload, type ForceDelegationReservationResult, type ForceDelegationWriteResult, type PreToolEffectCommitReport, type PreToolEffectDependencies, type PreToolEffectRuntimeContext, type PreToolFinalDisposition, type PreToolBatchSnapshot, type ReadBudgetWarningEffectPayload, type ReadBudgetWarningMutationResult } from './types.js';
+import { type AdvisoryClaimDisposition, type AdvisoryClaimEffectPayload, type ForceDelegationAttemptEffectPayload, type ForceDelegationReservationResult, type ForceDelegationWriteResult, type PreToolEffectCommitReport, type PreToolEffectDependencies, type PreToolEffectRuntimeContext, type PreToolFinalDisposition, type PreToolBatchSnapshot, type PreToolModelRoutingOverrides, type ReadBudgetWarningEffectPayload, type ReadBudgetWarningMutationResult } from './types.js';
 /**
  * Re-plan and reserve force-delegation attempts against the latest durable
  * ledger under one owner lock. Callers must use the returned plan for final
  * reduction; a failed reservation is an indeterminate safety failure.
  */
-export declare function reserveAndPlanPreToolBatch(envelope: CanonicalHookEnvelope, snapshot: PreToolBatchSnapshot): ForceDelegationReservationResult;
+export declare function reserveAndPlanPreToolBatch(envelope: CanonicalHookEnvelope, snapshot: PreToolBatchSnapshot, modelRoutingOverrides?: PreToolModelRoutingOverrides): ForceDelegationReservationResult;
 /**
  * Atomic, bounded owner write for the force-delegation attempt window.
  */

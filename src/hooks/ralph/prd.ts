@@ -15,6 +15,7 @@
 import { createHash } from 'crypto';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
+import { stripLeadingUtf8Bom } from '../../../scripts/lib/utf8-bom.mjs';
 import { getOmcRoot, getSessionStateDir } from '../../lib/worktree-paths.js';
 import { withStateFileMutationLock } from '../../lib/mode-state-io.js';
 import { atomicWriteJsonSync } from '../../lib/atomic-write.js';
@@ -92,7 +93,25 @@ export interface PRD {
    * PRDs without this field read back as undefined and are fully supported.
    */
   reconciliation?: PrdReconciliationConfig;
+  /**
+   * Optional repo quality class — the bar the ralph skill writes acceptance
+   * criteria against (prototype / production / library). Preserved by
+   * normalizePrd so a code-mediated write (markStoryComplete and friends go
+   * read → normalize → write) cannot silently erase the executor's
+   * declaration. Invalid values are dropped, not fatal.
+   */
+  repoQualityClass?: RepoQualityClass;
+  /**
+   * Optional feedback command list (build / lint / test style) the run's
+   * feedback baseline and gates execute. Same preservation guarantee as
+   * repoQualityClass; invalid entries are dropped and the list is capped.
+   */
+  feedbackCommands?: string[];
 }
+
+export const REPO_QUALITY_CLASSES = ['prototype', 'production', 'library'] as const;
+export type RepoQualityClass = (typeof REPO_QUALITY_CLASSES)[number];
+export const MAX_FEEDBACK_COMMANDS = 20;
 
 export interface PRDStatus {
   /** Total number of stories */
@@ -355,14 +374,39 @@ function normalizePrd(candidate: unknown): PRD | null {
   }
 
   const reconciliation = normalizeReconciliation(prd.reconciliation);
+  const repoQualityClass = normalizeRepoQualityClass(prd.repoQualityClass);
+  const feedbackCommands = normalizeFeedbackCommands(prd.feedbackCommands);
 
   return {
     project: prd.project,
     branchName: prd.branchName,
     description: prd.description,
     userStories: userStories as UserStory[],
-    ...(reconciliation ? { reconciliation } : {})
+    ...(reconciliation ? { reconciliation } : {}),
+    ...(repoQualityClass ? { repoQualityClass } : {}),
+    ...(feedbackCommands ? { feedbackCommands } : {})
   };
+}
+
+/**
+ * Fail-soft validators for the executor-declared run fields: an invalid value
+ * is dropped (the run falls back to defaults) rather than invalidating an
+ * otherwise valid PRD.
+ */
+function normalizeRepoQualityClass(candidate: unknown): RepoQualityClass | undefined {
+  return typeof candidate === 'string' && (REPO_QUALITY_CLASSES as readonly string[]).includes(candidate)
+    ? candidate as RepoQualityClass
+    : undefined;
+}
+
+function normalizeFeedbackCommands(candidate: unknown): string[] | undefined {
+  if (!Array.isArray(candidate)) {
+    return undefined;
+  }
+  const commands = candidate
+    .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+    .slice(0, MAX_FEEDBACK_COMMANDS);
+  return commands.length > 0 ? commands : undefined;
 }
 
 /**
@@ -442,7 +486,9 @@ function normalizeObservableCheck(candidate: unknown): ObservableCheck | null {
 
 export function readPrdFromPath(prdPath: string): { prd?: PRD; error?: string } {
   try {
-    const content = readFileSync(prdPath, 'utf-8');
+    // A prd.json edited in an editor that saves "UTF-8 with BOM" keeps U+FEFF as the
+    // first character, which JSON.parse rejects.
+    const content = stripLeadingUtf8Bom(readFileSync(prdPath, 'utf-8'));
     const parsed = JSON.parse(content) as unknown;
     const normalized = normalizePrd(parsed);
 

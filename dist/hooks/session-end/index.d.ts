@@ -123,7 +123,6 @@ export declare function admitSessionEnd(input: SessionEndInput, event?: SessionE
 export declare function processSessionEnd(input: SessionEndInput): Promise<HookOutput>;
 /** Wiki producer has no foreground lock or write; it only seals a durable capture/no-op intent. */
 export declare function admitWikiSessionEnd(input: SessionEndInput, event?: SessionEndProducerAdmission): Promise<SessionEndAdmissionResult>;
-export declare function processWikiSessionEnd(input: SessionEndInput): Promise<HookOutput>;
+export { publishWikiSessionEndBootstrap as processWikiSessionEnd } from './wiki-foreground-bootstrap.js';
 export declare function handleSessionEnd(input: SessionEndInput): Promise<HookOutput>;
-export {};
 //# sourceMappingURL=index.d.ts.map

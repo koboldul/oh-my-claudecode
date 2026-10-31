@@ -1,6 +1,15 @@
 export const TEAM_NAME_SAFE_PATTERN = /^[a-z0-9][a-z0-9-]{0,29}$/;
-export const WORKER_NAME_SAFE_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+export const WORKER_NAME_SAFE_PATTERN = /^[a-z0-9][a-z0-9-]{1,49}$/;
 export const TASK_ID_SAFE_PATTERN = /^\d{1,20}$/;
+export const SCALE_UP_OPERATION_ID_SAFE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+export function isCanonicalWorkerName(value: unknown): value is string {
+  return typeof value === 'string' && WORKER_NAME_SAFE_PATTERN.test(value);
+}
+
+export function isSafeScaleUpOperationId(value: unknown): value is string {
+  return typeof value === 'string' && SCALE_UP_OPERATION_ID_SAFE_PATTERN.test(value);
+}
 
 export const TEAM_TASK_STATUSES = ['pending', 'blocked', 'in_progress', 'completed', 'failed'] as const;
 export type TeamTaskStatus = (typeof TEAM_TASK_STATUSES)[number];

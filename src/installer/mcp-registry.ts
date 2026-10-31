@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { dirname, join } from 'path';
+import { isDeepStrictEqual } from 'util';
 
 import { getClaudeConfigDir } from '../utils/config-dir.js';
 import {
@@ -298,6 +299,45 @@ function entriesEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function codexEntriesEqual(
+  codexEntry: UnifiedMcpRegistryEntry,
+  registryEntry: UnifiedMcpRegistryEntry,
+  typeFieldPresent: boolean,
+): boolean {
+  if (typeFieldPresent && codexEntry.type === undefined) {
+    return false;
+  }
+
+  const comparableCodexEntry = { ...codexEntry };
+  const comparableRegistryEntry = { ...registryEntry };
+  if (typeFieldPresent) {
+    comparableCodexEntry.type = normalizeCodexMcpType(codexEntry.type);
+    comparableRegistryEntry.type = normalizeCodexMcpType(
+      registryEntry.type ?? inferCodexMcpTransportType(registryEntry),
+    );
+  } else {
+    const inferredType = inferCodexMcpTransportType(codexEntry);
+    if (
+      registryEntry.type !== undefined
+      && normalizeCodexMcpType(registryEntry.type) !== inferredType
+    ) {
+      return false;
+    }
+    delete comparableRegistryEntry.type;
+  }
+  return isDeepStrictEqual(comparableCodexEntry, comparableRegistryEntry);
+}
+
+function normalizeCodexMcpType(type: string | undefined): string | undefined {
+  return type === 'streamable-http' ? 'http' : type;
+}
+
+function inferCodexMcpTransportType(entry: UnifiedMcpRegistryEntry): string | undefined {
+  if (entry.command && !entry.url) return 'stdio';
+  if (entry.url && !entry.command) return 'http';
+  return undefined;
+}
+
 export function applyRegistryToClaudeSettings(
   settings: Record<string, unknown>,
 ): { settings: Record<string, unknown>; changed: boolean } {
@@ -342,37 +382,152 @@ function syncClaudeMcpConfig(
 }
 
 function escapeTomlString(value: string): string {
-  return value
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"');
+  // TOML basic strings (double-quoted) forbid all control chars U+0000-U+001F except tab (U+0009),
+  // and also forbid U+007F (DEL).
+  // Escape order: backslash first to avoid re-escaping.
+  let result = value.replace(/\\/g, '\\\\');
+  
+  // Escape other special characters and control codes
+  // An unpaired surrogate is not a Unicode scalar value, so TOML cannot carry it
+  // either way: it has no UTF-8 encoding, and a \uXXXX escape naming a surrogate
+  // is rejected outright by a conforming parser (Python's tomllib refuses the
+  // whole document with "Escaped character is not a Unicode scalar value"), which
+  // would make one bad value unreadable for the entire Codex config rather than
+  // just for itself.
+  //
+  // Substitute U+FFFD, which is what the UTF-8 write produced anyway -- now
+  // explicitly and with a document that still parses. A matched pair is a real
+  // astral character and is left alone.
+  result = result.replace(
+    /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g,
+    '\uFFFD',
+  );
+
+  result = result.replace(/["\n\r\t\b\f\0-\x07\x0b\x0e-\x1f\x7f]/g, (char) => {
+    switch (char) {
+      case '"':
+        return '\\"';
+      case '\n':
+        return '\\n';
+      case '\r':
+        return '\\r';
+      case '\t':
+        return '\\t';
+      case '\b':
+        return '\\b';
+      case '\f':
+        return '\\f';
+      default: {
+        // All other control chars: escape as \uXXXX
+        const code = char.charCodeAt(0);
+        return `\\u${code.toString(16).padStart(4, '0')}`;
+      }
+    }
+  });
+  
+  return result;
 }
 
 function unescapeTomlString(value: string): string {
-  return value
-    .replace(/\\"/g, '"')
-    .replace(/\\\\/g, '\\');
+  // Handle escape sequences in a single pass to avoid round-trip bugs:
+  // - \uXXXX and \UXXXXXXXX (Unicode escapes)
+  // - \" (quote), \\ (backslash), \n (newline), \r (carriage return), \t (tab), \b (backspace), \f (form feed)
+  // Single pass prevents issues like C:\\users\\u0041dir being incorrectly decoded.
+  return value.replace(/\\(U[0-9a-fA-F]{8}|u[0-9a-fA-F]{4}|["\\nrtbf])/g, (_, escaped: string) => {
+    if (escaped[0] === 'U') {
+      const codePoint = parseInt(escaped.slice(1), 16);
+      return codePoint <= 0x10ffff && !(codePoint >= 0xd800 && codePoint <= 0xdfff)
+        ? String.fromCodePoint(codePoint)
+        : `\\${escaped}`;
+    }
+    if (escaped[0] === 'u') {
+      // \uXXXX: decode unicode escape
+      return String.fromCharCode(parseInt(escaped.slice(1), 16));
+    }
+    // Single-character escapes
+    switch (escaped) {
+      case 'n':
+        return '\n';
+      case 'r':
+        return '\r';
+      case 't':
+        return '\t';
+      case 'b':
+        return '\b';
+      case 'f':
+        return '\f';
+      case '"':
+        return '"';
+      case '\\':
+        return '\\';
+      default:
+        return escaped;
+    }
+  });
 }
 
 function renderTomlString(value: string): string {
   return `"${escapeTomlString(value)}"`;
 }
 
-function isValidTomlLiteralContent(content: string): boolean {
+function isValidTomlLiteralContent(content: string, allowNewlines = false): boolean {
   // TOML literal strings permit only tab (U+0009) among control characters.
-  // Reject U+0000–U+0008, U+000A–U+001F, and U+007F (DEL).
+  // Multiline strings additionally permit line feed (U+000A).
   for (let i = 0; i < content.length; i++) {
     const code = content.charCodeAt(i);
-    if ((code <= 0x08) || (code >= 0x0A && code <= 0x1F) || code === 0x7F) {
+    if (
+      code <= 0x08
+      || (code >= 0x0A && code <= 0x1F && !(allowNewlines && code === 0x0A))
+      || code === 0x7F
+    ) {
       return false;
     }
   }
   return true;
 }
 
+function foldTomlMultilineBasicString(value: string): string {
+  let result = '';
+  for (let index = 0; index < value.length;) {
+    if (value[index] !== '\\') {
+      result += value[index++];
+      continue;
+    }
+
+    let backslashEnd = index;
+    while (value[backslashEnd] === '\\') backslashEnd++;
+    let whitespaceEnd = backslashEnd;
+    while (value[whitespaceEnd] === ' ' || value[whitespaceEnd] === '\t') whitespaceEnd++;
+
+    const backslashCount = backslashEnd - index;
+    if (backslashCount % 2 === 1 && value[whitespaceEnd] === '\n') {
+      result += '\\'.repeat(backslashCount - 1);
+      index = whitespaceEnd + 1;
+      while (value[index] === ' ' || value[index] === '\t' || value[index] === '\n') index++;
+      continue;
+    }
+
+    result += '\\'.repeat(backslashCount) + value.slice(backslashEnd, whitespaceEnd);
+    index = whitespaceEnd;
+  }
+  return result;
+}
+
 function parseTomlQuotedString(value: string): string | undefined {
   const trimmed = value.trim();
 
-  const basicMatch = trimmed.match(/^"((?:\\.|[^"\\])*)"$/);
+  const multilineBasicMatch = trimmed.match(/^"""([\s\S]*?)"""\s*(?:#.*)?$/);
+  if (multilineBasicMatch) {
+    return unescapeTomlString(foldTomlMultilineBasicString(multilineBasicMatch[1].replace(/^\r?\n/, '')));
+  }
+
+  const multilineLiteralMatch = trimmed.match(/^'''([\s\S]*?)'''\s*(?:#.*)?$/);
+  if (multilineLiteralMatch) {
+    const content = multilineLiteralMatch[1].replace(/^\r?\n/, '');
+    return isValidTomlLiteralContent(content, true) ? content : undefined;
+  }
+
+  const basicMatch = trimmed.match(/^"((?:\\.|[^"\\])*)"\s*(?:#.*)?$/);
   if (basicMatch) {
     return unescapeTomlString(basicMatch[1]);
   }
@@ -380,7 +535,7 @@ function parseTomlQuotedString(value: string): string | undefined {
   // TOML literal string ('...'): single-line, no escape processing.
   // Reject raw CR/LF and multi-line; preserve every interior character verbatim.
   if (trimmed.startsWith("'") && !trimmed.includes('\n') && !trimmed.includes('\r')) {
-    const literalMatch = trimmed.match(/^'([^']*)'$/);
+    const literalMatch = trimmed.match(/^'([^']*)'\s*(?:#.*)?$/);
     if (literalMatch && isValidTomlLiteralContent(literalMatch[1])) {
       return literalMatch[1];
     }
@@ -565,6 +720,115 @@ function parseTomlKey(value: string): string | undefined {
   return parsed && parsed.trim().length > 0 ? parsed : undefined;
 }
 
+function parseTomlDottedKey(value: string): string[] | undefined {
+  const keys: string[] = [];
+  let index = 0;
+
+  const skipWhitespace = () => {
+    while (value[index] === ' ' || value[index] === '\t') {
+      index++;
+    }
+  };
+
+  skipWhitespace();
+  while (index < value.length) {
+    const start = index;
+    const quote = value[index];
+
+    if (quote === '"') {
+      index++;
+      let closed = false;
+      while (index < value.length) {
+        if (value[index] === '\\') {
+          index += 2;
+        } else if (value[index++] === '"') {
+          closed = true;
+          break;
+        }
+      }
+      if (!closed) {
+        return undefined;
+      }
+    } else if (quote === "'") {
+      index++;
+      while (index < value.length && value[index] !== "'") {
+        index++;
+      }
+      if (index >= value.length) {
+        return undefined;
+      }
+      index++;
+    } else {
+      while (index < value.length && value[index] !== '.' && value[index] !== ' ' && value[index] !== '\t') {
+        index++;
+      }
+    }
+
+    const key = parseTomlKey(value.slice(start, index));
+    if (!key) {
+      return undefined;
+    }
+    keys.push(key);
+
+    skipWhitespace();
+    if (index === value.length) {
+      return keys;
+    }
+    if (value[index] !== '.') {
+      return undefined;
+    }
+    index++;
+    skipWhitespace();
+    if (index === value.length) {
+      return undefined;
+    }
+  }
+
+  return undefined;
+}
+
+function parseTomlTableHeader(line: string): string[] | undefined {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('[') || trimmed.startsWith('[[')) {
+    return undefined;
+  }
+
+  let quote: '"' | "'" | undefined;
+  let escaped = false;
+  let closingBracket = -1;
+  for (let index = 1; index < trimmed.length; index++) {
+    const character = trimmed[index];
+    if (quote === '"') {
+      if (escaped) {
+        escaped = false;
+      } else if (character === '\\') {
+        escaped = true;
+      } else if (character === '"') {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (quote === "'") {
+      if (character === "'") {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === ']') {
+      closingBracket = index;
+      break;
+    }
+  }
+
+  if (closingBracket < 0 || (trimmed.slice(closingBracket + 1).trim() && !trimmed.slice(closingBracket + 1).trimStart().startsWith('#'))) {
+    return undefined;
+  }
+
+  return parseTomlDottedKey(trimmed.slice(1, closingBracket));
+}
+
 function renderTomlStringMapInline(values: Record<string, string>): string {
   const entries = Object.entries(values)
     .sort(([left], [right]) => left.localeCompare(right))
@@ -647,10 +911,10 @@ function parseCodexMcpServerNames(content: string): Set<string> {
       continue;
     }
 
-    const sectionMatch = line.match(/^\[mcp_servers\.([^\]]+)\]$/);
-    if (sectionMatch) {
-      const name = sectionMatch[1].trim();
-      if (name && CODEX_MCP_SERVER_NAME_PATTERN.test(name)) {
+    const tableKeys = parseTomlTableHeader(line);
+    if (tableKeys?.[0] === 'mcp_servers' && tableKeys.length >= 2) {
+      const name = tableKeys[1];
+      if (CODEX_MCP_SERVER_NAME_PATTERN.test(name)) {
         names.add(name);
       }
     }
@@ -688,8 +952,36 @@ export function syncCodexConfigToml(existingContent: string, registry: UnifiedMc
   };
 }
 
-function parseCodexMcpRegistryEntries(content: string): UnifiedMcpRegistry {
+interface ParsedCodexMcpRegistry {
+  entries: UnifiedMcpRegistry;
+  typeFieldsPresent: Set<string>;
+}
+
+type TomlMultilineDelimiter = '"""' | "'''";
+
+function hasClosingTomlMultilineString(value: string, delimiter: TomlMultilineDelimiter): boolean {
+  let escaped = false;
+  for (let index = delimiter.length; index <= value.length - delimiter.length; index++) {
+    if (delimiter === '"""') {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (value[index] === '\\') {
+        escaped = true;
+        continue;
+      }
+    }
+    if (value.startsWith(delimiter, index)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function parseCodexMcpRegistryEntries(content: string): ParsedCodexMcpRegistry {
   const entries: UnifiedMcpRegistry = {};
+  const typeFieldsPresent = new Set<string>();
   const lines = content.split(/\r?\n/);
   let currentName: string | null = null;
   let currentEntry: UnifiedMcpRegistryEntry = {};
@@ -706,30 +998,36 @@ function parseCodexMcpRegistryEntries(content: string): UnifiedMcpRegistry {
     currentSection = null;
   };
 
-  for (const rawLine of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const rawLine = lines[lineIndex];
     const line = rawLine.trim();
     if (!line || line.startsWith('#')) {
       continue;
     }
 
-    const headersSectionMatch = line.match(/^\[mcp_servers\.([^\]]+)\.headers\]$/);
-    if (headersSectionMatch) {
-      const name = headersSectionMatch[1].trim();
-      if (!currentName || currentName !== name) {
+    const tableKeys = parseTomlTableHeader(line);
+    if (tableKeys) {
+      const name = tableKeys[0] === 'mcp_servers' ? tableKeys[1] : undefined;
+      if (name && CODEX_MCP_SERVER_NAME_PATTERN.test(name) && tableKeys.length === 3 && tableKeys[2] === 'headers') {
+        if (!currentName || currentName !== name) {
+          flushCurrent();
+          currentName = name;
+          currentEntry = {};
+        }
+        currentSection = 'headers';
+      } else if (name && CODEX_MCP_SERVER_NAME_PATTERN.test(name) && tableKeys.length === 2) {
         flushCurrent();
         currentName = name;
         currentEntry = {};
+        currentSection = 'server';
+      } else {
+        flushCurrent();
       }
-      currentSection = 'headers';
       continue;
     }
 
-    const sectionMatch = line.match(/^\[mcp_servers\.([^\]]+)\]$/);
-    if (sectionMatch) {
+    if (line.startsWith('[[')) {
       flushCurrent();
-      currentName = sectionMatch[1].trim();
-      currentEntry = {};
-      currentSection = 'server';
       continue;
     }
 
@@ -742,11 +1040,21 @@ function parseCodexMcpRegistryEntries(content: string): UnifiedMcpRegistry {
       continue;
     }
 
-    const key = currentSection === 'headers' ? parseTomlKey(rawKey) : rawKey.trim();
+    const key = parseTomlKey(rawKey);
     if (!key) {
       continue;
     }
-    const value = rawValueParts.join('=').trim();
+    let value = rawValueParts.join('=').trim();
+    const multilineDelimiter: TomlMultilineDelimiter | undefined = value.startsWith('"""')
+      ? '"""'
+      : value.startsWith("'''")
+        ? "'''"
+        : undefined;
+    if (multilineDelimiter && !hasClosingTomlMultilineString(value, multilineDelimiter)) {
+      while (lineIndex + 1 < lines.length && !hasClosingTomlMultilineString(value, multilineDelimiter)) {
+        value += `\n${lines[++lineIndex]}`;
+      }
+    }
 
     if (currentSection === 'headers') {
       const parsed = parseTomlQuotedString(value);
@@ -763,6 +1071,7 @@ function parseCodexMcpRegistryEntries(content: string): UnifiedMcpRegistry {
       const parsed = parseTomlQuotedString(value);
       if (parsed) currentEntry.url = parsed;
     } else if (key === 'type') {
+      typeFieldsPresent.add(currentName);
       const parsed = parseTomlQuotedString(value);
       if (parsed) currentEntry.type = parsed;
     } else if (key === 'env') {
@@ -778,7 +1087,10 @@ function parseCodexMcpRegistryEntries(content: string): UnifiedMcpRegistry {
   }
 
   flushCurrent();
-  return Object.fromEntries(Object.entries(entries).sort(([left], [right]) => left.localeCompare(right)));
+  return {
+    entries: Object.fromEntries(Object.entries(entries).sort(([left], [right]) => left.localeCompare(right))),
+    typeFieldsPresent,
+  };
 }
 
 export function syncUnifiedMcpRegistryTargets(
@@ -871,9 +1183,10 @@ export function inspectUnifiedMcpRegistrySync(): UnifiedMcpRegistryStatus {
   const serverNames = Object.keys(registry);
   const claudeSettings = readJsonObject(claudeConfigPath);
   const claudeEntries = extractClaudeMcpRegistry(claudeSettings);
-  const codexEntries = existsSync(codexConfigPath)
+  const codexRegistry = existsSync(codexConfigPath)
     ? parseCodexMcpRegistryEntries(readFileSync(codexConfigPath, 'utf-8'))
-    : {};
+    : { entries: {}, typeFieldsPresent: new Set<string>() };
+  const codexEntries = codexRegistry.entries;
 
   const claudeMissing: string[] = [];
   const claudeMismatched: string[] = [];
@@ -889,7 +1202,7 @@ export function inspectUnifiedMcpRegistrySync(): UnifiedMcpRegistryStatus {
 
     if (!codexEntries[name]) {
       codexMissing.push(name);
-    } else if (!entriesEqual(codexEntries[name], entry)) {
+    } else if (!codexEntriesEqual(codexEntries[name], entry, codexRegistry.typeFieldsPresent.has(name))) {
       codexMismatched.push(name);
     }
   }

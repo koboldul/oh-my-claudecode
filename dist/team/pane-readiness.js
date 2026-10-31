@@ -9,10 +9,6 @@ const PROVIDER_IDLE_PROMPT_LINES = {
     antigravity: LEGACY_IDLE_PROMPT_LINE,
     copilot: LEGACY_IDLE_PROMPT_LINE,
 };
-export function isCliAgentType(value) {
-    return typeof value === 'string'
-        && Object.prototype.hasOwnProperty.call(PROVIDER_IDLE_PROMPT_LINES, value);
-}
 export function paneLineLooksLikeIdlePrompt(line, provider) {
     if (provider === undefined)
         return LEGACY_IDLE_PROMPT_LINE.test(line);

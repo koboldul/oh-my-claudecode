@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,7 @@ import {
   awaitWorkerLaunchAcknowledgement,
   awaitWorkerLaunchProviderStarted,
   buildWorkerLaunchBootstrapSpec,
+  buildWindowsSupervisorInvocation,
   buildWindowsSupervisorSource,
   cleanupWorkerLaunchTransport,
   observeWorkerLaunchProvider,
@@ -32,6 +33,7 @@ import {
   materializeProviderSpawnInvocation,
   quoteWindowsCreateProcessArgument,
 } from '../worker-launch-ack.js';
+import type { WorkerLaunchBootstrapSpec } from '../worker-launch-ack.js';
 import {
   captureOwnedProcessGroup,
   getProcessStartIdentity,
@@ -40,6 +42,7 @@ import {
   terminateOwnedProcessTree,
 } from '../../platform/process-utils.js';
 import { getOmcRoot } from '../../lib/worktree-paths.js';
+import { getWorkerEnv } from '../model-contract.js';
 
 let cwd = '';
 const disposableProviders = new Set<ReturnType<typeof spawn>>();
@@ -2340,12 +2343,7 @@ describe('worker launch acknowledgement', () => {
       nonce: launchAttempt.nonce,
     });
     expect(descriptor.provider_argv).toEqual(providerArgv);
-    const homeKey = process.platform === 'win32' ? 'USERPROFILE' : 'HOME';
-    const ambientHome = process.env[homeKey];
-    expect(descriptor.provider_env).toEqual({
-      ...providerEnv,
-      ...(ambientHome ? { [homeKey]: ambientHome } : {}),
-    });
+    expect(descriptor.provider_env).toEqual(providerEnv);
     await expect(materializeWorkerLaunchTransport({
       attempt: launchAttempt,
       providerArgv: ['codex'],
@@ -2412,18 +2410,84 @@ describe('worker launch acknowledgement', () => {
     await expect(readFile(launchAttempt.bootstrapDescriptorPath, 'utf8')).resolves.toContain(launchAttempt.attempt_id);
   });
 
-  it('propagates only the canonical home variable for each platform', () => {
+  it('round trips a Windows descriptor and reapplies one canonical SystemRoot to the supervisor environment', async () => {
+    const launchAttempt = await attempt();
+    const providerEnv = { EXPLICIT_PROVIDER_VALUE: 'yes' };
+    const baselineEnv = {
+      PATH: 'C:\\Windows\\System32',
+      TEMP: 'C:\\Temp',
+      TMP: 'C:\\Temp',
+      SystemRoot: 'C:\\Windows',
+      SYSTEMROOT: 'D:\\ConflictingWindows',
+      USERPROFILE: 'C:\\Users\\provider',
+      HOME: '/home/wrong-platform',
+      GH_TOKEN: 'ambient-secret',
+    };
+    const materialized = await materializeWorkerLaunchTransport({
+      attempt: launchAttempt,
+      providerArgv: ['codex'],
+      providerEnv,
+      cwd,
+      platform: 'win32',
+    });
+
+    const written = JSON.parse(await readFile(materialized.bootstrapDescriptorPath, 'utf8')) as WorkerLaunchBootstrapSpec;
+    expect(written.provider_env).toEqual(providerEnv);
+    const consumed = await readAndConsumeWorkerLaunchDescriptor(materialized.bootstrapDescriptorPath, 'win32') as WorkerLaunchBootstrapSpec;
+    const invocation = buildWindowsSupervisorInvocation(consumed, baselineEnv);
+    if (!invocation.stdinPayload) throw new Error('worker_launch_test_supervisor_payload_missing');
+    expect(invocation.command.length + invocation.args.join(' ').length + 16).toBeLessThan(32_767);
+    const payload = JSON.parse(invocation.stdinPayload) as {
+      canonical_json: string;
+      authority_digest: string;
+      provider_env: Record<string, string>;
+    };
+    expect(JSON.parse(payload.canonical_json)).toMatchObject({ provider_env: providerEnv });
+    expect(createHash('sha256').update(payload.canonical_json, 'utf8').digest('hex')).toBe(payload.authority_digest);
+    expect(payload.provider_env).toEqual({
+      ...providerEnv,
+      PATH: 'C:\\Windows\\System32',
+      TEMP: 'C:\\Temp',
+      TMP: 'C:\\Temp',
+      SystemRoot: 'C:\\Windows',
+      USERPROFILE: 'C:\\Users\\provider',
+    });
+    expect(Object.keys(payload.provider_env).filter(key => key.toUpperCase() === 'SYSTEMROOT'))
+      .toEqual(['SystemRoot']);
+    await expect(cleanupWorkerLaunchTransport(launchAttempt, 'windows_descriptor_round_trip')).resolves.toBe(true);
+  });
+
+  it('propagates only the canonical identity variables for each platform', () => {
     const posix = buildProviderEnvironment(undefined, {
       PATH: '/usr/bin:/bin',
       HOME: '/home/provider',
+      USER: 'provider',
+      LOGNAME: 'provider',
+      TERM: 'xterm-256color',
+      COLORTERM: 'truecolor',
       USERPROFILE: 'C:\\Users\\wrong-platform',
       GH_TOKEN: 'ambient-secret',
     }, 'linux');
-    expect(posix).toEqual({ PATH: '/usr/bin:/bin', HOME: '/home/provider' });
+    expect(posix).toEqual({
+      PATH: '/usr/bin:/bin',
+      HOME: '/home/provider',
+      USER: 'provider',
+      TERM: 'xterm-256color',
+      COLORTERM: 'truecolor',
+    });
+
+    const macos = buildProviderEnvironment(undefined, {
+      PATH: '/usr/bin:/bin',
+      HOME: '/Users/provider',
+      USER: 'provider',
+      USERPROFILE: 'C:\\Users\\wrong-platform',
+    }, 'darwin');
+    expect(macos).toEqual({ PATH: '/usr/bin:/bin', HOME: '/Users/provider', USER: 'provider' });
 
     const windows = buildProviderEnvironment(undefined, {
       PATH: 'C:\\Windows\\System32',
       HOME: '/home/wrong-platform',
+      USER: 'provider',
       USERPROFILE: 'C:\\Users\\provider',
       SystemRoot: 'C:\\Windows',
       GH_TOKEN: 'ambient-secret',
@@ -2442,12 +2506,18 @@ describe('worker launch acknowledgement', () => {
       PATH: '/usr/bin:/bin', HOME: '', USERPROFILE: 'C:\\Users\\wrong-platform',
     }, 'linux')).toEqual({ PATH: '/usr/bin:/bin' });
     expect(buildProviderEnvironment(undefined, {
+      PATH: '/usr/bin:/bin', HOME: '/Users/provider', USER: '',
+    }, 'darwin')).toEqual({ PATH: '/usr/bin:/bin', HOME: '/Users/provider' });
+    expect(buildProviderEnvironment(undefined, {
       PATH: 'C:\\Windows\\System32', USERPROFILE: '', HOME: '/home/wrong-platform',
     }, 'win32')).toEqual({ PATH: 'C:\\Windows\\System32' });
 
     expect(buildProviderEnvironment({ HOME: '/home/explicit' }, {
       PATH: '/usr/bin:/bin', HOME: '/home/ambient',
     }, 'linux')).toMatchObject({ PATH: '/usr/bin:/bin', HOME: '/home/explicit' });
+    expect(buildProviderEnvironment({ USER: 'explicit' }, {
+      PATH: '/usr/bin:/bin', HOME: '/Users/ambient', USER: 'ambient',
+    }, 'darwin')).toEqual({ PATH: '/usr/bin:/bin', HOME: '/Users/ambient', USER: 'explicit' });
     expect(buildProviderEnvironment({ USERPROFILE: 'D:\\Users\\explicit' }, {
       PATH: 'C:\\Windows\\System32', USERPROFILE: 'C:\\Users\\ambient',
     }, 'win32')).toMatchObject({ PATH: 'C:\\Windows\\System32', USERPROFILE: 'D:\\Users\\explicit' });
@@ -2470,6 +2540,7 @@ describe('worker launch acknowledgement', () => {
         cwd,
         { releaseAfterSpawn: true },
       );
+      expect(spec.provider_env).not.toHaveProperty('HOME');
       const bootstrap = runWorkerLaunchBootstrap(spec);
       await expect(awaitWorkerLaunchAcknowledgement(launchAttempt, { timeoutMs: LAUNCH_WAIT_TIMEOUT_MS, pollIntervalMs: 5 }))
         .resolves.toEqual({ ok: true });
@@ -2509,6 +2580,43 @@ describe('worker launch acknowledgement', () => {
       value: 'provider-value',
       attempt: launchAttempt.attempt_id,
     });
+  });
+
+  it('preserves Claude secure-storage login and terminal colors through supervised launch', async () => {
+    const launchAttempt = await attempt();
+    const envKeys = ['CLAUDE_SECURESTORAGE_CONFIG_DIR', 'TERM', 'COLORTERM'] as const;
+    const saved = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+    process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR = join(cwd, 'claude-secure-storage');
+    process.env.TERM = 'xterm-256color';
+    process.env.COLORTERM = 'truecolor';
+
+    try {
+      const workerEnv = getWorkerEnv('launch-team', 'worker-1', 'claude', process.env);
+      const marker = join(cwd, 'claude-worker-env.json');
+      const providerScript = `require('node:fs').writeFileSync(${JSON.stringify(marker)},JSON.stringify({secureStorage:process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,term:process.env.TERM,color:process.env.COLORTERM}));setTimeout(()=>process.exit(0),200)`;
+      const bootstrap = runWorkerLaunchBootstrap(buildWorkerLaunchBootstrapSpec(
+        launchAttempt,
+        [process.execPath, '-e', providerScript],
+        cwd,
+        { providerEnv: workerEnv, releaseAfterSpawn: true },
+      ));
+      await expect(awaitWorkerLaunchAcknowledgement(launchAttempt, {
+        timeoutMs: LAUNCH_WAIT_TIMEOUT_MS,
+        pollIntervalMs: 5,
+      })).resolves.toEqual({ ok: true });
+      await expect(bootstrap).resolves.toEqual({ outcome: 'ran', exitCode: 0, signal: null });
+      await expect(readFile(marker, 'utf8').then(JSON.parse)).resolves.toEqual({
+        secureStorage: join(cwd, 'claude-secure-storage'),
+        term: 'xterm-256color',
+        color: 'truecolor',
+      });
+    } finally {
+      for (const key of envKeys) {
+        const value = saved[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
   });
 
   it('rejects provider environment tampering through the authority digest', async () => {
@@ -2771,21 +2879,26 @@ describe('worker launch acknowledgement', () => {
     for (const key of ['GH_TOKEN', 'AWS_SECRET_ACCESS_KEY', 'ANTHROPIC_API_KEY', 'NODE_OPTIONS', 'HTTPS_PROXY']) {
       expect(spec.provider_env).not.toHaveProperty(key);
     }
-    const originalPlatform = process.platform;
-    Object.defineProperty(process, 'platform', { value: 'win32' });
-    try {
-      expect(() => buildWorkerLaunchBootstrapSpec(launchAttempt, ['codex'], cwd, { providerEnv: { OMC_WORKER_LAUNCH_SPEC_FILE: 'x' } })).toThrow('worker_launch_provider_env_reserved');
-      expect(() => buildWorkerLaunchBootstrapSpec(launchAttempt, ['codex'], cwd, { providerEnv: { PATH: 'one', Path: 'two' } })).toThrow('worker_launch_provider_env_key_alias_conflict');
-      expect(() => buildWorkerLaunchBootstrapSpec(launchAttempt, ['codex'], cwd, { providerEnv: { SystemRoot: 'D:\\attacker' } })).toThrow('worker_launch_provider_env_reserved');
-      expect(() => buildWorkerLaunchBootstrapSpec(launchAttempt, ['codex'], cwd, { providerEnv: { SYSTEMROOT: 'D:\\attacker' } })).toThrow('worker_launch_provider_env_reserved');
-    } finally { Object.defineProperty(process, 'platform', { value: originalPlatform }); }
+    const platform = 'win32';
+    expect(() => buildWorkerLaunchBootstrapSpec(launchAttempt, ['codex'], cwd, {
+      providerEnv: { OMC_WORKER_LAUNCH_SPEC_FILE: 'x' }, platform,
+    })).toThrow('worker_launch_provider_env_reserved');
+    expect(() => buildWorkerLaunchBootstrapSpec(launchAttempt, ['codex'], cwd, {
+      providerEnv: { PATH: 'one', Path: 'two' }, platform,
+    })).toThrow('worker_launch_provider_env_key_alias_conflict');
+    expect(() => buildWorkerLaunchBootstrapSpec(launchAttempt, ['codex'], cwd, {
+      providerEnv: { SystemRoot: 'D:\\attacker' }, platform,
+    })).toThrow('worker_launch_provider_env_reserved');
+    expect(() => buildWorkerLaunchBootstrapSpec(launchAttempt, ['codex'], cwd, {
+      providerEnv: { SYSTEMROOT: 'D:\\attacker' }, platform,
+    })).toThrow('worker_launch_provider_env_reserved');
   });
 
   it('binds the Windows supervisor source, environment, Job Object, and argv protocol', () => {
     const source = buildWindowsSupervisorSource();
-    const create = source.indexOf('CreateProcessW(');
-    const assign = source.indexOf('AssignProcessToJobObject(');
-    const resume = source.indexOf('ResumeThread(');
+    const create = source.indexOf('[O]::CreateConsoleProcess(');
+    const assign = source.indexOf('[O]::AssignProcessToJobObject(');
+    const resume = source.indexOf('[O]::ResumeThread(');
 
     expect(create).toBeGreaterThan(-1);
     expect(source).toContain('0x00000400');
@@ -2875,5 +2988,123 @@ describe('worker launch acknowledgement', () => {
     await rm(materialized.bootstrapDescriptorPath, { force: true });
     await symlink(materialized.wrapperPath, materialized.bootstrapDescriptorPath);
     await expect(readAndConsumeWorkerLaunchDescriptor(materialized.bootstrapDescriptorPath)).rejects.toThrow();
+  });
+
+  it('resolves env passthrough at provider exec time without persisting to bootstrap.json', async () => {
+    const sourceEnv = {
+      PATH: '/usr/bin:/bin',
+      HOME: '/home/provider',
+      CUSTOM_PROVIDER_TOKEN: 'secret-token-123',
+      ANOTHER_CUSTOM_VAR: 'another-value',
+    };
+
+    // Verify that without passthrough, custom vars are NOT in the environment
+    const runtimeEnv = buildProviderEnvironment(
+      { EXPLICIT: 'yes' },
+      sourceEnv,
+      'linux',
+    );
+    expect(runtimeEnv).toHaveProperty('EXPLICIT', 'yes');
+    expect(runtimeEnv).not.toHaveProperty('CUSTOM_PROVIDER_TOKEN');
+    expect(runtimeEnv).not.toHaveProperty('ANOTHER_CUSTOM_VAR');
+
+    // Verify that custom vars ARE included when passthrough is specified
+    const runtimeEnvWithPassthrough = buildProviderEnvironment(
+      { EXPLICIT: 'yes' },
+      sourceEnv,
+      'linux',
+      ['CUSTOM_PROVIDER_TOKEN', 'ANOTHER_CUSTOM_VAR'],
+    );
+    expect(runtimeEnvWithPassthrough).toHaveProperty('EXPLICIT', 'yes');
+    expect(runtimeEnvWithPassthrough).toHaveProperty('CUSTOM_PROVIDER_TOKEN', 'secret-token-123');
+    expect(runtimeEnvWithPassthrough).toHaveProperty('ANOTHER_CUSTOM_VAR', 'another-value');
+
+    // Passthrough vars that don't exist in sourceEnv should be silently skipped
+    const runtimeEnvMissingVar = buildProviderEnvironment(
+      { EXPLICIT: 'yes' },
+      sourceEnv,
+      'linux',
+      ['NONEXISTENT_VAR', 'CUSTOM_PROVIDER_TOKEN'],
+    );
+    expect(runtimeEnvMissingVar).toHaveProperty('CUSTOM_PROVIDER_TOKEN', 'secret-token-123');
+    expect(runtimeEnvMissingVar).not.toHaveProperty('NONEXISTENT_VAR');
+  });
+
+  it('parses OMC_TEAM_WORKER_ENV_PASSTHROUGH from source environment', () => {
+    const sourceEnv = {
+      PATH: '/usr/bin',
+      HOME: '/home/user',
+      OMC_TEAM_WORKER_ENV_PASSTHROUGH: 'CUSTOM_VAR1, CUSTOM_VAR2, CUSTOM_VAR3',
+      CUSTOM_VAR1: 'value1',
+      CUSTOM_VAR2: 'value2',
+      CUSTOM_VAR3: 'value3',
+    };
+
+    // When OMC_TEAM_WORKER_ENV_PASSTHROUGH is set, those vars should be included
+    const runtimeEnv = buildProviderEnvironment(
+      {},
+      sourceEnv,
+      'linux',
+    );
+    expect(runtimeEnv).toHaveProperty('CUSTOM_VAR1', 'value1');
+    expect(runtimeEnv).toHaveProperty('CUSTOM_VAR2', 'value2');
+    expect(runtimeEnv).toHaveProperty('CUSTOM_VAR3', 'value3');
+    // The passthrough env var itself should NOT be in the output
+    expect(runtimeEnv).not.toHaveProperty('OMC_TEAM_WORKER_ENV_PASSTHROUGH');
+  });
+
+  it('validates passthrough env var names and rejects invalid syntax', () => {
+    const sourceEnv = {
+      PATH: '/usr/bin',
+      HOME: '/home/user',
+      VALID_NAME: 'value',
+    };
+
+    // Valid names should work
+    expect(() => buildProviderEnvironment(
+      {},
+      sourceEnv,
+      'linux',
+      ['VALID_NAME', '_UNDERSCORE_PREFIX', 'VAR123'],
+    )).not.toThrow();
+
+    // Invalid names should be rejected
+    expect(() => buildProviderEnvironment(
+      {},
+      sourceEnv,
+      'linux',
+      ['INVALID-NAME'],
+    )).toThrow('worker_launch_env_passthrough_key_invalid');
+
+    expect(() => buildProviderEnvironment(
+      {},
+      sourceEnv,
+      'linux',
+      ['123INVALID'],
+    )).toThrow('worker_launch_env_passthrough_key_invalid');
+  });
+
+  it('rejects reserved and internal env var names in passthrough', () => {
+    const sourceEnv = {
+      PATH: '/usr/bin',
+      HOME: '/home/user',
+      OMC_WORKER_LAUNCH_SPEC: 'value',
+    };
+
+    // Internal keys should be rejected
+    expect(() => buildProviderEnvironment(
+      {},
+      sourceEnv,
+      'linux',
+      ['OMC_WORKER_LAUNCH_SPEC'],
+    )).toThrow('worker_launch_env_passthrough_key_reserved');
+
+    // Windows reserved keys should be rejected on win32
+    expect(() => buildProviderEnvironment(
+      {},
+      sourceEnv,
+      'win32',
+      ['SYSTEMROOT'],
+    )).toThrow('worker_launch_env_passthrough_key_reserved');
   });
 });

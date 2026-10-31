@@ -21,6 +21,9 @@ function paneArtifact(instanceId, paneIds, leaderPaneId = '%10', sessionName = '
         })),
     };
 }
+// Dead-owner reservations need a start identity valid on the host platform:
+// isProcessIdentityDead rejects foreign-platform tokens (e.g. linux:* on win32).
+const DEAD_OWNER_START_IDENTITY = process.platform === 'darwin' ? 'darwin:99999:0' : `${process.platform}:99999`;
 function makeProject(prefix) {
     const cwd = mkdtempSync(join(tmpdir(), prefix));
     execFileSync('git', ['init'], { cwd, stdio: 'pipe' });
@@ -459,6 +462,16 @@ describe('team cli', () => {
         expect(output.status).toBe('running');
         rmSync(cwd, { recursive: true, force: true });
         logSpy.mockRestore();
+    });
+    it.each(['3x', '2.5', 'abc'])('teamCommand start rejects non-integer --count %j', async (value) => {
+        const cwd = makeProject('omc-team-cli-bad-count-');
+        const { teamCommand } = await import('../team.js');
+        await expect(teamCommand([
+            'start', '--agent', 'gemini', '--count', value,
+            '--task', 'lint all modules', '--name', 'lint-team', '--cwd', cwd, '--json',
+        ])).rejects.toThrow('Invalid --count value');
+        expect(mocks.spawn).not.toHaveBeenCalled();
+        rmSync(cwd, { recursive: true, force: true });
     });
     it('teamCommand start --agent antigravity --count expands antigravity worker types', async () => {
         const write = vi.fn();
@@ -1267,6 +1280,232 @@ describe('team cli', () => {
         expect(payload.sessionFound).toBe(true);
         rmSync(cwd, { recursive: true, force: true });
         logSpy.mockRestore();
+    });
+    it('team shutdown handles nonexistent team gracefully and exits 0', async () => {
+        const { teamCommand } = await import('../team.js');
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        const cwd = makeProject('omc-team-cli-nonexistent-shutdown-');
+        const originalExitCode = process.exitCode;
+        process.exitCode = 0; // Reset before test
+        // Attempting to shutdown a team that doesn't exist should not throw
+        // but should exit gracefully with a diagnostic message
+        await teamCommand(['shutdown', 'nonexistent-team', '--cwd', cwd]);
+        // Should have logged a diagnostic message
+        expect(logSpy).toHaveBeenCalledWith('No team state found for nonexistent-team');
+        expect(errorSpy).not.toHaveBeenCalled();
+        // Should exit with code 0 (success)
+        expect(process.exitCode).not.toBe(1);
+        // Restore original exit code
+        process.exitCode = originalExitCode;
+        rmSync(cwd, { recursive: true, force: true });
+        logSpy.mockRestore();
+        errorSpy.mockRestore();
+    });
+    it('team shutdown cleans up partial-state team (config without valid instance_id), removes reservation', async () => {
+        const { cleanupAbandonedTeamState } = await import('../../team/runtime-v2.js');
+        const { teamStateRoot, TeamPaths, teamWorkspaceHash, canonicalTeamStatePath } = await import('../../team/state-paths.js');
+        const { teamInstanceLifecycleLockPath } = await import('../../team/team-instance.js');
+        const { mkdir, writeFile } = await import('fs/promises');
+        const { join } = await import('path');
+        const cwd = makeProject('omc-team-cli-partial-state-');
+        const teamName = 'partial-team';
+        const teamRoot = teamStateRoot(cwd, teamName);
+        const workspaceHash = teamWorkspaceHash(cwd, teamName);
+        const reservationPath = canonicalTeamStatePath(cwd, TeamPaths.teamInstanceReservation(workspaceHash, teamName));
+        const lockPath = teamInstanceLifecycleLockPath(cwd, teamName);
+        // Create team state directory and config
+        await mkdir(teamRoot, { recursive: true });
+        await mkdir(join(reservationPath, '..'), { recursive: true });
+        // Create a config file without instance_id (simulating partial startup failure)
+        const config = {
+            name: teamName,
+            task: 'test',
+            agent_type: 'executor',
+            worker_count: 0,
+            max_workers: 20,
+            workers: [],
+            created_at: new Date().toISOString(),
+            next_task_id: 1,
+        };
+        await writeFile(join(teamRoot, 'config.json'), JSON.stringify(config));
+        // Create a dead-owner reservation to simulate partial state
+        const reservation = {
+            schema_version: 1,
+            kind: 'team-instance-reservation',
+            instance_id: '11111111-1111-4111-8111-111111111111',
+            team_name: teamName,
+            cwd,
+            workspace_hash: workspaceHash,
+            state_root: teamRoot,
+            phase: 'pending',
+            owner: { pid: 99999, process_started_at: DEAD_OWNER_START_IDENTITY, nonce: 'test' },
+            reservation_path: reservationPath,
+            lifecycle_lock_path: lockPath,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+        };
+        await writeFile(reservationPath, JSON.stringify(reservation));
+        // Verify state exists before cleanup
+        expect(existsSync(teamRoot)).toBe(true);
+        expect(existsSync(reservationPath)).toBe(true);
+        // Call the cleanup function (which acquires the lock)
+        await cleanupAbandonedTeamState(teamName, cwd);
+        // All state should be completely removed
+        expect(existsSync(teamRoot)).toBe(false);
+        expect(existsSync(reservationPath)).toBe(false);
+        rmSync(cwd, { recursive: true, force: true });
+    });
+    it('startTeamV2 pre-reserve cleanup removes dead-owner reservation but rejects live-owner', async () => {
+        const { cleanupStaleReservations } = await import('../../team/runtime-v2.js');
+        const { currentProcessStartIdentity } = await import('../../team/team-owner-epoch.js');
+        const { TeamPaths, teamWorkspaceHash, canonicalTeamStatePath } = await import('../../team/state-paths.js');
+        const { teamInstanceLifecycleLockPath } = await import('../../team/team-instance.js');
+        const { mkdir, writeFile } = await import('fs/promises');
+        const { join } = await import('path');
+        const cwd = makeProject('omc-team-cli-pre-reserve-');
+        const teamName = 'prereserve-team';
+        const workspaceHash = teamWorkspaceHash(cwd, teamName);
+        const reservationPath = canonicalTeamStatePath(cwd, TeamPaths.teamInstanceReservation(workspaceHash, teamName));
+        // Create directory for reservation
+        await mkdir(join(reservationPath, '..'), { recursive: true });
+        // Scenario 1: Dead-owner reservation should be cleaned up
+        const deadOwnerRes = {
+            schema_version: 1,
+            kind: 'team-instance-reservation',
+            instance_id: '11111111-1111-4111-8111-111111111111',
+            team_name: teamName,
+            cwd,
+            workspace_hash: workspaceHash,
+            state_root: join(cwd, '.omc', 'state', 'team', teamName),
+            phase: 'pending',
+            owner: { pid: 99999, process_started_at: DEAD_OWNER_START_IDENTITY, nonce: 'test-nonce' },
+            reservation_path: reservationPath,
+            lifecycle_lock_path: teamInstanceLifecycleLockPath(cwd, teamName),
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+        };
+        await writeFile(reservationPath, JSON.stringify(deadOwnerRes));
+        // Call cleanup (as startTeamV2 does)
+        await cleanupStaleReservations(teamName, cwd);
+        // Dead-owner reservation should be gone (reserve can now proceed)
+        expect(existsSync(reservationPath)).toBe(false);
+        // Scenario 2: Live-owner reservation should NOT be cleaned up
+        const currentIdentity = currentProcessStartIdentity(process.pid);
+        const liveOwnerRes = { ...deadOwnerRes, owner: { pid: process.pid, process_started_at: currentIdentity, nonce: 'nonce' } };
+        await writeFile(reservationPath, JSON.stringify(liveOwnerRes));
+        // Call cleanup again
+        await cleanupStaleReservations(teamName, cwd);
+        // Live-owner reservation should remain (reserve will still fail with team_name_already_reserved)
+        expect(existsSync(reservationPath)).toBe(true);
+        process.exitCode = 0;
+        rmSync(cwd, { recursive: true, force: true });
+    });
+    it('cleanupStaleReservations removes dead-owner reservation but NOT live-owner reservation', async () => {
+        const { cleanupStaleReservations } = await import('../../team/runtime-v2.js');
+        const { currentProcessStartIdentity } = await import('../../team/team-owner-epoch.js');
+        const { teamInstanceLifecycleLockPath } = await import('../../team/team-instance.js');
+        const { TeamPaths, teamWorkspaceHash, canonicalTeamStatePath } = await import('../../team/state-paths.js');
+        const { mkdir, writeFile } = await import('fs/promises');
+        const { join } = await import('path');
+        const cwd = makeProject('omc-team-cli-stale-reservation-');
+        const teamName = 'stale-test-team';
+        const workspaceHash = teamWorkspaceHash(cwd, teamName);
+        const reservationPath = canonicalTeamStatePath(cwd, TeamPaths.teamInstanceReservation(workspaceHash, teamName));
+        const currentIdentity = currentProcessStartIdentity(process.pid);
+        // Create directory for reservation
+        await mkdir(join(reservationPath, '..'), { recursive: true });
+        // Test 1: Dead-owner reservation should be removed
+        const deadOwnerRes = {
+            schema_version: 1,
+            kind: 'team-instance-reservation',
+            instance_id: '11111111-1111-4111-8111-111111111111',
+            team_name: teamName,
+            cwd,
+            workspace_hash: workspaceHash,
+            state_root: join(cwd, '.omc', 'state', 'team', teamName),
+            phase: 'pending',
+            owner: {
+                pid: 99999, // Dead PID (guaranteed to be unavailable)
+                process_started_at: DEAD_OWNER_START_IDENTITY, // Valid format for this platform
+                nonce: 'test-nonce',
+            },
+            reservation_path: reservationPath,
+            lifecycle_lock_path: teamInstanceLifecycleLockPath(cwd, teamName),
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+        };
+        await writeFile(reservationPath, JSON.stringify(deadOwnerRes));
+        await cleanupStaleReservations(teamName, cwd);
+        // Dead-owner reservation should be gone
+        expect(existsSync(reservationPath)).toBe(false);
+        // Test 2: Live-owner reservation should NOT be removed
+        const currentOwnerRes = { ...deadOwnerRes, owner: { pid: process.pid, process_started_at: currentIdentity, nonce: 'nonce' } };
+        await writeFile(reservationPath, JSON.stringify(currentOwnerRes));
+        await cleanupStaleReservations(teamName, cwd);
+        // Live-owner reservation should remain
+        expect(existsSync(reservationPath)).toBe(true);
+        // Test 3: Active reservation should NOT be removed even when its owner (the exited start CLI) is dead
+        await writeFile(reservationPath, JSON.stringify({ ...deadOwnerRes, phase: 'active' }));
+        await cleanupStaleReservations(teamName, cwd);
+        expect(existsSync(reservationPath)).toBe(true);
+        process.exitCode = 0;
+        rmSync(cwd, { recursive: true, force: true });
+    });
+    it('team shutdown from a fresh shell keeps the active reservation after the start CLI exited', async () => {
+        const { teamCommand } = await import('../team.js');
+        const { assertTeamInstanceUnderLock, reserveTeamInstance, withTeamInstanceLifecycleLock, } = await import('../../team/team-instance.js');
+        const { teamStateRoot, TeamPaths, teamWorkspaceHash, canonicalTeamStatePath } = await import('../../team/state-paths.js');
+        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        const originalExitCode = process.exitCode;
+        process.exitCode = 0;
+        const cwd = makeProject('omc-team-cli-active-reservation-');
+        const teamName = 'active-team';
+        const reservationPath = canonicalTeamStatePath(cwd, TeamPaths.teamInstanceReservation(teamWorkspaceHash(cwd, teamName), teamName));
+        const teamRoot = teamStateRoot(cwd, teamName);
+        // `omc team start`: reserve, write the identity-bearing config, activate.
+        await reserveTeamInstance({ teamName, cwd, instanceId: INSTANCE_ID });
+        mkdirSync(teamRoot, { recursive: true });
+        writeFileSync(join(teamRoot, 'config.json'), JSON.stringify({
+            name: teamName,
+            instance_id: INSTANCE_ID,
+            task: 'demo',
+            agent_type: 'claude',
+            worker_launch_mode: 'interactive',
+            worker_count: 0,
+            max_workers: 20,
+            workers: [],
+            created_at: new Date().toISOString(),
+            tmux_session: `${teamName}:0`,
+            leader_pane_id: null,
+            hud_pane_id: null,
+            resize_hook_name: null,
+            resize_hook_target: null,
+            next_task_id: 1,
+        }));
+        // The start CLI owns the reservation and exits once the team is active,
+        // so a later shutdown sees an active reservation with a dead owner.
+        const reservation = JSON.parse(readFileSync(reservationPath, 'utf-8'));
+        writeFileSync(reservationPath, JSON.stringify({
+            ...reservation,
+            phase: 'active',
+            owner: { ...reservation.owner, pid: 99999, process_started_at: DEAD_OWNER_START_IDENTITY },
+        }));
+        // shutdownTeamV2 first asserts the instance reservation under the
+        // lifecycle lock; run that authority step and stop before tmux effects.
+        mocks.shutdownTeamV2.mockImplementation(async (name, dir, options) => {
+            await withTeamInstanceLifecycleLock(dir, name, () => assertTeamInstanceUnderLock({ teamName: name, cwd: dir, instanceId: options.instanceId }));
+            return { outcome: 'cleaned' };
+        });
+        await teamCommand(['shutdown', teamName, '--cwd', cwd]);
+        expect(errorSpy).not.toHaveBeenCalled();
+        expect(process.exitCode).toBe(0);
+        expect(mocks.shutdownTeamV2).toHaveBeenCalledTimes(1);
+        expect(existsSync(reservationPath)).toBe(true);
+        process.exitCode = originalExitCode;
+        logSpy.mockRestore();
+        errorSpy.mockRestore();
     });
     it('legacy shorthand start alias supports optional ralph token', async () => {
         const write = vi.fn();

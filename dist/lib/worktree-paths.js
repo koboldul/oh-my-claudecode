@@ -1551,9 +1551,16 @@ export function resolveSessionStatePath(stateName, sessionId, worktreeRoot) {
  * single-string variant) remain for back-compat but new code should prefer
  * this helper.
  */
-export function resolveSessionStatePaths(stateName, sessionId, worktreeRoot, _opts) {
+export function resolveSessionStatePaths(stateName, sessionId, worktreeRoot, opts) {
     const normalizedName = stateName.endsWith('-state') ? stateName : `${stateName}-state`;
-    const legacy = resolveStatePath(stateName, worktreeRoot);
+    const fileName = opts?.fileName ?? `${normalizedName}.json`;
+    if (opts?.fileName !== undefined
+        && (fileName.trim() !== fileName || !/^[A-Za-z0-9][A-Za-z0-9_-]*\.json$/.test(fileName))) {
+        throw new Error(`Invalid session state filename: ${fileName}`);
+    }
+    const legacy = opts?.fileName
+        ? resolveOmcPath(`state/${fileName}`, worktreeRoot)
+        : resolveStatePath(stateName, worktreeRoot);
     if (!sessionId) {
         return {
             sessionScoped: '',
@@ -1563,7 +1570,7 @@ export function resolveSessionStatePaths(stateName, sessionId, worktreeRoot, _op
         };
     }
     validateSessionId(sessionId);
-    const sessionScoped = resolveOmcPath(`state/sessions/${sessionId}/${normalizedName}.json`, worktreeRoot);
+    const sessionScoped = resolveOmcPath(`state/sessions/${sessionId}/${fileName}`, worktreeRoot);
     // effectiveRead probes session-scoped first; fall back to legacy when the
     // session-scoped file does not yet exist (first-read back-compat).
     const effectiveRead = (existsSync(sessionScoped) ? sessionScoped : legacy);
@@ -2024,7 +2031,7 @@ export function validateWorkingDirectory(workingDirectory) {
         catch {
             throw new Error(`workingDirectory '${workingDirectory}' does not exist or is not accessible.`);
         }
-        if (providedRootReal !== trustedRootReal) {
+        if (!sameCanonicalPath(providedRootReal, trustedRootReal)) {
             console.error('[worktree] workingDirectory resolved to different git worktree root, using trusted root', {
                 workingDirectory: resolved,
                 providedRoot: providedRootReal,
@@ -2204,12 +2211,12 @@ export function resolveWorkingDirectoryOrLinkedWorktree(workingDirectory) {
         catch {
             throw new Error(`workingDirectory '${workingDirectory}' does not exist or is not accessible.`);
         }
-        if (providedRootReal === trustedRootReal) {
+        if (sameCanonicalPath(providedRootReal, trustedRootReal)) {
             return { status: 'ok', root: providedRoot };
         }
         const trustedCommonDir = getGitCommonDir(trustedRoot);
         const providedCommonDir = getGitCommonDir(providedRoot);
-        if (trustedCommonDir && providedCommonDir && providedCommonDir === trustedCommonDir) {
+        if (trustedCommonDir && providedCommonDir && sameCanonicalPath(providedCommonDir, trustedCommonDir)) {
             return { status: 'ok', root: providedRoot };
         }
         // Different repository (#3858): reject visibly instead of silently
@@ -2240,7 +2247,7 @@ export function resolveWorkingDirectoryOrLinkedWorktree(workingDirectory) {
         catch {
             gitMetadataReal = gitMetadataDir;
         }
-        if (gitMetadataReal !== trustedRootReal) {
+        if (!sameCanonicalPath(gitMetadataReal, trustedRootReal)) {
             throw new Error(formatGitProbeFailedMessage(workingDirectory));
         }
     }

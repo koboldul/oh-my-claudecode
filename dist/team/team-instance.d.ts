@@ -1,5 +1,5 @@
 import { teamInstanceLifecycleLockPath } from './state-paths.js';
-import type { TeamInstanceAssertion, TeamInstanceBinding, TeamInstanceCleanupRecord, TeamInstanceCleanupResult, TeamInstanceDisposalAuthorization, TeamInstanceId, TeamInstancePendingConfig, TeamInstanceRequest, TeamInstanceReservation } from './types.js';
+import type { TeamInstanceAssertion, TeamInstanceBinding, TeamInstanceCleanupRecord, TeamInstanceCleanupResult, TeamInstanceDisposalAuthorization, TeamInstanceId, TeamInstancePendingConfig, TeamInstanceRequest, TeamInstanceReservation, TeamScaleUpWorktreeCleanupReceipt, TeamScaleUpWorktreeRecoveryEvidence, TeamScaleUpWorktreeRecoveryRetirementProof } from './types.js';
 /** Errors are stable enough for callers to classify without parsing messages. */
 export type TeamInstanceErrorCode = 'team_instance_id_invalid' | 'team_instance_name_invalid' | 'team_instance_cwd_invalid' | 'team_instance_process_identity_unavailable' | 'team_instance_reservation_conflict' | 'team_instance_authority_missing' | 'team_instance_authority_corrupt' | 'team_instance_mismatch' | 'team_instance_newer_instance' | 'team_instance_state_unknown' | 'team_instance_state_corrupt' | 'team_instance_state_missing' | 'team_instance_startup_config_missing' | 'team_instance_startup_not_empty' | 'team_instance_reservation_active' | 'team_instance_owner_unknown' | 'team_instance_final_state_required' | 'team_instance_receipt_publish_failed' | 'team_instance_rename_failed' | 'team_instance_remove_failed' | 'team_instance_reservation_release_failed' | 'team_instance_cleanup_inconsistent';
 export declare class TeamInstanceError extends Error {
@@ -10,6 +10,7 @@ export declare class TeamInstanceError extends Error {
 export interface TeamInstanceIo {
     publishReservation?: (path: string, record: TeamInstanceReservation) => Promise<void> | void;
     publishCleanupReceipt?: (path: string, record: TeamInstanceCleanupRecord) => Promise<void> | void;
+    publishScaleUpRecoveryEvidence?: (path: string, record: TeamScaleUpWorktreeRecoveryEvidence) => Promise<void> | void;
     renameStateRoot?: (source: string, destination: string) => Promise<void> | void;
     removeTree?: (path: string) => Promise<void> | void;
 }
@@ -26,6 +27,16 @@ export declare function createTeamInstanceBinding(input: TeamInstanceRequest): T
 /** The one external lock shared by startup, lifecycle mutation and cleanup. */
 export { teamInstanceLifecycleLockPath };
 export declare function withTeamInstanceLifecycleLock<T>(cwd: string, teamName: string, fn: () => Promise<T> | T, timeoutMs?: number): Promise<T>;
+export declare function listTeamScaleUpWorktreeRecoveryEvidence(input: BoundTeamInstance): Promise<TeamScaleUpWorktreeRecoveryEvidence[]>;
+export declare function publishTeamScaleUpWorktreeRecoveryEvidence(input: BoundTeamInstance, operationId: string, receipt: TeamScaleUpWorktreeCleanupReceipt, diagnostics: {
+    originalError: string;
+    cleanupError: string;
+}, options?: TeamInstanceOperationOptions): Promise<TeamScaleUpWorktreeRecoveryEvidence>;
+export declare function retireTeamScaleUpWorktreeRecoveryEvidenceUnderLock(input: BoundTeamInstance, proof: TeamScaleUpWorktreeRecoveryRetirementProof): Promise<void>;
+export declare function assertNoTeamScaleUpWorktreeRecoveryEvidence(input: BoundTeamInstance, options?: {
+    allowForeignNamedState?: boolean;
+    inspectDetachedState?: boolean;
+}): Promise<void>;
 /**
  * Reserve a new instance under the caller's lifecycle lock.  This function is
  * intentionally lock-free so startup can reserve, write its pending config,

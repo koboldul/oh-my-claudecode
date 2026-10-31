@@ -1,7 +1,7 @@
 // src/hud/copilot-setup.ts
 import { chmodSync as chmodSync2, existsSync as existsSync5, readFileSync as readFileSync5 } from "node:fs";
 import { homedir as homedir3 } from "node:os";
-import { dirname as dirname7, join as join10, normalize as normalize3, parse as parsePath, resolve as resolve3, sep as sep4 } from "node:path";
+import { dirname as dirname7, join as join10, normalize as normalize3, parse as parsePath, resolve as resolve4, sep as sep4 } from "node:path";
 import { fileURLToPath as fileURLToPath3 } from "node:url";
 
 // node_modules/jsonc-parser/lib/esm/impl/scanner.js
@@ -1414,7 +1414,7 @@ function applyEdits(text, edits) {
 }
 
 // src/installer/index.ts
-import { join as join8, dirname as dirname5, resolve as resolve2, isAbsolute as isAbsolute2, basename as basename3, relative as relative2, sep as sep3 } from "path";
+import { join as join8, dirname as dirname5, resolve as resolve3, isAbsolute as isAbsolute3, basename as basename4, relative as relative2, sep as sep3 } from "path";
 
 // src/installer/hooks.ts
 import { join as join2, dirname } from "path";
@@ -1566,6 +1566,21 @@ var HOOKS_SETTINGS_CONFIG_NODE = {
           }
         ]
       }
+    ],
+    // SessionEnd chain enqueuer (software factory third link). Must delegate to
+    // the bridge (--hook=session-end) — the only entry that runs
+    // processSessionEnd → planChainEnqueue. async:true per issue #3240
+    // (Windows shutdown kills synchronous SessionEnd hooks).
+    SessionEnd: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: buildHookCommand("session-end.mjs"),
+            async: true
+          }
+        ]
+      }
     ]
   }
 };
@@ -1602,13 +1617,11 @@ function getRuntimePackageVersion() {
   return "unknown";
 }
 
+// src/utils/plugin-cache-validation.ts
+import { basename, dirname as dirname3, isAbsolute, join as join4, parse as parse4, resolve } from "path";
+var PLUGIN_ROOT_REQUIREMENTS = [join4("hooks", "hooks.json"), join4("scripts", "run.cjs"), "scripts"];
+
 // src/utils/paths.ts
-import { join as join4, dirname as dirname3 } from "path";
-var PLUGIN_ROOT_REQUIREMENTS = [
-  join4("hooks", "hooks.json"),
-  join4("scripts", "run.cjs"),
-  "scripts"
-];
 var OCCUPIED_CODES = new Set(
   process.platform === "win32" ? ["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR", "EPERM", "EACCES"] : ["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR"]
 );
@@ -1633,13 +1646,13 @@ function buildHudWrapper(packageDir) {
 // src/lib/worktree-paths.ts
 import { AsyncLocalStorage } from "node:async_hooks";
 import { closeSync, existsSync as existsSync3, lstatSync as lstatSync2, mkdirSync, openSync, readFileSync as readFileSync4, readSync, realpathSync as realpathSync2, readdirSync, writeFileSync, unlinkSync, statSync } from "fs";
-import { resolve, normalize as normalize2, relative, sep as sep2, join as join6, isAbsolute, basename, dirname as dirname4 } from "path";
+import { resolve as resolve2, normalize as normalize2, relative, sep as sep2, join as join6, isAbsolute as isAbsolute2, basename as basename2, dirname as dirname4 } from "path";
 import { pathToFileURL } from "url";
 var canonicalWorkingDirectoryRoots = /* @__PURE__ */ new WeakMap();
 var worktreePathRenderScope = new AsyncLocalStorage();
 var projectIdentifierOperationScope = new AsyncLocalStorage();
 function callerVisibleTrustedRootLabel(trustedRoot) {
-  const label = basename(trustedRoot);
+  const label = basename2(trustedRoot);
   return label.length > 0 ? label : "current repository";
 }
 function attachCanonicalWorkingDirectoryRoots(target, providedRoot, trustedRoot) {
@@ -1711,7 +1724,7 @@ var ForeignWorkingDirectoryError = class extends Error {
 };
 
 // src/utils/user-skill-compat.ts
-import { basename as basename2, join as join7 } from "path";
+import { basename as basename3, join as join7 } from "path";
 var CLAUDE_SKILLS_DIR = join7(getClaudeConfigDir(), "skills");
 var OMC_LEARNED_DIR = join7(CLAUDE_SKILLS_DIR, "omc-learned");
 
@@ -1982,12 +1995,21 @@ import * as path from "path";
 import * as crypto from "crypto";
 
 // src/lib/file-identity.ts
+function fileIdentityOf(stats) {
+  return {
+    dev: BigInt(stats.dev),
+    ino: BigInt(stats.ino)
+  };
+}
 function identitiesEqual(left, right) {
-  if (!left || left.ino !== right.ino) return false;
-  if (left.dev === 0 || right.dev === 0) {
-    return left.ino !== 0 && (process.platform === "win32" || left.dev === right.dev);
+  if (!left) return false;
+  const leftIdentity = fileIdentityOf(left);
+  const rightIdentity = fileIdentityOf(right);
+  if (leftIdentity.ino !== rightIdentity.ino) return false;
+  if (leftIdentity.dev === 0n || rightIdentity.dev === 0n) {
+    return leftIdentity.ino !== 0n && (process.platform === "win32" || leftIdentity.dev === rightIdentity.dev);
   }
-  return left.dev === right.dev;
+  return leftIdentity.dev === rightIdentity.dev;
 }
 
 // src/lib/atomic-write.ts
@@ -2019,15 +2041,15 @@ function writeAllSync(fd, content, label) {
   }
 }
 function verifyPrivateTempFile(fd, tempPath, label, operations) {
-  const fdStats = fsSync.fstatSync(fd);
+  const fdStats = descriptorStats(fd, operations);
   let pathStats;
   try {
-    pathStats = (operations?.lstat ?? fsSync.lstatSync)(tempPath);
+    pathStats = pathnameStats(tempPath, operations);
   } catch {
     throw new Error(`${label} temporary file was replaced before rename`);
   }
   const isWindows2 = process.platform === "win32";
-  const isPrivateRegularSingleLink = (stats) => stats.isFile() && (isWindows2 ? stats.nlink <= 1 : stats.nlink === 1) && (isWindows2 || (stats.mode & 511) === 384);
+  const isPrivateRegularSingleLink = (stats) => stats.isFile() && (isWindows2 ? Number(stats.nlink) <= 1 : Number(stats.nlink) === 1) && (isWindows2 || (Number(stats.mode) & 511) === 384);
   if (!isPrivateRegularSingleLink(fdStats) || !isPrivateRegularSingleLink(pathStats)) {
     throw new Error(
       `${label} temporary file must be a private regular single-link file`
@@ -2038,10 +2060,10 @@ function verifyPrivateTempFile(fd, tempPath, label, operations) {
   }
 }
 function verifyPublishedFile(fd, filePath, label, operations) {
-  const fdStats = fsSync.fstatSync(fd);
+  const fdStats = descriptorStats(fd, operations);
   let pathStats;
   try {
-    pathStats = (operations?.lstat ?? fsSync.lstatSync)(filePath);
+    pathStats = pathnameStats(filePath, operations);
   } catch {
     throw new Error(`${label} target was replaced at publication`);
   }
@@ -2069,18 +2091,22 @@ function preservePriorTarget(filePath, operations) {
     return null;
   }
 }
+function descriptorStats(fd, operations) {
+  return operations ? fsSync.fstatSync(fd) : fsSync.fstatSync(fd, { bigint: true });
+}
+function pathnameStats(filePath, operations) {
+  return operations ? operations.lstat(filePath) : fsSync.lstatSync(filePath, { bigint: true });
+}
 function currentFileIdentity(filePath, operations) {
   try {
-    const stats = (operations?.lstat ?? fsSync.lstatSync)(filePath);
-    return { dev: stats.dev, ino: stats.ino };
+    return fileIdentityOf(pathnameStats(filePath, operations));
   } catch {
     return null;
   }
 }
-function descriptorIdentity(fd) {
+function descriptorIdentity(fd, operations) {
   try {
-    const stats = fsSync.fstatSync(fd);
-    return { dev: stats.dev, ino: stats.ino };
+    return fileIdentityOf(descriptorStats(fd, operations));
   } catch {
     return null;
   }
@@ -2127,7 +2153,7 @@ function atomicWriteFileSync(filePath, content, hooks, operations) {
     let publishedIdentity = null;
     try {
       verifyPublishedFile(fd, filePath, "atomic write", operations);
-      publishedIdentity = descriptorIdentity(fd);
+      publishedIdentity = descriptorIdentity(fd, operations);
       hooks?.afterRename?.();
       verifyPublishedFile(fd, filePath, "atomic write", operations);
     } catch (error) {
@@ -2211,7 +2237,7 @@ function getDefaultPackageRoot() {
     if (parent === candidate) break;
     candidate = parent;
   }
-  return resolve3(dirname7(fileURLToPath3(import.meta.url)), "..", "..");
+  return resolve4(dirname7(fileURLToPath3(import.meta.url)), "..", "..");
 }
 function quoteCommandPath2(value) {
   return `"${value.replace(/\\/g, "/").replace(/"/g, '\\"')}"`;
@@ -2305,7 +2331,7 @@ function readOptionalFile(path2) {
 function buildSnapshot(options) {
   const home = options.homeDir ?? homedir3();
   const copilotHome = options.copilotHome ? resolveHomeSetting(options.copilotHome, home, ".copilot") : getCopilotHome(process.env, home);
-  const packageRoot = resolve3(options.packageRoot ?? getDefaultPackageRoot());
+  const packageRoot = resolve4(options.packageRoot ?? getDefaultPackageRoot());
   const settingsPath = join10(copilotHome, "settings.json");
   const wrapperPath = join10(copilotHome, "hud", "omc-hud.mjs");
   const helperPath = join10(copilotHome, "hud", "lib", "config-dir.mjs");
@@ -2471,7 +2497,7 @@ function runCli(args) {
   }
   const options = {
     replaceExisting: args.includes("--replace"),
-    packageRoot: pluginDirIndex >= 0 ? resolve3(args[pluginDirIndex + 1]) : void 0
+    packageRoot: pluginDirIndex >= 0 ? resolve4(args[pluginDirIndex + 1]) : void 0
   };
   const result = action === "setup" || action === "repair" ? configureCopilotHud(options) : inspectCopilotHud(options);
   if (args.includes("--json")) {
@@ -2483,7 +2509,7 @@ function runCli(args) {
   return result.needsRepair ? 1 : 0;
 }
 var entrypoint = process.argv[1];
-if (entrypoint && resolve3(entrypoint) === resolve3(fileURLToPath3(import.meta.url))) {
+if (entrypoint && resolve4(entrypoint) === resolve4(fileURLToPath3(import.meta.url))) {
   process.exitCode = runCli(process.argv.slice(2));
 }
 export {

@@ -1,4 +1,4 @@
-export type SessionEndActionName = 'foreground-cleanup' | 'wiki-capture' | 'team-cleanup' | 'python-cleanup' | 'reply-cleanup' | 'callback' | 'notification' | 'openclaw';
+export type SessionEndActionName = 'foreground-cleanup' | 'wiki-capture' | 'team-cleanup' | 'python-cleanup' | 'reply-cleanup' | 'callback' | 'notification' | 'openclaw' | 'spawn-next';
 export type ActionStatus = 'pending' | 'claimed' | 'retryable' | 'completed' | 'expired';
 export interface SessionEndActionState {
     class: 'required' | 'best-effort';
@@ -122,11 +122,17 @@ export declare function reapStaleSessionEndOwner(directory: string, sessionId: s
  * Releasing ownership without reaching `complete` is the one path that leaves a
  * job non-terminal, so the caller's reason is persisted with it (issue #4076).
  */
-export declare function releaseSessionEndJob(directory: string, sessionId: string, nonce: string, generation: number, reason?: string): SessionEndJobV1 | null;
+export declare function releaseSessionEndJob(directory: string, sessionId: string, nonce: string, generation: number, reason?: string, actionResult?: {
+    name: SessionEndActionName;
+    runnerNonce: string;
+    completed: boolean;
+    code: string;
+    deliveryStarted?: boolean;
+}): SessionEndJobV1 | null;
 export declare function updateSessionEndJob(directory: string, sessionId: string, expectedOwner: string, mutate: (job: SessionEndJobV1) => void): SessionEndJobV1 | null;
 export declare function claimSessionEndAction(directory: string, sessionId: string, ownerNonce: string, name: SessionEndActionName, deadlineAt: number): SessionEndJobV1 | null;
 export declare function markSessionEndActionRunner(directory: string, sessionId: string, ownerNonce: string, name: SessionEndActionName, runnerNonce: string, phase: 'started' | 'armed' | 'result-recorded'): SessionEndJobV1 | null;
-export declare function finishSessionEndAction(directory: string, sessionId: string, ownerNonce: string, name: SessionEndActionName, runnerNonce: string, completed: boolean, code: string): SessionEndJobV1 | null;
+export declare function finishSessionEndAction(directory: string, sessionId: string, ownerNonce: string, name: SessionEndActionName, runnerNonce: string, completed: boolean, code: string, deliveryStarted?: boolean): SessionEndJobV1 | null;
 /** Claims fair durable discovery tickets and retires tickets whose manifests are terminal. */
 export declare function claimSessionEndDiscoveryTickets(directory: string, limit?: number, leaseMs?: number): Array<{
     sessionId: string;

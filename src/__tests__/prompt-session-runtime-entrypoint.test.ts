@@ -1,7 +1,6 @@
 import { execFileSync, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import {
   copyFileSync,
-  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -20,6 +19,7 @@ import {
   expect,
   it,
 } from 'vitest';
+import { stageHookRuntimeSupport } from './helpers/staged-hook-runtime.js';
 
 const REPO_ROOT = process.cwd();
 const BUILD_RUNTIME_PATH = join(
@@ -213,12 +213,7 @@ function stagePlugin(runtime: 'valid' | 'missing' = 'valid'): StagedPlugin {
   const root = mkdtempSync(join(tmpdir(), 'omc-prompt-session-entrypoint-'));
   tempRoots.push(root);
   const scriptsDir = join(root, 'scripts');
-  mkdirSync(scriptsDir, { recursive: true });
-  cpSync(
-    join(REPO_ROOT, 'scripts', 'lib'),
-    join(scriptsDir, 'lib'),
-    { recursive: true },
-  );
+  stageHookRuntimeSupport(root, REPO_ROOT);
 
   const scripts = {} as Record<ScriptName, string>;
   for (const [name, config] of Object.entries(SCRIPT_CONFIG) as Array<

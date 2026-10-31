@@ -1,3 +1,5 @@
+/** Reuse one canonical storage anchor within a complete team operation. */
+export declare function withTeamStatePathScope<T>(cwd: string, fn: () => T): T;
 /**
  * Typed path builders for all team state files.
  * All paths are relative to cwd.
@@ -102,6 +104,10 @@ export declare const TeamPaths: {
     readonly teamInstanceReservation: (workspaceHash: string, teamName: string) => string;
     readonly teamInstanceCleanupRoot: (workspaceHash: string, teamName: string, instanceId: string) => string;
     readonly teamInstanceCleanupReceipt: (workspaceHash: string, teamName: string, instanceId: string) => string;
+    readonly teamInstanceScaleUpRecoveryRoot: (workspaceHash: string, teamName: string, instanceId: string) => string;
+    readonly teamInstanceScaleUpRecoveryOperationRoot: (workspaceHash: string, teamName: string, instanceId: string, operationId: string) => string;
+    readonly teamInstanceScaleUpRecoveryEvidence: (workspaceHash: string, teamName: string, instanceId: string, operationId: string) => string;
+    readonly teamInstanceScaleUpRecoveryRetiredOperationRoot: (workspaceHash: string, teamName: string, instanceId: string, operationId: string) => string;
     readonly teamInstanceDetachedRoot: (workspaceHash: string, teamName: string, instanceId: string) => string;
     readonly recoveryRequestPending: (requestId: string) => string;
     readonly recoveryRequestResult: (requestId: string) => string;

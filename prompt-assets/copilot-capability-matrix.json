@@ -320,6 +320,19 @@
       "transformations": []
     },
     {
+      "id": "map",
+      "source": "skills/map/SKILL.md",
+      "output": "skills-copilot/map/SKILL.md",
+      "intendedOutcome": "Route a job to its owning skill without executing the workflow.",
+      "claudeMechanism": "Canonical skill-routing prompt with manual-only handoffs.",
+      "copilotMechanism": "Generated canonical prompt preserving explicit skill routing and manual invocation boundaries.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
       "id": "minimal-code-discipline",
       "source": "skills/minimal-code-discipline/SKILL.md",
       "output": "skills-copilot/minimal-code-discipline/SKILL.md",
@@ -392,6 +405,19 @@
       ]
     },
     {
+      "id": "pr",
+      "source": "skills/pr/SKILL.md",
+      "output": "skills-copilot/pr/SKILL.md",
+      "intendedOutcome": "Draft a PR body from existing verification evidence and decision artifacts.",
+      "claudeMechanism": "Canonical evidence-consumption and PR assembly prompt.",
+      "copilotMechanism": "Generated canonical prompt preserving evidence provenance and reversibility assessment.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
       "id": "project-session-manager",
       "source": "skills/project-session-manager/SKILL.md",
       "output": "skills-copilot/project-session-manager/SKILL.md",
@@ -439,6 +465,19 @@
         "interactive-prompts",
         "skill-tool"
       ]
+    },
+    {
+      "id": "refit",
+      "source": "skills/refit/SKILL.md",
+      "output": "skills-copilot/refit/SKILL.md",
+      "intendedOutcome": "Survey recorded environment friction and propose individually approved improvements.",
+      "claudeMechanism": "Canonical retrospective prompt using OMC instrumentation and explicit approval.",
+      "copilotMechanism": "Generated canonical prompt retaining manual invocation and approval before any changes.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
     },
     {
       "id": "release",
@@ -522,6 +561,24 @@
       }
     },
     {
+      "id": "session-flow",
+      "source": "skills/session-flow/SKILL.md",
+      "output": "skills-copilot/session-flow/SKILL.md",
+      "intendedOutcome": "Reconstruct an evidence-backed session map without mutating unrelated task records.",
+      "claudeMechanism": "Canonical Claude session summary and ownership-marked native Task records.",
+      "copilotMechanism": "Generated prompt using the available task-list surface with read-only fallback when persistence is unavailable.",
+      "automatedEvidence": "generator drift, semantic scan, manifest routing, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "task-tracking"
+      ],
+      "frontmatter": {
+        "description": "Reorient in the current GitHub Copilot CLI session with an evidence-backed map of its goal, pivots, outcomes, current step, and open decisions."
+      }
+    },
+    {
       "id": "skill",
       "source": "skills/skill/SKILL.md",
       "output": "skills-copilot/skill/SKILL.md",
@@ -544,6 +601,19 @@
       "claudeMechanism": "Canonical Claude runtime-backed user-path prompt.",
       "copilotMechanism": "Generated prompt preserving the learner runtime's getClaudeConfigDir-backed user path.",
       "automatedEvidence": "generator drift, path contracts, alias guard, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "tdd",
+      "source": "skills/tdd/SKILL.md",
+      "output": "skills-copilot/tdd/SKILL.md",
+      "intendedOutcome": "Drive implementation through user-approved test seams and independent expected values.",
+      "claudeMechanism": "Canonical test-first execution discipline.",
+      "copilotMechanism": "Generated canonical prompt preserving approved seams, boundary substitutions, and red-green evidence.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
       "liveEvidenceRequired": false,
       "aliases": [],
       "bodyStrategy": "canonical",

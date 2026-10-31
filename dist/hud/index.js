@@ -5,7 +5,7 @@
  * Statusline command that visualizes oh-my-claudecode state.
  * Receives normalized host statusline stdin and outputs the formatted HUD.
  */
-import { readStdin, writeStdinCache, readStdinCache, getContextPercent, getModelId, getModelName, getRateLimitsFromStdin, stabilizeContextPercent, } from "./stdin.js";
+import { readStdin, writeStdinCache, readStdinCache, getContextPercent, getModelId, getEffortLevel, getModelName, getRateLimitsFromStdin, stabilizeContextPercent, } from "./stdin.js";
 import { parseTranscript } from "./transcript.js";
 import { readHudState, readHudConfig, getRunningTasks, writeHudState, initializeHUDState, } from "./state.js";
 import { readRalphStateForHud, readPrdStateForHud, readAutopilotStateForHud, } from "./omc-state.js";
@@ -36,16 +36,36 @@ function extractSessionIdFromPath(transcriptPath) {
     const match = transcriptPath.match(/([0-9a-f-]{36})(?:\.jsonl)?$/i);
     return match ? match[1] : null;
 }
+// The two sources round reset times differently (e.g. 17:59:59.924Z vs 18:00:00Z).
+const SAME_WINDOW_TOLERANCE_MS = 60 * 1000;
+/**
+ * Stdin rate limits only move when this session makes a request, so usage from
+ * other sessions or background agents leaves them stale. Usage within a window
+ * never decreases, so when both sources describe the same window the higher
+ * percentage is the fresher one.
+ */
+function pickFresherPercent(stdinPercent, stdinResetsAt, apiPercent, apiResetsAt) {
+    if (stdinPercent == null || apiPercent == null || !stdinResetsAt || !apiResetsAt) {
+        return stdinPercent;
+    }
+    const isSameWindow = Math.abs(stdinResetsAt.getTime() - apiResetsAt.getTime()) <= SAME_WINDOW_TOLERANCE_MS;
+    return isSameWindow ? Math.max(stdinPercent, apiPercent) : stdinPercent;
+}
 function mergeStdinRateLimits(stdinRateLimits, usageResult) {
     if (!stdinRateLimits) {
         return usageResult;
     }
+    const apiRateLimits = usageResult?.rateLimits ?? {};
+    const merged = { ...apiRateLimits, ...stdinRateLimits };
+    if (stdinRateLimits.fiveHourPercent != null) {
+        merged.fiveHourPercent = pickFresherPercent(stdinRateLimits.fiveHourPercent, stdinRateLimits.fiveHourResetsAt, apiRateLimits.fiveHourPercent, apiRateLimits.fiveHourResetsAt);
+    }
+    if (stdinRateLimits.weeklyPercent != null) {
+        merged.weeklyPercent = pickFresherPercent(stdinRateLimits.weeklyPercent, stdinRateLimits.weeklyResetsAt, apiRateLimits.weeklyPercent, apiRateLimits.weeklyResetsAt);
+    }
     return {
         ...(usageResult ?? {}),
-        rateLimits: {
-            ...(usageResult?.rateLimits ?? {}),
-            ...stdinRateLimits,
-        },
+        rateLimits: merged,
     };
 }
 /**
@@ -375,6 +395,7 @@ async function mainImpl(watchMode = false, skipInit = false) {
             contextDisplayScope: currentSessionId ?? cwd,
             modelName: getModelName(stdin),
             modelId: getModelId(stdin),
+            effortLevel: getEffortLevel(stdin),
             ralph,
             ultrawork: null,
             prd,

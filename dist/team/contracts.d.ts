@@ -1,6 +1,9 @@
 export declare const TEAM_NAME_SAFE_PATTERN: RegExp;
 export declare const WORKER_NAME_SAFE_PATTERN: RegExp;
 export declare const TASK_ID_SAFE_PATTERN: RegExp;
+export declare const SCALE_UP_OPERATION_ID_SAFE_PATTERN: RegExp;
+export declare function isCanonicalWorkerName(value: unknown): value is string;
+export declare function isSafeScaleUpOperationId(value: unknown): value is string;
 export declare const TEAM_TASK_STATUSES: readonly ["pending", "blocked", "in_progress", "completed", "failed"];
 export type TeamTaskStatus = (typeof TEAM_TASK_STATUSES)[number];
 export declare const TEAM_TERMINAL_TASK_STATUSES: ReadonlySet<TeamTaskStatus>;

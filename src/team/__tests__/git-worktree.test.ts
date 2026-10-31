@@ -1,6 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync, symlinkSync } from 'fs';
-import { join } from 'path';
+import {
+  mkdtempSync,
+  rmSync,
+  existsSync,
+  writeFileSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  symlinkSync,
+  chmodSync,
+} from 'fs';
+import { dirname, join, resolve } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import {
@@ -9,17 +19,40 @@ import {
   listTeamWorktrees,
   cleanupTeamWorktrees,
   ensureWorkerWorktree,
+  getBranchName,
+  getWorktreePath,
   installWorktreeRootAgents,
   restoreWorktreeRootAgents,
   prepareWorkerWorktreeForRemoval,
+  isWorktreeMetadataPublicationFailure,
 } from '../git-worktree.js';
+import { withTeamStatePathScope } from '../state-paths.js';
+
+function canonicalFixturePath(path: string): string {
+  let canonical: string;
+  try {
+    canonical = realpathSync.native(path);
+  } catch {
+    canonical = resolve(path);
+  }
+  return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+}
+
+function registeredWorktreePaths(repoDir: string): string[] {
+  return execFileSync('git', ['worktree', 'list', '--porcelain'], {
+    cwd: repoDir,
+    encoding: 'utf-8',
+  }).split(/\r?\n/)
+    .filter(line => line.startsWith('worktree '))
+    .map(line => canonicalFixturePath(line.slice('worktree '.length)));
+}
 
 describe('git-worktree', () => {
   let repoDir: string;
   const teamName = 'test-wt';
 
   beforeEach(() => {
-    repoDir = mkdtempSync(join(tmpdir(), 'git-worktree-test-'));
+    repoDir = realpathSync.native(mkdtempSync(join(tmpdir(), 'git-worktree-test-')));
     // Initialize a git repo with an initial commit
     execFileSync('git', ['init'], { cwd: repoDir, stdio: 'pipe' });
     execFileSync('git', ['config', 'user.email', 'test@test.com'], { cwd: repoDir, stdio: 'pipe' });
@@ -42,7 +75,9 @@ describe('git-worktree', () => {
     it('creates worktree at correct path', () => {
       const info = createWorkerWorktree(teamName, 'worker1', repoDir);
 
-      expect(info.path).toContain(`.omc/team/${teamName}/worktrees/worker1`);
+      expect(realpathSync.native(info.path)).toBe(
+        realpathSync.native(getWorktreePath(repoDir, teamName, 'worker1')),
+      );
       expect(info.branch).toBe(`omc-team/${teamName}/worker1`);
       expect(info.workerName).toBe('worker1');
       expect(info.teamName).toBe(teamName);
@@ -67,6 +102,67 @@ describe('git-worktree', () => {
       expect(info2.reused).toBe(true);
     });
 
+    it('rejects a lossy worker-name alias before touching an existing canonical worktree', () => {
+      const workerName = 'worker-2';
+      const info = createWorkerWorktree(teamName, workerName, repoDir);
+      installWorktreeRootAgents(teamName, workerName, repoDir, info.path, 'managed overlay');
+      const branchOid = execFileSync('git', ['rev-parse', info.branch], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim();
+      const metadata = listTeamWorktrees(teamName, repoDir);
+      const agents = readFileSync(join(info.path, 'AGENTS.md'));
+
+      expect(() => ensureWorkerWorktree(teamName, 'worker-2!', repoDir, {
+        mode: 'named',
+        requireCleanLeader: false,
+      })).toThrow(/worktree_worker_name_noncanonical/);
+
+      expect(existsSync(info.path)).toBe(true);
+      expect(registeredWorktreePaths(repoDir)).toContain(canonicalFixturePath(info.path));
+      expect(execFileSync('git', ['rev-parse', info.branch], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim()).toBe(branchOid);
+      expect(listTeamWorktrees(teamName, repoDir)).toEqual(metadata);
+      expect(readFileSync(join(info.path, 'AGENTS.md'))).toEqual(agents);
+    });
+
+    it('keeps invalid worker names as a disabled/default no-op', () => {
+      const missingRepo = join(repoDir, 'missing-repo');
+
+      expect(ensureWorkerWorktree(teamName, 'worker-2!', missingRepo)).toBeNull();
+      expect(ensureWorkerWorktree(teamName, 'worker-2!', missingRepo, {
+        mode: 'disabled',
+      })).toBeNull();
+      expect(existsSync(missingRepo)).toBe(false);
+    });
+
+    it('preserves a reused worktree and branch when metadata publication fails', () => {
+      const workerName = 'worker-reused-publication-failure';
+      const info = createWorkerWorktree(teamName, workerName, repoDir);
+      const omcRoot = join(info.path, '..', '..', '..', '..');
+      const metadataPath = join(omcRoot, 'state', 'team', teamName, 'worktrees.json');
+      const branchHead = execFileSync('git', ['rev-parse', info.branch], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim();
+      rmSync(metadataPath, { force: true });
+      mkdirSync(metadataPath, { recursive: true });
+
+      expect(() => createWorkerWorktree(teamName, workerName, repoDir)).toThrow(/worktrees\.json/);
+
+      expect(existsSync(info.path)).toBe(true);
+      expect(registeredWorktreePaths(repoDir)).toContain(canonicalFixturePath(info.path));
+      expect(execFileSync('git', ['rev-parse', info.branch], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim()).toBe(branchHead);
+
+      rmSync(metadataPath, { recursive: true, force: true });
+      removeWorkerWorktree(teamName, workerName, repoDir, info.path);
+    });
+
     it('rejects a stale plain directory instead of deleting files', () => {
       const stalePath = join(repoDir, '.omc', 'team', teamName, 'worktrees', 'worker-stale');
       rmSync(stalePath, { recursive: true, force: true });
@@ -83,7 +179,9 @@ describe('git-worktree', () => {
         requireCleanLeader: false,
       });
 
-      expect(info?.path).toContain(`.omc/team/${teamName}/worktrees/worker-detached`);
+      expect(realpathSync.native(info!.path)).toBe(
+        realpathSync.native(getWorktreePath(repoDir, teamName, 'worker-detached')),
+      );
       expect(info?.detached).toBe(true);
       expect(info?.created).toBe(true);
       expect(info?.reused).toBe(false);
@@ -110,6 +208,204 @@ describe('git-worktree', () => {
       expect(() => createWorkerWorktree(teamName, 'worker-dirty', repoDir)).toThrow(/worktree_dirty/);
       expect(existsSync(join(info.path, 'dirty.txt'))).toBe(true);
     });
+
+    it('removes the exact created worktree and owned branch when metadata publication fails', () => {
+      const workerName = 'worker-metadata-failure';
+      const worktreePath = getWorktreePath(repoDir, teamName, workerName);
+      const omcRoot = join(worktreePath, '..', '..', '..', '..');
+      const metadataPath = join(omcRoot, 'state', 'team', teamName, 'worktrees.json');
+      const branch = getBranchName(teamName, workerName);
+      mkdirSync(metadataPath, { recursive: true });
+
+      let publicationFailure: unknown;
+      try {
+        createWorkerWorktree(teamName, workerName, repoDir);
+      } catch (error) {
+        publicationFailure = error;
+      }
+      expect(publicationFailure).toBeInstanceOf(Error);
+      expect(publicationFailure).toMatchObject({
+        code: 'worktree_metadata_publication_failed',
+        teamName,
+        workerName,
+        worktreePath,
+        worktreeBranch: branch,
+        worktreeMode: 'named',
+        cleanupVerified: true,
+        cause: expect.any(Error),
+      });
+      if (publicationFailure instanceof Error && publicationFailure.cause instanceof Error) {
+        expect(publicationFailure.cause.message).toMatch(/worktrees\.json/);
+      }
+
+      expect(existsSync(worktreePath)).toBe(false);
+      expect(registeredWorktreePaths(repoDir)).not.toContain(canonicalFixturePath(worktreePath));
+      expect(execFileSync('git', ['branch', '--list', branch], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim()).toBe('');
+      expect(() => removeWorkerWorktree(teamName, workerName, repoDir, worktreePath)).not.toThrow();
+    });
+
+    it('returns exact retry authority when metadata publication and branch cleanup both fail', () => {
+      const workerName = 'worker-metadata-branch-lock';
+      const worktreePath = getWorktreePath(repoDir, teamName, workerName);
+      const branch = getBranchName(teamName, workerName);
+      const omcRoot = join(worktreePath, '..', '..', '..', '..');
+      const metadataPath = join(omcRoot, 'state', 'team', teamName, 'worktrees.json');
+      const gitDir = realpathSync.native(join(
+        repoDir,
+        execFileSync('git', ['rev-parse', '--git-dir'], {
+          cwd: repoDir,
+          encoding: 'utf-8',
+        }).trim(),
+      ));
+      const hookPath = join(gitDir, 'hooks', 'post-checkout');
+      const branchLockPath = join(gitDir, 'refs', 'heads', `${branch}.lock`);
+      const shellQuote = (value: string): string =>
+        `'${value.replace(/\\/g, '/').replace(/'/g, "'\\''")}'`;
+      mkdirSync(dirname(hookPath), { recursive: true });
+      writeFileSync(hookPath, [
+        '#!/bin/sh',
+        `mkdir -p ${shellQuote(dirname(branchLockPath))}`,
+        `printf locked > ${shellQuote(branchLockPath)}`,
+      ].join('\n'), 'utf-8');
+      chmodSync(hookPath, 0o755);
+      mkdirSync(metadataPath, { recursive: true });
+
+      try {
+        let publicationFailure: unknown;
+        try {
+          createWorkerWorktree(teamName, workerName, repoDir);
+        } catch (error) {
+          publicationFailure = error;
+        }
+
+        expect(isWorktreeMetadataPublicationFailure(publicationFailure)).toBe(true);
+        if (!isWorktreeMetadataPublicationFailure(publicationFailure)) {
+          throw new Error('expected worktree metadata publication failure');
+        }
+        expect(publicationFailure).toMatchObject({
+          code: 'worktree_metadata_publication_cleanup_failed',
+          teamName,
+          workerName,
+          worktreePath,
+          worktreeBranch: branch,
+          worktreeMode: 'named',
+          cleanupVerified: false,
+          cause: expect.any(Error),
+          cleanupError: expect.any(Error),
+        });
+        expect(existsSync(branchLockPath)).toBe(true);
+        expect(existsSync(worktreePath)).toBe(false);
+        expect(execFileSync('git', ['branch', '--list', branch], {
+          cwd: repoDir,
+          encoding: 'utf-8',
+        }).trim()).toContain(branch);
+
+        const receipt = {
+          path: publicationFailure.worktreePath,
+          branch: publicationFailure.worktreeBranch,
+          mode: publicationFailure.worktreeMode,
+          created: true as const,
+          reused: false as const,
+        };
+        expect(() => removeWorkerWorktree(teamName, workerName, repoDir, receipt)).toThrow(
+          /worktree_branch_remove_failed/,
+        );
+
+        rmSync(branchLockPath, { force: true });
+        expect(() => removeWorkerWorktree(teamName, workerName, repoDir, receipt)).not.toThrow();
+        expect(execFileSync('git', ['branch', '--list', branch], {
+          cwd: repoDir,
+          encoding: 'utf-8',
+        }).trim()).toBe('');
+      } finally {
+        rmSync(branchLockPath, { force: true });
+        rmSync(metadataPath, { recursive: true, force: true });
+        rmSync(hookPath, { force: true });
+      }
+    });
+
+    it('does not clean a same-named worktree on a new root when failed publication rolls back', async () => {
+      const workerName = 'worker-publication-root-switch';
+      const stateParent = realpathSync.native(mkdtempSync(join(tmpdir(), 'git-worktree-publication-root-')));
+      const storageA = join(stateParent, 'storage-a');
+      const storageB = join(stateParent, 'storage-b');
+      const previousStateDir = process.env.OMC_STATE_DIR;
+      mkdirSync(storageA, { recursive: true });
+      mkdirSync(storageB, { recursive: true });
+
+      try {
+        process.env.OMC_STATE_DIR = storageB;
+        const worktreeB = getWorktreePath(repoDir, teamName, workerName);
+        mkdirSync(worktreeB, { recursive: true });
+        const sentinelB = join(worktreeB, 'do-not-remove.txt');
+        writeFileSync(sentinelB, 'root-b');
+
+        process.env.OMC_STATE_DIR = storageA;
+        await withTeamStatePathScope(repoDir, async () => {
+          const worktreeA = getWorktreePath(repoDir, teamName, workerName);
+          const omcRootA = join(worktreeA, '..', '..', '..', '..');
+          const metadataPathA = join(omcRootA, 'state', 'team', teamName, 'worktrees.json');
+          mkdirSync(metadataPathA, { recursive: true });
+
+          await Promise.resolve();
+          process.env.OMC_STATE_DIR = storageB;
+
+          expect(() => ensureWorkerWorktree(teamName, workerName, repoDir, {
+            mode: 'detached',
+            requireCleanLeader: false,
+          })).toThrow(/worktrees\.json/);
+          expect(existsSync(worktreeA)).toBe(false);
+          expect(readFileSync(sentinelB, 'utf-8')).toBe('root-b');
+          expect(registeredWorktreePaths(repoDir)).not.toContain(canonicalFixturePath(worktreeA));
+        });
+      } finally {
+        if (previousStateDir === undefined) delete process.env.OMC_STATE_DIR;
+        else process.env.OMC_STATE_DIR = previousStateDir;
+        rmSync(stateParent, { recursive: true, force: true });
+      }
+    });
+
+    it('keeps creation and metadata on the captured root after an awaited environment change', async () => {
+      const stateParent = realpathSync.native(mkdtempSync(join(tmpdir(), 'git-worktree-state-root-')));
+      const storageA = join(stateParent, 'storage-a');
+      const storageB = join(stateParent, 'storage-b');
+      const previousStateDir = process.env.OMC_STATE_DIR;
+      mkdirSync(storageA, { recursive: true });
+      mkdirSync(storageB, { recursive: true });
+
+      try {
+        process.env.OMC_STATE_DIR = storageB;
+        const worktreeB = getWorktreePath(repoDir, teamName, 'worker-root-switch');
+        const omcRootB = join(worktreeB, '..', '..', '..', '..');
+        process.env.OMC_STATE_DIR = storageA;
+
+        await withTeamStatePathScope(repoDir, async () => {
+          const expectedPath = getWorktreePath(repoDir, teamName, 'worker-root-switch');
+          await Promise.resolve();
+          process.env.OMC_STATE_DIR = storageB;
+
+          const info = ensureWorkerWorktree(teamName, 'worker-root-switch', repoDir, {
+            mode: 'detached',
+            requireCleanLeader: false,
+          });
+          expect(info?.path).toBe(expectedPath);
+          expect(listTeamWorktrees(teamName, repoDir)).toEqual([
+            expect.objectContaining({ workerName: 'worker-root-switch', path: expectedPath }),
+          ]);
+          expect(existsSync(worktreeB)).toBe(false);
+          expect(existsSync(join(omcRootB, 'state', 'team', teamName, 'worktrees.json'))).toBe(false);
+
+          removeWorkerWorktree(teamName, 'worker-root-switch', repoDir, expectedPath);
+        });
+      } finally {
+        if (previousStateDir === undefined) delete process.env.OMC_STATE_DIR;
+        else process.env.OMC_STATE_DIR = previousStateDir;
+        rmSync(stateParent, { recursive: true, force: true });
+      }
+    });
   });
 
   describe('removeWorkerWorktree', () => {
@@ -135,6 +431,94 @@ describe('git-worktree', () => {
       expect(branches).not.toContain('omc-team/');
     });
 
+    it('does not delete a same-named branch when removing an owned detached worktree', () => {
+      const workerName = 'worker-detached-branch-sentinel';
+      const syntheticBranch = getBranchName(teamName, workerName);
+      execFileSync('git', ['branch', syntheticBranch], { cwd: repoDir, stdio: 'pipe' });
+      const info = ensureWorkerWorktree(teamName, workerName, repoDir, {
+        mode: 'detached',
+        requireCleanLeader: false,
+      });
+
+      expect(info).toMatchObject({
+        branch: 'HEAD',
+        mode: 'detached',
+        created: true,
+        reused: false,
+      });
+      removeWorkerWorktree(teamName, workerName, repoDir);
+
+      expect(existsSync(info!.path)).toBe(false);
+      expect(execFileSync('git', ['branch', '--list', syntheticBranch], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim()).toContain(syntheticBranch);
+    });
+
+    it('rejects a forged detached receipt for another worker path', () => {
+      const workerOne = 'worker-detached-one';
+      const workerTwo = 'worker-detached-two';
+      const infoOne = ensureWorkerWorktree(teamName, workerOne, repoDir, {
+        mode: 'detached',
+        requireCleanLeader: false,
+      });
+      const infoTwo = ensureWorkerWorktree(teamName, workerTwo, repoDir, {
+        mode: 'detached',
+        requireCleanLeader: false,
+      });
+
+      expect(() => removeWorkerWorktree(teamName, workerOne, repoDir, {
+        path: infoTwo!.path,
+        branch: 'HEAD',
+        mode: 'detached',
+        created: true,
+        reused: false,
+      })).toThrow(/worktree_path_mismatch/);
+
+      expect(existsSync(infoOne!.path)).toBe(true);
+      expect(existsSync(infoTwo!.path)).toBe(true);
+      expect(listTeamWorktrees(teamName, repoDir).map(entry => entry.workerName).sort()).toEqual([
+        workerOne,
+        workerTwo,
+      ]);
+
+      removeWorkerWorktree(teamName, workerOne, repoDir, infoOne!);
+      expect(existsSync(infoOne!.path)).toBe(false);
+      expect(existsSync(infoTwo!.path)).toBe(true);
+      expect(listTeamWorktrees(teamName, repoDir).map(entry => entry.workerName)).toEqual([workerTwo]);
+    });
+
+    it('rejects a lossy worker-name alias without touching the actual worktree authority', () => {
+      const workerName = 'worker-2';
+      const alias = 'worker-2!';
+      const info = createWorkerWorktree(teamName, workerName, repoDir);
+      const branchOid = execFileSync('git', ['rev-parse', info.branch], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim();
+      const metadata = listTeamWorktrees(teamName, repoDir);
+
+      expect(() => removeWorkerWorktree(teamName, alias, repoDir, {
+        path: info.path,
+        branch: info.branch,
+        mode: 'named',
+        created: true,
+        reused: false,
+      })).toThrow(/worktree_worker_name_noncanonical/);
+
+      expect(existsSync(info.path)).toBe(true);
+      expect(registeredWorktreePaths(repoDir)).toContain(canonicalFixturePath(info.path));
+      expect(execFileSync('git', ['rev-parse', info.branch], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim()).toBe(branchOid);
+      expect(listTeamWorktrees(teamName, repoDir)).toEqual(metadata);
+
+      removeWorkerWorktree(teamName, workerName, repoDir);
+      expect(existsSync(info.path)).toBe(false);
+      expect(listTeamWorktrees(teamName, repoDir)).toEqual([]);
+    });
+
     it('throws and preserves metadata when git refuses to remove a registered worktree', () => {
       const workerName = 'locked-worker';
       const info = createWorkerWorktree(teamName, workerName, repoDir);
@@ -144,10 +528,57 @@ describe('git-worktree', () => {
 
       expect(existsSync(info.path)).toBe(true);
       expect(listTeamWorktrees(teamName, repoDir).map(w => w.workerName)).toContain(workerName);
-      const worktreeList = execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: repoDir, encoding: 'utf-8' });
-      expect(worktreeList).toContain(info.path);
+      expect(registeredWorktreePaths(repoDir)).toContain(canonicalFixturePath(info.path));
 
       execFileSync('git', ['worktree', 'unlock', info.path], { cwd: repoDir, stdio: 'pipe' });
+    });
+
+    it('preserves metadata when branch deletion fails and completes cleanup on retry', () => {
+      const workerName = 'worker-branch-lock';
+      const info = createWorkerWorktree(teamName, workerName, repoDir);
+      const branchLockPath = join(repoDir, '.git', 'refs', 'heads', `${info.branch}.lock`);
+      mkdirSync(join(branchLockPath, '..'), { recursive: true });
+      writeFileSync(branchLockPath, 'locked');
+
+      expect(() => removeWorkerWorktree(teamName, workerName, repoDir)).toThrow(
+        /worktree_branch_remove_failed/,
+      );
+      expect(existsSync(info.path)).toBe(false);
+      expect(execFileSync('git', ['branch', '--list', info.branch], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim()).toContain(info.branch);
+      expect(listTeamWorktrees(teamName, repoDir)).toEqual([
+        expect.objectContaining({
+          workerName,
+          path: info.path,
+          branch: info.branch,
+          mode: 'named',
+          created: true,
+          reused: false,
+        }),
+      ]);
+      expect(cleanupTeamWorktrees(teamName, repoDir)).toEqual({
+        removed: [],
+        preserved: [
+          expect.objectContaining({
+            workerName,
+            path: info.path,
+            reason: expect.stringContaining('worktree_branch_remove_failed'),
+          }),
+        ],
+      });
+
+      rmSync(branchLockPath, { force: true });
+      expect(cleanupTeamWorktrees(teamName, repoDir)).toEqual({
+        removed: [workerName],
+        preserved: [],
+      });
+      expect(execFileSync('git', ['branch', '--list', info.branch], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim()).toBe('');
+      expect(listTeamWorktrees(teamName, repoDir)).toEqual([]);
     });
 
     it('does not throw for non-existent worktree', () => {
@@ -162,6 +593,48 @@ describe('git-worktree', () => {
 
       expect(() => removeWorkerWorktree(teamName, workerName, repoDir)).toThrow(/worktree_path_is_symlink/);
       expect(existsSync(join(repoDir, 'README.md'))).toBe(true);
+    });
+
+    it('removes only the persisted worktree when the storage alias is retargeted after await', async () => {
+      const workerName = 'worker-retargeted-root';
+      const stateParent = realpathSync.native(mkdtempSync(join(tmpdir(), 'git-worktree-alias-root-')));
+      const storageA = join(stateParent, 'storage-a');
+      const storageB = join(stateParent, 'storage-b');
+      const storageAlias = join(stateParent, 'storage-alias');
+      const previousStateDir = process.env.OMC_STATE_DIR;
+      mkdirSync(storageA, { recursive: true });
+      mkdirSync(storageB, { recursive: true });
+      symlinkSync(storageA, storageAlias, process.platform === 'win32' ? 'junction' : 'dir');
+
+      try {
+        process.env.OMC_STATE_DIR = storageAlias;
+        const info = withTeamStatePathScope(repoDir, () =>
+          ensureWorkerWorktree(teamName, workerName, repoDir, {
+            mode: 'detached',
+            requireCleanLeader: false,
+          }))!;
+
+        process.env.OMC_STATE_DIR = storageB;
+        const worktreeB = getWorktreePath(repoDir, teamName, workerName);
+        mkdirSync(worktreeB, { recursive: true });
+        const sentinelB = join(worktreeB, 'do-not-remove.txt');
+        writeFileSync(sentinelB, 'root-b');
+        process.env.OMC_STATE_DIR = storageAlias;
+
+        await withTeamStatePathScope(repoDir, async () => {
+          await Promise.resolve();
+          rmSync(storageAlias, { recursive: true, force: true });
+          symlinkSync(storageB, storageAlias, process.platform === 'win32' ? 'junction' : 'dir');
+          removeWorkerWorktree(teamName, workerName, repoDir, info.path);
+        });
+
+        expect(existsSync(info.path)).toBe(false);
+        expect(readFileSync(sentinelB, 'utf8')).toBe('root-b');
+      } finally {
+        if (previousStateDir === undefined) delete process.env.OMC_STATE_DIR;
+        else process.env.OMC_STATE_DIR = previousStateDir;
+        rmSync(stateParent, { recursive: true, force: true });
+      }
     });
   });
 
@@ -227,12 +700,13 @@ describe('git-worktree', () => {
       const workerName = 'worker-agents-clean-preflight';
       const info = createWorkerWorktree(teamName, workerName, repoDir);
       const agentsPath = join(info.path, 'AGENTS.md');
+      const originalAgents = readFileSync(agentsPath);
       const backupPath = join(repoDir, '.omc', 'state', 'team', teamName, 'workers', workerName, 'worktree-root-agents.json');
       installWorktreeRootAgents(teamName, workerName, repoDir, info.path, 'managed overlay\n');
 
       expect(() => prepareWorkerWorktreeForRemoval(teamName, workerName, repoDir, info.path)).not.toThrow();
 
-      expect(readFileSync(agentsPath, 'utf-8')).toBe('original root instructions\n');
+      expect(readFileSync(agentsPath)).toEqual(originalAgents);
       expect(existsSync(backupPath)).toBe(false);
     });
 
@@ -243,18 +717,20 @@ describe('git-worktree', () => {
       execFileSync('git', ['commit', '-m', 'Add root agents'], { cwd: repoDir, stdio: 'pipe' });
       const workerName = 'worker-agents-partial-install';
       const info = createWorkerWorktree(teamName, workerName, repoDir);
+      const agentsPath = join(info.path, 'AGENTS.md');
+      const originalAgents = readFileSync(agentsPath);
       const backupDir = join(repoDir, '.omc', 'state', 'team', teamName, 'workers', workerName);
       const backupPath = join(backupDir, 'worktree-root-agents.json');
       mkdirSync(backupDir, { recursive: true });
       writeFileSync(backupPath, JSON.stringify({
         worktreePath: info.path,
         hadOriginal: true,
-        originalContent: 'original root instructions\n',
+        originalContent: originalAgents.toString('utf8'),
         installedContent: 'managed overlay\n',
         installedAt: new Date().toISOString(),
       }), 'utf-8');
 
-      expect(readFileSync(join(info.path, 'AGENTS.md'), 'utf-8')).toBe('original root instructions\n');
+      expect(readFileSync(agentsPath)).toEqual(originalAgents);
 
       removeWorkerWorktree(teamName, workerName, repoDir);
 
@@ -319,15 +795,53 @@ describe('git-worktree', () => {
     it('restores a pre-existing worktree-root AGENTS.md before removing a clean worktree', () => {
       const info = createWorkerWorktree(teamName, 'worker-agents', repoDir);
       const agentsPath = join(info.path, 'AGENTS.md');
+      const originalAgents = readFileSync(agentsPath);
 
       installWorktreeRootAgents(teamName, 'worker-agents', repoDir, info.path, 'managed worker overlay');
       expect(readFileSync(agentsPath, 'utf-8')).toBe('managed worker overlay');
 
       restoreWorktreeRootAgents(teamName, 'worker-agents', repoDir, info.path);
-      expect(readFileSync(agentsPath, 'utf-8')).toBe('original instructions');
+      expect(readFileSync(agentsPath)).toEqual(originalAgents);
 
       removeWorkerWorktree(teamName, 'worker-agents', repoDir);
       expect(existsSync(info.path)).toBe(false);
+    });
+
+    it('restores overlays without deleting a reused worktree or branch', () => {
+      const workerName = 'worker-reused-cleanup';
+      const branch = getBranchName(teamName, workerName);
+      const worktreePath = getWorktreePath(repoDir, teamName, workerName);
+      mkdirSync(join(worktreePath, '..'), { recursive: true });
+      execFileSync('git', ['branch', branch], { cwd: repoDir, stdio: 'pipe' });
+      execFileSync('git', ['worktree', 'add', worktreePath, branch], { cwd: repoDir, stdio: 'pipe' });
+      const info = ensureWorkerWorktree(teamName, workerName, repoDir, {
+        mode: 'named',
+        requireCleanLeader: false,
+      });
+      expect(info).toMatchObject({ branch, created: false, reused: true });
+      expect(realpathSync.native(info!.path)).toBe(realpathSync.native(worktreePath));
+      const originalAgents = readFileSync(join(worktreePath, 'AGENTS.md'));
+
+      installWorktreeRootAgents(teamName, workerName, repoDir, worktreePath, 'managed worker overlay');
+      expect(readFileSync(join(worktreePath, 'AGENTS.md'), 'utf-8')).toBe('managed worker overlay');
+
+      const result = cleanupTeamWorktrees(teamName, repoDir);
+
+      expect(result).toEqual({
+        removed: [],
+        retired: [workerName],
+        preserved: [],
+      });
+      expect(existsSync(worktreePath)).toBe(true);
+      expect(readFileSync(join(worktreePath, 'AGENTS.md'))).toEqual(originalAgents);
+      expect(execFileSync('git', ['branch', '--list', branch], {
+        cwd: repoDir,
+        encoding: 'utf-8',
+      }).trim()).toContain(branch);
+      expect(listTeamWorktrees(teamName, repoDir)).toEqual([]);
+
+      execFileSync('git', ['worktree', 'remove', worktreePath], { cwd: repoDir, stdio: 'pipe' });
+      execFileSync('git', ['branch', '-D', branch], { cwd: repoDir, stdio: 'pipe' });
     });
 
     it('preserves a worktree when the managed root AGENTS.md was edited', () => {

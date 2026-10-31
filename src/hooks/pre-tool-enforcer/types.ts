@@ -86,6 +86,24 @@ export interface PreToolModelRoutingSnapshot {
   readonly tierEnvironment: Readonly<Record<string, string>>;
 }
 
+export type PreToolJevModelTier = 'haiku' | 'sonnet' | 'opus';
+
+export interface PreToolJevModelRoutingObservation {
+  readonly originalInput: Readonly<Record<string, unknown>>;
+  readonly modifiedInput: Readonly<Record<string, unknown>>;
+  readonly injected: boolean;
+  readonly model: PreToolJevModelTier;
+}
+
+export interface PreToolJevObservations {
+  readonly slopWarning?: boolean;
+  readonly modelRouting?: PreToolJevModelRoutingObservation;
+}
+
+export type PreToolModelRoutingOverrides = Readonly<
+  Record<string, PreToolJevModelTier>
+>;
+
 export interface ForceDelegationThreshold {
   readonly count?: number;
   readonly windowSeconds?: number;
@@ -302,6 +320,7 @@ export interface PreToolCallPlan {
   readonly legacyPresentation: LegacyPresentation;
   readonly nextForceDelegationLedger: VirtualForceDelegationLedger;
   readonly advisoryCandidate?: AdvisoryCandidate;
+  readonly jevObservations?: PreToolJevObservations;
 }
 
 export interface PreToolBatchPlan {

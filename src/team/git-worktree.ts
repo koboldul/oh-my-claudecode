@@ -20,7 +20,8 @@ import { atomicWriteJson, ensureDirWithMode, validateResolvedPath } from './fs-u
 import { validateWorktreeRemovalTarget } from '../lib/worktree-cleanup-safety.js';
 import { sanitizeName } from './tmux-session.js';
 import { withFileLockSync } from '../lib/file-lock.js';
-import { getOmcRoot } from '../lib/worktree-paths.js';
+import { absPath, withTeamStatePathScope } from './state-paths.js';
+import { isCanonicalWorkerName } from './contracts.js';
 
 export type TeamWorktreeMode = 'disabled' | 'detached' | 'named';
 
@@ -31,6 +32,7 @@ export interface WorktreeInfo {
   teamName: string;
   createdAt: string;
   repoRoot?: string;
+  mode?: Exclude<TeamWorktreeMode, 'disabled'>;
   detached?: boolean;
   created?: boolean;
   reused?: boolean;
@@ -43,15 +45,24 @@ export interface EnsureWorkerWorktreeOptions {
 }
 
 export interface EnsureWorkerWorktreeResult extends WorktreeInfo {
-  mode: TeamWorktreeMode;
+  mode: Exclude<TeamWorktreeMode, 'disabled'>;
   repoRoot: string;
   detached: boolean;
   created: boolean;
   reused: boolean;
 }
 
+export interface WorktreeRemovalReceipt {
+  path: string;
+  branch: string;
+  mode: Exclude<TeamWorktreeMode, 'disabled'>;
+  created: boolean;
+  reused: boolean;
+}
+
 export interface CleanupTeamWorktreesResult {
   removed: string[];
+  retired?: string[];
   preserved: Array<{ workerName: string; path: string; reason: string }>;
 }
 
@@ -71,6 +82,32 @@ interface WorktreeMetadataReadResult {
   issues: WorktreeMetadataReadIssue[];
 }
 
+export interface WorktreeMetadataPublicationFailure extends Error {
+  code: 'worktree_metadata_publication_failed' | 'worktree_metadata_publication_cleanup_failed';
+  teamName: string;
+  workerName: string;
+  worktreePath: string;
+  worktreeBranch: string;
+  worktreeMode: Exclude<TeamWorktreeMode, 'disabled'>;
+  cleanupVerified: boolean;
+  cleanupError?: unknown;
+}
+
+export function isWorktreeMetadataPublicationFailure(
+  error: unknown,
+): error is WorktreeMetadataPublicationFailure {
+  if (!(error instanceof Error)) return false;
+  if (!('code' in error)
+    || (error.code !== 'worktree_metadata_publication_failed'
+      && error.code !== 'worktree_metadata_publication_cleanup_failed')) return false;
+  return 'teamName' in error && typeof error.teamName === 'string'
+    && 'workerName' in error && typeof error.workerName === 'string'
+    && 'worktreePath' in error && typeof error.worktreePath === 'string'
+    && 'worktreeBranch' in error && typeof error.worktreeBranch === 'string'
+    && 'worktreeMode' in error && (error.worktreeMode === 'named' || error.worktreeMode === 'detached')
+    && 'cleanupVerified' in error && typeof error.cleanupVerified === 'boolean';
+}
+
 interface WorktreeRootAgentsBackup {
   worktreePath: string;
   hadOriginal: boolean;
@@ -84,14 +121,47 @@ export interface WorktreeRootAgentsRestoreResult {
   reason?: string;
 }
 
+function getTeamWorktreesRoot(repoRoot: string, teamName: string): string {
+  return join(absPath(repoRoot, '.omc'), 'team', sanitizeName(teamName), 'worktrees');
+}
+
 /** Get canonical native team worktree path for a worker. */
 export function getWorktreePath(repoRoot: string, teamName: string, workerName: string): string {
-  return join(getOmcRoot(repoRoot), 'team', sanitizeName(teamName), 'worktrees', sanitizeName(workerName));
+  return join(getTeamWorktreesRoot(repoRoot, teamName), sanitizeName(workerName));
 }
 
 /** Get branch name for a worker. */
 export function getBranchName(teamName: string, workerName: string): string {
   return `omc-team/${sanitizeName(teamName)}/${sanitizeName(workerName)}`;
+}
+
+export function assertWorkerWorktreeRemovalReceiptBinding(
+  teamName: string,
+  workerName: string,
+  repoRoot: string,
+  receipt: WorktreeRemovalReceipt,
+): void {
+  assertCanonicalWorkerName(workerName);
+  if (receipt.created === receipt.reused
+    || (receipt.mode !== 'named' && receipt.mode !== 'detached')) {
+    const error = new Error(`worktree_ownership_invalid: incomplete removal authority for ${workerName}`);
+    (error as Error & { code?: string }).code = 'worktree_ownership_invalid';
+    throw error;
+  }
+  assertExactWorkerWorktreePath(repoRoot, teamName, workerName, receipt.path);
+  const expectedBranch = receipt.mode === 'named' ? getBranchName(teamName, workerName) : 'HEAD';
+  if (receipt.branch !== expectedBranch) {
+    const error = new Error(`worktree_ownership_mismatch: unexpected branch ${receipt.branch} for ${workerName}`);
+    (error as Error & { code?: string }).code = 'worktree_ownership_mismatch';
+    throw error;
+  }
+}
+
+function assertCanonicalWorkerName(workerName: string): void {
+  if (isCanonicalWorkerName(workerName)) return;
+  const error = new Error(`worktree_worker_name_noncanonical: ${workerName}`);
+  (error as Error & { code?: string }).code = 'worktree_worker_name_noncanonical';
+  throw error;
 }
 
 function git(repoRoot: string, args: string[], cwd = repoRoot): string {
@@ -122,9 +192,62 @@ function assertCleanLeaderWorktree(repoRoot: string): void {
 
 function canonicalPathForComparison(path: string): string {
   try {
-    return realpathSync(path);
+    const canonical = process.platform === 'win32' ? realpathSync.native(path) : realpathSync(path);
+    return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
   } catch {
-    return resolve(path);
+    const canonical = resolve(path);
+    return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+  }
+}
+
+function assertExactWorkerWorktreePath(
+  repoRoot: string,
+  teamName: string,
+  workerName: string,
+  candidatePath: string,
+): string {
+  const expectedPath = getWorktreePath(repoRoot, teamName, workerName);
+  if (canonicalPathForComparison(candidatePath) !== canonicalPathForComparison(expectedPath)) {
+    const error = new Error(`worktree_path_mismatch: expected exact path for ${workerName}`);
+    (error as Error & { code?: string }).code = 'worktree_path_mismatch';
+    throw error;
+  }
+  return expectedPath;
+}
+
+function localBranchExists(repoRoot: string, branch: string): boolean {
+  try {
+    execFileSync('git', ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], {
+      cwd: repoRoot,
+      stdio: 'pipe',
+      windowsHide: true,
+    });
+    return true;
+  } catch (error) {
+    if ((error as { status?: unknown }).status === 1) return false;
+    const wrapped = new Error(`worktree_branch_verify_failed:${branch}`, { cause: error });
+    (wrapped as Error & { code?: string }).code = 'worktree_branch_verify_failed';
+    throw wrapped;
+  }
+}
+
+function removeOwnedLocalBranch(repoRoot: string, branch: string): void {
+  if (!localBranchExists(repoRoot, branch)) return;
+  try {
+    execFileSync('git', ['branch', '-D', branch], {
+      cwd: repoRoot,
+      stdio: 'pipe',
+      windowsHide: true,
+    });
+  } catch (error) {
+    const wrapped = new Error(`worktree_branch_remove_failed:${branch}`, { cause: error });
+    (wrapped as Error & { code?: string }).code = 'worktree_branch_remove_failed';
+    throw wrapped;
+  }
+  if (localBranchExists(repoRoot, branch)) {
+    const error = new Error(`worktree_branch_remove_unverified:${branch}`);
+    (error as Error & { code?: string }).code = 'worktree_branch_remove_unverified';
+    throw error;
   }
 }
 
@@ -209,16 +332,16 @@ function isWorktreeDirtyExcept(wtPath: string, ignoredRootPaths: string[] = []):
 
 /** Get worktree metadata path. */
 function getMetadataPath(repoRoot: string, teamName: string): string {
-  return join(getOmcRoot(repoRoot), 'state', 'team', sanitizeName(teamName), 'worktrees.json');
+  return join(absPath(repoRoot, '.omc'), 'state', 'team', sanitizeName(teamName), 'worktrees.json');
 }
 
 function getLegacyMetadataPath(repoRoot: string, teamName: string): string {
-  return join(getOmcRoot(repoRoot), 'state', 'team-bridge', sanitizeName(teamName), 'worktrees.json');
+  return join(absPath(repoRoot, '.omc'), 'state', 'team-bridge', sanitizeName(teamName), 'worktrees.json');
 }
 
 
 function getWorkerStateDir(repoRoot: string, teamName: string, workerName: string): string {
-  return join(getOmcRoot(repoRoot), 'state', 'team', sanitizeName(teamName), 'workers', sanitizeName(workerName));
+  return join(absPath(repoRoot, '.omc'), 'state', 'team', sanitizeName(teamName), 'workers', sanitizeName(workerName));
 }
 
 function getRootAgentsBackupPath(repoRoot: string, teamName: string, workerName: string): string {
@@ -256,11 +379,12 @@ export function installWorktreeRootAgents(
   worktreePath: string,
   overlayContent: string,
 ): void {
+  assertCanonicalWorkerName(workerName);
   // The worker worktree, its root AGENTS.md, and the backup all live under
-  // getOmcRoot(repoRoot) — which in a .omc-workspace layout sits ABOVE repoRoot.
+  // The scoped OMC root may sit ABOVE repoRoot in a .omc-workspace layout.
   // Validate against the shared OMC root (and the worktree itself for AGENTS.md),
   // not the sub-repo, or multi-repo writes throw false path-traversal errors.
-  const omcRoot = getOmcRoot(repoRoot);
+  const omcRoot = absPath(repoRoot, '.omc');
   validateResolvedPath(worktreePath, omcRoot);
   const agentsPath = join(worktreePath, 'AGENTS.md');
   validateResolvedPath(agentsPath, worktreePath);
@@ -300,7 +424,8 @@ export function restoreWorktreeRootAgents(
   repoRoot: string,
   worktreePath?: string,
 ): WorktreeRootAgentsRestoreResult {
-  const omcRoot = getOmcRoot(repoRoot);
+  assertCanonicalWorkerName(workerName);
+  const omcRoot = absPath(repoRoot, '.omc');
   const backupPath = getRootAgentsBackupPath(repoRoot, teamName, workerName);
   validateResolvedPath(backupPath, omcRoot);
   const backup = readRootAgentsBackup(repoRoot, teamName, workerName);
@@ -362,7 +487,7 @@ function readMetadata(repoRoot: string, teamName: string): WorktreeInfo[] {
 
 
 function listRootAgentsBackupIssues(repoRoot: string, teamName: string, entries: WorktreeInfo[]): WorktreeMetadataReadIssue[] {
-  const workersDir = join(getOmcRoot(repoRoot), 'state', 'team', sanitizeName(teamName), 'workers');
+  const workersDir = join(absPath(repoRoot, '.omc'), 'state', 'team', sanitizeName(teamName), 'workers');
   if (!existsSync(workersDir)) return [];
   const knownWorkers = new Set(entries.map((entry) => sanitizeName(entry.workerName)));
   const issues: WorktreeMetadataReadIssue[] = [];
@@ -389,8 +514,9 @@ function listRootAgentsBackupIssues(repoRoot: string, teamName: string, entries:
 /** Write native worktree metadata. */
 function writeMetadata(repoRoot: string, teamName: string, entries: WorktreeInfo[]): void {
   const metaPath = getMetadataPath(repoRoot, teamName);
-  validateResolvedPath(metaPath, join(getOmcRoot(repoRoot), 'state', 'team'));
-  ensureDirWithMode(join(getOmcRoot(repoRoot), 'state', 'team', sanitizeName(teamName)));
+  const teamStateRoot = join(absPath(repoRoot, '.omc'), 'state', 'team');
+  validateResolvedPath(metaPath, teamStateRoot);
+  ensureDirWithMode(join(teamStateRoot, sanitizeName(teamName)));
   atomicWriteJson(metaPath, entries);
 }
 
@@ -406,6 +532,49 @@ function forgetMetadataUnlocked(repoRoot: string, teamName: string, workerName: 
   const existing = readMetadata(repoRoot, teamName).filter(entry => entry.workerName !== workerName);
   writeMetadata(repoRoot, teamName, existing);
 }
+
+function rollbackCreatedWorktreeAfterMetadataFailure(
+  repoRoot: string,
+  teamName: string,
+  workerName: string,
+  worktreePath: string,
+  branch: string,
+  mode: Exclude<TeamWorktreeMode, 'disabled'>,
+): void {
+  const exactWorktreePath = assertExactWorkerWorktreePath(
+    repoRoot,
+    teamName,
+    workerName,
+    worktreePath,
+  );
+  checkWorkerWorktreeRemovalSafety(teamName, workerName, repoRoot, exactWorktreePath);
+  const registeredBranch = getRegisteredWorktreeBranch(repoRoot, exactWorktreePath);
+  const expectedBranch = mode === 'named' ? branch : 'HEAD';
+  if (registeredBranch !== expectedBranch) {
+    throw new Error(
+      `worktree_creation_cleanup_authority_lost: expected ${expectedBranch} at ${exactWorktreePath}, found ${registeredBranch ?? 'unregistered'}`,
+    );
+  }
+
+  try {
+    execFileSync('git', ['worktree', 'remove', exactWorktreePath], {
+      cwd: repoRoot,
+      stdio: 'pipe',
+      windowsHide: true,
+    });
+  } catch (error) {
+    throw new Error(`worktree_creation_cleanup_remove_failed:${exactWorktreePath}`, { cause: error });
+  }
+
+  if (existsSync(exactWorktreePath) || isRegisteredWorktreePath(repoRoot, exactWorktreePath)) {
+    throw new Error(`worktree_creation_cleanup_unverified:${exactWorktreePath}`);
+  }
+
+  if (mode === 'named') {
+    removeOwnedLocalBranch(repoRoot, branch);
+  }
+}
+
 function assertCompatibleExistingWorktree(
   repoRoot: string,
   wtPath: string,
@@ -448,14 +617,28 @@ export function normalizeTeamWorktreeMode(value: unknown): TeamWorktreeMode {
 
 /**
  * Ensure a worker worktree exists according to the selected opt-in mode.
- * Disabled mode is a no-op. Existing clean compatible worktrees are reused;
- * dirty or mismatched existing worktrees throw without deleting files.
+ * Disabled/default mode returns null without validating the worker name or
+ * touching state. Enabled modes require a canonical worker name. Existing
+ * clean compatible worktrees are reused; dirty or mismatched existing
+ * worktrees throw without deleting files.
  */
 export function ensureWorkerWorktree(
   teamName: string,
   workerName: string,
   repoRoot: string,
   options: EnsureWorkerWorktreeOptions = {},
+): EnsureWorkerWorktreeResult | null {
+  if ((options.mode ?? 'disabled') === 'disabled') return null;
+  assertCanonicalWorkerName(workerName);
+  return withTeamStatePathScope(repoRoot, () =>
+    ensureWorkerWorktreeScoped(teamName, workerName, repoRoot, options));
+}
+
+function ensureWorkerWorktreeScoped(
+  teamName: string,
+  workerName: string,
+  repoRoot: string,
+  options: EnsureWorkerWorktreeOptions,
 ): EnsureWorkerWorktreeResult | null {
   const mode = options.mode ?? 'disabled';
   if (mode === 'disabled') return null;
@@ -469,7 +652,7 @@ export function ensureWorkerWorktree(
 
   const wtPath = getWorktreePath(repoRoot, teamName, workerName);
   const branch = mode === 'named' ? getBranchName(teamName, workerName) : 'HEAD';
-  validateResolvedPath(wtPath, join(getOmcRoot(repoRoot), 'team'));
+  validateResolvedPath(wtPath, join(absPath(repoRoot, '.omc'), 'team'));
 
   try {
     execFileSync('git', ['worktree', 'prune'], { cwd: repoRoot, stdio: 'pipe', windowsHide: true });
@@ -493,7 +676,7 @@ export function ensureWorkerWorktree(
     return info;
   }
 
-  const wtDir = join(getOmcRoot(repoRoot), 'team', sanitizeName(teamName), 'worktrees');
+  const wtDir = getTeamWorktreesRoot(repoRoot, teamName);
   ensureDirWithMode(wtDir);
 
   const args = mode === 'named'
@@ -513,7 +696,48 @@ export function ensureWorkerWorktree(
     created: true,
     reused: false,
   };
-  recordMetadata(repoRoot, teamName, info);
+  try {
+    recordMetadata(repoRoot, teamName, info);
+  } catch (publicationError) {
+    try {
+      rollbackCreatedWorktreeAfterMetadataFailure(repoRoot, teamName, workerName, wtPath, branch, mode);
+    } catch (cleanupError) {
+      const error: WorktreeMetadataPublicationFailure = Object.assign(
+        new Error(
+          `worktree_metadata_publication_failed:${publicationError instanceof Error ? publicationError.message : String(publicationError)}; `
+            + `cleanup_error:${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+          { cause: publicationError },
+        ),
+        {
+          code: 'worktree_metadata_publication_cleanup_failed' as const,
+          teamName,
+          workerName,
+          worktreePath: wtPath,
+          worktreeBranch: branch,
+          worktreeMode: mode,
+          cleanupVerified: false,
+          cleanupError,
+        },
+      );
+      throw error;
+    }
+    const error: WorktreeMetadataPublicationFailure = Object.assign(
+      new Error(
+        `worktree_metadata_publication_failed:${publicationError instanceof Error ? publicationError.message : String(publicationError)}`,
+        { cause: publicationError },
+      ),
+      {
+        code: 'worktree_metadata_publication_failed' as const,
+        teamName,
+        workerName,
+        worktreePath: wtPath,
+        worktreeBranch: branch,
+        worktreeMode: mode,
+        cleanupVerified: true,
+      },
+    );
+    throw error;
+  }
   return info;
 }
 
@@ -543,16 +767,17 @@ export function checkWorkerWorktreeRemovalSafety(
   repoRoot: string,
   worktreePath?: string,
 ): void {
+  assertCanonicalWorkerName(workerName);
   const wtPath = worktreePath ?? getWorktreePath(repoRoot, teamName, workerName);
   const backup = readRootAgentsBackup(repoRoot, teamName, workerName);
 
-  if (!existsSync(wtPath)) return;
-
   validateWorktreeRemovalTarget({
     candidatePath: wtPath,
-    expectedRoots: [join(getOmcRoot(repoRoot), 'team', sanitizeName(teamName), 'worktrees')],
+    expectedRoots: [getTeamWorktreesRoot(repoRoot, teamName)],
     mainRepoRoots: [repoRoot],
+    requireExisting: false,
   });
+  if (!existsSync(wtPath)) return;
 
   let ignoreRootAgents = false;
   if (backup) {
@@ -591,7 +816,21 @@ export function prepareWorkerWorktreeForRemoval(
   repoRoot: string,
   worktreePath?: string,
 ): void {
-  const wtPath = worktreePath ?? getWorktreePath(repoRoot, teamName, workerName);
+  return withTeamStatePathScope(repoRoot, () =>
+    prepareWorkerWorktreeForRemovalScoped(teamName, workerName, repoRoot, worktreePath));
+}
+
+function prepareWorkerWorktreeForRemovalScoped(
+  teamName: string,
+  workerName: string,
+  repoRoot: string,
+  worktreePath?: string,
+): void {
+  assertCanonicalWorkerName(workerName);
+  const expectedPath = getWorktreePath(repoRoot, teamName, workerName);
+  const wtPath = worktreePath
+    ? assertExactWorkerWorktreePath(repoRoot, teamName, workerName, worktreePath)
+    : expectedPath;
   checkWorkerWorktreeRemovalSafety(teamName, workerName, repoRoot, wtPath);
 
   const agentsRestore = restoreWorktreeRootAgents(teamName, workerName, repoRoot, wtPath);
@@ -602,19 +841,90 @@ export function prepareWorkerWorktreeForRemoval(
   }
 }
 
-/** Remove a worker's worktree and branch, preserving dirty worktrees. */
+function worktreeRemovalReceiptFromInfo(info: WorktreeInfo): WorktreeRemovalReceipt | null {
+  if (typeof info.path !== 'string' || typeof info.branch !== 'string') return null;
+  if (info.mode !== 'named' && info.mode !== 'detached') return null;
+  if (typeof info.created !== 'boolean' || typeof info.reused !== 'boolean') return null;
+  if (info.created === info.reused) return null;
+  return {
+    path: info.path,
+    branch: info.branch,
+    mode: info.mode,
+    created: info.created,
+    reused: info.reused,
+  };
+}
+
+/** Remove an owned worker worktree or restore a borrowed worktree's managed overlay. */
 export function removeWorkerWorktree(
   teamName: string,
   workerName: string,
   repoRoot: string,
+  authority?: string | WorktreeRemovalReceipt,
 ): void {
-  const wtPath = getWorktreePath(repoRoot, teamName, workerName);
-  const branch = getBranchName(teamName, workerName);
+  return withTeamStatePathScope(repoRoot, () =>
+    removeWorkerWorktreeScoped(teamName, workerName, repoRoot, authority));
+}
+
+function removeWorkerWorktreeScoped(
+  teamName: string,
+  workerName: string,
+  repoRoot: string,
+  authority?: string | WorktreeRemovalReceipt,
+): void {
+  assertCanonicalWorkerName(workerName);
   const metaLockPath = `${getMetadataPath(repoRoot, teamName)}.lock`;
 
   withFileLockSync(metaLockPath, () => {
+    const persisted = readMetadata(repoRoot, teamName).find(entry => entry.workerName === workerName);
+    const suppliedPath = typeof authority === 'string' ? authority : authority?.path;
+    const expectedPath = getWorktreePath(repoRoot, teamName, workerName);
+    if (suppliedPath) assertExactWorkerWorktreePath(repoRoot, teamName, workerName, suppliedPath);
+    if (persisted) assertExactWorkerWorktreePath(repoRoot, teamName, workerName, persisted.path);
+    const persistedReceipt = persisted ? worktreeRemovalReceiptFromInfo(persisted) : null;
+    const suppliedReceipt = typeof authority === 'object' ? authority : null;
+    if (suppliedReceipt) {
+      assertWorkerWorktreeRemovalReceiptBinding(teamName, workerName, repoRoot, suppliedReceipt);
+    }
+    if (suppliedReceipt && persisted
+      && (suppliedReceipt.branch !== persisted.branch
+        || (persisted.mode !== undefined && suppliedReceipt.mode !== persisted.mode)
+        || (persisted.created !== undefined && suppliedReceipt.created !== persisted.created)
+        || (persisted.reused !== undefined && suppliedReceipt.reused !== persisted.reused))) {
+      const error = new Error(`worktree_ownership_mismatch: persisted ownership differs for ${workerName}`);
+      (error as Error & { code?: string }).code = 'worktree_ownership_mismatch';
+      throw error;
+    }
+    const receipt = suppliedReceipt ?? persistedReceipt;
+    const wtPath = expectedPath;
+    if (persisted && !receipt) {
+      const error = new Error(`worktree_ownership_incomplete: cannot retire worktree for ${workerName}`);
+      (error as Error & { code?: string }).code = 'worktree_ownership_incomplete';
+      throw error;
+    }
+    if (receipt) {
+      assertWorkerWorktreeRemovalReceiptBinding(teamName, workerName, repoRoot, receipt);
+      const expectedBranch = receipt.mode === 'named' ? getBranchName(teamName, workerName) : 'HEAD';
+      const registeredBranch = getRegisteredWorktreeBranch(repoRoot, wtPath);
+      if (registeredBranch && registeredBranch !== expectedBranch) {
+        const error = new Error(
+          `worktree_ownership_mismatch: expected ${expectedBranch} at ${wtPath}, found ${registeredBranch}`,
+        );
+        (error as Error & { code?: string }).code = 'worktree_ownership_mismatch';
+        throw error;
+      }
+      if (!receipt.created && existsSync(wtPath) && !registeredBranch) {
+        const error = new Error(`worktree_ownership_mismatch: borrowed worktree is no longer registered at ${wtPath}`);
+        (error as Error & { code?: string }).code = 'worktree_ownership_mismatch';
+        throw error;
+      }
+    }
     prepareWorkerWorktreeForRemoval(teamName, workerName, repoRoot, wtPath);
 
+    if (!receipt?.created || receipt.reused) {
+      if (persisted) forgetMetadataUnlocked(repoRoot, teamName, workerName);
+      return;
+    }
     const wasRegisteredWorktree = isRegisteredWorktreePath(repoRoot, wtPath);
     try {
       execFileSync('git', ['worktree', 'remove', wtPath], { cwd: repoRoot, stdio: 'pipe', windowsHide: true });
@@ -632,22 +942,22 @@ export function removeWorkerWorktree(
       execFileSync('git', ['worktree', 'prune'], { cwd: repoRoot, stdio: 'pipe', windowsHide: true });
     } catch { /* ignore */ }
 
-    try {
-      execFileSync('git', ['branch', '-D', branch], { cwd: repoRoot, stdio: 'pipe', windowsHide: true });
-    } catch { /* branch may not exist */ }
+    if (receipt.mode === 'named') {
+      removeOwnedLocalBranch(repoRoot, receipt.branch);
+    }
 
     // If a stale plain directory remains and it is not a registered worktree, remove it
     // only after the shared path guard proves it is an OMC team worktree child.
     if (existsSync(wtPath) && !isRegisteredWorktreePath(repoRoot, wtPath)) {
       validateWorktreeRemovalTarget({
         candidatePath: wtPath,
-        expectedRoots: [join(getOmcRoot(repoRoot), 'team', sanitizeName(teamName), 'worktrees')],
+        expectedRoots: [getTeamWorktreesRoot(repoRoot, teamName)],
         mainRepoRoots: [repoRoot],
       });
       rmSync(wtPath, { recursive: true, force: true });
     }
 
-    forgetMetadataUnlocked(repoRoot, teamName, workerName);
+    if (persisted) forgetMetadataUnlocked(repoRoot, teamName, workerName);
   });
 }
 
@@ -685,14 +995,22 @@ export function inspectTeamWorktreeCleanupSafety(
   };
 }
 
-/** Remove all clean worktrees for a team, preserving dirty worktrees. */
+/** Remove owned clean worktrees and retire restored borrowed worktree receipts. */
 export function cleanupTeamWorktrees(
   teamName: string,
   repoRoot: string
 ): CleanupTeamWorktreesResult {
+  return withTeamStatePathScope(repoRoot, () => cleanupTeamWorktreesScoped(teamName, repoRoot));
+}
+
+function cleanupTeamWorktreesScoped(
+  teamName: string,
+  repoRoot: string,
+): CleanupTeamWorktreesResult {
   const safety = inspectTeamWorktreeCleanupSafety(teamName, repoRoot);
   const entries = safety.entries;
   const removed: string[] = [];
+  const retired: string[] = [];
   const preserved: Array<{ workerName: string; path: string; reason: string }> = [...safety.blockers];
 
   if (preserved.length > 0) {
@@ -701,8 +1019,13 @@ export function cleanupTeamWorktrees(
 
   for (const entry of entries) {
     try {
-      removeWorkerWorktree(teamName, entry.workerName, repoRoot);
-      removed.push(entry.workerName);
+      removeWorkerWorktree(teamName, entry.workerName, repoRoot, entry.path);
+      const receipt = worktreeRemovalReceiptFromInfo(entry);
+      if (receipt && !receipt.created && receipt.reused) {
+        retired.push(entry.workerName);
+      } else {
+        removed.push(entry.workerName);
+      }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       preserved.push({ workerName: entry.workerName, path: entry.path, reason });
@@ -710,5 +1033,5 @@ export function cleanupTeamWorktrees(
     }
   }
 
-  return { removed, preserved };
+  return retired.length > 0 ? { removed, retired, preserved } : { removed, preserved };
 }

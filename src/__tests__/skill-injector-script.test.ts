@@ -1,11 +1,12 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { provisionStandaloneStateLockBridge } from '../installer/index.js';
 import {
   stageHookRuntime,
+  stageHookRuntimeSupport,
   type StagedHookRuntime,
 } from './helpers/staged-hook-runtime.js';
 
@@ -119,9 +120,9 @@ Module._load = function(request, parent, isMain) {
 });
 
 describe('skill-injector.mjs learned skill injection', () => {
-  function writeLearnedSkill(projectDir: string) {
+  function writeLearnedSkill(projectDir: string, withBom = false) {
     mkdirSync(join(projectDir, '.omc', 'skills'), { recursive: true });
-    writeFileSync(join(projectDir, '.omc', 'skills', 'release-notes.md'), `---
+    writeFileSync(join(projectDir, '.omc', 'skills', 'release-notes.md'), `${withBom ? '\uFEFF' : ''}---
 name: Release Notes
 triggers:
   - release notes
@@ -142,7 +143,7 @@ Write concise release notes.`);
     expect(output.hookSpecificOutput?.additionalContext).toContain('### Release Notes (project)');
   });
 
-  it('injects a matching learned skill through the trusted run.cjs Worker path', () => {
+  it('injects a BOM-prefixed learned skill through the standalone fallback Worker path', () => {
     const projectDir = makeTempDir('skill-injector-worker-project-');
     const pluginRoot = makeTempDir('skill-injector-worker-plugin-');
     const scriptsDir = join(pluginRoot, 'scripts');
@@ -150,7 +151,7 @@ Write concise release notes.`);
     const runtimePath = join(pluginRoot, 'bridge', 'hook-runtime.cjs');
     mkdirSync(join(pluginRoot, 'bridge'), { recursive: true });
     mkdirSync(join(pluginRoot, 'hooks'), { recursive: true });
-    cpSync(join(process.cwd(), 'scripts', 'lib'), libDir, { recursive: true });
+    stageHookRuntimeSupport(pluginRoot, PACKAGE_ROOT);
     // The copied state-lock.mjs resolves better-sqlite3 relative to the temp
     // plugin root, so replace it with a bridge pinned to the package root.
     provisionStandaloneStateLockBridge(PACKAGE_ROOT, join(libDir, 'state-lock.mjs'));
@@ -174,7 +175,7 @@ Write concise release notes.`);
         }] }],
       },
     }));
-    writeLearnedSkill(projectDir);
+    writeLearnedSkill(projectDir, true);
 
     const result = spawnSync(NODE, [join(scriptsDir, 'run.cjs'), join(scriptsDir, 'skill-injector.mjs')], {
       cwd: projectDir,

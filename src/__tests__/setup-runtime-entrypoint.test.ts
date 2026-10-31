@@ -271,6 +271,11 @@ describe('shipped setup canonical runtime entrypoints', () => {
   it('preserves exact Claude maintenance output and explicit maintenance matcher behavior', () => {
     const staged = stagePlugin();
     const cwd = makeWorktree('claude maintenance');
+    execFileSync('git', ['init', '--quiet'], {
+      cwd,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
     const stateDir = join(cwd, '.omc', 'state');
     const staleState = join(stateDir, 'old-setup-state.json');
     mkdirSync(stateDir, { recursive: true });

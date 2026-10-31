@@ -144,9 +144,11 @@ function numberFromEnvironment(
   minimum = Number.NEGATIVE_INFINITY,
   maximum = Number.POSITIVE_INFINITY,
 ): number {
-  if (value === undefined || value === '') return fallback;
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return fallback;
+  if (value === undefined) return fallback;
+  const normalized = value.trim();
+  if (!/^[+-]?\d+$/.test(normalized)) return fallback;
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed)) return fallback;
   return Math.max(minimum, Math.min(maximum, parsed));
 }
 

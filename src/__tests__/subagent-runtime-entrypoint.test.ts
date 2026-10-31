@@ -1,7 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
   copyFileSync,
-  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -20,6 +19,7 @@ import {
   expect,
   it,
 } from 'vitest';
+import { stageHookRuntimeSupport } from './helpers/staged-hook-runtime.js';
 
 const ROOT = process.cwd();
 const FIXTURE_PATH = join(
@@ -127,13 +127,12 @@ describe('native Copilot subagentStart shipped entrypoint', () => {
       'index.js',
     );
     mkdirSync(project, { recursive: true });
-    mkdirSync(join(project, '.git'));
-    mkdirSync(dirname(scriptPath), { recursive: true });
-    cpSync(
-      join(ROOT, 'scripts', 'lib'),
-      join(pluginRoot, 'scripts', 'lib'),
-      { recursive: true },
-    );
+    execFileSync('git', ['init', '--quiet'], {
+      cwd: project,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    stageHookRuntimeSupport(pluginRoot, ROOT);
     copyFileSync(
       join(ROOT, 'scripts', 'subagent-tracker.mjs'),
       scriptPath,

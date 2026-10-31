@@ -60,8 +60,13 @@ const EXPECTED_SCRIPTS_BY_EVENT: Readonly<
     'session-start.mjs',
     'project-memory-session.mjs',
     'wiki-session-start.mjs',
+    'stale-run-reporter.mjs',
+    'runs-reconciler.mjs',
   ],
-  preToolUse: ['pre-tool-enforcer.mjs'],
+  preToolUse: [
+    'pre-tool-enforcer.mjs',
+    'git-guardrails.mjs',
+  ],
   permissionRequest: ['permission-handler.mjs'],
   postToolUse: [
     'post-tool-verifier.mjs',
@@ -84,6 +89,7 @@ const EXPECTED_SCRIPTS_BY_EVENT: Readonly<
     'context-guard-stop.mjs',
     'workflow-drift-guard.mjs',
     'persistent-mode.mjs',
+    'budget-guard.mjs',
     'code-simplifier.mjs',
   ],
   sessionEnd: [
@@ -162,12 +168,13 @@ function projectClaudeManifestToNativeCopilot(
           || (group.matcher !== 'init' && group.matcher !== 'maintenance'),
       )
       .flatMap((group) =>
-        (group.hooks ?? []).map((hook) => {
-          const { async: _async, matcher: _matcher, ...nativeHook } = hook;
-          return copilotEvent === 'permissionRequest'
-            ? { ...nativeHook, matcher: 'bash|powershell' }
-            : nativeHook;
-        }),
+        (group.hooks ?? [])
+          .map((hook) => {
+            const { async: _async, matcher: _matcher, ...nativeHook } = hook;
+            return copilotEvent === 'permissionRequest'
+              ? { ...nativeHook, matcher: 'bash|powershell' }
+              : nativeHook;
+          }),
       );
   }
 
@@ -276,8 +283,10 @@ describe('GitHub Copilot CLI native hook manifest routing', () => {
       join(COPILOT_FIXTURE_ROOT, FIXTURE_BY_EVENT.permissionRequest),
     );
 
-    expect(manifest.hooks.preToolUse).toHaveLength(1);
-    expect(manifest.hooks.preToolUse[0].matcher).toBeUndefined();
+    expect(manifest.hooks.preToolUse).toHaveLength(2);
+    expect(manifest.hooks.preToolUse.every(
+      (entry) => entry.matcher === undefined,
+    )).toBe(true);
     expect(permissionEntries).toHaveLength(1);
     expect(permissionEntries[0].matcher).toBe('bash|powershell');
     expect(routeFixture(

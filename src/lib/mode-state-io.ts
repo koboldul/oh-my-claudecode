@@ -14,7 +14,6 @@ import {
   getOmcRoot,
   probeGitTopLevel,
   resolveStatePath,
-  resolveSessionStatePath,
   resolveSessionStatePaths,
   ensureSessionStateDir,
   ensureOmcDir,
@@ -22,8 +21,23 @@ import {
 } from './worktree-paths.js';
 import { getProcessStartIdentitySync } from '../platform/process-utils.js';
 import { atomicWriteJsonSync } from './atomic-write.js';
+import { sameFileIdentity } from './file-identity.js';
 import { MODE_CONFIRMATION_SKILL_MAP } from './mode-names.js';
 import { decodeProcessStartFromFilename, encodeProcessStartForFilename, normalizeProcessStartIdentity } from '../../templates/hooks/lib/process-start-identity.mjs';
+import { observeModeStateClear, observeModeStateWrite } from './runs-ledger.js';
+
+/**
+ * Derive the .omc root from a state file path itself: state files always
+ * live under `<omcRoot>/state/...`, so the last `/state/` boundary is the
+ * anchor. Deterministic — unlike getOmcRoot() with no argument, which falls
+ * back to process.cwd() and is unreliable inside MCP/server processes.
+ */
+function omcRootFromStatePath(filePath: string): string | null {
+  const normalized = filePath.replaceAll('\\', '/');
+  const idx = normalized.lastIndexOf('/state/');
+  if (idx === -1) return null;
+  return normalized.slice(0, idx);
+}
 
 type MutationLockOwner = { version: 1; pid: number; processStart: string; createdAt: string; nonce: string };
 type BetterSqlite3 = import('better-sqlite3').Database;
@@ -139,8 +153,8 @@ function mutationDbPath(lockPath: string): string {
 }
 
 function ownerFromRow(row: Record<string, unknown> | undefined): MutationLockOwner | null {
-  if (!row || row.version !== 1 || !Number.isSafeInteger(row.pid) || (row.pid as number) <= 0 || typeof row.process_start !== 'string' || typeof row.created_at !== 'string' || typeof row.nonce !== 'string') return null;
-  return { version: 1, pid: row.pid as number, processStart: row.process_start, createdAt: row.created_at, nonce: row.nonce };
+  if (!row || row.version !== 1 || typeof row.pid !== 'number' || !Number.isSafeInteger(row.pid) || row.pid <= 0 || typeof row.process_start !== 'string' || typeof row.created_at !== 'string' || typeof row.nonce !== 'string') return null;
+  return { version: 1, pid: row.pid, processStart: row.process_start, createdAt: row.created_at, nonce: row.nonce };
 }
 
 function writeAllSync(fd: number, content: string, label: string): void {
@@ -158,8 +172,14 @@ function readLockOwner(path: string): MutationLockOwner | 'absent' | null {
   try {
     const value = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
     const pid = value.pid;
-    if (value.version !== 1 || !Number.isSafeInteger(pid) || (pid as number) <= 0 || typeof value.processStart !== 'string' || !/^\S+$/.test(value.processStart) || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt)) || typeof value.nonce !== 'string' || !/^[0-9a-f-]{36}$/i.test(value.nonce)) return null;
-    return value as unknown as MutationLockOwner;
+    if (value.version !== 1 || typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0 || typeof value.processStart !== 'string' || !/^\S+$/.test(value.processStart) || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt)) || typeof value.nonce !== 'string' || !/^[0-9a-f-]{36}$/i.test(value.nonce)) return null;
+    return {
+      version: 1,
+      pid,
+      processStart: value.processStart,
+      createdAt: value.createdAt,
+      nonce: value.nonce,
+    };
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : null;
   }
@@ -169,15 +189,38 @@ function sameOwner(left: MutationLockOwner | null, right: MutationLockOwner): bo
   return left !== null && left.pid === right.pid && left.processStart === right.processStart && left.nonce === right.nonce;
 }
 
-type LockArtifactIdentity = { dev: number; ino: number };
+// BigInt ids: NTFS file IDs exceed 2^53 once the MFT sequence number reaches
+// 32, and a Number ino rounds distinct files onto the same value.
+type LockArtifactIdentity = { dev: bigint; ino: bigint };
+type LockArtifactSnapshot =
+  | { status: 'absent' }
+  | { status: 'changed' }
+  | { status: 'invalid' }
+  | { status: 'present'; owner: MutationLockOwner; identity: LockArtifactIdentity };
 
 function lockArtifactIdentity(path: string): LockArtifactIdentity | null {
   try {
-    const stats = statSync(path);
+    const stats = statSync(path, { bigint: true });
     return stats.isFile() ? { dev: stats.dev, ino: stats.ino } : null;
   } catch {
     return null;
   }
+}
+
+function lockArtifactSnapshot(path: string): LockArtifactSnapshot {
+  const before = lockArtifactIdentity(path);
+  const owner = readLockOwner(path);
+  const after = lockArtifactIdentity(path);
+  if (owner === 'absent') {
+    return before === null && after === null
+      ? { status: 'absent' }
+      : { status: 'changed' };
+  }
+  if (owner === null) return { status: 'invalid' };
+  if (before === null || after === null || !sameFileIdentity(before, after)) {
+    return { status: 'changed' };
+  }
+  return { status: 'present', owner, identity: before };
 }
 
 /**
@@ -193,6 +236,23 @@ function reclaimDeadLockOwner(
   observedIdentity: LockArtifactIdentity,
 ): 'removed' | 'changed' | 'failed' {
   const quarantinePath = `${path}.reclaim.${process.pid}.${randomUUID()}`;
+  // The liveness verdict can be seconds old (the win32 probe spawns PowerShell),
+  // and the identity alone cannot tell a replacement apart when its inode reuses
+  // the old one (or when the identity was captured after the probe). Renaming a
+  // live replacement into quarantine opens a window in which a third contender
+  // publishes, leaving two holders. Re-verify the exact artifact, owner record
+  // AND file identity, immediately before the rename. Bracketing the read with
+  // two stats binds the record that was read to the identity that was checked.
+  const before = lockArtifactIdentity(path);
+  const currentOwner = readLockOwner(path);
+  const after = lockArtifactIdentity(path);
+  if (
+    currentOwner === 'absent' || currentOwner === null || !sameOwner(currentOwner, observedOwner) ||
+    before === null || after === null ||
+    !sameFileIdentity(before, observedIdentity) || !sameFileIdentity(after, observedIdentity)
+  ) {
+    return 'changed';
+  }
   try {
     renameSync(path, quarantinePath);
   } catch (error) {
@@ -208,8 +268,7 @@ function reclaimDeadLockOwner(
       movedOwner !== 'absent' &&
       movedOwner !== null &&
       movedIdentity !== null &&
-      movedIdentity.dev === observedIdentity.dev &&
-      movedIdentity.ino === observedIdentity.ino &&
+      sameFileIdentity(movedIdentity, observedIdentity) &&
       sameOwner(movedOwner, observedOwner)
     ) {
       try {
@@ -361,12 +420,19 @@ function acquireFileLockAt(path: string, attempts: number): MutationLock | null 
         return null;
       }
 
+      // Capture the file identity before the probe. If it changes during the probe,
+      // another process has published a replacement lock and we must skip reclamation.
+      const observedIdentity = lockArtifactIdentity(path);
+      if (observedIdentity === null) continue;
       const existing = readLockOwner(path);
       if (existing === 'absent') continue;
       if (!existing) {
         lastMutationLockFailure = 'unverifiable';
         return null;
       }
+      // Re-verify the identity hasn't changed before probing liveness.
+      const recheck = lockArtifactIdentity(path);
+      if (!recheck || !sameFileIdentity(recheck, observedIdentity)) continue;
       const live = ownerLive(existing);
       if (live === null) {
         lastMutationLockFailure = 'unverifiable';
@@ -378,11 +444,6 @@ function acquireFileLockAt(path: string, attempts: number): MutationLock | null 
           Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
           continue;
         }
-        return null;
-      }
-      const observedIdentity = lockArtifactIdentity(path);
-      if (observedIdentity === null) {
-        lastMutationLockFailure = 'unverifiable';
         return null;
       }
       const reclaimed = reclaimDeadLockOwner(path, existing, observedIdentity);
@@ -435,18 +496,18 @@ function acquireLockAt(path: string, attempts = 50): MutationLock | null {
   try {
     db.exec('BEGIN IMMEDIATE');
     const rawRow = db.prepare('SELECT version, pid, process_start, created_at, nonce FROM state_mutation_locks WHERE lock_key = ?').get(key) as Record<string, unknown> | undefined;
-    if (rawRow) {
-      const row = ownerFromRow(rawRow);
-      if (!row) {
-        db.exec('ROLLBACK');
-        db.close();
-        lastMutationLockFailure = 'unverifiable';
-        if (process.env.OMC_LOCK_DEBUG) console.error(`[lock-debug] acquireLockAt row-invalid ${path}`);
-        return null;
-      }
-      const live = ownerLive(row);
+    const observedRow = rawRow ? ownerFromRow(rawRow) : null;
+    if (rawRow && !observedRow) {
+      db.exec('ROLLBACK');
+      db.close();
+      lastMutationLockFailure = 'unverifiable';
+      if (process.env.OMC_LOCK_DEBUG) console.error(`[lock-debug] acquireLockAt row-invalid ${path}`);
+      return null;
+    }
+    if (observedRow) {
+      db.exec('ROLLBACK');
+      const live = ownerLive(observedRow);
       if (live === null || live) {
-        db.exec('ROLLBACK');
         db.close();
         if (process.env.OMC_LOCK_DEBUG) console.error(`[lock-debug] acquireLockAt row-live=${live} ${path}`);
         if (live === null || attempts <= 1) {
@@ -456,20 +517,54 @@ function acquireLockAt(path: string, attempts = 50): MutationLock | null {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
         return acquireLockAt(path, attempts - 1);
       }
-      db.prepare('DELETE FROM state_mutation_locks WHERE lock_key = ?').run(key);
-    }
-    const artifact = readLockOwner(path);
-    if (artifact !== 'absent') {
-      if (!artifact) {
+
+      db.exec('BEGIN IMMEDIATE');
+      const rawCurrentRow = db.prepare('SELECT version, pid, process_start, created_at, nonce FROM state_mutation_locks WHERE lock_key = ?').get(key) as Record<string, unknown> | undefined;
+      const currentRow = rawCurrentRow ? ownerFromRow(rawCurrentRow) : null;
+      if (rawCurrentRow && !currentRow) {
         db.exec('ROLLBACK');
         db.close();
         lastMutationLockFailure = 'unverifiable';
-        console.error(`[omc-lock] state_mutation_lock_unverifiable: ${path}`);
         return null;
       }
-      const live = ownerLive(artifact);
-      if (live === null || live) {
+      if (!sameOwner(currentRow, observedRow)) {
         db.exec('ROLLBACK');
+        db.close();
+        if (attempts <= 1) {
+          lastMutationLockFailure = 'contention';
+          return null;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        return acquireLockAt(path, attempts - 1);
+      }
+    }
+
+    const observedArtifact = lockArtifactSnapshot(path);
+    if (observedArtifact.status === 'invalid') {
+      db.exec('ROLLBACK');
+      db.close();
+      lastMutationLockFailure = 'unverifiable';
+      console.error(`[omc-lock] state_mutation_lock_unverifiable: ${path}`);
+      return null;
+    }
+    if (observedArtifact.status === 'changed') {
+      db.exec('ROLLBACK');
+      db.close();
+      if (attempts <= 1) {
+        lastMutationLockFailure = 'contention';
+        return null;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      return acquireLockAt(path, attempts - 1);
+    }
+
+    if (
+      observedArtifact.status === 'present' &&
+      (!observedRow || !sameOwner(observedArtifact.owner, observedRow))
+    ) {
+      db.exec('ROLLBACK');
+      const live = ownerLive(observedArtifact.owner);
+      if (live === null || live) {
         db.close();
         if (process.env.OMC_LOCK_DEBUG) console.error(`[lock-debug] acquireLockAt artifact-live=${live} ${path}`);
         if (live === null || attempts <= 1) {
@@ -479,14 +574,58 @@ function acquireLockAt(path: string, attempts = 50): MutationLock | null {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
         return acquireLockAt(path, attempts - 1);
       }
-      const observedIdentity = lockArtifactIdentity(path);
-      if (observedIdentity === null) {
+
+      db.exec('BEGIN IMMEDIATE');
+      const rawCurrentRow = db.prepare('SELECT version, pid, process_start, created_at, nonce FROM state_mutation_locks WHERE lock_key = ?').get(key) as Record<string, unknown> | undefined;
+      const currentRow = rawCurrentRow ? ownerFromRow(rawCurrentRow) : null;
+      if (rawCurrentRow && !currentRow) {
         db.exec('ROLLBACK');
         db.close();
         lastMutationLockFailure = 'unverifiable';
         return null;
       }
-      const reclaimed = reclaimDeadLockOwner(path, artifact, observedIdentity);
+      const rowChanged = observedRow
+        ? !sameOwner(currentRow, observedRow)
+        : rawCurrentRow !== undefined;
+      if (rowChanged) {
+        db.exec('ROLLBACK');
+        db.close();
+        if (attempts <= 1) {
+          lastMutationLockFailure = 'contention';
+          return null;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        return acquireLockAt(path, attempts - 1);
+      }
+
+      const currentArtifact = lockArtifactSnapshot(path);
+      if (currentArtifact.status === 'invalid') {
+        db.exec('ROLLBACK');
+        db.close();
+        lastMutationLockFailure = 'unverifiable';
+        return null;
+      }
+      if (
+        currentArtifact.status !== 'present' ||
+        !sameOwner(currentArtifact.owner, observedArtifact.owner) ||
+        !sameFileIdentity(currentArtifact.identity, observedArtifact.identity)
+      ) {
+        db.exec('ROLLBACK');
+        db.close();
+        if (attempts <= 1) {
+          lastMutationLockFailure = 'contention';
+          return null;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        return acquireLockAt(path, attempts - 1);
+      }
+    }
+
+    if (observedRow) {
+      db.prepare('DELETE FROM state_mutation_locks WHERE lock_key = ?').run(key);
+    }
+    if (observedArtifact.status === 'present') {
+      const reclaimed = reclaimDeadLockOwner(path, observedArtifact.owner, observedArtifact.identity);
       if (reclaimed !== 'removed') {
         db.exec('ROLLBACK');
         db.close();
@@ -614,6 +753,13 @@ export function withStateFileMutationLock<T>(
 function processStartIdentity(pid: number): string | 'absent' | null {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   if (process.env.NODE_ENV === 'test' && process.env.OMC_TEST_EMERGENCY_PROCESS_START_UNKNOWN_PID === String(pid)) return null;
+  if (pid !== process.pid) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return 'absent';
+    }
+  }
   const identity = getProcessStartIdentitySync(pid);
   if (identity !== null) return identity;
   try { process.kill(pid, 0); return null; } catch (error) {
@@ -633,6 +779,10 @@ export function writeStateFileLocked(filePath: string, state: Record<string, unk
   } catch {
     success = false;
   }
+  if (success) {
+    const omcRoot = omcRootFromStatePath(filePath);
+    if (omcRoot) observeModeStateWrite(omcRoot, filePath, state);
+  }
   return releaseMutationLock(lock) && success;
 }
 
@@ -640,6 +790,12 @@ export function clearStateFileLocked(filePath: string, expectedGeneration?: Stat
   if (!recoverEmergencyStateFile(filePath)) return false;
   const lock = acquireMutationLock(filePath);
   if (!lock) return false;
+  let previousState: Record<string, unknown> | null = null;
+  try {
+    if (existsSync(filePath)) previousState = JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>;
+  } catch {
+    previousState = null;
+  }
   let success = false;
   try {
     if (existsSync(filePath)) {
@@ -659,6 +815,10 @@ export function clearStateFileLocked(filePath: string, expectedGeneration?: Stat
     }
   } catch {
     success = false;
+  }
+  if (success) {
+    const omcRoot = omcRootFromStatePath(filePath);
+    if (omcRoot) observeModeStateClear(omcRoot, filePath, previousState);
   }
   return releaseMutationLock(lock) && success;
 }
@@ -696,12 +856,7 @@ export function clearStateFileLockedIf(
     } else if (expectedGeneration && !sameStateFileGeneration(filePath, expectedGeneration)) {
       result = 'skipped';
     } else {
-      let current: Record<string, unknown>;
-      try {
-        current = JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>;
-      } catch {
-        current = undefined as unknown as Record<string, unknown>;
-      }
+      const current = JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown> | null;
       if (!current || !predicate(current)) {
         result = current ? 'skipped' : 'failed';
       } else {
@@ -717,6 +872,8 @@ export function clearStateFileLockedIf(
         } else {
           unlinkSync(filePath);
           result = 'cleared';
+          const omcRoot = omcRootFromStatePath(filePath);
+          if (omcRoot) observeModeStateClear(omcRoot, filePath, current);
         }
       }
     }
@@ -835,12 +992,12 @@ type EmergencyMutationJournal = {
   phase: 'preparing' | 'prepared' | 'quarantined' | 'published';
 };
 
-type FileIdentity = { dev: number; ino: number };
+type FileIdentity = { dev: bigint; ino: bigint };
 
 /** A stable file generation used to bind cleanup to one publication. */
 export interface StateFileGeneration {
-  dev: number;
-  ino: number;
+  dev: bigint;
+  ino: bigint;
   digest: string;
 }
 
@@ -1034,14 +1191,12 @@ function readEmergencyJournal(path: string): EmergencyMutationJournal | null {
 
 function fileIdentity(path: string): FileIdentity | null {
   try {
-    const stat = statSync(path);
+    const stat = statSync(path, { bigint: true });
     return { dev: stat.dev, ino: stat.ino };
   } catch { return null; }
 }
 
-function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
-  return left.dev === right.dev && left.ino === right.ino;
-}
+// Shared comparison handles BigInt identities and the Windows dev=0 quirk.
 
 function captureStateFile(path: string): CapturedStateFile | null {
   try {
@@ -1070,7 +1225,7 @@ export function captureStateFileGeneration(path: string): CapturedStateFile | nu
 function sameStateFileGeneration(path: string, expected: StateFileGeneration): boolean {
   try {
     const identity = fileIdentity(path);
-    if (!identity || identity.dev !== expected.dev || identity.ino !== expected.ino) return false;
+    if (!identity || !sameFileIdentity(identity, expected)) return false;
     return stateDigest(readFileSync(path, 'utf8')) === expected.digest;
   } catch {
     return false;
@@ -1097,7 +1252,7 @@ function replaceGenerationForTest(path: string): void {
 
 function sameFile(path: string, expected: FileIdentity): boolean {
   const actual = fileIdentity(path);
-  return actual !== null && actual.dev === expected.dev && actual.ino === expected.ino;
+  return actual !== null && sameFileIdentity(actual, expected);
 }
 
 function reconcileEmergencyPublicationTemps(filePath: string, authorizeState?: EmergencyStateAuthorization): boolean {
@@ -1799,7 +1954,7 @@ function resolveStateRoot(directory?: string): string {
 function resolveFile(mode: string, directory?: string, sessionId?: string): string {
   const baseDir = resolveStateRoot(directory);
   if (sessionId) {
-    return resolveSessionStatePath(mode, sessionId, baseDir);
+    return resolveSessionStatePaths(mode, sessionId, baseDir).sessionScoped;
   }
   return resolveStatePath(mode, baseDir);
 }
@@ -1913,14 +2068,14 @@ export function findSessionOwnedStateCandidates(
 ): StateFileDiscovery[] {
   const matches = new Map<string, StateFileDiscovery>();
   const baseDir = resolveStateRoot(directory);
-  const expectedPath = resolveSessionStatePath(mode, sessionId, baseDir);
+  const expectedPath = resolveSessionStatePaths(mode, sessionId, baseDir).sessionScoped;
   const expected = discoverStateFile(expectedPath);
   if (expected && canClearStateForSession(expected.state, sessionId)) {
     matches.set(expectedPath, expected);
   }
 
   for (const sid of listSessionIds(baseDir)) {
-    const candidatePath = resolveSessionStatePath(mode, sid, baseDir);
+    const candidatePath = resolveSessionStatePaths(mode, sid, baseDir).sessionScoped;
     const candidate = discoverStateFile(candidatePath);
     if (candidate?.ownerSessionId === sessionId) matches.set(candidatePath, candidate);
   }
@@ -1953,7 +2108,7 @@ export function findCompletedSessionStateCandidates(
     if (requesterSessionId && sid === requesterSessionId) continue;
     const completionEvidencePath = join(getOmcRoot(baseDir), 'sessions', `${sid}.json`);
     if (!hasAuthenticatedCompletionEvidence(completionEvidencePath, sid)) continue;
-    const candidatePath = resolveSessionStatePath(mode, sid, baseDir);
+    const candidatePath = resolveSessionStatePaths(mode, sid, baseDir).sessionScoped;
     const candidate = discoverStateFile(candidatePath, { completedSessionId: sid, completionEvidencePath });
     if (candidate?.state.active === true && candidate.ownerSessionId === sid) matches.push(candidate);
   }
@@ -2214,7 +2369,9 @@ export function clearModeStateFile(
     for (const candidate of captured.artifacts) unlinkCapturedIfPresent(candidate);
   } else {
     for (const legacyPath of getLegacyStateCandidates(mode, baseDir)) unlinkIfPresent(legacyPath);
-    for (const sid of listSessionIds(baseDir)) unlinkIfPresent(resolveSessionStatePath(mode, sid, baseDir));
+    for (const sid of listSessionIds(baseDir)) {
+      unlinkIfPresent(resolveSessionStatePaths(mode, sid, baseDir).sessionScoped);
+    }
     for (const artifactPath of getRuntimeArtifactCandidates(mode, baseDir)) unlinkIfPresent(artifactPath);
   }
 

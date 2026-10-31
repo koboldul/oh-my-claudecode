@@ -67,6 +67,7 @@ export interface CanonicalHookEventPayload {
     promptAliases?: readonly string[];
     initialPrompt?: string;
     promptId?: string;
+    turnId?: string;
     goal?: CanonicalGoalSnapshot;
     source?: string;
     model?: string;

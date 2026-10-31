@@ -12,9 +12,9 @@ import type { TeamConfig, TeamInstanceBinding, TeamInstanceDisposalAuthorization
 export declare function isValidPersistedMaxWorkers(value: unknown): value is number | undefined;
 export declare function alignActiveFenceRevisions(config: TeamConfig, revision: number): TeamConfig;
 /** Accept only a complete revisioned authoritative config; return null for malformed values. */
-export declare function validateRevisionedTeamConfig(value: unknown, expectedTeamName?: string): TeamConfig | null;
+export declare function validateRevisionedTeamConfig(value: unknown, expectedTeamName?: string, expectedCwd?: string): TeamConfig | null;
 /** Legacy configs predate revision authority and require the complete historical core shape. */
-export declare function validateLegacyTeamConfig(value: unknown, expectedTeamName?: string): TeamConfig | null;
+export declare function validateLegacyTeamConfig(value: unknown, expectedTeamName?: string, expectedCwd?: string): TeamConfig | null;
 /**
  * Instance and tmux-server identities are immutable once they appear in
  * authoritative state. Legacy state with no identity remains readable, but it

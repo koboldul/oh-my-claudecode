@@ -4,6 +4,7 @@ import { dirname, join } from 'path';
 import { execFileSync } from 'node:child_process';
 import { getNativeContainedFs } from '../graph/runtime/native-contained-fs.js';
 import { absPath, TeamPaths } from './state-paths.js';
+const PROCESS_IDENTITY_PROBE_TIMEOUT_MS = 3000;
 function canonicalize(value) {
     if (value === null || typeof value !== 'object')
         return JSON.stringify(value);
@@ -96,11 +97,12 @@ function probeProcessStartIdentityForPlatform(pid, platform, exec, read, strict)
             return { identity: `linux:${bootId}:${ticks}`, precise: true };
         }
         if (platform === 'win32') {
-            if (strict)
-                return { identity: null, precise: false };
-            const command = `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`;
-            const ticks = exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], { encoding: 'utf8', windowsHide: true }).trim();
-            return /^\d+$/.test(ticks)
+            // .NET StartTime.Ticks is an absolute UTC creation timestamp, not an
+            // uptime-relative value, so pairing it with the PID remains unique
+            // across reboots without a separate boot identifier.
+            const command = `$p = [System.Diagnostics.Process]::GetProcessById(${pid}); if ($p) { $p.StartTime.ToUniversalTime().Ticks }`;
+            const ticks = exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], { encoding: 'utf8', timeout: PROCESS_IDENTITY_PROBE_TIMEOUT_MS, windowsHide: true }).trim();
+            return /^[1-9]\d*$/.test(ticks)
                 ? { identity: `win32:${ticks}`, precise: true }
                 : { identity: null, precise: false };
         }
@@ -180,6 +182,8 @@ export function isValidStrictProcessStartIdentity(value, platform = process.plat
         // second-resolution fallback and is not destructive evidence.
         return match !== null && Number(match[2]) > 0 && Number(match[2]) < 1_000_000;
     }
+    if (platform === 'win32')
+        return /^win32:[1-9]\d*$/.test(value);
     return false;
 }
 let ownProcessStartIdentity;

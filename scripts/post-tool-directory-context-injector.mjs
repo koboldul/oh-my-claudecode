@@ -4,66 +4,89 @@
  * PostToolUse Hook: Directory Context Injector (issue #4006 finding 1)
  *
  * Injects the nearest README.md / AGENTS.md files, walking up from the
- * accessed file to the working directory root, into context when Claude
+ * accessed file to the working directory root, into context when a host
  * reads or edits a file.
- *
- * Claude Code's own memory loader discovers nested CLAUDE.md only, so a
- * nested AGENTS.md — which is exactly what `deepinit` generates — is never
- * loaded natively. The directory-readme-injector hook implementation existed
- * but was registered nowhere, so no install ever ran it and every nested
- * deepinit file was inert.
- *
- * Dedup is per session and per resolved context-file path (see the hook's
- * storage module), so the same AGENTS.md is injected at most once per session
- * no matter how many files under it are touched.
  */
 
-import { isAbsolute, join, dirname } from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { isAbsolute, join } from 'path';
+import { pathToFileURL } from 'url';
 import { readStdin } from './lib/stdin.mjs';
+import {
+  describeHookRunFailure,
+  encodeLegacyCompatibleHookOutput,
+  loadHookRuntime,
+  resolveHookPluginRoot,
+  surfaceOptionalHookFailure,
+} from './lib/hook-runtime-loader.mjs';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const SKIP_HOOKS = (process.env.OMC_SKIP_HOOKS || '')
+  .split(',')
+  .map((value) => value.trim());
+const HOOK_DISABLED =
+  process.env.DISABLE_OMC === '1'
+  || process.env.DISABLE_OMC === 'true'
+  || SKIP_HOOKS.includes('post-tool-use');
 
-function getRuntimeBaseDir() {
-  return process.env.CLAUDE_PLUGIN_ROOT || join(__dirname, '..');
-}
-
-// Dynamic import — graceful no-op when dist/ is not built (first run / dev)
 let createDirectoryReadmeInjectorHook = null;
 try {
-  const runtimeBase = getRuntimeBaseDir();
-  const mod = await import(
-    pathToFileURL(join(runtimeBase, 'dist', 'hooks', 'directory-readme-injector', 'index.js')).href
-  );
-  createDirectoryReadmeInjectorHook = mod.createDirectoryReadmeInjectorHook;
+  const moduleUrl = pathToFileURL(join(
+    resolveHookPluginRoot(),
+    'dist',
+    'hooks',
+    'directory-readme-injector',
+    'index.js',
+  )).href;
+  const module = await import(moduleUrl);
+  createDirectoryReadmeInjectorHook =
+    module.createDirectoryReadmeInjectorHook;
 } catch {
-  // dist not available — skip directory context injection silently
+  // dist is optional on a first development run.
 }
 
-/**
- * Extract the primary file path from tool input.
- * All tracked tools (read, write, edit, multiedit) expose file_path at the
- * top level of tool_input.
- */
 function extractFilePath(toolInput) {
-  if (!toolInput) return null;
+  if (!toolInput || typeof toolInput !== 'object') return null;
   return toolInput.file_path || toolInput.path || null;
 }
 
-async function main() {
-  // Honor the documented kill switches (issues #838, #3253) with the same
-  // `post-tool-use` event token as the other PostToolUse hooks.
-  const skipHooks = (process.env.OMC_SKIP_HOOKS || '').split(',').map((s) => s.trim());
-  if (
-    process.env.DISABLE_OMC === '1' ||
-    process.env.DISABLE_OMC === 'true' ||
-    skipHooks.includes('post-tool-use')
-  ) {
-    console.log(JSON.stringify({ continue: true }));
-    return;
+function processDirectoryContext(data) {
+  if (HOOK_DISABLED) {
+    return { continue: true };
+  }
+  if (!createDirectoryReadmeInjectorHook) {
+    return { continue: true, suppressOutput: true };
   }
 
+  const toolName = data.toolName || '';
+  const toolInput = data.toolInput || {};
+  const sessionId = data.sessionId || 'unknown';
+  const cwd = data.directory || process.cwd();
+  const rawPath = extractFilePath(toolInput);
+  if (typeof rawPath !== 'string' || rawPath.length === 0) {
+    return { continue: true, suppressOutput: true };
+  }
+
+  const filePath = isAbsolute(rawPath) ? rawPath : join(cwd, rawPath);
+  const hook = createDirectoryReadmeInjectorHook(cwd);
+  const contextText = hook.processToolExecution(
+    toolName,
+    filePath,
+    sessionId,
+  );
+
+  if (!contextText) {
+    return { continue: true, suppressOutput: true };
+  }
+
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: 'PostToolUse',
+      additionalContext: contextText,
+    },
+  };
+}
+
+async function main() {
   try {
     const input = await readStdin();
     if (!input.trim()) {
@@ -71,45 +94,34 @@ async function main() {
       return;
     }
 
-    let data = {};
-    try { data = JSON.parse(input); } catch { /* ignore parse errors */ }
+    const runtime = loadHookRuntime();
+    let legacyOutput;
+    const result = await runtime.runHookJson(
+      'post-tool-use',
+      input,
+      (unit, envelope) => {
+        legacyOutput = processDirectoryContext(
+          runtime.buildLegacyProcessorInput(envelope, unit),
+        );
+        return legacyOutput;
+      },
+    );
 
-    if (!createDirectoryReadmeInjectorHook) {
-      console.log(JSON.stringify({ continue: true }));
-      return;
-    }
+    const failure = describeHookRunFailure(runtime, result);
+    if (failure) throw new Error(failure);
 
-    const toolName = data.tool_name || data.toolName || '';
-    const toolInput = data.tool_input || data.toolInput || {};
-    const sessionId = data.session_id || data.sessionId || 'unknown';
-    const cwd = data.cwd || process.cwd();
-
-    const rawPath = extractFilePath(toolInput);
-    if (!rawPath) {
-      console.log(JSON.stringify({ continue: true }));
-      return;
-    }
-
-    const filePath = isAbsolute(rawPath) ? rawPath : join(cwd, rawPath);
-
-    const hook = createDirectoryReadmeInjectorHook(cwd);
-    const contextText = hook.processToolExecution(toolName, filePath, sessionId);
-
-    if (contextText) {
-      console.log(JSON.stringify({
-        continue: true,
-        hookSpecificOutput: {
-          hookEventName: 'PostToolUse',
-          additionalContext: contextText,
-        },
-      }));
-    } else {
-      console.log(JSON.stringify({ continue: true }));
-    }
-  } catch {
-    // Always continue on error — context injection is additive only
-    console.log(JSON.stringify({ continue: true }));
+    console.log(JSON.stringify(
+      encodeLegacyCompatibleHookOutput(
+        runtime,
+        result,
+        legacyOutput,
+      ),
+    ));
+  } catch (error) {
+    surfaceOptionalHookFailure(error, {
+      hookName: 'post-tool-directory-context-injector',
+    });
   }
 }
 
-main();
+void main();

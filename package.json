@@ -1,6 +1,6 @@
 {
   "name": "oh-my-claude-sisyphus",
-  "version": "5.5.0",
+  "version": "5.7.19",
   "description": "Multi-agent orchestration system for Claude Code - Inspired by oh-my-opencode",
   "type": "module",
   "main": "dist/index.js",
@@ -36,6 +36,9 @@
     "commands",
     "commands-copilot",
     "hooks",
+    "scripts/build-contained-fs.mjs",
+    "scripts/postinstall-contained-fs.mjs",
+    "scripts/verify-graph-contained-fs.mjs",
     "scripts",
     "skills",
     "skills-copilot",
@@ -96,7 +99,8 @@
     "verify:skill-entitlements": "node scripts/generate-skill-entitlements.mjs --verify",
     "generate:prompt-projections": "node scripts/generate-prompt-projections.mjs",
     "verify:prompt-projections": "node scripts/generate-prompt-projections.mjs --verify",
-    "build:contained-fs": "node scripts/build-contained-fs.mjs"
+    "build:contained-fs": "node scripts/build-contained-fs.mjs",
+    "postinstall": "node scripts/postinstall-contained-fs.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.1.0",

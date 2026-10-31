@@ -10,6 +10,7 @@ import {
   releaseFailedStartupReservationUnderLock,
   retryTeamInstanceDisposal,
   reserveTeamInstance,
+  reserveTeamInstanceUnderLock,
   withTeamInstanceLifecycleLock,
   type TeamInstanceIo,
 } from '../team-instance.js';
@@ -56,6 +57,7 @@ async function activate(binding: TeamInstanceBinding): Promise<void> {
 
 beforeEach(() => {
   cwd = mkdtempSync(join(realpathSync(tmpdir()), 'omc-team-instance-'));
+  writeFileSync(join(cwd, '.omc-workspace'), '{}');
   previousHome = process.env.HOME;
   previousUserProfile = process.env.USERPROFILE;
   previousOmcStateDir = process.env.OMC_STATE_DIR;
@@ -94,7 +96,7 @@ describe('team instance reservation and cleanup contract', () => {
       .toMatchObject({ reason: { code: 'team_instance_reservation_conflict' } });
   });
 
-  it('serializes reservations from shared-root subdirectories and symlink aliases', async () => {
+  it('serializes reservations from shared-root subdirectories', async () => {
     const sharedRoot = join(cwd, 'central-state');
     const left = join(cwd, 'repo-left');
     const right = join(cwd, 'repo-right');
@@ -107,7 +109,13 @@ describe('team instance reservation and cleanup contract', () => {
       reserveTeamInstance({ teamName: 'shared-root', cwd: right, instanceId: id('2') }),
     ]);
     expect(subdirectoryResults.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+  });
 
+  it('serializes reservations from symlinked cwd aliases', async () => {
+    const sharedRoot = join(cwd, 'central-state');
+    const left = join(cwd, 'repo-left');
+    mkdirSync(left, { recursive: true });
+    process.env.OMC_STATE_DIR = sharedRoot;
     const alias = join(cwd, 'repo-alias');
     try {
       symlinkSync(left, alias, 'dir');
@@ -122,11 +130,19 @@ describe('team instance reservation and cleanup contract', () => {
       reserveTeamInstance({ teamName: 'alias-root', cwd: alias, instanceId: id('4') }),
     ]);
     expect(aliasResults.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+  });
 
+  it('preserves reservation identity through storage-root symlink aliases', async () => {
+    const left = join(cwd, 'repo-left');
     const storageTarget = join(cwd, 'storage-target');
     const storageAlias = join(cwd, 'storage-alias');
+    mkdirSync(left, { recursive: true });
     mkdirSync(storageTarget, { recursive: true });
-    symlinkSync(storageTarget, storageAlias, 'dir');
+    try {
+      symlinkSync(storageTarget, storageAlias, 'dir');
+    } catch {
+      return;
+    }
     process.env.OMC_STATE_DIR = storageTarget;
     const targetBinding = createTeamInstanceBinding({ teamName: 'empty-storage-alias', cwd: left, instanceId: id('5') });
     await reserveTeamInstance({ teamName: targetBinding.team_name, cwd: left, instanceId: targetBinding.instance_id });
@@ -139,6 +155,72 @@ describe('team instance reservation and cleanup contract', () => {
       cwd: left,
       instanceId: aliasBinding.instance_id,
     })).rejects.toMatchObject({ code: 'team_instance_reservation_conflict' });
+  });
+
+  it('pins the storage root while a lifecycle callback recomputes the binding', async () => {
+    const teamName = 'stable-operation-root';
+    const instanceId = id('7');
+    const storageA = join(cwd, 'storage-a');
+    const storageB = join(cwd, 'storage-b');
+    mkdirSync(storageA, { recursive: true });
+    mkdirSync(storageB, { recursive: true });
+
+    process.env.OMC_STATE_DIR = storageA;
+    const bindingA = createTeamInstanceBinding({ teamName, cwd, instanceId });
+    const lockA = teamInstanceLifecycleLockPath(cwd, teamName);
+    process.env.OMC_STATE_DIR = storageB;
+    const bindingB = createTeamInstanceBinding({ teamName, cwd, instanceId });
+    const reservationB = join(
+      canonicalTeamOmcRoot(cwd),
+      TeamPaths.teamInstanceReservation(bindingB.workspace_hash, teamName).slice('.omc/'.length),
+    );
+    const lockB = teamInstanceLifecycleLockPath(cwd, teamName);
+    process.env.OMC_STATE_DIR = storageA;
+
+    const reservation = await withTeamInstanceLifecycleLock(cwd, teamName, async () => {
+      expect(existsSync(lockA)).toBe(true);
+      expect(existsSync(lockB)).toBe(false);
+      process.env.OMC_STATE_DIR = storageB;
+      return reserveTeamInstanceUnderLock({ teamName, cwd, instanceId });
+    });
+
+    expect(reservation.state_root).toBe(bindingA.state_root);
+    expect(existsSync(reservation.reservation_path)).toBe(true);
+    expect(existsSync(bindingB.state_root)).toBe(false);
+    expect(existsSync(reservationB)).toBe(false);
+  });
+
+  it('keeps ordinary state effects on the locked root when a storage alias is retargeted', async () => {
+    const teamName = 'retargeted-storage-alias';
+    const storageA = join(cwd, 'storage-target-a');
+    const storageB = join(cwd, 'storage-target-b');
+    const storageAlias = join(cwd, 'storage-alias');
+    mkdirSync(storageA, { recursive: true });
+    mkdirSync(storageB, { recursive: true });
+    symlinkSync(storageA, storageAlias, process.platform === 'win32' ? 'junction' : 'dir');
+
+    process.env.OMC_STATE_DIR = storageAlias;
+    const bindingA = createTeamInstanceBinding({ teamName, cwd, instanceId: id('8') });
+    const lockA = teamInstanceLifecycleLockPath(cwd, teamName);
+    process.env.OMC_STATE_DIR = storageB;
+    const bindingB = createTeamInstanceBinding({ teamName, cwd, instanceId: id('8') });
+    const lockB = teamInstanceLifecycleLockPath(cwd, teamName);
+    process.env.OMC_STATE_DIR = storageAlias;
+
+    const configPath = await withTeamInstanceLifecycleLock(cwd, teamName, async () => {
+      expect(existsSync(lockA)).toBe(true);
+      rmSync(storageAlias, { recursive: true, force: true });
+      symlinkSync(storageB, storageAlias, process.platform === 'win32' ? 'junction' : 'dir');
+      const path = absPath(cwd, TeamPaths.config(teamName));
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, 'anchored');
+      return path;
+    });
+
+    expect(configPath).toBe(join(bindingA.state_root, 'config.json'));
+    expect(readFileSync(join(bindingA.state_root, 'config.json'), 'utf8')).toBe('anchored');
+    expect(existsSync(join(bindingB.state_root, 'config.json'))).toBe(false);
+    expect(existsSync(lockB)).toBe(false);
   });
 
   it('rejects a disposable team-root symlink before reservation effects', async () => {

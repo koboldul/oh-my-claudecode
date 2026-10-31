@@ -531,6 +531,12 @@ const KNOWN_AGENT_NAME_SET = new Set<string>(KNOWN_AGENT_NAMES);
 // /team external providers here are CLI integrations, not deprecated MCP delegation routes.
 const TEAM_ROLE_PROVIDERS = new Set(["claude", "codex", "gemini", "grok", "cursor", "antigravity", "copilot"]);
 const TEAM_ROLE_TIERS = new Set(["HIGH", "MEDIUM", "LOW"]);
+// Only providers whose CLI has a verified effort flag (see model-contract.ts buildLaunchArgs).
+const REASONING_EFFORT_BY_PROVIDER: Record<string, Set<string>> = {
+  claude: new Set(["low", "medium", "high", "xhigh", "max"]),
+  codex: new Set(["low", "medium", "high", "xhigh", "max", "ultra"]),
+  antigravity: new Set(["low", "medium", "high", "max"]),
+};
 
 export function validateTeamConfig(config: PluginConfig): void {
   const team = (config as Record<string, unknown>).team as
@@ -595,6 +601,8 @@ export function validateTeamConfig(config: PluginConfig): void {
       continue;
     }
 
+    const provider = (spec.provider ?? "claude") as string;
+
     if (spec.provider !== undefined) {
       if (typeof spec.provider !== "string" || !TEAM_ROLE_PROVIDERS.has(spec.provider)) {
         throw new Error(
@@ -613,6 +621,21 @@ export function validateTeamConfig(config: PluginConfig): void {
       if (typeof spec.agent !== "string" || !KNOWN_AGENT_NAME_SET.has(spec.agent)) {
         throw new Error(
           `[OMC] team.roleRouting.${rawRoleKey}.agent: unknown agent "${String(spec.agent)}". Allowed: ${[...KNOWN_AGENT_NAME_SET].join(", ")}`,
+        );
+      }
+    }
+
+    if (spec.reasoningEffort !== undefined) {
+      if (typeof spec.reasoningEffort !== "string") {
+        throw new Error(
+          `[OMC] team.roleRouting.${rawRoleKey}.reasoningEffort: must be a string, got ${typeof spec.reasoningEffort}`,
+        );
+      }
+      const allowedForProvider = REASONING_EFFORT_BY_PROVIDER[provider];
+      if (!allowedForProvider || !allowedForProvider.has(spec.reasoningEffort)) {
+        const allowed = allowedForProvider ? [...allowedForProvider].join("|") : "(not supported for this provider)";
+        throw new Error(
+          `[OMC] team.roleRouting.${rawRoleKey}.reasoningEffort: invalid value "${spec.reasoningEffort}" for provider "${provider}". Allowed: ${allowed}`,
         );
       }
     }
@@ -640,7 +663,6 @@ const AUTOPILOT_WORKFLOW_RESERVED_NAMES = new Set([
   "qa",
   "autoresearch",
   "ultraqa",
-  "merge-readiness",
   "self-improve",
   "ultrawork",
   "ultrapilot",
@@ -1390,7 +1412,7 @@ export function generateConfigSchema(): object {
               not: {
                 enum: [
                   "autopilot", "ralplan", "execution", "ralph", "qa", "autoresearch", "ultraqa",
-                  "merge-readiness", "self-improve", "ultrawork", "ultrapilot", "swarm", "pipeline",
+                  "self-improve", "ultrawork", "ultrapilot", "swarm", "pipeline",
                   "plan", "team", "cancel", "deep-interview", "deepsearch", "ultrathink", "tdd",
                   "code-review", "security-review", "analyze", "search",
                 ],

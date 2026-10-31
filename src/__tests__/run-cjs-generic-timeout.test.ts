@@ -6,7 +6,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -572,11 +572,7 @@ process.exit(0);
       expect(grandchildPid).toBeGreaterThan(0);
 
       const runnerExit = new Promise<void>(resolve => runner.once('exit', () => resolve()));
-      if (process.platform === 'win32') {
-        spawnSync('taskkill', ['/F', '/PID', String(runner.pid)], { windowsHide: true, stdio: 'ignore', timeout: 2000 });
-      } else {
-        runner.kill('SIGTERM');
-      }
+      expect(runner.kill('SIGTERM')).toBe(true);
       await Promise.race([
         runnerExit,
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error('runner did not exit after cancel')), 5000)),

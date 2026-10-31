@@ -93,6 +93,22 @@ export interface PurgeCacheResult {
     /** Errors encountered (non-fatal) */
     errors: string[];
 }
+/**
+ * Compare two semver-like version strings descending (higher version first).
+ * Non-numeric segments fall back to 0.
+ */
+/**
+ * The trailing path segment, split on either separator.
+ *
+ * These paths come from the plugin registration file, so on Windows they are
+ * native and splitting on '/' alone returned the whole string. The comparator
+ * then read the drive and directory names as version components: every path
+ * under the default .claude directory parsed to the same leading numbers, so
+ * '...\\1.2.3' and '...\\1.2.4' compared equal and the newest active version
+ * was not reliably chosen.
+ */
+export declare function versionLeaf(path: string): string;
+export declare function compareSemverDesc(a: string, b: string): number;
 export declare function purgeStalePluginCacheVersions(options?: {
     skipGracePeriod?: boolean;
 }): PurgeCacheResult;

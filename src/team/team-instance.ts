@@ -2,7 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 
-import { TEAM_NAME_SAFE_PATTERN } from './contracts.js';
+import {
+  isCanonicalWorkerName,
+  isSafeScaleUpOperationId,
+  TEAM_NAME_SAFE_PATTERN,
+} from './contracts.js';
 import {
   canonicalTeamCwd,
   canonicalTeamStatePath,
@@ -12,8 +16,10 @@ import {
   teamInstanceLifecycleLockPath,
   teamWorkspaceHash,
   TeamPaths,
+  withTeamStatePathScope,
 } from './state-paths.js';
 import { withProcessIdentityFileLock } from './process-identity-lock.js';
+import { assertWorkerWorktreeRemovalReceiptBinding } from './git-worktree.js';
 import {
   currentProcessStartIdentity,
   isProcessIdentityDead,
@@ -32,6 +38,9 @@ import type {
   TeamInstanceRequest,
   TeamInstanceReservation,
   TeamInstanceReservationPhase,
+  TeamScaleUpWorktreeCleanupReceipt,
+  TeamScaleUpWorktreeRecoveryEvidence,
+  TeamScaleUpWorktreeRecoveryRetirementProof,
 } from './types.js';
 import { isValidTeamInstanceId } from './types.js';
 
@@ -74,6 +83,10 @@ export class TeamInstanceError extends Error {
 export interface TeamInstanceIo {
   publishReservation?: (path: string, record: TeamInstanceReservation) => Promise<void> | void;
   publishCleanupReceipt?: (path: string, record: TeamInstanceCleanupRecord) => Promise<void> | void;
+  publishScaleUpRecoveryEvidence?: (
+    path: string,
+    record: TeamScaleUpWorktreeRecoveryEvidence,
+  ) => Promise<void> | void;
   renameStateRoot?: (source: string, destination: string) => Promise<void> | void;
   removeTree?: (path: string) => Promise<void> | void;
 }
@@ -103,7 +116,6 @@ const TEAM_INSTANCE_RESERVATION_PHASES: readonly TeamInstanceReservationPhase[] 
 const TEAM_INSTANCE_CLEANUP_PHASES: readonly TeamInstanceCleanupRecord['phase'][] = [
   'prepared', 'detached', 'removing', 'failed', 'completed',
 ];
-
 function fail(code: TeamInstanceErrorCode, message: string = code): never {
   throw new TeamInstanceError(code, message);
 }
@@ -167,6 +179,45 @@ function expectedPaths(binding: TeamInstanceBinding): {
   };
 }
 
+function scaleUpRecoveryPaths(binding: TeamInstanceBinding, operationId: string): {
+  root: string;
+  operationRoot: string;
+  evidence: string;
+  retiredOperationRoot: string;
+} {
+  if (!isSafeScaleUpOperationId(operationId)) {
+    fail('team_instance_authority_corrupt', 'invalid_scale_up_operation_id');
+  }
+  return {
+    root: canonicalTeamStatePath(binding.cwd, TeamPaths.teamInstanceScaleUpRecoveryRoot(
+      binding.workspace_hash,
+      binding.team_name,
+      binding.instance_id,
+    )),
+    operationRoot: canonicalTeamStatePath(binding.cwd, TeamPaths.teamInstanceScaleUpRecoveryOperationRoot(
+      binding.workspace_hash,
+      binding.team_name,
+      binding.instance_id,
+      operationId,
+    )),
+    evidence: canonicalTeamStatePath(binding.cwd, TeamPaths.teamInstanceScaleUpRecoveryEvidence(
+      binding.workspace_hash,
+      binding.team_name,
+      binding.instance_id,
+      operationId,
+    )),
+    retiredOperationRoot: canonicalTeamStatePath(
+      binding.cwd,
+      TeamPaths.teamInstanceScaleUpRecoveryRetiredOperationRoot(
+        binding.workspace_hash,
+        binding.team_name,
+        binding.instance_id,
+        operationId,
+      ),
+    ),
+  };
+}
+
 async function assertBindingPathsSafe(binding: TeamInstanceBinding): Promise<void> {
   const paths = expectedPaths(binding);
   try {
@@ -188,6 +239,22 @@ async function assertExternalCleanupPathsSafe(binding: TeamInstanceBinding): Pro
     await assertTeamStatePathSafe(binding.cwd, paths.cleanupRoot);
     await assertTeamStatePathSafe(binding.cwd, paths.cleanup);
     await assertTeamStatePathSafe(binding.cwd, paths.detached);
+  } catch (error: unknown) {
+    if (error instanceof TeamInstanceError) throw error;
+    fail('team_instance_state_corrupt', error instanceof Error ? error.message : String(error));
+  }
+}
+
+async function assertScaleUpRecoveryPathsSafe(
+  binding: TeamInstanceBinding,
+  operationId: string,
+): Promise<void> {
+  const paths = scaleUpRecoveryPaths(binding, operationId);
+  try {
+    await assertTeamStatePathSafe(binding.cwd, paths.root);
+    await assertTeamStatePathSafe(binding.cwd, paths.operationRoot);
+    await assertTeamStatePathSafe(binding.cwd, paths.evidence);
+    await assertTeamStatePathSafe(binding.cwd, paths.retiredOperationRoot);
   } catch (error: unknown) {
     if (error instanceof TeamInstanceError) throw error;
     fail('team_instance_state_corrupt', error instanceof Error ? error.message : String(error));
@@ -475,6 +542,90 @@ function isValidCleanupRecord(value: unknown, binding: TeamInstanceBinding): val
     && canonicalTeamStatePath(binding.cwd, value.receipt_path) === expected.cleanup;
 }
 
+function isValidScaleUpWorktreeRecoveryEvidence(
+  value: unknown,
+  binding: TeamInstanceBinding,
+  operationId: string,
+): value is TeamScaleUpWorktreeRecoveryEvidence {
+  if (!isRecord(value)
+    || Object.keys(value).some(key => ![
+      'schema_version',
+      'kind',
+      'instance_id',
+      'team_name',
+      'cwd',
+      'workspace_hash',
+      'state_root',
+      'operation_id',
+      'evidence_path',
+      'receipt',
+      'original_error',
+      'cleanup_error',
+      'created_at',
+      'updated_at',
+    ].includes(key))
+    || value.schema_version !== 1
+    || value.kind !== 'team-scale-up-worktree-recovery'
+    || value.instance_id !== binding.instance_id
+    || value.team_name !== binding.team_name
+    || typeof value.cwd !== 'string'
+    || canonicalTeamCwd(value.cwd) !== binding.cwd
+    || value.workspace_hash !== binding.workspace_hash
+    || typeof value.state_root !== 'string'
+    || canonicalTeamStatePath(binding.cwd, value.state_root) !== canonicalPath(binding.state_root)
+    || value.operation_id !== operationId
+    || typeof value.evidence_path !== 'string'
+    || typeof value.original_error !== 'string'
+    || value.original_error.length === 0
+    || typeof value.cleanup_error !== 'string'
+    || value.cleanup_error.length === 0
+    || !isTimestamp(value.created_at)
+    || !isTimestamp(value.updated_at)
+    || !isValidScaleUpWorktreeCleanupReceipt(value.receipt, binding)) return false;
+  const paths = scaleUpRecoveryPaths(binding, operationId);
+  return canonicalTeamStatePath(binding.cwd, value.evidence_path) === paths.evidence;
+}
+
+function isValidScaleUpWorktreeCleanupReceipt(
+  value: unknown,
+  binding: TeamInstanceBinding,
+): value is TeamScaleUpWorktreeCleanupReceipt {
+  if (!isRecord(value)
+    || Object.keys(value).some(key => ![
+    'worker_name',
+    'path',
+    'branch',
+    'mode',
+    'created',
+    'reused',
+    'effect_scope',
+  ].includes(key))
+    || !isCanonicalWorkerName(value.worker_name)
+    || !isNonEmptyString(value.path)
+    || !isNonEmptyString(value.branch)
+    || (value.mode !== 'detached' && value.mode !== 'named')
+    || value.created !== true
+    || value.reused !== false
+    || value.effect_scope !== 'created_before_worker_persist') return false;
+  try {
+    assertWorkerWorktreeRemovalReceiptBinding(
+      binding.team_name,
+      value.worker_name,
+      binding.cwd,
+      {
+        path: value.path,
+        branch: value.branch,
+        mode: value.mode,
+        created: value.created,
+        reused: value.reused,
+      },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
@@ -539,18 +690,20 @@ async function inspectTeamState(binding: TeamInstanceBinding): Promise<TeamState
 }
 
 function bindingFromInput(input: TeamInstanceRequest, requireInstanceId: boolean): TeamInstanceBinding {
-  validateTeamName(input.teamName);
-  const cwd = validateCwd(input.cwd);
-  const instanceId = input.instanceId === undefined
-    ? (requireInstanceId ? fail('team_instance_id_invalid', 'instance_id_required') : randomUUID())
-    : validateInstanceId(input.instanceId);
-  return {
-    instance_id: instanceId,
-    team_name: input.teamName,
-    cwd,
-    workspace_hash: teamWorkspaceHash(cwd, input.teamName),
-    state_root: canonicalTeamStateRoot(cwd, input.teamName),
-  };
+  return withTeamStatePathScope(input.cwd, () => {
+    validateTeamName(input.teamName);
+    const cwd = validateCwd(input.cwd);
+    const instanceId = input.instanceId === undefined
+      ? (requireInstanceId ? fail('team_instance_id_invalid', 'instance_id_required') : randomUUID())
+      : validateInstanceId(input.instanceId);
+    return {
+      instance_id: instanceId,
+      team_name: input.teamName,
+      cwd,
+      workspace_hash: teamWorkspaceHash(cwd, input.teamName),
+      state_root: canonicalTeamStateRoot(cwd, input.teamName),
+    };
+  });
 }
 
 function bindingFromBoundInput(input: BoundTeamInstance): TeamInstanceBinding {
@@ -612,19 +765,297 @@ export async function withTeamInstanceLifecycleLock<T>(
   fn: () => Promise<T> | T,
   timeoutMs = 10_000,
 ): Promise<T> {
-  validateTeamName(teamName);
-  const canonicalCwd = validateCwd(cwd);
-  const lifecyclePath = teamInstanceLifecycleLockPath(canonicalCwd, teamName);
+  return withTeamStatePathScope(cwd, async () => {
+    validateTeamName(teamName);
+    const canonicalCwd = validateCwd(cwd);
+    const lifecyclePath = teamInstanceLifecycleLockPath(canonicalCwd, teamName);
+    try {
+      assertTeamStatePathSafeSync(canonicalCwd, lifecyclePath);
+    } catch (error: unknown) {
+      throw new TeamInstanceError(
+        'team_instance_state_corrupt',
+        error instanceof Error ? error.message : String(error),
+        { cause: error },
+      );
+    }
+    return withProcessIdentityFileLock(lifecyclePath, fn, timeoutMs);
+  });
+}
+
+async function readTeamScaleUpWorktreeRecoveryEvidence(
+  binding: TeamInstanceBinding,
+  operationId: string,
+): Promise<TeamScaleUpWorktreeRecoveryEvidence | null> {
+  await assertScaleUpRecoveryPathsSafe(binding, operationId);
+  const paths = scaleUpRecoveryPaths(binding, operationId);
+  const rootKind = await pathKind(paths.operationRoot);
+  if (rootKind === 'missing') return null;
+  if (rootKind !== 'directory') {
+    fail('team_instance_authority_corrupt', 'scale_up_recovery_operation_root_invalid');
+  }
+  const entries = await readdir(paths.operationRoot);
+  if (entries.length !== 1 || entries[0] !== basename(paths.evidence)) {
+    fail('team_instance_authority_corrupt', 'scale_up_recovery_operation_contents_invalid');
+  }
+  const state = await readJsonState(paths.evidence);
+  if (state.kind !== 'value'
+    || !isValidScaleUpWorktreeRecoveryEvidence(state.value, binding, operationId)) {
+    fail('team_instance_authority_corrupt', 'scale_up_recovery_evidence_invalid');
+  }
+  return state.value as TeamScaleUpWorktreeRecoveryEvidence;
+}
+
+export async function listTeamScaleUpWorktreeRecoveryEvidence(
+  input: BoundTeamInstance,
+): Promise<TeamScaleUpWorktreeRecoveryEvidence[]> {
+  const binding = bindingFromBoundInput(input);
+  const root = scaleUpRecoveryPaths(binding, 'probe').root;
+  await assertTeamStatePathSafe(binding.cwd, root);
+  const rootKind = await pathKind(root);
+  if (rootKind === 'missing') return [];
+  if (rootKind !== 'directory') {
+    fail('team_instance_authority_corrupt', 'scale_up_recovery_root_invalid');
+  }
+  const operationIds = (await readdir(root)).sort();
+  const records: TeamScaleUpWorktreeRecoveryEvidence[] = [];
+  for (const operationId of operationIds) {
+    if (!isSafeScaleUpOperationId(operationId)) {
+      fail('team_instance_authority_corrupt', 'invalid_scale_up_recovery_entry');
+    }
+    const record = await readTeamScaleUpWorktreeRecoveryEvidence(binding, operationId);
+    if (!record) fail('team_instance_authority_corrupt', 'scale_up_recovery_evidence_missing');
+    records.push(record);
+  }
+  return records;
+}
+
+export async function publishTeamScaleUpWorktreeRecoveryEvidence(
+  input: BoundTeamInstance,
+  operationId: string,
+  receipt: TeamScaleUpWorktreeCleanupReceipt,
+  diagnostics: { originalError: string; cleanupError: string },
+  options: TeamInstanceOperationOptions = {},
+): Promise<TeamScaleUpWorktreeRecoveryEvidence> {
+  const binding = bindingFromBoundInput(input);
+  await assertScaleUpRecoveryPathsSafe(binding, operationId);
+  assertWorkerWorktreeRemovalReceiptBinding(
+    binding.team_name,
+    receipt.worker_name,
+    binding.cwd,
+    receipt,
+  );
+  if (!receipt.created || receipt.reused
+    || receipt.effect_scope !== 'created_before_worker_persist') {
+    fail('team_instance_authority_corrupt', 'scale_up_recovery_receipt_unowned');
+  }
+  if (diagnostics.originalError.length === 0 || diagnostics.cleanupError.length === 0) {
+    fail('team_instance_authority_corrupt', 'scale_up_recovery_diagnostics_missing');
+  }
+  const existing = await readTeamScaleUpWorktreeRecoveryEvidence(binding, operationId);
+  if (existing) {
+    if (stableJson(existing.receipt) !== stableJson(receipt)
+      || existing.original_error !== diagnostics.originalError
+      || existing.cleanup_error !== diagnostics.cleanupError) {
+      fail('team_instance_mismatch', 'scale_up_recovery_evidence_conflict');
+    }
+    return existing;
+  }
+
+  const paths = scaleUpRecoveryPaths(binding, operationId);
+  const createdAt = new Date().toISOString();
+  const record: TeamScaleUpWorktreeRecoveryEvidence = {
+    schema_version: 1,
+    kind: 'team-scale-up-worktree-recovery',
+    instance_id: binding.instance_id,
+    team_name: binding.team_name,
+    cwd: binding.cwd,
+    workspace_hash: binding.workspace_hash,
+    state_root: binding.state_root,
+    operation_id: operationId,
+    evidence_path: paths.evidence,
+    receipt,
+    original_error: diagnostics.originalError,
+    cleanup_error: diagnostics.cleanupError,
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
+  const stagingRoot = `${paths.operationRoot}.staging-${process.pid}-${randomUUID()}`;
+  let published = false;
   try {
-    assertTeamStatePathSafeSync(canonicalCwd, lifecyclePath);
+    await assertTeamStatePathSafe(binding.cwd, stagingRoot);
+    await mkdir(dirname(paths.operationRoot), { recursive: true, mode: 0o700 });
+    await mkdir(stagingRoot, { recursive: false, mode: 0o700 });
+    const stagedEvidencePath = join(stagingRoot, basename(paths.evidence));
+    if (options.io?.publishScaleUpRecoveryEvidence) {
+      await options.io.publishScaleUpRecoveryEvidence(stagedEvidencePath, record);
+    } else {
+      await defaultPublish(stagedEvidencePath, record);
+    }
+    await verifyPublished(stagedEvidencePath, record);
+    await rename(stagingRoot, paths.operationRoot);
+    published = true;
+    await verifyPublished(paths.evidence, record);
+    return record;
   } catch (error: unknown) {
+    try { await rm(stagingRoot, { recursive: true, force: true }); } catch { /* preserve the original error */ }
+    const raced = await readTeamScaleUpWorktreeRecoveryEvidence(binding, operationId).catch(() => null);
+    if (raced
+      && stableJson(raced.receipt) === stableJson(receipt)
+      && raced.original_error === diagnostics.originalError
+      && raced.cleanup_error === diagnostics.cleanupError) return raced;
     throw new TeamInstanceError(
-      'team_instance_state_corrupt',
-      error instanceof Error ? error.message : String(error),
+      'team_instance_receipt_publish_failed',
+      `${published ? 'scale_up_recovery_verification_failed' : 'scale_up_recovery_publish_failed'}:${error instanceof Error ? error.message : String(error)}`,
       { cause: error },
     );
   }
-  return withProcessIdentityFileLock(lifecyclePath, fn, timeoutMs);
+}
+
+function isValidScaleUpRecoveryRetirementProof(
+  value: TeamScaleUpWorktreeRecoveryRetirementProof,
+  operationId: string,
+): boolean {
+  return isSafeScaleUpOperationId(operationId)
+    && value.protocol === 'team-scale-up-worktree-recovery-settled-v1'
+    && value.operation_id === operationId
+    && value.worktree === 'absent'
+    && value.worker_state === 'absent'
+    && value.worker_config === 'absent'
+    && value.provider_effects === 'absent'
+    && value.pane_effects === 'absent'
+    && value.scale_up_fence === 'released';
+}
+
+export async function retireTeamScaleUpWorktreeRecoveryEvidenceUnderLock(
+  input: BoundTeamInstance,
+  proof: TeamScaleUpWorktreeRecoveryRetirementProof,
+): Promise<void> {
+  const binding = bindingFromBoundInput(input);
+  if (!isValidScaleUpRecoveryRetirementProof(proof, proof.operation_id)) {
+    fail('team_instance_final_state_required', 'scale_up_recovery_retirement_proof_required');
+  }
+  await assertTeamInstanceUnderLock(binding);
+  const record = await readTeamScaleUpWorktreeRecoveryEvidence(binding, proof.operation_id);
+  if (!record) return;
+  const configState = await readJsonState(canonicalTeamStatePath(
+    binding.cwd,
+    TeamPaths.config(binding.team_name),
+  ));
+  if (configState.kind !== 'value' || !isRecord(configState.value)
+    || configState.value.active_scale_up !== undefined
+    || !Array.isArray(configState.value.workers)
+    || configState.value.workers.some(worker =>
+      isRecord(worker) && worker.name === record.receipt.worker_name)) {
+    fail('team_instance_final_state_required', 'scale_up_recovery_fence_or_worker_still_present');
+  }
+  const workerStatePath = canonicalTeamStatePath(
+    binding.cwd,
+    TeamPaths.workerDir(binding.team_name, record.receipt.worker_name),
+  );
+  if (await pathKind(workerStatePath) !== 'missing') {
+    fail('team_instance_final_state_required', 'scale_up_recovery_worker_state_still_present');
+  }
+  const paths = scaleUpRecoveryPaths(binding, proof.operation_id);
+  if (await pathKind(paths.retiredOperationRoot) !== 'missing') {
+    fail('team_instance_authority_corrupt', 'scale_up_recovery_retired_root_conflict');
+  }
+  await mkdir(dirname(paths.retiredOperationRoot), { recursive: true, mode: 0o700 });
+  try {
+    await rename(paths.operationRoot, paths.retiredOperationRoot);
+  } catch (error: unknown) {
+    throw new TeamInstanceError(
+      'team_instance_remove_failed',
+      `scale_up_recovery_retire_failed:${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+  try { await rm(paths.retiredOperationRoot, { recursive: true, force: true }); } catch { /* settled tombstone is non-authoritative */ }
+}
+
+export async function assertNoTeamScaleUpWorktreeRecoveryEvidence(
+  input: BoundTeamInstance,
+  options: {
+    allowForeignNamedState?: boolean;
+    inspectDetachedState?: boolean;
+  } = {},
+): Promise<void> {
+  const binding = bindingFromBoundInput(input);
+  const records = await listTeamScaleUpWorktreeRecoveryEvidence(binding);
+  if (records.length > 0) {
+    fail('team_instance_final_state_required', `scale_up_recovery_pending:${records[0].operation_id}`);
+  }
+  const namedOperation = await pendingScaleUpConfigRecoveryOperation(
+    binding,
+    binding.state_root,
+    options.allowForeignNamedState === true,
+  );
+  const detachedOperation = options.inspectDetachedState
+    ? await pendingScaleUpConfigRecoveryOperation(
+      binding,
+      expectedPaths(binding).detached,
+      false,
+    )
+    : undefined;
+  const pendingOperation = namedOperation ?? detachedOperation;
+  if (pendingOperation) {
+    fail('team_instance_final_state_required', `scale_up_config_recovery_pending:${pendingOperation}`);
+  }
+}
+
+async function pendingScaleUpConfigRecoveryOperation(
+  binding: TeamInstanceBinding,
+  root: string,
+  allowForeignState: boolean,
+): Promise<string | undefined> {
+  const rootKind = await pathKind(root);
+  if (rootKind === 'missing') return undefined;
+  if (rootKind !== 'directory') {
+    if (allowForeignState) return undefined;
+    fail('team_instance_state_corrupt', 'scale_up_recovery_state_root_invalid');
+  }
+  const state = await readJsonState(join(root, 'config.json'));
+  if (state.kind === 'missing') return undefined;
+  if (state.kind !== 'value') {
+    fail('team_instance_state_corrupt', 'scale_up_recovery_config_invalid');
+  }
+  const identity = identityFromDocument(state.value, binding);
+  if (identity === undefined) {
+    fail('team_instance_state_unknown', 'scale_up_recovery_config_identity_missing');
+  }
+  if (identity !== binding.instance_id.toLowerCase()) {
+    if (allowForeignState) return undefined;
+    fail('team_instance_newer_instance', 'scale_up_recovery_config_instance_mismatch');
+  }
+  const config = state.value as Record<string, unknown>;
+  const attempt = config.active_scale_up;
+  if (attempt === undefined) return undefined;
+  if (!isRecord(attempt)) {
+    fail('team_instance_state_corrupt', 'scale_up_recovery_config_attempt_invalid');
+  }
+  const receipts = attempt.worktree_cleanup_receipts;
+  if (receipts === undefined) return undefined;
+  if (!Array.isArray(receipts)) {
+    fail('team_instance_state_corrupt', 'scale_up_recovery_config_receipts_invalid');
+  }
+  if (receipts.length === 0) return undefined;
+  if (!isSafeScaleUpOperationId(attempt.operation_id)
+    || !isValidTeamInstanceId(attempt.instance_id)
+    || attempt.instance_id.toLowerCase() !== binding.instance_id.toLowerCase()
+    || !['reserved', 'effects', 'committed', 'failed'].includes(attempt.phase as string)
+    || !Array.isArray(attempt.baseline_worker_names)
+    || !attempt.baseline_worker_names.every(isCanonicalWorkerName)
+    || new Set(attempt.baseline_worker_names).size !== attempt.baseline_worker_names.length) {
+    fail('team_instance_state_corrupt', 'scale_up_recovery_config_authority_invalid');
+  }
+  const workerNames = new Set<string>();
+  for (const receipt of receipts) {
+    if (!isValidScaleUpWorktreeCleanupReceipt(receipt, binding)
+      || workerNames.has(receipt.worker_name)) {
+      fail('team_instance_state_corrupt', 'scale_up_recovery_config_receipt_invalid');
+    }
+    workerNames.add(receipt.worker_name);
+  }
+  return attempt.operation_id;
 }
 
 /**
@@ -664,10 +1095,12 @@ export function reserveTeamInstance(
   input: TeamInstanceRequest,
   options: TeamInstanceOperationOptions = {},
 ): Promise<TeamInstanceReservation> {
-  const binding = bindingFromInput(input, false);
-  return withTeamInstanceLifecycleLock(binding.cwd, binding.team_name,
-    () => reserveTeamInstanceUnderLock({ teamName: binding.team_name, cwd: binding.cwd, instanceId: binding.instance_id }, options),
-    options.timeoutMs);
+  return withTeamStatePathScope(input.cwd, () => {
+    const binding = bindingFromInput(input, false);
+    return withTeamInstanceLifecycleLock(binding.cwd, binding.team_name,
+      () => reserveTeamInstanceUnderLock({ teamName: binding.team_name, cwd: binding.cwd, instanceId: binding.instance_id }, options),
+      options.timeoutMs);
+  });
 }
 
 /** Return the minimal config projection safe to write before startup effects. */
@@ -767,9 +1200,11 @@ export function releaseFailedStartupReservation(
   input: BoundTeamInstance,
   options: TeamInstanceOperationOptions = {},
 ): Promise<void> {
-  const binding = bindingFromBoundInput(input);
-  return withTeamInstanceLifecycleLock(binding.cwd, binding.team_name,
-    () => releaseFailedStartupReservationUnderLock(binding, options), options.timeoutMs);
+  return withTeamStatePathScope(input.cwd, () => {
+    const binding = bindingFromBoundInput(input);
+    return withTeamInstanceLifecycleLock(binding.cwd, binding.team_name,
+      () => releaseFailedStartupReservationUnderLock(binding, options), options.timeoutMs);
+  });
 }
 
 async function renameIntoDetachedRoot(
@@ -948,6 +1383,10 @@ export async function disposeTeamInstanceUnderLock(
   // prepared disposal.
   await assertExternalCleanupPathsSafe(binding);
   const existing = await readCleanupReceipt(binding);
+  await assertNoTeamScaleUpWorktreeRecoveryEvidence(binding, {
+    allowForeignNamedState: existing !== null,
+    inspectDetachedState: existing !== null,
+  });
   if (existing) return resumeCleanupUnderLock(binding, authorization, existing, options);
 
   await assertBindingPathsSafe(binding);
@@ -985,9 +1424,11 @@ export function disposeTeamInstance(
   options: TeamInstanceOperationOptions = {},
 ): Promise<TeamInstanceCleanupResult> {
   assertAuthorization(authorization);
-  const binding = bindingFromBoundInput(input);
-  return withTeamInstanceLifecycleLock(binding.cwd, binding.team_name,
-    () => disposeTeamInstanceUnderLock(binding, authorization, options), options.timeoutMs);
+  return withTeamStatePathScope(input.cwd, () => {
+    const binding = bindingFromBoundInput(input);
+    return withTeamInstanceLifecycleLock(binding.cwd, binding.team_name,
+      () => disposeTeamInstanceUnderLock(binding, authorization, options), options.timeoutMs);
+  });
 }
 
 /**
@@ -1005,6 +1446,10 @@ export async function retryTeamInstanceDisposalUnderLock(
   await assertExternalCleanupPathsSafe(binding);
   const existing = await readCleanupReceipt(binding);
   if (!existing) fail('team_instance_authority_missing', 'team_instance_cleanup_receipt_missing');
+  await assertNoTeamScaleUpWorktreeRecoveryEvidence(binding, {
+    allowForeignNamedState: true,
+    inspectDetachedState: true,
+  });
   return resumeCleanupUnderLock(binding, authorization, existing, options);
 }
 
@@ -1014,7 +1459,9 @@ export function retryTeamInstanceDisposal(
   authorization: TeamInstanceDisposalAuthorization,
   options: TeamInstanceOperationOptions = {},
 ): Promise<TeamInstanceCleanupResult> {
-  const binding = bindingFromBoundInput(input);
-  return withTeamInstanceLifecycleLock(binding.cwd, binding.team_name,
-    () => retryTeamInstanceDisposalUnderLock(binding, authorization, options), options.timeoutMs);
+  return withTeamStatePathScope(input.cwd, () => {
+    const binding = bindingFromBoundInput(input);
+    return withTeamInstanceLifecycleLock(binding.cwd, binding.team_name,
+      () => retryTeamInstanceDisposalUnderLock(binding, authorization, options), options.timeoutMs);
+  });
 }

@@ -353,6 +353,7 @@ function normalizeEventPayload(
   );
   const initialPrompt = firstStringField(raw, ['initialPrompt', 'initial_prompt']);
   const promptId = firstStringField(raw, hostFieldKeys(host, 'prompt_id', 'promptId'));
+  const turnId = firstStringField(raw, ['turn_id', 'turnId']);
   const message = firstDefinedField(raw, ['message']);
   const messagePrompt = isRecord(message)
     ? firstStringField(message, ['content'])
@@ -483,6 +484,7 @@ function normalizeEventPayload(
     ...(promptAliases.length > 0 ? { promptAliases } : {}),
     ...(initialPrompt !== undefined ? { initialPrompt } : {}),
     ...(promptId !== undefined ? { promptId } : {}),
+    ...(turnId !== undefined ? { turnId } : {}),
     ...(goal !== undefined ? { goal } : {}),
     ...(source !== undefined ? { source } : {}),
     ...(model !== undefined ? { model } : {}),

@@ -22,6 +22,7 @@
  */
 
 import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from 'fs';
+import { stripLeadingUtf8Bom } from './lib/utf8-bom.mjs';
 import { join, dirname, isAbsolute } from 'path';
 import { homedir } from 'os';
 import { fileURLToPath } from 'url';
@@ -36,6 +37,8 @@ import {
   loadHookRuntime,
   surfaceOptionalHookFailure,
 } from './lib/hook-runtime-loader.mjs';
+import { isJevShadowOptedIn, recordJevShadow } from './lib/jev-shadow.mjs';
+import { initializeRalphStateForSkill, createPrdScaffold } from './lib/ralph-startup.mjs';
 
 // Resolve OMC package root: CLAUDE_PLUGIN_ROOT (plugin system) or derive from this script's location
 const _omcRoot = process.env.CLAUDE_PLUGIN_ROOT ||
@@ -157,6 +160,7 @@ ANALYSIS MODE. Gather context before diving deep:
 const TDD_MESSAGE = `<tdd-mode>
 [TDD MODE ACTIVATED]
 Write or update tests first when practical, confirm they fail for the right reason, then implement the minimal fix and re-run verification.
+Call the Skill tool with "tdd" for the full discipline at pre-agreed seams.
 </tdd-mode>
 
 ---
@@ -213,7 +217,7 @@ function isExplicitRalplanSlashInvocation(prompt) {
 }
 
 function isExplicitAskSlashInvocation(prompt) {
-  return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini|antigravity|agy|grok|cursor|copilot)\b/i.test(prompt);
+  return /^\s*\/(?:oh-my-claudecode:)?ask\s+(?:claude|codex|gemini|antigravity|agy|grok|cursor|copilot|muse)\b/i.test(prompt);
 }
 
 function isRetiredSlashInvocation(prompt) {
@@ -254,8 +258,8 @@ function sanitizeForKeywordDetection(text) {
   return stripPastedCommandPayloads(text)
     // 0. Strip HTML/markdown comments before tag stripping
     .replace(/<!--[\s\S]*?-->/g, '')
-    // 1. Strip XML-style tag blocks: <tag-name ...>...</tag-name> (multi-line, greedy on tag name)
-    .replace(/<(\w[\w-]*)[\s>][\s\S]*?<\/\1>/g, '')
+    // 1. Strip XML-style tag blocks; closing-tag attributes stay on one line and stop at adjacent tags.
+    .replace(/<(\w[\w-]*)[\s>][\s\S]*?<\/\1(?:[ \t][^<>\r\n]*)?>/g, '')
     // 2. Strip self-closing XML tags: <tag-name />, <tag-name attr="val" />
     .replace(/<\w[\w-]*(?:\s[^>]*)?\s*\/>/g, '')
     // 3. Strip URLs: http://... or https://... up to whitespace
@@ -411,6 +415,18 @@ const INFORMATIONAL_INTENT_PATTERNS = [
   /(?:什么是|什麼是|怎(?:么|樣)用|如何使用|解释|說明|说明)/u,
   /(?:ทำไม|อะไร|ยังไง|อย่างไร|คืออะไร|หมายถึง|แปลว่า|อธิบาย|มั้ย|ไหม|เหรอ|หรอ|หรือไม่|หรือเปล่า|ใช่ไหม|ถูกมั้ย|เกี่ยวกับ|เหมือน)/u,
 ];
+const STRONG_HELP_QUERY_PATTERN =
+  /\?|？|\b(?:how\s+(?:to|do\s+i)\s+use|what(?:'s|\s+is)|what\s+are|explain|describe|tell\s+me\s+about)\b|(?:사용법|使い方|什么是|怎么用|如何使用)/iu;
+// Help-request constructions ("tell me", "how to use", "what is"), not bare
+// help terms or particles such as 사용법, 使い方, or とは, keep task objects actionable.
+const MULTILINGUAL_HELP_REQUEST_PATTERN =
+  /(?:알려\s?줘|알려줄래|설명해\s?줘|뭐야|뭔데|어떻게\s*(?:써|쓰|사용)|教えて|説明して|って何|如何使用|怎(?:么|樣)用|是什么|什么是|(?:(?:请|請)\s*(?:解释|解釋|說明|说明)|(?:解释|解釋|說明|说明)(?:一下|下|如何|怎么|怎麼|怎样|怎樣))|คืออะไร|ใช้(?:งาน)?ยังไง|ใช้(?:งาน)?อย่างไร)/u;
+const ENGLISH_HELP_REQUEST_PATTERN =
+  /\b(?:what(?:'s|\s+is)|what\s+are|how\s+(?:to|do\s+i)\s+use|explain|describe|tell\s+me\s+about)\b/iu;
+const TASK_ACTION_VERB_PATTERN =
+  /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build|create|make|run|start|enable|activate|invoke|trigger|launch)\b|(?:ทำ|ทํา|สร้าง|แก้|เปิด|รัน|เรียก|เริ่ม|만들어줘|만들어|생성해|추가해|수정해|편집해|작성해|구현해|고쳐(?:줘)?|실행해|作成して|作って|修正して|直して|追加して|実装して|更新して|実行して|创建|生成|修复|修改|构建|实现|执行)/iu;
+const RESULTS_REPORTING_REQUEST_PATTERN =
+  /(?:(?:결과|변경\s*(?:사항|내용)|수정\s*(?:사항|내용)|変更(?:内容|点)|修正内容)[^\n]{0,24}(?:알려\s?줘|알려줄래|설명해\s?줘|教えて|説明して)|(?:(?:结果|結果|(?:改动|改動|更改|修改|变更|變更)(?:内容|內容|结果|結果))[^\n]{0,24}(?:解释|說明|说明)|(?:解释|說明|说明)[^\n]{0,24}(?:结果|結果|改动|改動|更改|修改|变更|變更))|(?:results?|changes?|summary)[^\n]{0,24}(?:tell\s+me|explain|describe)|(?:tell\s+me|explain|describe)[^\n]{0,24}(?:results?|changes?|summary))/iu;
 const INFORMATIONAL_CONTEXT_WINDOW = 80;
 const QUOTED_SPAN_PATTERN =
   /"[^"\n]{1,400}"|'[^'\n]{1,400}'|“[^”\n]{1,400}”|‘[^’\n]{1,400}’/g;
@@ -484,6 +500,9 @@ const SYSTEM_ECHO_SIGNATURES = [
 ];
 
 const MAX_STATE_PROMPT_LEN = 500;
+// Must match PASTED_ECHO_PROMPT_SENTINEL in persistent-mode.mjs/.cjs and
+// src/hooks/autopilot/enforcement.ts, which treat it as an orphan marker.
+const PASTED_ECHO_PROMPT_SENTINEL = '(prompt omitted: pasted system echo)';
 
 function stripSystemEchoes(text) {
   if (typeof text !== 'string' || text.length === 0) return '';
@@ -534,7 +553,7 @@ function sanitizePromptForState(prompt) {
   }
 
   if (looksLikeSystemEcho(trimmed)) {
-    return '(prompt omitted: pasted system echo)';
+    return PASTED_ECHO_PROMPT_SENTINEL;
   }
 
   // Fallback (stripping left nothing but original isn't recognizably an echo)
@@ -630,7 +649,28 @@ function hasActivationIntentNearKeyword(context, keyword) {
 
 function hasDirectInvocationPrefix(text, position) {
   const prefix = text.slice(0, position);
-  return /^\s*(?:[$/!]\s*|force:\s*|oh-my-(?:claudecode|codex):\s*)?$/i.test(prefix);
+  return /^\s*(?:[$/!]\s*|force:\s*|\/?oh-my-(?:claudecode|codex):\s*)?$/i.test(prefix);
+}
+
+// A leading alias is direct only with invocation syntax or an action; a bare
+// alias can be ordinary prose in supported languages.
+function hasDirectLeadingInvocation(text, position, keywordLength) {
+  const prefix = text.slice(0, position);
+  if (!hasDirectInvocationPrefix(text, position)) {
+    return false;
+  }
+
+  if (/^\s*\/oh-my-(?:claudecode|codex):\s*$/i.test(prefix)) {
+    return true;
+  }
+
+  return /^\s*[:：]/.test(text.slice(position + keywordLength)) || hasLeadingCommandVerb(text, position, keywordLength);
+}
+
+function hasLeadingCommandVerb(text, position, keywordLength) {
+  return /^\s+(?:fix|debug|investigate|resolve|handle|patch|address|implement|build|create|make|run|start|enable|activate|invoke|trigger|launch|plan)\b/i.test(
+    text.slice(position + keywordLength),
+  );
 }
 
 function hasConversationalInvocationNearKeyword(text, position, _keywordLength, _keywordText) {
@@ -717,12 +757,37 @@ function isAutopilotCreationAlias(keywordText) {
   return /^(?:build|create|make)\s+me\b/.test(normalized) || /^i\s+want\s+an?(?:\s+(?:app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension))?\s*$/.test(normalized);
 }
 
+function hasResultsReportingRequestAfterAction(text) {
+  const taskText = stripQuotedSpans(text);
+  const reportingRequestIndex = taskText.search(RESULTS_REPORTING_REQUEST_PATTERN);
+  if (reportingRequestIndex <= 0) return false;
+
+  const precedingTaskText = taskText.slice(0, reportingRequestIndex);
+  const precedingTextHasHelpRequest =
+    ENGLISH_HELP_REQUEST_PATTERN.test(precedingTaskText) || MULTILINGUAL_HELP_REQUEST_PATTERN.test(precedingTaskText);
+  return !precedingTextHasHelpRequest && TASK_ACTION_VERB_PATTERN.test(precedingTaskText);
+}
+
+function hasActionableRequestLine(text) {
+  const taskText = stripQuotedSpans(text);
+  if (/\?|？/u.test(taskText) || !TASK_ACTION_VERB_PATTERN.test(taskText)) return false;
+  const hasHelpRequest = ENGLISH_HELP_REQUEST_PATTERN.test(taskText) || MULTILINGUAL_HELP_REQUEST_PATTERN.test(taskText);
+  return !hasHelpRequest || hasResultsReportingRequestAfterAction(taskText);
+}
+
 function hasActionableCommandAfterSeparator(text, position, keywordLength) {
   const suffix = text.slice(position + keywordLength).match(/^\s*[:：]\s*([^\n]{0,80})/u)?.[1] ?? '';
-  if (/\?|？|\b(?:what(?:'s|\s+is)|how\s+(?:to|do\s+i)\s+use|explain|describe|tell\s+me\s+about)\b/iu.test(suffix)) {
+  const taskText = stripQuotedSpans(suffix);
+  if (/\?|？/u.test(taskText)) {
     return false;
   }
-  return /\b(?:fix|debug|investigate|resolve|handle|patch|address|implement|build|create|make|run|start|enable|activate|invoke|trigger|launch)\b|(?:ทำ|ทํา|สร้าง|แก้|เปิด|รัน|เรียก|เริ่ม)/iu.test(suffix);
+  if (
+    (ENGLISH_HELP_REQUEST_PATTERN.test(taskText) || MULTILINGUAL_HELP_REQUEST_PATTERN.test(taskText)) &&
+    !hasResultsReportingRequestAfterAction(taskText)
+  ) {
+    return false;
+  }
+  return TASK_ACTION_VERB_PATTERN.test(taskText);
 }
 
 function isRalphUltraworkMetaOrBanterContext(context, keywordText) {
@@ -755,12 +820,20 @@ function isRalphUltraworkMetaOrBanterContext(context, keywordText) {
   return metaOrBanterPatterns.some((pattern) => pattern.test(context));
 }
 
+function getLeadingRequestLine(text, position, keywordLength, line) {
+  const [sameLine, ...rest] = text.slice(position + keywordLength).replace(/^[^\S\n]*[:：]?/u, '').split('\n');
+  if (sameLine.trim()) {
+    return line;
+  }
+  return rest.find((candidate) => candidate.trim()) ?? line;
+}
+
 function isInformationalKeywordContext(text, position, keywordLength, keywordText) {
   const start = Math.max(0, position - INFORMATIONAL_CONTEXT_WINDOW);
   const end = Math.min(text.length, position + keywordLength + INFORMATIONAL_CONTEXT_WINDOW);
   const context = text.slice(start, end);
   const hasInformationalIntent = INFORMATIONAL_INTENT_PATTERNS.some((pattern) => pattern.test(context));
-  const hasStrongHelpQueryIntent = /\?|？|\b(?:how\s+(?:to|do\s+i)\s+use|what(?:'s|\s+is)|explain|describe|tell\s+me\s+about)\b|(?:사용법|使い方|什么是|怎么用|如何使用)/iu.test(context);
+  const hasStrongHelpQueryIntent = STRONG_HELP_QUERY_PATTERN.test(context);
   const lineBounds = getLineBounds(text, position);
   const line = text.slice(lineBounds.start, lineBounds.end);
   const questionOutsideQuotes = stripQuotedSpans(text);
@@ -809,6 +882,27 @@ function isInformationalKeywordContext(text, position, keywordLength, keywordTex
     if (!hasGenuineCommandNearQuote) {
       return true;
     }
+  }
+
+  // A direct leading invocation is decided by its own line: a command verb
+  // right after the keyword or an actionable command after the separator
+  // always runs, a help request on that line stays informational, and later
+  // prose never suppresses it.
+  if (keywordText && hasDirectLeadingInvocation(text, position, keywordLength)) {
+    if (hasActionableCommandSeparatorInvocation || hasLeadingCommandVerb(text, position, keywordLength)) {
+      return false;
+    }
+    // English help needs a help-query construction on the line, so task
+    // objects such as "update the explanation" stay actionable; the other
+    // languages keep their dedicated informational phrasing patterns. A bare
+    // prefix line is judged by the first nonempty request line after it.
+    const requestLine = getLeadingRequestLine(text, position, keywordLength, line);
+    if (hasActionableRequestLine(requestLine)) {
+      return false;
+    }
+    return INFORMATIONAL_INTENT_PATTERNS.slice(1).some((pattern) => pattern.test(requestLine)) ||
+      MULTILINGUAL_HELP_REQUEST_PATTERN.test(requestLine) ||
+      (INFORMATIONAL_INTENT_PATTERNS[0].test(requestLine) && STRONG_HELP_QUERY_PATTERN.test(requestLine));
   }
 
   if (keywordText) {
@@ -1014,7 +1108,8 @@ async function activateState(directory, prompt, stateName, sessionId) {
       project_path: directory,
       awaiting_confirmation: true,
       awaiting_confirmation_set_at: now,
-      last_checked_at: now
+      last_checked_at: now,
+      prd_mode: true, // CRITICAL: Enable PRD mode for ralph (issue #4363)
     };
   } else if (stateName === 'ralplan') {
     // Ralplan needs active + session_id for stop-hook enforcement
@@ -1058,6 +1153,18 @@ async function activateState(directory, prompt, stateName, sessionId) {
   }
 
   const safeSessionId = sessionId && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}$/.test(sessionId) ? sessionId : undefined;
+
+  // Initialize PRD scaffold for ralph state (issue #4363)
+  if (stateName === 'ralph') {
+    try {
+      const omcRoot = await resolveOmcStateRoot(directory);
+      createPrdScaffold(omcRoot, safeSessionId);
+    } catch (e) {
+      // PRD creation failure should not block ralph activation
+      if (process.env.OMC_DEBUG) console.error('[keyword-detector] PRD creation failed:', e.message);
+    }
+  }
+
   const { writePath } = await resolveSessionStatePathsForHook(directory, stateName, safeSessionId);
   try {
     mkdirSync(dirname(writePath), { recursive: true });
@@ -1454,10 +1561,11 @@ function getOmcUserConfigDir() {
   return process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
 }
 
-// Mirrors src/utils/jsonc.ts:stripJsoncComments (strips comments AND trailing commas)
+// Mirrors src/utils/jsonc.ts:stripJsoncComments (strips a leading BOM, comments AND trailing commas)
 function stripJsoncComments(content) {
-  return stripTrailingCommas(stripComments(content));
+  return stripTrailingCommas(stripComments(stripLeadingUtf8Bom(content)));
 }
+
 
 function stripComments(content) {
   let result = '';
@@ -1470,7 +1578,9 @@ function stripComments(content) {
     if (content[i] === '/' && content[i + 1] === '*') {
       i += 2;
       while (i < content.length && !(content[i] === '*' && content[i + 1] === '/')) i++;
+      if (i >= content.length) throw new SyntaxError('Unterminated JSONC block comment');
       i += 2;
+      result += ' ';
       continue;
     }
     if (content[i] === '"') {
@@ -1658,6 +1768,54 @@ function createHookOutput(additionalContext) {
   };
 }
 
+const SKILL_TRIGGER_QUESTIONS = {
+  'skill-trigger': {
+    type: 'choice',
+    instructions: 'Which skill or mode should this user prompt trigger?',
+    criteria: {
+      cancel: 'The prompt explicitly invokes the cancel trigger.',
+      ralph: 'The prompt explicitly invokes the ralph trigger.',
+      autopilot: 'The prompt explicitly invokes the autopilot trigger.',
+      ralplan: 'The prompt explicitly invokes the ralplan trigger.',
+      tdd: 'The prompt explicitly invokes the tdd trigger.',
+      'code-review': 'The prompt explicitly invokes the code-review trigger.',
+      'security-review': 'The prompt explicitly invokes the security-review trigger.',
+      ultrathink: 'The prompt explicitly invokes the ultrathink trigger.',
+      deepsearch: 'The prompt explicitly invokes the deepsearch trigger.',
+      analyze: 'The prompt explicitly invokes the analyze trigger.',
+      'deep-interview': 'The prompt explicitly invokes the deep-interview trigger.',
+      codex: 'The prompt explicitly invokes the codex trigger.',
+      none: 'No trigger fires; handle the prompt without a mode or skill.',
+    },
+  },
+};
+
+const INTENT_QUESTIONS = {
+  intent: {
+    type: 'noul',
+    instructions:
+      'Does this user prompt start an Intent-intake request (a non-engineer contributor stating a problem/goal/constraints to start the requirements intake flow)?',
+    criteria: {
+      true: 'The prompt states a problem, goal, or constraints from a contributor and starts the Intent intake — a goal-level intent.md with problem/goal/users-and-systems/constraints/open-questions, not a solution design.',
+      false: 'Everything else: solution or engineering work, informational questions, or an existing workflow. Not an Intent-intake request.',
+    },
+  },
+};
+
+const TASK_SIZE_QUESTIONS = {
+  'task-size': {
+    type: 'choice',
+    instructions: 'What size is this task — how much orchestration does it warrant?',
+    criteria: {
+      small: 'Single-file or few-line change; run directly without heavy modes',
+      medium: 'Multi-file but single-area change; standard delegation',
+      large: 'Multi-area or architectural change; heavy orchestration (ralph/autopilot/team) is warranted',
+    },
+  },
+};
+
+const INTENT_SLASH_PATTERN = /^\s*\/(?:oh-my-claudecode:|omc:)?intent(?=\s|$|[?!.,;:])/i;
+
 async function processKeywordDetector(data) {
   try {
     const directory = data.directory || process.cwd();
@@ -1700,8 +1858,7 @@ async function processKeywordDetector(data) {
     }
 
     if (isRetiredSlashInvocation(prompt)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-      return;
+      return { continue: true, suppressOutput: true };
     }
 
     // `/ask <provider> ...` delegates the remainder of the prompt to an
@@ -1850,7 +2007,58 @@ async function processKeywordDetector(data) {
     }
 
     // Resolve conflicts
-    const resolved = resolveConflicts(uniqueMatches);
+    let resolved = resolveConflicts(uniqueMatches);
+
+    const permissionMode = data.permission_mode;
+    if (isJevShadowOptedIn('skill-trigger', process.env, permissionMode)) {
+      const jevResult = recordJevShadow({
+        point: 'skill-trigger',
+        state: { prompt: cleanPrompt, source: 'user-prompt-submit' },
+        questions: SKILL_TRIGGER_QUESTIONS,
+        heuristic: resolved.map((match) => match.name),
+        permissionMode,
+      });
+
+      // In active mode, use Jev's skill choice
+      if (jevResult && jevResult.mode === 'active' && jevResult.answer) {
+        const jevChoice = jevResult.answer.choice?.toLowerCase();
+        if (jevChoice && jevChoice !== 'none') {
+          // Override with Jev's chosen skill
+          const matchedKeyword = uniqueMatches.find((m) => m.name === jevChoice);
+          resolved = matchedKeyword ? [matchedKeyword] : resolved;
+        } else if (jevChoice === 'none') {
+          // Jev says no trigger
+          resolved = [];
+        }
+      }
+    }
+    if (isJevShadowOptedIn('intent', process.env, permissionMode)) {
+      const jevResult = recordJevShadow({
+        point: 'intent',
+        state: { prompt: cleanPrompt, mode_name: 'intent' },
+        questions: INTENT_QUESTIONS,
+        heuristic: INTENT_SLASH_PATTERN.test(cleanPrompt),
+        permissionMode,
+      });
+      // In active mode, intent Jev answer could be used here if needed
+      // Currently logging-only: resolved keywords come from skill-trigger
+    }
+    if (isJevShadowOptedIn('task-size', process.env, permissionMode)) {
+      try {
+        const { classifyTaskSize } = await import('../dist/hooks/task-size-detector/index.js');
+        const jevResult = recordJevShadow({
+          point: 'task-size',
+          state: { prompt: cleanPrompt, source: 'user-prompt-submit' },
+          questions: TASK_SIZE_QUESTIONS,
+          heuristic: classifyTaskSize(cleanPrompt),
+          permissionMode,
+        });
+        // In active mode, task-size Jev answer could be used here if needed
+        // Currently logging-only: task sizing is handled on TypeScript side
+      } catch {
+        // The compiled twin is optional for script-only installs; never affect prompt handling.
+      }
+    }
 
     // Import flow tracer once (best-effort)
     let tracer = null;
@@ -1937,17 +2145,22 @@ async function processKeywordDetector(data) {
     }
 
     // Activate states for modes that need them (team removed — explicit-only via /team skill)
-    const stateModes = resolved.filter(m => ['ralph', 'ultragoal', 'autopilot', 'ralplan'].includes(m.name));
+    // A prompt that sanitizes to the pasted-echo sentinel has no recoverable
+    // user request, so a state armed from it can never be attributed or
+    // confirmed and would block every Stop after the confirmation TTL (#4250).
+    const isPastedEchoPrompt = sanitizePromptForState(prompt) === PASTED_ECHO_PROMPT_SENTINEL;
+    const stateModes = isPastedEchoPrompt
+      ? []
+      : resolved.filter(m => ['ralph', 'ultragoal', 'autopilot', 'ralplan'].includes(m.name));
     for (const mode of stateModes) {
       const activationError = await activateState(directory, prompt, mode.name, sessionId);
       if (activationError === 'workflow_descriptor_integrity_failed') {
         return createHookOutput('workflow_descriptor_integrity_failed');
       }
       if (activationError) {
-        console.log(JSON.stringify(createHookOutput(
+        return createHookOutput(
           `[OMC STATE ERROR] ${activationError} No ${mode.name} state was activated.`,
-        )));
-        return;
+        );
       }
     }
 

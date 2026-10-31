@@ -10,6 +10,7 @@ import { evaluateAgentHeavyPreflight } from '../../scripts/lib/pre-tool-enforcer
 import { clearWorktreeCache, getOmcRoot } from '../lib/worktree-paths.js';
 const SCRIPT_PATH = join(process.cwd(), 'scripts', 'pre-tool-enforcer.mjs');
 const ADVISORY_TEST_NOW_MS = Date.now();
+const RUNNER_PATH = join(process.cwd(), 'scripts', 'run.cjs');
 function makeGitTemp(prefix) {
     const directory = mkdtempSync(join(tmpdir(), prefix));
     execFileSync('git', ['init'], { cwd: directory, stdio: 'pipe' });
@@ -76,6 +77,39 @@ function runPreToolEnforcerWithEnv(input, env = {}) {
         },
     });
     return JSON.parse(stdout.trim());
+}
+function runCodexPreToolEnforcer(input, cwd, env = {}) {
+    const homeDir = join(cwd, '.codex-home');
+    const configDir = join(homeDir, '.claude');
+    const tmpDir = join(cwd, '.codex-tmp');
+    mkdirSync(configDir, { recursive: true });
+    mkdirSync(tmpDir, { recursive: true });
+    return execFileSync(process.execPath, [RUNNER_PATH, SCRIPT_PATH], {
+        cwd,
+        input: JSON.stringify(input),
+        encoding: 'utf-8',
+        timeout: 10_000,
+        env: {
+            ...process.env,
+            HOME: homeDir,
+            USERPROFILE: homeDir,
+            CLAUDE_CONFIG_DIR: configDir,
+            PLUGIN_ROOT: process.cwd(),
+            CLAUDE_PLUGIN_ROOT: process.cwd(),
+            NODE_ENV: 'test',
+            DISABLE_OMC: '',
+            OMC_SKIP_HOOKS: '',
+            OMC_STATE_DIR: '',
+            OMC_HOST: '',
+            COPILOT_CLI: '',
+            COPILOT_AGENT_SESSION_ID: '',
+            TMPDIR: tmpDir,
+            OMC_QUIET: '',
+            OMC_PRE_TOOL_ADVISORY_COOLDOWN_MS: '',
+            OMC_PRE_TOOL_ADVISORY_NOW_MS: '1000',
+            ...env,
+        },
+    }).trim();
 }
 function writeJson(filePath, data) {
     mkdirSync(dirname(filePath), { recursive: true });
@@ -157,6 +191,15 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
         expect(beforeCooldown).toEqual({ continue: true, suppressOutput: true });
         expect(atCooldown.hookSpecificOutput.additionalContext).toContain('Use parallel execution for independent tasks');
     });
+    it('does not truncate non-integer cooldown values to a few milliseconds', () => {
+        for (const cooldown of ['1e4', '30_000']) {
+            const sessionId = `session-3163-${cooldown}`;
+            const run = (nowMs) => runPreToolEnforcerWithEnv({ tool_name: 'Bash', cwd: tempDir, session_id: sessionId }, { OMC_PRE_TOOL_ADVISORY_COOLDOWN_MS: cooldown, OMC_PRE_TOOL_ADVISORY_NOW_MS: nowMs });
+            run(String(ADVISORY_TEST_NOW_MS));
+            expect(run(String(ADVISORY_TEST_NOW_MS + 100)))
+                .toEqual({ continue: true, suppressOutput: true });
+        }
+    });
     it('treats a future same-message timestamp as already emitted', () => {
         runWithThrottle('Bash', String(ADVISORY_TEST_NOW_MS + 10_000));
         const output = runWithThrottle('Bash', String(ADVISORY_TEST_NOW_MS));
@@ -193,6 +236,78 @@ describe('pre-tool-enforcer advisory throttling (issue #3163)', () => {
         expect(Object.keys(state.entries)).toHaveLength(1);
         expect(Object.values(state.entries)[0].last_emitted_at_ms)
             .toBe(ADVISORY_TEST_NOW_MS + 20_000);
+    });
+});
+describe('Codex PreToolUse output contract (issue #4488)', () => {
+    let tempDir;
+    beforeEach(() => {
+        tempDir = makeGitTemp('pre-tool-enforcer-codex-4488-');
+    });
+    afterEach(() => {
+        rmSync(tempDir, { recursive: true, force: true });
+    });
+    it('keeps advisory context and emits no stdout for the cooldown no-op through run.cjs', () => {
+        const input = {
+            hook_event_name: 'PreToolUse',
+            session_id: 'synthetic-repro',
+            cwd: tempDir,
+            tool_name: 'Bash',
+            tool_input: { command: 'printf synthetic' },
+        };
+        const firstRaw = runCodexPreToolEnforcer(input, tempDir);
+        const first = JSON.parse(firstRaw);
+        const firstHookOutput = first.hookSpecificOutput;
+        expect(first).not.toHaveProperty('continue');
+        expect(first).not.toHaveProperty('suppressOutput');
+        expect(firstHookOutput.additionalContext).toContain('Use parallel execution for independent tasks');
+        expect(runCodexPreToolEnforcer(input, tempDir)).toBe('');
+    });
+    it('emits no output for no-op, task-list, and disabled paths and denies invalid input', () => {
+        expect(runCodexPreToolEnforcer({ tool_name: 'ToolSearch', cwd: tempDir }, tempDir)).toBe('');
+        expect(runCodexPreToolEnforcer({ tool_name: 'TaskList', cwd: tempDir }, tempDir)).toBe('');
+        expect(runCodexPreToolEnforcer({ tool_name: 'Bash', cwd: tempDir }, tempDir, { DISABLE_OMC: '1' })).toBe('');
+        const invalid = JSON.parse(runCodexPreToolEnforcer(null, tempDir));
+        expect(invalid.hookSpecificOutput).toMatchObject({
+            permissionDecision: 'deny',
+            permissionDecisionReason: 'Hook input must be a JSON object.',
+        });
+    });
+    it('preserves denial and marks model-input rewrites as allowed', () => {
+        const deniedSession = 'codex-ultragoal-deny';
+        writeJson(join(tempDir, '.omc', 'state', 'sessions', deniedSession, 'ultragoal-state.json'), {
+            active: true,
+            session_id: deniedSession,
+            project_path: tempDir,
+            objective: 'complete the aggregate ultragoal',
+            last_checked_at: new Date().toISOString(),
+        });
+        const denied = JSON.parse(runCodexPreToolEnforcer({
+            hook_event_name: 'PreToolUse',
+            session_id: deniedSession,
+            cwd: tempDir,
+            tool_name: 'Bash',
+            tool_input: { command: 'echo safe' },
+        }, tempDir));
+        const deniedHookOutput = denied.hookSpecificOutput;
+        expect(denied).not.toHaveProperty('continue');
+        expect(denied).not.toHaveProperty('suppressOutput');
+        expect(deniedHookOutput.permissionDecision).toBe('deny');
+        writeJson(join(tempDir, '.claude', 'omc.jsonc'), {
+            agents: { explore: { model: 'sonnet' } },
+        });
+        const rewritten = JSON.parse(runCodexPreToolEnforcer({
+            hook_event_name: 'PreToolUse',
+            session_id: 'codex-model-rewrite',
+            cwd: tempDir,
+            tool_name: 'Task',
+            tool_input: { subagent_type: 'oh-my-claudecode:explore', description: 'find files', prompt: 'x' },
+        }, tempDir));
+        const rewrittenHookOutput = rewritten.hookSpecificOutput;
+        const updatedInput = rewrittenHookOutput.updatedInput;
+        expect(rewritten).not.toHaveProperty('continue');
+        expect(rewritten).not.toHaveProperty('suppressOutput');
+        expect(rewrittenHookOutput.permissionDecision).toBe('allow');
+        expect(updatedInput.model).toBe('sonnet');
     });
 });
 describe('pre-tool-enforcer fallback gating (issue #970)', () => {

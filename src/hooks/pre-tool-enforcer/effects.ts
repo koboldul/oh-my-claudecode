@@ -39,6 +39,7 @@ import {
   type PreToolFinalDisposition,
   type PreToolBatchSnapshot,
   type PreToolHookEffect,
+  type PreToolModelRoutingOverrides,
   type ReadBudgetWarningEffectPayload,
   type ReadBudgetWarningMutationResult,
   type ReplayAppendOnceResult,
@@ -217,11 +218,12 @@ function boundedForceDelegationEvents(
 export function reserveAndPlanPreToolBatch(
   envelope: CanonicalHookEnvelope,
   snapshot: PreToolBatchSnapshot,
+  modelRoutingOverrides: PreToolModelRoutingOverrides = {},
 ): ForceDelegationReservationResult {
   if (!snapshot.forceDelegation?.enforce) {
     return {
       status: 'planned',
-      plan: planPreToolBatch(envelope, snapshot),
+      plan: planPreToolBatch(envelope, snapshot, modelRoutingOverrides),
       generation: snapshot.forceDelegationLedger.generation ?? 0,
     };
   }
@@ -269,7 +271,11 @@ export function reserveAndPlanPreToolBatch(
           })),
         },
       };
-      const plan = planPreToolBatch(envelope, currentSnapshot);
+      const plan = planPreToolBatch(
+        envelope,
+        currentSnapshot,
+        modelRoutingOverrides,
+      );
       const reservations = plan.evaluations.flatMap(
         (evaluation) => evaluation.effects ?? [],
       ).filter(

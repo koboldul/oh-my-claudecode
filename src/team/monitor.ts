@@ -17,10 +17,11 @@ import { performance } from 'perf_hooks';
 import { CANONICAL_TEAM_ROLES, KNOWN_AGENT_NAMES } from '../shared/types.js';
 import type { RoleAssignment } from '../shared/types.js';
 
-import { WORKER_NAME_SAFE_PATTERN } from './contracts.js';
+import { isCanonicalWorkerName, isSafeScaleUpOperationId } from './contracts.js';
 
 import { TeamPaths, absPath, canonicalTeamCwd, canonicalTeamStatePath } from './state-paths.js';
 import { withProcessIdentityFileLock } from './process-identity-lock.js';
+import { assertWorkerWorktreeRemovalReceiptBinding } from './git-worktree.js';
 import type {
   TeamConfig,
   TeamInstanceBinding,
@@ -156,7 +157,7 @@ function isStringArray(value: unknown): value is string[] {
 
 
 function isWorkerInfo(value: unknown): boolean {
-  if (!isRecord(value) || typeof value.name !== 'string' || !WORKER_NAME_SAFE_PATTERN.test(value.name) || !isSafeCounter(value.index) || value.index < 1) return false;
+  if (!isRecord(value) || !isCanonicalWorkerName(value.name) || !isSafeCounter(value.index) || value.index < 1) return false;
   return (value.role === undefined || typeof value.role === 'string')
     && (value.assigned_tasks === undefined || isStringArray(value.assigned_tasks))
     && (value.worker_cli === undefined || ['claude', 'codex', 'gemini', 'cursor', 'grok', 'antigravity', 'copilot'].includes(value.worker_cli as string))
@@ -192,18 +193,60 @@ function isOwnerEpoch(value: unknown): boolean {
 
 function isRecoveryAttempt(value: unknown): boolean {
   return isRecord(value) && isNonEmptyString(value.request_id) && isNonEmptyString(value.recovery_id)
-    && isNonEmptyString(value.worker_name) && isSafeCounter(value.owner_epoch) && value.owner_epoch > 0
+    && isCanonicalWorkerName(value.worker_name) && isSafeCounter(value.owner_epoch) && value.owner_epoch > 0
     && isNonEmptyString(value.owner_nonce) && ['reserved', 'requeued', 'ready', 'active', 'services_pending', 'adopted', 'failed'].includes(value.phase as string)
     && (value.original_pane_id === undefined || typeof value.original_pane_id === 'string')
     && isSafeCounter(value.state_revision) && isTimestamp(value.created_at) && isTimestamp(value.updated_at);
 }
 
-function isScaleUpAttempt(value: unknown): boolean {
-  return isRecord(value) && isNonEmptyString(value.operation_id) && ['reserved', 'effects', 'committed', 'failed'].includes(value.phase as string)
-    && (value.instance_id === undefined || isValidTeamInstanceId(value.instance_id))
-    && isSafeCounter(value.pid) && value.pid > 0 && isNonEmptyString(value.process_started_at) && isSafeCounter(value.state_revision)
-    && isTimestamp(value.created_at) && isTimestamp(value.updated_at)
-    && (value.failure_reason === undefined || typeof value.failure_reason === 'string');
+function isScaleUpWorktreeCleanupReceipts(
+  value: unknown,
+  teamName: string,
+  cwd: string,
+): boolean {
+  if (value === undefined) return true;
+  if (!Array.isArray(value)) return false;
+  const workerNames = new Set<string>();
+  return value.every(receipt => {
+    if (!isRecord(receipt) || !isCanonicalWorkerName(receipt.worker_name)
+      || workerNames.has(receipt.worker_name)
+      || !isNonEmptyString(receipt.path) || !isNonEmptyString(receipt.branch)
+      || !['detached', 'named'].includes(receipt.mode as string)
+      || receipt.created !== true || receipt.reused !== false
+      || receipt.effect_scope !== 'created_before_worker_persist') return false;
+    try {
+      assertWorkerWorktreeRemovalReceiptBinding(teamName, receipt.worker_name, cwd, {
+        path: receipt.path,
+        branch: receipt.branch,
+        mode: receipt.mode as 'detached' | 'named',
+        created: receipt.created,
+        reused: receipt.reused,
+      });
+    } catch {
+      return false;
+    }
+    workerNames.add(receipt.worker_name);
+    return true;
+  });
+}
+
+function isScaleUpAttempt(value: unknown, teamName: string, cwd?: string): boolean {
+  if (!isRecord(value) || !isSafeScaleUpOperationId(value.operation_id)
+    || !['reserved', 'effects', 'committed', 'failed'].includes(value.phase as string)
+    || (value.instance_id !== undefined && !isValidTeamInstanceId(value.instance_id))
+    || !isSafeCounter(value.pid) || value.pid <= 0 || !isNonEmptyString(value.process_started_at)
+    || !isSafeCounter(value.state_revision) || !isTimestamp(value.created_at) || !isTimestamp(value.updated_at)
+    || (value.failure_reason !== undefined && typeof value.failure_reason !== 'string')
+    || (value.cleanup_failures !== undefined && !isStringArray(value.cleanup_failures))
+    || (value.baseline_worker_names !== undefined
+      && (!Array.isArray(value.baseline_worker_names)
+        || !value.baseline_worker_names.every(isCanonicalWorkerName)
+        || new Set(value.baseline_worker_names).size !== value.baseline_worker_names.length))
+    || (value.worktree_cleanup_receipts !== undefined
+      && (cwd === undefined
+        || !isScaleUpWorktreeCleanupReceipts(value.worktree_cleanup_receipts, teamName, cwd)))) return false;
+  return value.worktree_cleanup_receipts === undefined
+    || value.baseline_worker_names !== undefined;
 }
 
 function isScaleDownAttempt(value: unknown): boolean {
@@ -255,7 +298,12 @@ function isOptionalCopilotDefaults(value: unknown): boolean {
     );
 }
 
-function isTeamConfig(value: unknown, requireRevision: boolean, expectedTeamName?: string): value is TeamConfig {
+function isTeamConfig(
+  value: unknown,
+  requireRevision: boolean,
+  expectedTeamName?: string,
+  expectedCwd?: string,
+): value is TeamConfig {
   if (!isRecord(value) || !isNonEmptyString(value.name) || (expectedTeamName !== undefined && value.name !== expectedTeamName)
     || (value.instance_id !== undefined && !isValidTeamInstanceId(value.instance_id))
     || (value.tmux_server_identity !== undefined && !isValidTmuxServerIdentity(value.tmux_server_identity))
@@ -276,13 +324,23 @@ function isTeamConfig(value: unknown, requireRevision: boolean, expectedTeamName
     || !isOptionalConfiguredRoutingRoles(value.configured_routing_roles)
     || !isOptionalExternalModelsDefaults(value.external_models_defaults)
     || !isOptionalCopilotDefaults(value.copilot_defaults)) return false;
+  if (expectedCwd !== undefined && value.leader_cwd !== undefined
+    && (!isNonEmptyString(value.leader_cwd)
+      || canonicalTeamCwd(value.leader_cwd) !== canonicalTeamCwd(expectedCwd))) return false;
+  const authorityCwd = expectedCwd !== undefined
+    ? canonicalTeamCwd(expectedCwd)
+    : (isNonEmptyString(value.leader_cwd) ? canonicalTeamCwd(value.leader_cwd) : undefined);
+  if (isRecord(value.active_scale_up)
+    && value.active_scale_up.worktree_cleanup_receipts !== undefined
+    && authorityCwd === undefined) return false;
   if (requireRevision ? !isSafeCounter(value.state_revision) : value.state_revision !== undefined && !isSafeCounter(value.state_revision)) return false;
   if (!requireRevision && Object.hasOwn(value, 'state_revision')) return false;
   return (value.lifecycle_state === undefined || ['starting', 'active', 'shutting_down', 'stopped'].includes(value.lifecycle_state as string))
     && (value.runtime_owner_epoch === undefined || isOwnerEpoch(value.runtime_owner_epoch))
     && (value.active_recovery === undefined || isRecoveryAttempt(value.active_recovery))
     && (value.last_recovery === undefined || isRecoveryAttempt(value.last_recovery))
-    && (value.active_scale_up === undefined || isScaleUpAttempt(value.active_scale_up))
+    && (value.active_scale_up === undefined
+      || isScaleUpAttempt(value.active_scale_up, value.name, authorityCwd))
     && (value.active_scale_down === undefined || isScaleDownAttempt(value.active_scale_down))
     && (value.service_descriptor === undefined || isServiceDescriptor(value.service_descriptor))
     && (value.shutdown_attempt === undefined || isShutdownAttempt(value.shutdown_attempt))
@@ -312,7 +370,7 @@ function hasUniqueWorkerIdentity(workers: unknown[]): boolean {
   const names = new Set<string>();
   const indices = new Set<number>();
   return workers.every(worker => {
-    if (!isRecord(worker) || typeof worker.name !== 'string' || !WORKER_NAME_SAFE_PATTERN.test(worker.name) || typeof worker.index !== 'number') return false;
+    if (!isRecord(worker) || !isCanonicalWorkerName(worker.name) || typeof worker.index !== 'number') return false;
     if (names.has(worker.name) || indices.has(worker.index)) return false;
     names.add(worker.name);
     indices.add(worker.index);
@@ -392,13 +450,21 @@ export function alignActiveFenceRevisions(config: TeamConfig, revision: number):
 }
 
 /** Accept only a complete revisioned authoritative config; return null for malformed values. */
-export function validateRevisionedTeamConfig(value: unknown, expectedTeamName?: string): TeamConfig | null {
-  return isTeamConfig(value, true, expectedTeamName) ? value : null;
+export function validateRevisionedTeamConfig(
+  value: unknown,
+  expectedTeamName?: string,
+  expectedCwd?: string,
+): TeamConfig | null {
+  return isTeamConfig(value, true, expectedTeamName, expectedCwd) ? value : null;
 }
 
 /** Legacy configs predate revision authority and require the complete historical core shape. */
-export function validateLegacyTeamConfig(value: unknown, expectedTeamName?: string): TeamConfig | null {
-  return isTeamConfig(value, false, expectedTeamName) ? value : null;
+export function validateLegacyTeamConfig(
+  value: unknown,
+  expectedTeamName?: string,
+  expectedCwd?: string,
+): TeamConfig | null {
+  return isTeamConfig(value, false, expectedTeamName, expectedCwd) ? value : null;
 }
 
 function isPendingTeamInstanceConfig(
@@ -504,8 +570,8 @@ async function assertPersistedConfigPathBinding(teamName: string, cwd: string, i
   if (state.kind === 'invalid') throw new Error('invalid_persisted_state');
   if (state.kind === 'value') {
     const valid = Object.hasOwn(state.value, 'state_revision')
-      ? validateRevisionedTeamConfig(state.value, teamName)
-      : validateLegacyTeamConfig(state.value, teamName);
+      ? validateRevisionedTeamConfig(state.value, teamName, cwd)
+      : validateLegacyTeamConfig(state.value, teamName, cwd);
     if (!valid) throw new Error('invalid_persisted_state');
     const manifestState = await readJsonFileState<TeamManifestV2>(absPath(cwd, TeamPaths.manifest(teamName)));
     if (manifestState.kind === 'invalid') throw new Error('invalid_persisted_state');
@@ -515,7 +581,8 @@ async function assertPersistedConfigPathBinding(teamName: string, cwd: string, i
   if (!includeManifestWhenAbsent) return;
   const manifestState = await readJsonFileState<TeamManifestV2>(absPath(cwd, TeamPaths.manifest(teamName)));
   if (manifestState.kind === 'invalid') throw new Error('invalid_persisted_state');
-  if (manifestState.kind === 'value' && !validateLegacyTeamConfig(configFromManifest(normalizeTeamManifest(manifestState.value)), teamName)) {
+  if (manifestState.kind === 'value'
+    && !validateLegacyTeamConfig(configFromManifest(normalizeTeamManifest(manifestState.value)), teamName, cwd)) {
     throw new Error('invalid_persisted_state');
   }
 }
@@ -531,11 +598,11 @@ export async function readTeamConfig(teamName: string, cwd: string): Promise<Tea
   if (manifest) assertValidTmuxServerIdentity(manifest.tmux_server_identity);
   if (config && manifest) assertMatchingProjectionIdentity(config, manifest);
   if (config && Object.hasOwn(config, 'state_revision')) {
-    const revisioned = validateRevisionedTeamConfig(config, teamName);
+    const revisioned = validateRevisionedTeamConfig(config, teamName, cwd);
     if (!revisioned) throw new Error('invalid_persisted_state');
     return canonicalizeTeamConfigWorkers(revisioned);
   }
-  if (config && !validateLegacyTeamConfig(config, teamName)) throw new Error('invalid_persisted_state');
+  if (config && !validateLegacyTeamConfig(config, teamName, cwd)) throw new Error('invalid_persisted_state');
   if (manifestState.kind === 'invalid') throw new Error('invalid_persisted_state');
   if (!config && !manifest) return null;
   if (!manifest) return config ? canonicalizeTeamConfigWorkers(config) : null;
@@ -558,13 +625,13 @@ export async function readRevisionedTeamConfig(teamName: string, cwd: string): P
   ]);
   if (state.kind === 'invalid') throw new Error('invalid_persisted_state');
   if (state.kind === 'missing') return null;
-  const revisioned = validateRevisionedTeamConfig(state.value, teamName);
+  const revisioned = validateRevisionedTeamConfig(state.value, teamName, cwd);
   if (revisioned) {
     if (manifestState.kind === 'invalid') throw new Error('invalid_persisted_state');
     if (manifestState.kind === 'value') assertMatchingProjectionIdentity(revisioned, manifestState.value);
     return { config: canonicalizeTeamConfigWorkers(revisioned), stateRevision: revisioned.state_revision! };
   }
-  if (!validateLegacyTeamConfig(state.value, teamName)) throw new Error('invalid_persisted_state');
+  if (!validateLegacyTeamConfig(state.value, teamName, cwd)) throw new Error('invalid_persisted_state');
   return null;
 }
 
@@ -582,11 +649,11 @@ export async function migrateTeamConfigRevision(teamName: string, cwd: string): 
     if (configState.kind === 'invalid') throw new Error('invalid_persisted_state');
     let current: TeamConfig;
     if (configState.kind === 'value') {
-      const legacy = validateLegacyTeamConfig(configState.value, teamName);
+      const legacy = validateLegacyTeamConfig(configState.value, teamName, cwd);
       if (legacy) {
         current = legacy;
       } else {
-        const revisioned = validateRevisionedTeamConfig(configState.value, teamName);
+        const revisioned = validateRevisionedTeamConfig(configState.value, teamName, cwd);
         if (!revisioned) throw new Error('invalid_persisted_state');
         return { config: canonicalizeTeamConfigWorkers(revisioned), stateRevision: revisioned.state_revision! };
       }
@@ -596,12 +663,12 @@ export async function migrateTeamConfigRevision(teamName: string, cwd: string): 
       if (manifestState.kind === 'missing') return null;
       current = configFromManifest(normalizeTeamManifest(manifestState.value));
     }
-    const revisioned = validateRevisionedTeamConfig(current, teamName);
+    const revisioned = validateRevisionedTeamConfig(current, teamName, cwd);
     if (revisioned) return { config: canonicalizeTeamConfigWorkers(revisioned), stateRevision: revisioned.state_revision! };
-    if (!validateLegacyTeamConfig(current, teamName)) throw new Error('invalid_persisted_state');
+    if (!validateLegacyTeamConfig(current, teamName, cwd)) throw new Error('invalid_persisted_state');
     current.state_revision = 0;
     current.lifecycle_state ??= 'active';
-    if (!validateRevisionedTeamConfig(current, teamName)) throw new Error('invalid_persisted_state');
+    if (!validateRevisionedTeamConfig(current, teamName, cwd)) throw new Error('invalid_persisted_state');
     await saveTeamConfigUnlocked(current, cwd);
     return { config: canonicalizeTeamConfigWorkers(current), stateRevision: 0 };
   });
@@ -780,7 +847,7 @@ export async function saveTeamConfigAtRevision(
   // Shape-validate the proposed config with fences already carrying their intended revision
   // numbers (callers set state_revision on fences). Do NOT align yet — alignment before
   // ownership comparison would launder foreign fences onto a matching revision.
-  if (!validateRevisionedTeamConfig(alignActiveFenceRevisions(config, config.state_revision), config.name)) {
+  if (!validateRevisionedTeamConfig(alignActiveFenceRevisions(config, config.state_revision), config.name, cwd)) {
     throw new Error('invalid_persisted_state');
   }
   await assertPersistedConfigPathBinding(config.name, cwd);
@@ -794,7 +861,7 @@ export async function saveTeamConfigAtRevision(
     assertActiveFenceOwnershipTransition(current.config, config, options);
 
     const locked = alignActiveFenceRevisions(config, config.state_revision!);
-    if (!validateRevisionedTeamConfig(locked, locked.name)) throw new Error('invalid_persisted_state');
+    if (!validateRevisionedTeamConfig(locked, locked.name, cwd)) throw new Error('invalid_persisted_state');
     await saveTeamConfigUnlocked(locked, cwd);
     const verified = await readRevisionedTeamConfig(locked.name, cwd);
     if (verified?.stateRevision !== locked.state_revision) return false;
@@ -904,9 +971,14 @@ export async function readShutdownAck(
   const ack = await readJsonSafe<{ status: 'accept' | 'reject'; reason?: string; updated_at?: string }>(
     absPath(cwd, TeamPaths.shutdownAck(teamName, workerName)),
   );
-  if (!ack) return null;
-  if (requestedAfter && ack.updated_at) {
-    if (new Date(ack.updated_at).getTime() < new Date(requestedAfter).getTime()) {
+  if (!isRecord(ack) || (ack.status !== 'accept' && ack.status !== 'reject')) return null;
+
+  if ((ack.reason !== undefined && typeof ack.reason !== 'string')
+    || (ack.updated_at !== undefined && !isTimestamp(ack.updated_at))) return null;
+
+  if (requestedAfter !== undefined) {
+    if (!isTimestamp(requestedAfter) || ack.updated_at === undefined) return null;
+    if (Date.parse(ack.updated_at) < Date.parse(requestedAfter)) {
       return null; // Stale ack from a previous request
     }
   }
@@ -1095,7 +1167,7 @@ export async function commitInitialTeamConfigUnderLock(
     || config.instance_id.toLowerCase() !== instance.instance_id) {
     throw new Error('team_instance_mismatch');
   }
-  if (config.state_revision !== 0 || !validateRevisionedTeamConfig(config, config.name)) {
+  if (config.state_revision !== 0 || !validateRevisionedTeamConfig(config, config.name, instance.cwd)) {
     throw new Error('invalid_persisted_state');
   }
 
@@ -1124,7 +1196,7 @@ export async function commitInitialTeamConfigUnderLock(
     await saveTeamConfigUnlocked(config, instance.cwd);
     const persisted = await readJsonFileState<TeamConfig>(absPath(instance.cwd, TeamPaths.config(config.name)));
     if (persisted.kind !== 'value'
-      || !validateRevisionedTeamConfig(persisted.value, config.name)
+      || !validateRevisionedTeamConfig(persisted.value, config.name, instance.cwd)
       || persisted.value.state_revision !== 0
       || persisted.value.instance_id?.toLowerCase() !== instance.instance_id) {
       throw new Error('team_instance_startup_config_commit_unverified');
@@ -1134,7 +1206,9 @@ export async function commitInitialTeamConfigUnderLock(
 
 export async function saveTeamConfig(config: TeamConfig, cwd: string, expectedRevision?: number): Promise<void> {
   const inputIsRevisioned = Object.hasOwn(config, 'state_revision');
-  if (!(inputIsRevisioned ? validateRevisionedTeamConfig(config, config.name) : validateLegacyTeamConfig(config, config.name))) {
+  if (!(inputIsRevisioned
+    ? validateRevisionedTeamConfig(config, config.name, cwd)
+    : validateLegacyTeamConfig(config, config.name, cwd))) {
     throw new Error('invalid_persisted_state');
   }
   await assertPersistedConfigPathBinding(config.name, cwd);
@@ -1142,8 +1216,10 @@ export async function saveTeamConfig(config: TeamConfig, cwd: string, expectedRe
     const currentState = await readJsonFileState<TeamConfig>(absPath(cwd, TeamPaths.config(config.name)));
     if (currentState.kind === 'invalid') throw new Error('invalid_persisted_state');
     const current = currentState.kind === 'value' ? currentState.value : null;
-    if (current && Object.hasOwn(current, 'state_revision') && !validateRevisionedTeamConfig(current, config.name)) throw new Error('invalid_persisted_state');
-    if (current && !Object.hasOwn(current, 'state_revision') && !validateLegacyTeamConfig(current, config.name)) throw new Error('invalid_persisted_state');
+    if (current && Object.hasOwn(current, 'state_revision')
+      && !validateRevisionedTeamConfig(current, config.name, cwd)) throw new Error('invalid_persisted_state');
+    if (current && !Object.hasOwn(current, 'state_revision')
+      && !validateLegacyTeamConfig(current, config.name, cwd)) throw new Error('invalid_persisted_state');
     if (current) {
       assertTeamInstanceConfigImmutable(current, config);
       assertLeaderSessionIdImmutable(current, config);
@@ -1165,7 +1241,7 @@ export async function saveTeamConfig(config: TeamConfig, cwd: string, expectedRe
       nextRevision = config.state_revision ?? 0;
     }
     const committed = alignActiveFenceRevisions({ ...config, state_revision: nextRevision }, nextRevision);
-    if (!validateRevisionedTeamConfig(committed, config.name)) throw new Error('invalid_persisted_state');
+    if (!validateRevisionedTeamConfig(committed, config.name, cwd)) throw new Error('invalid_persisted_state');
     await saveTeamConfigUnlocked(committed, cwd);
     Object.assign(config, committed);
   });

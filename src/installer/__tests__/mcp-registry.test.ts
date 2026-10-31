@@ -416,6 +416,63 @@ describe('unified MCP registry sync', () => {
     expect(second.content).toBe(result.content);
   });
 
+  it('normalizes quoted TOML table keys without splitting quoted dots', () => {
+    const existingToml = [
+      '[mcp_servers . "exa"]',
+      'command = "uvx"',
+      'args = ["exa"]',
+      '',
+      "[mcp_servers . 'linear']",
+      'command = "uvx"',
+      'args = ["linear"]',
+      '',
+      '[mcp_servers."a.b"]',
+      'command = "uvx"',
+      'args = ["dotted"]',
+      '',
+    ].join('\n');
+
+    const result = syncCodexConfigToml(existingToml, {
+      exa: { command: 'uvx', args: ['exa'] },
+      linear: { command: 'uvx', args: ['linear'] },
+      a: { command: 'uvx', args: ['a'] },
+      'a.b': { command: 'uvx', args: ['dotted'] },
+    });
+
+    expect(result.content.match(/^\[mcp_servers \. "exa"\]$/gm)).toHaveLength(1);
+    expect(result.content.match(/^\[mcp_servers \. 'linear'\]$/gm)).toHaveLength(1);
+    expect(result.content.match(/^\[mcp_servers\.a\]$/gm)).toHaveLength(1);
+    expect(result.content.match(/^\[mcp_servers\."a\.b"\]$/gm)).toHaveLength(1);
+    expect(result.content).not.toContain('[mcp_servers.exa]');
+    expect(result.content).not.toContain('[mcp_servers.linear]');
+    expect(result.content).not.toContain('[mcp_servers.a.b]');
+  });
+
+  it('keeps quoted Codex server tables idempotent across setup syncs', () => {
+    writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify({
+      exa: { command: 'uvx', args: ['exa'] },
+    }, null, 2));
+    writeFileSync(getCodexConfigPath(), [
+      'model = "gpt-5"',
+      '',
+      '[mcp_servers."exa"]',
+      'command = "uvx"',
+      'args = ["exa"]',
+      '',
+    ].join('\n'));
+
+    const first = syncUnifiedMcpRegistryTargets({ theme: 'dark' });
+    const afterFirst = readFileSync(getCodexConfigPath(), 'utf-8');
+    const second = syncUnifiedMcpRegistryTargets({ theme: 'dark' });
+    const afterSecond = readFileSync(getCodexConfigPath(), 'utf-8');
+
+    expect(first.result.codexChanged).toBe(false);
+    expect(second.result.codexChanged).toBe(false);
+    expect(afterSecond).toBe(afterFirst);
+    expect(afterSecond.match(/^\[mcp_servers(?:\.exa|\."exa")\]$/gm)).toHaveLength(1);
+    expect(afterSecond).not.toContain('# BEGIN OMC MANAGED MCP REGISTRY');
+  });
+
   it('preserves an existing user-owned codex table when setup sync runs repeatedly', () => {
     writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify({
       atlassian: { command: 'uvx', args: ['mcp-atlassian'] },
@@ -775,6 +832,24 @@ describe('unified MCP registry sync', () => {
     expect(status.codexMismatched).toEqual([]);
   });
 
+  it('escapes newlines in args so the rendered Codex TOML stays valid and round-trips (issue #4157)', () => {
+    const script = '# ok-mcp-v2\nBUNDLE="$HOME/ok.sh"\r\nexec "$BUNDLE" mcp';
+    const registry = {
+      'open-knowledge': { command: '/bin/sh', args: ['-l', '-c', script] },
+    };
+
+    writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+    writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+    syncUnifiedMcpRegistryTargets({});
+
+    const toml = readFileSync(getCodexConfigPath(), 'utf-8');
+    expect(toml).toContain('args = ["-l", "-c", "# ok-mcp-v2\\nBUNDLE=\\"$HOME/ok.sh\\"\\r\\nexec \\"$BUNDLE\\" mcp"]');
+
+    const status = inspectUnifiedMcpRegistrySync();
+    expect(status.codexMissing).toEqual([]);
+    expect(status.codexMismatched).toEqual([]);
+  });
+
   it('parses mixed literal and basic string arrays with delimiters and escapes', () => {
     // Literal token contains comma, bracket, equals, hash, and backslash (delimiter-rich).
     const literalRich = String.raw`C:\data\file,[name]=#.py`;
@@ -798,6 +873,128 @@ describe('unified MCP registry sync', () => {
 
     expect(status.codexMissing).toEqual([]);
     expect(status.codexMismatched).toEqual([]);
+  });
+
+  it('ignores inferable omitted Codex MCP types and key order while reporting real differences (issue #4294)', () => {
+    const registry = {
+      context7: {
+        command: '/tools/context7-mcp.sh',
+        type: 'stdio',
+        env: { ZED: 'last', ALPHA: 'first' },
+      },
+      deepwiki: { url: 'https://mcp.deepwiki.com/mcp', type: 'http' },
+      changed: { command: 'python', args: ['server.py'], type: 'stdio' },
+      typeMismatch: { url: 'https://mcp.example.com', type: 'http' },
+      typeComment: { url: 'https://mcp.example.com/comment', type: 'http' },
+      typeLiteralComment: { url: 'https://mcp.example.com/literal-comment', type: 'http' },
+      sseOmitted: { url: 'https://mcp.example.com/sse', type: 'sse' },
+      unparsedType: { command: 'node', type: 'stdio' },
+      quotedTypeMismatch: { url: 'https://mcp.example.com/quoted', type: 'http' },
+      httpAlias: { url: 'https://mcp.example.com/http-alias', type: 'http' },
+      streamableAlias: { url: 'https://mcp.example.com/streamable-alias', type: 'streamable-http' },
+      streamableOmitted: { url: 'https://mcp.example.com/streamable-omitted', type: 'streamable-http' },
+      unicodeTypeMismatch: { url: 'https://mcp.example.com/unicode', type: 'http' },
+      implicitStdio: { command: '/tools/implicit-stdio.sh' },
+      implicitHttp: { url: 'https://mcp.example.com/implicit-http' },
+      implicitTypeMismatch: { url: 'https://mcp.example.com/implicit-mismatch' },
+      multilineType: { url: 'https://mcp.example.com/multiline-type' },
+      multilineLiteralType: { url: 'https://mcp.example.com/multiline-literal-type' },
+      multilineContinuationType: { url: 'https://mcp.example.com/multiline-continuation' },
+      multilineSpacedContinuationType: { url: 'https://mcp.example.com/multiline-spaced-continuation' },
+    };
+
+    writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+    writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+    writeFileSync(getCodexConfigPath(), [
+      '[mcp_servers.context7]',
+      'command = "/tools/context7-mcp.sh"',
+      'env = { ALPHA = "first", ZED = "last" }',
+      '',
+      '[mcp_servers.deepwiki]',
+      'url = "https://mcp.deepwiki.com/mcp"',
+      '',
+      '[mcp_servers.changed]',
+      'command = "node"',
+      'args = ["server.py"]',
+      '',
+      '[mcp_servers.typeMismatch]',
+      'url = "https://mcp.example.com"',
+      'type = "sse" # transport',
+      '',
+      '[mcp_servers.typeComment]',
+      'url = "https://mcp.example.com/comment"',
+      'type = "http" # transport',
+      '',
+      '[mcp_servers.typeLiteralComment]',
+      'url = "https://mcp.example.com/literal-comment"',
+      "type = 'http' # transport",
+      '',
+      '[mcp_servers.sseOmitted]',
+      'url = "https://mcp.example.com/sse"',
+      '',
+      '[mcp_servers.unparsedType]',
+      'command = "node"',
+      'type = 17',
+      '',
+      '[mcp_servers.quotedTypeMismatch]',
+      'url = "https://mcp.example.com/quoted"',
+      '"type" = "sse"',
+      '',
+      '[mcp_servers.httpAlias]',
+      'url = "https://mcp.example.com/http-alias"',
+      'type = "streamable-http"',
+      '',
+      '[mcp_servers.streamableAlias]',
+      'url = "https://mcp.example.com/streamable-alias"',
+      'type = "http"',
+      '',
+      '[mcp_servers.streamableOmitted]',
+      'url = "https://mcp.example.com/streamable-omitted"',
+      '',
+      '[mcp_servers.unicodeTypeMismatch]',
+      'url = "https://mcp.example.com/unicode"',
+      '"\\U00000074ype" = "sse"',
+      '',
+      '[mcp_servers.implicitStdio]',
+      'command = "/tools/implicit-stdio.sh"',
+      'type = "stdio"',
+      '',
+      '[mcp_servers.implicitHttp]',
+      'url = "https://mcp.example.com/implicit-http"',
+      'type = "streamable-http"',
+      '',
+      '[mcp_servers.implicitTypeMismatch]',
+      'url = "https://mcp.example.com/implicit-mismatch"',
+      'type = "sse"',
+      '',
+      '[mcp_servers.multilineType]',
+      'url = "https://mcp.example.com/multiline-type"',
+      'type = """',
+      'http"""',
+      '',
+      '[mcp_servers.multilineLiteralType]',
+      'url = "https://mcp.example.com/multiline-literal-type"',
+      "type = '''",
+      "http'''",
+      '',
+      '[mcp_servers.multilineContinuationType]',
+      'url = "https://mcp.example.com/multiline-continuation"',
+      'type = """ht\\',
+      '    tp"""',
+      '',
+      '[mcp_servers.multilineSpacedContinuationType]',
+      'url = "https://mcp.example.com/multiline-spaced-continuation"',
+      'type = """ht\\   ',
+      '    tp"""',
+      '',
+    ].join('\n'));
+
+    const status = inspectUnifiedMcpRegistrySync();
+
+    expect(status.codexMissing).toEqual([]);
+    expect(status.codexMismatched).toEqual(['changed', 'implicitTypeMismatch', 'quotedTypeMismatch', 'sseOmitted', 'typeMismatch', 'unicodeTypeMismatch', 'unparsedType']);
+    expect(status.claudeMissing).toEqual([]);
+    expect(status.claudeMismatched).toEqual([]);
   });
 
   it('parses literal url, type, and nested header values (issue #3601)', () => {
@@ -988,4 +1185,161 @@ describe('unified MCP registry sync', () => {
     expect(status.claudeMissing).toEqual([]);
     expect(status.claudeMismatched).toEqual([]);
   });
+
+  it('round-trips all TOML-forbidden control characters with proper escapes (issue #4157)', () => {
+    // Create a registry with a command that contains all control characters that must be escaped:
+    // - \n (U+000A) newline: \n
+    // - \r (U+000D) carriage return: \r
+    // - \t (U+0009) tab: \t (TOML allows tab in basic strings, but we escape for safety)
+    // - \b (U+0008) backspace: \b
+    // - \f (U+000C) form feed: \f
+    // - \x00 (U+0000) NUL: \u0000
+    // - \x1f (U+001F) unit separator (last control char before space): \u001f
+    // - \x7f (U+007F) DEL: \u007f
+    // - quotes and backslashes
+    const testString = 'test\nnewline\rcarriage\ttab\bbackspace\fformfeed\x00null\x1funit\x7fdel"quote\\backslash';
+    const registry = {
+      'control-test': { command: '/bin/sh', args: [testString] },
+    };
+
+    writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+    writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+    syncUnifiedMcpRegistryTargets({});
+
+    // Read the rendered TOML
+    const toml = readFileSync(getCodexConfigPath(), 'utf-8');
+
+    // Verify that the TOML block is present
+    expect(toml).toContain('[mcp_servers.control-test]');
+
+    // Verify that raw control characters are NOT in the TOML output
+    // (except tab, which is allowed but we escape anyway)
+    for (let i = 0; i <= 0x1f; i++) {
+      if (i !== 0x09 && i !== 0x0a && i !== 0x0d) {
+        // Skip the control characters we handle elsewhere
+        const char = String.fromCharCode(i);
+        expect(toml).not.toContain(char);
+      }
+    }
+    expect(toml).not.toContain(String.fromCharCode(0x7f));
+
+    // Verify that the proper escapes are present
+    expect(toml).toContain('\\n'); // newline escape
+    expect(toml).toContain('\\r'); // carriage return escape
+    expect(toml).toContain('\\t'); // tab escape
+    expect(toml).toContain('\\b'); // backspace escape
+    expect(toml).toContain('\\f'); // form feed escape
+    expect(toml).toContain('\\u0000'); // NUL escape
+    expect(toml).toContain('\\u001f'); // unit separator escape
+    expect(toml).toContain('\\u007f'); // DEL escape
+    expect(toml).toContain('\\"'); // quote escape
+    expect(toml).toContain('\\\\'); // backslash escape
+
+    // Verify that the registry is still in sync (no round-trip errors)
+    const status = inspectUnifiedMcpRegistrySync();
+    expect(status.codexMissing).toEqual([]);
+    expect(status.codexMismatched).toEqual([]);
+  });
+
+  it('round-trips Windows paths with backslash followed by u (not unicode escape) correctly (issue #4157)', () => {
+    // Regression test: C:\users\u0041dir should NOT decode the \u0041 as unicode.
+    // In TOML: the original path is C:\users\u0041dir (literal text, not unicode escape).
+    // Escaped TOML string: "C:\\\\users\\\\u0041dir" (each \ becomes \\\\, and u0041 stays as u0041).
+    // When unescaped, should return to: C:\users\u0041dir
+    const windowsPath = 'C:\\users\\u0041dir';
+    const registry = {
+      'windows-path': { command: windowsPath, args: [] },
+    };
+
+    writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+    writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+    syncUnifiedMcpRegistryTargets({});
+
+    const status = inspectUnifiedMcpRegistrySync();
+    expect(status.codexMissing).toEqual([]);
+    expect(status.codexMismatched).toEqual([]);
+  });
+
+  it('round-trips backslash followed by n (not newline escape) correctly (issue #4157)', () => {
+    // Regression test: a literal backslash followed by the letter 'n' should NOT be decoded as newline.
+    // This can occur in Windows paths or other contexts.
+    // Original: "path\\nfile.txt" (backslash-n, not a newline)
+    // Escaped TOML: "path\\\\nfile.txt" (the \\ becomes \\\\ for the backslash)
+    // When unescaped, should return to: "path\\nfile.txt" (backslash followed by n, not a newline)
+    const backslashN = 'path\\nfile.txt';
+    const registry = {
+      'backslash-n': { command: '/bin/sh', args: [backslashN] },
+    };
+
+    writeFileSync(getUnifiedMcpRegistryPath(), JSON.stringify(registry, null, 2));
+    writeFileSync(getClaudeMcpConfigPath(), JSON.stringify({ mcpServers: registry }, null, 2));
+    syncUnifiedMcpRegistryTargets({});
+
+    const toml = readFileSync(getCodexConfigPath(), 'utf-8');
+    // The TOML should contain the escaped form: \\n (backslash escape followed by n)
+    expect(toml).toContain('\\\\n');
+
+    const status = inspectUnifiedMcpRegistrySync();
+    expect(status.codexMissing).toEqual([]);
+    expect(status.codexMismatched).toEqual([]);
+  });
+
+  describe('surrogate handling in Codex TOML values', () => {
+    const makeRegistry = (value: string) => ({
+      surrogate_probe: {
+        command: 'node',
+        args: ['server.js'],
+        env: { TOKEN: value },
+        managed: true,
+      },
+    }) as unknown as Parameters<typeof syncCodexConfigToml>[1];
+
+    /**
+     * The TOML rule a conforming parser enforces: inside a basic string, every
+     * \\uXXXX / \\UXXXXXXXX escape must name a Unicode scalar value, and the text
+     * itself must be well-formed. Python's tomllib rejects a whole document that
+     * breaks either ("Escaped character is not a Unicode scalar value"), so
+     * asserting the rendered output is UTF-8 clean is not enough on its own.
+     */
+    const expectRenderedTomlIsAcceptable = (content: string) => {
+      for (const [, digits] of content.matchAll(/\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})/g)) {
+        const codePoint = parseInt(digits, 16);
+        expect(codePoint >= 0xd800 && codePoint <= 0xdfff).toBe(false);
+      }
+      expect(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(content)).toBe(false);
+      expect(Buffer.from(content, 'utf-8').toString('utf-8')).toBe(content);
+    };
+
+    it('replaces an unpaired high surrogate with U+FFFD', () => {
+      // Escaping it as \\ud800 instead would be rejected by a conforming parser,
+      // making one bad value break the entire config rather than only itself.
+      const { content } = syncCodexConfigToml('model = "gpt-5"\n', makeRegistry('\ud800'));
+      expect(content).toContain('TOKEN = "\uFFFD"');
+      expect(content).not.toMatch(/\\u[dD][89abAB]/);
+      expectRenderedTomlIsAcceptable(content);
+    });
+
+    it('replaces an unpaired low surrogate with U+FFFD', () => {
+      const { content } = syncCodexConfigToml('model = "gpt-5"\n', makeRegistry('a\udc00b'));
+      expect(content).toContain('TOKEN = "a\uFFFDb"');
+      expect(content).not.toMatch(/\\u[dD][c-fC-F]/);
+      expectRenderedTomlIsAcceptable(content);
+    });
+
+    it('leaves a matched surrogate pair as the astral character', () => {
+      const { content } = syncCodexConfigToml('model = "gpt-5"\n', makeRegistry('\ud83d\ude00'));
+      expect(content).toContain('TOKEN = "\u{1F600}"');
+      expectRenderedTomlIsAcceptable(content);
+    });
+
+    it('settles after one sync for each of those values', () => {
+      for (const value of ['\ud800', 'a\udc00b', '\ud83d\ude00', 'plain']) {
+        const first = syncCodexConfigToml('model = "gpt-5"\n', makeRegistry(value));
+        const second = syncCodexConfigToml(first.content, makeRegistry(value));
+        expect(second.changed).toBe(false);
+        expect(second.content).toBe(first.content);
+      }
+    });
+  });
+
 });

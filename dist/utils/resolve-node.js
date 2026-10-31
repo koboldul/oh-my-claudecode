@@ -2,6 +2,8 @@ import { existsSync, readdirSync } from 'fs';
 import { execSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
+import { MIN_NODE_VERSION } from './node-version.js';
+import { compareVersions } from './semver-compare.js';
 const EPHEMERAL_NODE_PATH_MARKERS = ['hostedtoolcache', '/runner/', '\\runner\\'];
 const SYSTEM_NODE_PATHS = ['/opt/homebrew/bin/node', '/usr/local/bin/node', '/usr/bin/node'];
 function isKnownEphemeralNodePath(nodePath) {
@@ -11,11 +13,20 @@ function resolveLatestVersionedNode(baseDir, nodeSegments) {
     if (!existsSync(baseDir))
         return undefined;
     try {
-        const latest = pickLatestVersion(readdirSync(baseDir));
-        if (!latest)
-            return undefined;
-        const nodePath = join(baseDir, latest, ...nodeSegments);
-        return existsSync(nodePath) ? nodePath : undefined;
+        const versions = readdirSync(baseDir);
+        while (versions.length > 0) {
+            const latest = pickLatestVersion(versions);
+            if (!latest)
+                break;
+            const majorVersion = Number.parseInt(latest.replace(/^v/, ''), 10);
+            if (majorVersion < MIN_NODE_VERSION)
+                break;
+            const nodePath = join(baseDir, latest, ...nodeSegments);
+            if (existsSync(nodePath))
+                return nodePath;
+            versions.splice(versions.indexOf(latest), 1);
+        }
+        return undefined;
     }
     catch {
         return undefined;
@@ -100,15 +111,6 @@ export function pickLatestVersion(versions) {
         return undefined;
     return versions
         .filter(v => /^v?\d/.test(v))
-        .sort((a, b) => {
-        const pa = a.replace(/^v/, '').split('.').map(s => parseInt(s, 10) || 0);
-        const pb = b.replace(/^v/, '').split('.').map(s => parseInt(s, 10) || 0);
-        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-            const diff = (pb[i] ?? 0) - (pa[i] ?? 0);
-            if (diff !== 0)
-                return diff;
-        }
-        return 0;
-    })[0];
+        .sort((a, b) => compareVersions(b, a))[0];
 }
 //# sourceMappingURL=resolve-node.js.map

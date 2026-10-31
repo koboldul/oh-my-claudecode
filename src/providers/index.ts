@@ -6,12 +6,14 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { resolve } from 'node:path';
 import type { ProviderName, RemoteUrlInfo, GitProvider } from './types.js';
 import { GitHubProvider } from './github.js';
 import { GitLabProvider } from './gitlab.js';
 import { BitbucketProvider } from './bitbucket.js';
-import { AzureDevOpsProvider } from './azure-devops.js';
+import { AzureDevOpsProvider, isAzureDevOpsHost } from './azure-devops.js';
 import { GiteaProvider } from './gitea.js';
+import { stripTrailingSlashes } from '../utils/url.js';
 
 // Singleton provider registry
 let providerRegistry: Map<ProviderName, GitProvider> | null = null;
@@ -48,7 +50,7 @@ function setCachedRemoteUrl(cwd: string, url: string | null): void {
 }
 
 function getRemoteUrl(cwd?: string): string | null {
-  const resolvedCwd = cwd ?? process.cwd();
+  const resolvedCwd = resolve(cwd ?? process.cwd());
   const cached = getCachedRemoteUrl(resolvedCwd);
   if (cached !== undefined) return cached;
 
@@ -77,12 +79,12 @@ export function detectProvider(remoteUrl: string): ProviderName {
   const url = remoteUrl.toLowerCase();
 
   // Extract host portion for accurate matching (strip port if present)
-  const hostMatch = url.match(/^(?:https?:\/\/|ssh:\/\/[^@]*@|[^@]+@)([^/:]+)/);
+  const hostMatch = url.match(/^(?:https?:\/\/(?:[^@/?#]+@)?|ssh:\/\/[^@/?#]*@|[^@/:?#]+@)([^/:?#]+)/);
   const rawHost = hostMatch ? hostMatch[1].toLowerCase() : '';
   const host = rawHost.replace(/:\d+$/, ''); // strip port for matching
 
   // Azure DevOps (check before generic patterns)
-  if (host.includes('dev.azure.com') || host.includes('ssh.dev.azure.com') || host.endsWith('.visualstudio.com')) {
+  if (isAzureDevOpsHost(host)) {
     return 'azure-devops';
   }
 
@@ -120,44 +122,47 @@ export function detectProvider(remoteUrl: string): ProviderName {
  * Supports HTTPS, SSH (SCP-style), and provider-specific formats.
  */
 export function parseRemoteUrl(url: string): RemoteUrlInfo | null {
-  const trimmed = url.trim();
+  // Browser addresses and some `git remote set-url` values keep a trailing
+  // slash. Git still fetches them. The matchers below require the URL to end
+  // on the repo name, so drop only trailing slashes before they run.
+  const trimmed = stripTrailingSlashes(url.trim());
 
   // Azure DevOps HTTPS: https://dev.azure.com/{org}/{project}/_git/{repo}
   const azureHttpsMatch = trimmed.match(
-    /https?:\/\/dev\.azure\.com\/([^/]+)\/([^/]+)\/_git\/([^/\s]+?)(?:\.git)?$/
+    /^https?:\/\/(?:[^/@?#]+@)?dev\.azure\.com\.?\/([^/]+)\/([^/]+)\/_git\/([^/\s]+)$/i
   );
   if (azureHttpsMatch) {
     return {
       provider: 'azure-devops',
       host: 'dev.azure.com',
       owner: `${azureHttpsMatch[1]}/${azureHttpsMatch[2]}`,
-      repo: azureHttpsMatch[3],
+      repo: azureHttpsMatch[3].replace(/\.git$/, ''),
     };
   }
 
   // Azure DevOps SSH: git@ssh.dev.azure.com:v3/{org}/{project}/{repo}
   const azureSshMatch = trimmed.match(
-    /git@ssh\.dev\.azure\.com:v3\/([^/]+)\/([^/]+)\/([^/\s]+?)(?:\.git)?$/
+    /^git@ssh\.dev\.azure\.com\.?:v3\/([^/]+)\/([^/]+)\/([^/\s]+)$/i
   );
   if (azureSshMatch) {
     return {
       provider: 'azure-devops',
       host: 'dev.azure.com',
       owner: `${azureSshMatch[1]}/${azureSshMatch[2]}`,
-      repo: azureSshMatch[3],
+      repo: azureSshMatch[3].replace(/\.git$/, ''),
     };
   }
 
   // Azure DevOps legacy HTTPS: https://{org}.visualstudio.com/{project}/_git/{repo}
   const azureLegacyMatch = trimmed.match(
-    /https?:\/\/([^.]+)\.visualstudio\.com\/([^/]+)\/_git\/([^/\s]+?)(?:\.git)?$/
+    /^https?:\/\/(?:[^/@?#]+@)?([^.]+)\.visualstudio\.com\.?\/([^/]+)\/_git\/([^/\s]+)$/i
   );
   if (azureLegacyMatch) {
     return {
       provider: 'azure-devops',
       host: `${azureLegacyMatch[1]}.visualstudio.com`,
       owner: `${azureLegacyMatch[1]}/${azureLegacyMatch[2]}`,
-      repo: azureLegacyMatch[3],
+      repo: azureLegacyMatch[3].replace(/\.git$/, ''),
     };
   }
 

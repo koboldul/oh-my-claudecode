@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { atomicWriteJsonSync } from '../../lib/atomic-write.js';
-import { getOmcRoot, validateSessionId } from '../../lib/worktree-paths.js';
+import { resolveSessionStatePaths, validateSessionId } from '../../lib/worktree-paths.js';
 function openClawRoutingSnapshot() {
     const values = [
         ['openClawConfig', 'OMC_OPENCLAW_CONFIG'],
@@ -19,7 +19,7 @@ function withOpenClawRouting(payload) {
 }
 const ACTIONS = [
     ['foreground-cleanup', 'required'], ['wiki-capture', 'required'], ['team-cleanup', 'required'], ['python-cleanup', 'required'], ['reply-cleanup', 'required'],
-    ['callback', 'best-effort'], ['notification', 'best-effort'], ['openclaw', 'best-effort'],
+    ['callback', 'best-effort'], ['notification', 'best-effort'], ['openclaw', 'best-effort'], ['spawn-next', 'best-effort'],
 ];
 const TEST_PRODUCER_GRACE_ENV = 'OMC_SESSION_END_TEST_PRODUCER_GRACE_MS';
 const PRODUCER_GRACE_MS = process.env.NODE_ENV === 'test' && /^\d+$/.test(process.env[TEST_PRODUCER_GRACE_ENV] ?? '')
@@ -30,6 +30,8 @@ const BEST_EFFORT_ACTION_EXECUTION_MS = ACTIONS.filter(([, actionClass]) => acti
 const REQUIRED_ACTION_MAX_ATTEMPTS = 3;
 const LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
 const DISCOVERY_FILE = 'discovery.json';
+const SESSION_END_ROOT_CACHE_LIMIT = 64;
+const sessionEndRootCache = new Map();
 function canonicalScopeDirectory(directory) {
     let resolved = path.resolve(directory);
     try {
@@ -47,7 +49,29 @@ function legacySessionEndScopeKey(directory) {
     return createHash('sha256').update(JSON.stringify(directory)).digest('hex');
 }
 function legacySessionEndJobsDirectory(directory) {
-    return path.join(getOmcRoot(directory), 'state', 'session-end-jobs');
+    const cacheKey = [
+        canonicalScopeDirectory(directory),
+        process.env.OMC_STATE_DIR ?? '',
+        process.env.HOME ?? '',
+        process.env.USERPROFILE ?? '',
+        process.env.XDG_CONFIG_HOME ?? '',
+        process.env.APPDATA ?? '',
+        process.env.LOCALAPPDATA ?? '',
+        process.env.CLAUDE_CONFIG_DIR ?? '',
+        process.env.OMC_CONFIG_PATH ?? '',
+    ].join('\0');
+    const cached = sessionEndRootCache.get(cacheKey);
+    if (cached)
+        return cached;
+    const stateMarker = resolveSessionStatePaths('session-end-jobs', undefined, directory, { fileName: 'session-end-jobs.json' }).effectiveWrite;
+    const resolved = path.join(path.dirname(stateMarker), 'session-end-jobs');
+    if (sessionEndRootCache.size >= SESSION_END_ROOT_CACHE_LIMIT) {
+        const oldest = sessionEndRootCache.keys().next().value;
+        if (oldest !== undefined)
+            sessionEndRootCache.delete(oldest);
+    }
+    sessionEndRootCache.set(cacheKey, resolved);
+    return resolved;
 }
 function legacySessionEndJobPath(directory, sessionId) {
     return path.join(legacySessionEndJobsDirectory(directory), `${sessionId}.json`);
@@ -296,14 +320,18 @@ export function updateSessionEndActionPayload(directory, sessionId, authority, a
             job.actions[name].payload = { ...job.actions[name].payload, ...payload };
     });
 }
-function mutateLatest(directory, sessionId, mutate) { for (let i = 0; i < 8; i++) {
-    const current = readSessionEndJob(directory, sessionId);
-    if (!current)
-        return null;
-    const result = mutateSessionEndJob(directory, sessionId, current.revision, mutate);
-    if (result)
-        return result;
-} return null; }
+function mutateLatest(directory, sessionId, mutate) {
+    for (let attempt = 0; attempt < 16; attempt++) {
+        const current = readSessionEndJob(directory, sessionId);
+        if (!current)
+            return null;
+        const result = mutateSessionEndJob(directory, sessionId, current.revision, mutate);
+        if (result)
+            return result;
+        Atomics.wait(LOCK_WAIT, 0, 0, Math.min(20, attempt + 1));
+    }
+    return null;
+}
 export function prepareCoreManifest(directory, sessionId, payload, admission) {
     const durablePayload = withOpenClawRouting(payload);
     let jobPath;
@@ -318,8 +346,31 @@ export function prepareCoreManifest(directory, sessionId, payload, admission) {
         const result = withLock(jobPath, () => {
             const existing = readPath(jobPath);
             if (existing) {
-                if (existing.phase === 'complete' || existing.producers.core.state !== 'absent')
+                if (existing.phase === 'complete')
                     return existing;
+                // Plugin/standalone coexistence can expose manifests written by an
+                // older build. Add only actions that are missing; existing producer
+                // admission and payloads remain authoritative.
+                const missing = ACTIONS.filter(([name]) => !(name in existing.actions));
+                if (existing.producers.core.state !== 'absent') {
+                    if (missing.length === 0)
+                        return existing;
+                    const next = {
+                        ...existing,
+                        actions: { ...existing.actions },
+                        revision: existing.revision + 1,
+                        updatedAt: nowIso(),
+                    };
+                    for (const [name, klass] of missing) {
+                        next.actions[name] = newAction(name, klass, durablePayload);
+                    }
+                    atomicWriteJsonSync(jobPath, next);
+                    const reread = readPath(jobPath);
+                    if (!reread || reread.revision !== next.revision) {
+                        throw new Error('session-end-manifest-reread-mismatch');
+                    }
+                    return reread;
+                }
                 const next = {
                     ...existing,
                     producers: {
@@ -336,6 +387,9 @@ export function prepareCoreManifest(directory, sessionId, payload, admission) {
                     revision: existing.revision + 1,
                     updatedAt: nowIso(),
                 };
+                for (const [name, klass] of missing) {
+                    next.actions[name] = newAction(name, klass, durablePayload);
+                }
                 for (const [name, action] of Object.entries(next.actions))
                     if (name !== 'wiki-capture')
                         action.payload = durablePayload;
@@ -518,16 +572,60 @@ export function reapStaleSessionEndOwner(directory, sessionId, expectedNonce, ex
             action.runner.phase = 'terminal';
     }
 } job.owner = null; job.phase = 'recoverable-failure'; job.recoverableFailure = { reason: `owner-reaped-${liveness}`, releasedAt: nowIso(), ownerNonce: expectedNonce }; }); }
+function recordSessionEndActionResult(action, completed, code, deliveryStarted = true) {
+    if (!completed && !deliveryStarted) {
+        action.status = 'pending';
+        action.attempts = Math.max(0, action.attempts - 1);
+        action.lastOutcomeCode = code;
+        action.completedAt = undefined;
+        action.claimantNonce = undefined;
+        if (action.runner)
+            action.runner.phase = 'terminal';
+        return;
+    }
+    action.status = completed ? 'completed' : action.class === 'best-effort' ? 'expired' : 'retryable';
+    action.lastOutcomeCode = code;
+    action.completedAt = completed ? nowIso() : undefined;
+    action.claimantNonce = undefined;
+    if (action.runner)
+        action.runner.phase = 'terminal';
+}
 /**
  * Releasing ownership without reaching `complete` is the one path that leaves a
  * job non-terminal, so the caller's reason is persisted with it (issue #4076).
  */
-export function releaseSessionEndJob(directory, sessionId, nonce, generation, reason = 'worker-released') { const current = readSessionEndJob(directory, sessionId); if (!current)
-    return null; return mutateSessionEndJob(directory, sessionId, current.revision, (job) => { if (!job.owner || job.owner.nonce !== nonce || job.owner.leaseGeneration !== generation)
-    throw new Error('release-conflict'); job.owner = null; if (job.phase !== 'complete') {
-    job.phase = 'recoverable-failure';
-    job.recoverableFailure = { reason, releasedAt: nowIso(), ownerNonce: nonce };
-} }); }
+export function releaseSessionEndJob(directory, sessionId, nonce, generation, reason = 'worker-released', actionResult) {
+    return mutateLatest(directory, sessionId, (job) => {
+        if (!job.owner || job.owner.nonce !== nonce || job.owner.leaseGeneration !== generation)
+            throw new Error('release-conflict');
+        if (actionResult) {
+            const action = job.actions[actionResult.name];
+            if (action.status === 'claimed'
+                && action.claimantNonce === nonce
+                && action.runner?.runnerNonce === actionResult.runnerNonce) {
+                recordSessionEndActionResult(action, actionResult.completed, actionResult.code, actionResult.deliveryStarted);
+            }
+        }
+        for (const action of Object.values(job.actions)) {
+            if (action.status !== 'claimed'
+                || action.claimantNonce !== nonce
+                || action.runner?.phase !== 'reserved') {
+                continue;
+            }
+            action.status = 'pending';
+            action.attempts = Math.max(0, action.attempts - 1);
+            action.claimantNonce = undefined;
+            action.claimedAt = undefined;
+            action.lastOutcomeCode = 'runner-not-started';
+            action.runner.phase = 'terminal';
+        }
+        job.owner = null;
+        if (job.phase !== 'complete') {
+            job.phase = 'recoverable-failure';
+            job.recoverableFailure = { reason, releasedAt: nowIso(), ownerNonce: nonce };
+        }
+    });
+}
 export function updateSessionEndJob(directory, sessionId, expectedOwner, mutate) { const current = readSessionEndJob(directory, sessionId); if (!current)
     return null; return mutateSessionEndJob(directory, sessionId, current.revision, (job) => { if (job.owner?.nonce !== expectedOwner || job.phase === 'complete')
     throw new Error('owner-conflict'); mutate(job); }); }
@@ -543,8 +641,8 @@ export function claimSessionEndAction(directory, sessionId, ownerNonce, name, de
 } action.status = 'claimed'; action.attempts++; action.claimantNonce = ownerNonce; action.claimedAt = nowIso(); action.runner = { attempt: action.attempts, runnerNonce: randomUUID(), phase: 'reserved', deadlineAt: new Date(deadlineAt).toISOString() }; }); }
 export function markSessionEndActionRunner(directory, sessionId, ownerNonce, name, runnerNonce, phase) { return updateSessionEndJob(directory, sessionId, ownerNonce, (job) => { const action = job.actions[name]; if (action.status !== 'claimed' || action.runner?.runnerNonce !== runnerNonce)
     throw new Error('runner-phase-conflict'); action.runner.phase = phase; }); }
-export function finishSessionEndAction(directory, sessionId, ownerNonce, name, runnerNonce, completed, code) { return updateSessionEndJob(directory, sessionId, ownerNonce, (job) => { const action = job.actions[name]; if (action.status !== 'claimed' || action.claimantNonce !== ownerNonce || action.runner?.runnerNonce !== runnerNonce)
-    throw new Error('action-result-conflict'); action.status = completed ? 'completed' : action.class === 'best-effort' ? 'expired' : 'retryable'; action.lastOutcomeCode = code; action.completedAt = completed ? nowIso() : undefined; action.claimantNonce = undefined; action.runner.phase = 'terminal'; }); }
+export function finishSessionEndAction(directory, sessionId, ownerNonce, name, runnerNonce, completed, code, deliveryStarted = true) { return updateSessionEndJob(directory, sessionId, ownerNonce, (job) => { const action = job.actions[name]; if (action.status !== 'claimed' || action.claimantNonce !== ownerNonce || action.runner?.runnerNonce !== runnerNonce)
+    throw new Error('action-result-conflict'); recordSessionEndActionResult(action, completed, code, deliveryStarted); }); }
 /** Claims fair durable discovery tickets and retires tickets whose manifests are terminal. */
 export function claimSessionEndDiscoveryTickets(directory, limit = 4, leaseMs = 15_000) {
     try {

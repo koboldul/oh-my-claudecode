@@ -23,6 +23,7 @@ const {
   writeFileSync,
   writeSync,
 } = require('fs');
+const { tmpdir } = require('os');
 const path = require('path');
 const { join, basename, dirname } = path;
 
@@ -78,7 +79,7 @@ function resolveTarget(targetPath) {
     if (!scriptRelative || !existsSync(cacheBase)) return null;
 
     const { readdirSync } = require('fs');
-    const entries = readdirSync(cacheBase).filter(version => /^\d+\.\d+\.\d+/.test(version));
+    const entries = readdirSync(cacheBase).filter(version => /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(version));
     entries.sort((a, b) => {
       const pa = a.split('.').map(Number);
       const pb = b.split('.').map(Number);
@@ -129,6 +130,20 @@ const WINDOWS_TIMEOUT_CUSHION_MS = 1500;
 const MAX_DECLARED_GENERIC_TIMEOUT_MS = 60000;
 const WINDOWS_REAP_TIMEOUT_MS = 400;
 const PROTOCOL_STDIO_SETTLE_MS = 150;
+const HOST_DELIVERY_ACK_ENV = 'OMC_RUNNER_HOST_DELIVERY_ACK';
+const HOST_DELIVERY_DEADLINE_ENV = 'OMC_RUNNER_HOST_DELIVERY_DEADLINE_AT';
+const HOST_DELIVERY_PROTOCOL = 'omc-host-delivery-v1';
+const HOST_DELIVERY_REQUEST = 'stdout-request';
+const HOST_DELIVERY_RESULT = 'stdout-result';
+const HOST_DELIVERY_ABORT = 'abort';
+const HOST_DELIVERY_PROCESS = 'process-spawn';
+const HOST_PROCESS_IDENTITY_REQUEST = 'process-identity-request';
+const HOST_PROCESS_IDENTITY_RESULT = 'process-identity-result';
+const HOST_DELIVERY_SCRIPT = 'post-tool-rules-injector.mjs';
+const HOST_DELIVERY_CHUNK_BYTES = 16 * 1024;
+const HOST_DELIVERY_MAX_BYTES = 16 * 1024 * 1024;
+const TEST_FORCE_GENERIC_ENV = 'OMC_RUNNER_TEST_FORCE_GENERIC';
+const TEST_PROCESS_RECEIPT_DIR_ENV = 'OMC_RUNNER_TEST_PROCESS_RECEIPT_DIR';
 // Empty source→tap→writer pipelines identify leaked descendant handles after
 // the leader exits. Legitimate buffered bytes are exempt from this idle bound.
 const PROTOCOL_SOURCE_IDLE_MS = 80;
@@ -191,10 +206,12 @@ function resolveInnerTimeoutMs(manifestHook, platform = process.platform) {
 const TRUSTED_WORKER_HOOKS = new Map([
   ['keyword-detector.mjs', { event: 'UserPromptSubmit', timeoutCapMs: 8000 }],
   ['skill-injector.mjs', { event: 'UserPromptSubmit', timeoutCapMs: 12000 }],
+  ['git-guardrails.mjs', { event: 'PreToolUse' }],
   ['pre-tool-enforcer.mjs', { event: 'PreToolUse' }],
   ['post-tool-verifier.mjs', { event: 'PostToolUse' }],
   ['project-memory-posttool.mjs', { event: 'PostToolUse' }],
   ['post-tool-rules-injector.mjs', { event: 'PostToolUse' }],
+  ['post-tool-directory-context-injector.mjs', { event: 'PostToolUse' }],
 ]);
 
 function resolveTrustedWorkerTimeoutMs(targetPath, manifestHook) {
@@ -217,6 +234,58 @@ function isCriticalManifestHook(manifestHook) {
 
 function hookFailureExitCode(manifestHook) {
   return isCriticalManifestHook(manifestHook) ? 2 : 0;
+}
+
+function recordTestExecutionRoute(route) {
+  const receiptPath = process.env.OMC_RUNNER_TEST_ROUTE_RECEIPT;
+  if (process.env.NODE_ENV !== 'test' || !receiptPath) return;
+  try {
+    writeFileSync(
+      receiptPath,
+      `${JSON.stringify({ route, pid: process.pid })}\n`,
+      'utf8',
+    );
+  } catch {
+    // Test instrumentation must not affect hook execution.
+  }
+}
+
+let testProcessReceiptSequence = 0;
+function recordTestProcess(role, pid, details = {}) {
+  const receiptDir = process.env[TEST_PROCESS_RECEIPT_DIR_ENV];
+  if (
+    process.env.NODE_ENV !== 'test'
+    || !receiptDir
+    || !Number.isInteger(pid)
+    || pid <= 0
+  ) {
+    return;
+  }
+  try {
+    testProcessReceiptSequence += 1;
+    const receiptPath = join(
+      receiptDir,
+      `${process.pid}-${testProcessReceiptSequence}-${role}-${pid}.json`,
+    );
+    writeFileSync(
+      receiptPath,
+      `${JSON.stringify({
+        role,
+        pid,
+        parentPid: process.pid,
+        recordedAt: Date.now(),
+        ...details,
+      })}\n`,
+      'utf8',
+    );
+  } catch {
+    // Test instrumentation must not affect hook execution.
+  }
+}
+
+function forceTrustedWorkerGenericForTest() {
+  return process.env.NODE_ENV === 'test'
+    && process.env[TEST_FORCE_GENERIC_ENV] === '1';
 }
 
 function resolveHookTimeoutMsFromRoot(pluginRoot, targetPath, extraArgs) {
@@ -270,18 +339,31 @@ function inferPluginRootFromTarget(targetPath) {
   return candidateRoot;
 }
 
-function resolveChildEnv(targetPath) {
+function resolveChildEnv(
+  targetPath,
+  hostDeliveryAck = false,
+  hostDeliveryDeadlineAt,
+) {
   const originalPluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
   const hasCopilotEnvSignal = Boolean(
     process.env.COPILOT_CLI
     || process.env.COPILOT_AGENT_SESSION_ID
     || process.env.OMC_HOST === 'copilot'
   );
-  const inferredPluginRoot = !originalPluginRoot && hasCopilotEnvSignal
+  const targetPluginRoot = !originalPluginRoot
     ? inferPluginRootFromTarget(targetPath)
+    : null;
+  const targetUnderCopilotInstall = Boolean(
+    targetPluginRoot
+    && /[\\/]\.copilot[\\/]installed-plugins[\\/]/i.test(targetPluginRoot)
+  );
+  const inferredPluginRoot = hasCopilotEnvSignal || targetUnderCopilotInstall
+    ? targetPluginRoot
     : null;
   const effectivePluginRoot = originalPluginRoot || inferredPluginRoot;
   const childEnv = { ...process.env };
+  delete childEnv[HOST_DELIVERY_ACK_ENV];
+  delete childEnv[HOST_DELIVERY_DEADLINE_ENV];
 
   if (!originalPluginRoot && inferredPluginRoot) {
     childEnv.CLAUDE_PLUGIN_ROOT = inferredPluginRoot;
@@ -296,6 +378,17 @@ function resolveChildEnv(targetPath) {
       childEnv.OMC_HOST = 'copilot';
     } else if (originalPluginRoot) {
       childEnv.OMC_HOST = 'claude';
+    }
+  }
+
+  if (hostDeliveryAck) {
+    childEnv[HOST_DELIVERY_ACK_ENV] = '1';
+    if (
+      Number.isSafeInteger(hostDeliveryDeadlineAt)
+      && hostDeliveryDeadlineAt > 0
+    ) {
+      childEnv[HOST_DELIVERY_DEADLINE_ENV] =
+        String(hostDeliveryDeadlineAt);
     }
   }
 
@@ -385,6 +478,203 @@ function resolveSessionEndTarget(resolution, extraArgs) {
 
 function isJsonObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isHostDeliveryMessage(message, kind) {
+  return isJsonObject(message)
+    && message.protocol === HOST_DELIVERY_PROTOCOL
+    && message.kind === kind
+    && typeof message.id === 'string'
+    && message.id.length > 0
+    && message.id.length <= 256;
+}
+
+function isHostDeliveryRequest(message) {
+  return isHostDeliveryMessage(message, HOST_DELIVERY_REQUEST)
+    && Number.isSafeInteger(message.bytes)
+    && message.bytes >= 0
+    && message.bytes <= HOST_DELIVERY_MAX_BYTES
+    && typeof message.payload === 'string'
+    && Buffer.byteLength(message.payload, 'utf8') === message.bytes
+    && Number.isFinite(message.timeoutMs)
+    && message.timeoutMs > 0;
+}
+
+function isHostDeliveryAbort(message) {
+  return isJsonObject(message)
+    && message.protocol === HOST_DELIVERY_PROTOCOL
+    && message.kind === HOST_DELIVERY_ABORT;
+}
+
+function isHostDeliveryProcess(message) {
+  return isJsonObject(message)
+    && message.protocol === HOST_DELIVERY_PROTOCOL
+    && message.kind === HOST_DELIVERY_PROCESS
+    && message.role === 'identity-probe'
+    && Number.isSafeInteger(message.pid)
+    && message.pid > 0;
+}
+
+function isHostProcessIdentityRequest(message) {
+  return isHostDeliveryMessage(message, HOST_PROCESS_IDENTITY_REQUEST)
+    && Number.isSafeInteger(message.pid)
+    && message.pid > 0;
+}
+
+function isHostProcessIdentityResult(message) {
+  return isHostDeliveryMessage(message, HOST_PROCESS_IDENTITY_RESULT)
+    && Number.isSafeInteger(message.pid)
+    && message.pid > 0
+    && typeof message.ok === 'boolean'
+    && (
+      message.ok === false
+      || (
+        typeof message.identity === 'string'
+        && /^ticks:\d{1,19}$/.test(message.identity)
+      )
+    );
+}
+
+function hostDeliveryResult(message, ok, error) {
+  return {
+    protocol: HOST_DELIVERY_PROTOCOL,
+    kind: HOST_DELIVERY_RESULT,
+    id: message.id,
+    ok,
+    ...(ok || !error ? {} : { error }),
+  };
+}
+
+function hostProcessIdentityResult(message, identity, error) {
+  const ok =
+    typeof identity === 'string'
+    && /^ticks:\d{1,19}$/.test(identity);
+  return {
+    protocol: HOST_DELIVERY_PROTOCOL,
+    kind: HOST_PROCESS_IDENTITY_RESULT,
+    id: message.id,
+    pid: message.pid,
+    ok,
+    ...(ok ? { identity } : {}),
+    ...(ok || !error ? {} : { error }),
+  };
+}
+
+function hostDeliveryAbort(error) {
+  return {
+    protocol: HOST_DELIVERY_PROTOCOL,
+    kind: HOST_DELIVERY_ABORT,
+    ...(error ? { error } : {}),
+  };
+}
+
+function createWindowsProcessIdentityBroker(deadlineAt) {
+  if (
+    process.platform !== 'win32'
+    || !Number.isSafeInteger(deadlineAt)
+    || deadlineAt <= Date.now()
+  ) {
+    return null;
+  }
+
+  const command = [
+    '$line = [Console]::In.ReadLine()',
+    '$targetPid = 0',
+    'if ([string]::IsNullOrWhiteSpace($line) -or '
+      + '-not [int]::TryParse($line, [ref]$targetPid) '
+      + '-or $targetPid -le 0) { exit 2 }',
+    'try {',
+    '  $target = [System.Diagnostics.Process]::GetProcessById($targetPid)',
+    '  $ticks = $target.StartTime.ToUniversalTime().Ticks',
+    '  if ($ticks -le 0) { exit 3 }',
+    '  [Console]::Out.WriteLine($ticks)',
+    '} catch { exit 3 }',
+  ].join('; ');
+
+  let child;
+  try {
+    child = spawn(
+      'powershell',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-InputFormat',
+        'Text',
+        '-OutputFormat',
+        'Text',
+        '-Command',
+        command,
+      ],
+      {
+        stdio: ['pipe', 'pipe', 'ignore'],
+        windowsHide: true,
+      },
+    );
+  } catch {
+    return null;
+  }
+
+  recordTestProcess('identity-probe', child.pid);
+  let output = '';
+  let requestedPid;
+  let settled = false;
+  let resolveResult;
+  const result = new Promise((resolve) => {
+    resolveResult = resolve;
+  });
+  const finish = (identity) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    resolveResult(identity);
+  };
+  const kill = () => {
+    try {
+      if (!child.killed) child.kill();
+    } catch {
+      // The helper may already have exited.
+    }
+  };
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', chunk => {
+    output += chunk;
+    if (output.length > 128) kill();
+  });
+  child.once('error', () => finish(null));
+  child.once('exit', () => {
+    const ticks = output.trim().match(/^\d{1,19}$/)?.[0];
+    finish(ticks ? `ticks:${ticks}` : null);
+  });
+  const timer = setTimeout(() => {
+    kill();
+  }, Math.max(1, deadlineAt - Date.now()));
+
+  return {
+    request(pid) {
+      if (
+        requestedPid !== undefined
+        || !Number.isSafeInteger(pid)
+        || pid <= 0
+        || Date.now() >= deadlineAt
+      ) {
+        return Promise.resolve(null);
+      }
+      requestedPid = pid;
+      try {
+        child.stdin.end(`${pid}\n`);
+      } catch {
+        kill();
+      }
+      return result;
+    },
+    close() {
+      if (!settled) {
+        try { child.stdin.destroy(); } catch { /* already closed */ }
+        kill();
+      }
+      return result;
+    },
+  };
 }
 
 function readSessionEndInput() {
@@ -732,7 +1022,7 @@ function leaderPresence(pid, expectedIdentity) {
   return captureProcessStartIdentity(pid) === expectedIdentity ? 'alive' : 'mismatch';
 }
 
-function reapTree(child, childIdentity) {
+async function reapTree(child, childIdentity) {
   // Identity-safe reap: only signal a live PID we spawned, or a confirmed-dead
   // detached leader's leftover process group. A live identity mismatch is PID
   // reuse — fail closed. Unknown (EPERM/identity-read failure) also fail closed.
@@ -747,19 +1037,32 @@ function reapTree(child, childIdentity) {
   if (process.platform === 'win32') {
     // Protocol stdout/stderr are owned by run.cjs pipes, so a descendant that
     // outlives this process cannot retain Claude Code's handles (#3920).
-    // Do not spawnSync here: Node waits for the killer even after its timeout,
-    // which can hold the runner past the declared host fuse. Fire-and-forget
-    // taskkill with stdio ignored after protocol detach is the fail-open path.
+    // Keep taskkill attached and bounded so the reaper itself cannot outlive
+    // the runner. Do not use spawnSync: Node can wait beyond its timeout.
     try {
       const killer = spawnProcess('taskkill', ['/T', '/F', '/PID', String(child.pid)], {
+        cwd: tmpdir(),
         windowsHide: true,
-        detached: true,
         stdio: 'ignore',
       });
-      killer.on('error', () => {});
-      killer.unref();
+      recordTestProcess('tree-reaper', killer.pid);
+      await new Promise(resolve => {
+        let settled = false;
+        let timer;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        };
+        killer.once('error', finish);
+        killer.once('close', finish);
+        timer = setTimeout(() => {
+          try { killer.kill('SIGKILL'); } catch { /* already exited */ }
+        }, WINDOWS_REAP_TIMEOUT_MS);
+      });
     } catch {
-      // best-effort; child.unref() still guarantees the runner exits
+      // best-effort; callers still release the owned child handle
     }
     return;
   }
@@ -782,12 +1085,15 @@ function resolveGenericChildCommand(targetPath, extraArgs, platform = process.pl
     : [targetPath, ...extraArgs];
 }
 
-function resolveGenericChildStdio(platform = process.platform) {
+function resolveGenericChildStdio(
+  platform = process.platform,
+  hostDeliveryAck = false,
+) {
   // stdin inherit: hook JSON payload from Claude Code.
   // stdout/stderr pipe: run.cjs owns the protocol handles so a descendant that
   // outlives the runner cannot keep Claude Code blocked on EOF (#3920).
   // ipc: Windows supervisor parent-death reap.
-  return platform === 'win32'
+  return platform === 'win32' || hostDeliveryAck
     ? ['inherit', 'pipe', 'pipe', 'ipc']
     : ['inherit', 'pipe', 'pipe'];
 }
@@ -819,6 +1125,8 @@ function createProtocolSink(hooks = {}) {
   };
   const discarded = { stdout: false, stderr: false };
   const closedDest = { stdout: false, stderr: false };
+  const deliveredBytes = { stdout: 0, stderr: 0 };
+  const deliveryWaiters = { stdout: [], stderr: [] };
   const bindings = { stdout: [], stderr: [] };
   const discardedSources = { stdout: [], stderr: [] };
   let installed = false;
@@ -826,6 +1134,33 @@ function createProtocolSink(hooks = {}) {
   let uninstallRequested = false;
   const onStdoutError = (error) => handleDestError('stdout', destinations.stdout, error);
   const onStderrError = (error) => handleDestError('stderr', destinations.stderr, error);
+  const onStdoutClose = () => handleDestClose('stdout');
+  const onStderrClose = () => handleDestClose('stderr');
+
+  function notifyDeliveryWaiters(name) {
+    const dest = destinations[name];
+    const failed = discarded[name]
+      || closedDest[name]
+      || !dest
+      || dest.destroyed
+      || !dest.writable;
+    const remaining = [];
+    for (const waiter of deliveryWaiters[name]) {
+      if (failed) {
+        clearTimeout(waiter.timer);
+        waiter.resolve(false);
+      } else if (
+        deliveredBytes[name] >= waiter.bytes
+        && !dest.writableNeedDrain
+      ) {
+        clearTimeout(waiter.timer);
+        waiter.resolve(true);
+      } else {
+        remaining.push(waiter);
+      }
+    }
+    deliveryWaiters[name] = remaining;
+  }
 
   function teardownChannel(name) {
     discarded[name] = true;
@@ -841,6 +1176,7 @@ function createProtocolSink(hooks = {}) {
     for (const binding of snapshot) {
       try { binding.source.destroy(); } catch { /* already destroyed */ }
     }
+    notifyDeliveryWaiters(name);
   }
 
   function discardChannel(name) {
@@ -855,6 +1191,7 @@ function createProtocolSink(hooks = {}) {
       discardedSources[name].push(binding.source);
       try { binding.source.resume(); } catch { /* already flowing or destroyed */ }
     }
+    notifyDeliveryWaiters(name);
   }
 
   function destroyDiscardedSources() {
@@ -869,14 +1206,26 @@ function createProtocolSink(hooks = {}) {
 
   function handleDestError(name, dest, error) {
     if (discarded[name]) return;
-    if (isClosedDestinationError(error)) closedDest[name] = true;
+    if (isClosedDestinationError(error)) {
+      handleDestClose(name);
+      return;
+    }
     // Close only the failed protocol channel first. Keep its child pipe
     // draining while the sibling channel remains available; reaping here can
     // race sibling bytes that the hook has not written yet.
     discardChannel(name);
     if (typeof hooks.onDestinationClose === 'function') hooks.onDestinationClose(name);
-    if (!isClosedDestinationError(error) && name === 'stdout') {
+    if (name === 'stdout') {
       void write(process.stderr, Buffer.from(`[run.cjs] protocol stream error: ${error.code || error.message}\n`));
+    }
+  }
+
+  function handleDestClose(name) {
+    if (discarded[name]) return;
+    closedDest[name] = true;
+    discardChannel(name);
+    if (typeof hooks.onDestinationClose === 'function') {
+      hooks.onDestinationClose(name);
     }
   }
 
@@ -886,6 +1235,8 @@ function createProtocolSink(hooks = {}) {
     installed = true;
     destinations.stdout.on('error', onStdoutError);
     destinations.stderr.on('error', onStderrError);
+    destinations.stdout.on('close', onStdoutClose);
+    destinations.stderr.on('close', onStderrClose);
   }
 
   function flushUninstall() {
@@ -893,6 +1244,8 @@ function createProtocolSink(hooks = {}) {
     installed = false;
     destinations.stdout.removeListener('error', onStdoutError);
     destinations.stderr.removeListener('error', onStderrError);
+    destinations.stdout.removeListener('close', onStdoutClose);
+    destinations.stderr.removeListener('close', onStderrClose);
     // Process-lifetime closed-dest guards remain so a late write callback
     // EPIPE after finish() cannot crash the runner.
   }
@@ -914,42 +1267,201 @@ function createProtocolSink(hooks = {}) {
     }
   }
 
-  function write(dest, data) {
+  function writeAcknowledged(dest, data, timeoutMs = PROTOCOL_STDIO_SETTLE_MS) {
     install();
     const name = dest === destinations.stderr ? 'stderr' : 'stdout';
-    if (discarded[name] || !dest || dest.destroyed || !dest.writable) return Promise.resolve();
-    if (dest.writableNeedDrain) {
-      discarded[name] = true;
-      return Promise.resolve();
+    if (discarded[name] || !dest || dest.destroyed || !dest.writable) {
+      return Promise.resolve(false);
     }
+    const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (payload.length === 0) return Promise.resolve(true);
     pendingWrites += 1;
     return new Promise((resolve) => {
       let settled = false;
-      const done = () => {
+      let offset = 0;
+      let activeDrain;
+      const finish = (ok, error) => {
         if (settled) return;
         settled = true;
-        resolve();
-      };
-      const completeWrite = (error) => {
-        if (writeCompleted) {
-          if (error) handleDestError(name, dest, error);
-          return;
-        }
-        writeCompleted = true;
         pendingWrites = Math.max(0, pendingWrites - 1);
-        if (error) handleDestError(name, dest, error);
         clearTimeout(timer);
-        done();
+        dest.off('error', onError);
+        dest.off('close', onClose);
+        if (activeDrain) dest.off('drain', activeDrain);
+        if (error) handleDestError(name, dest, error);
+        resolve(ok && !discarded[name] && !closedDest[name]);
         flushUninstall();
       };
-      let writeCompleted = false;
-      const timer = setTimeout(done, PROTOCOL_STDIO_SETTLE_MS);
-      try {
-        const ok = dest.write(data, (error) => completeWrite(error));
-        if (!ok) completeWrite();
-      } catch (error) {
-        completeWrite(error);
+      const onError = (error) => finish(false, error);
+      const onClose = () => finish(false);
+      const timer = setTimeout(() => {
+        discardChannel(name);
+        try { dest.destroy(); } catch { /* already closed */ }
+        finish(false);
+      }, Math.max(1, Math.floor(timeoutMs)));
+
+      dest.once('error', onError);
+      dest.once('close', onClose);
+
+      const writeNext = () => {
+        if (settled) return;
+        if (discarded[name] || dest.destroyed || !dest.writable) {
+          finish(false);
+          return;
+        }
+        if (dest.writableNeedDrain) {
+          activeDrain = () => {
+            activeDrain = undefined;
+            writeNext();
+          };
+          dest.once('drain', activeDrain);
+          return;
+        }
+        if (offset >= payload.length) {
+          finish(true);
+          return;
+        }
+
+        const end = Math.min(offset + HOST_DELIVERY_CHUNK_BYTES, payload.length);
+        const chunk = payload.subarray(offset, end);
+        let callbackComplete = false;
+        let drainComplete = true;
+        let writeReturned = false;
+        const maybeContinue = () => {
+          if (
+            settled
+            || !writeReturned
+            || !callbackComplete
+            || !drainComplete
+          ) {
+            return;
+          }
+          activeDrain = undefined;
+          offset = end;
+          writeNext();
+        };
+
+        try {
+          const accepted = dest.write(chunk, (error) => {
+            if (error) {
+              finish(false, error);
+              return;
+            }
+            callbackComplete = true;
+            maybeContinue();
+          });
+          writeReturned = true;
+          if (!accepted) {
+            drainComplete = false;
+            activeDrain = () => {
+              drainComplete = true;
+              maybeContinue();
+            };
+            dest.once('drain', activeDrain);
+          }
+          maybeContinue();
+        } catch (error) {
+          finish(false, error);
+        }
+      };
+
+      writeNext();
+    });
+  }
+
+  async function writeHostAcknowledged(data, timeoutMs) {
+    const dest = destinations.stdout;
+    const payload = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (
+      process.platform !== 'win32'
+      || dest !== process.stdout
+      || payload.length <= HOST_DELIVERY_CHUNK_BYTES
+    ) {
+      return writeAcknowledged(dest, payload, timeoutMs);
+    }
+    if (
+      discarded.stdout
+      || closedDest.stdout
+      || !dest
+      || dest.destroyed
+      || !dest.writable
+    ) {
+      return false;
+    }
+
+    pendingWrites += 1;
+    try {
+      const {
+        writeHostStdoutAndWait,
+      } = require('./lib/host-stdout-writer.cjs');
+      await writeHostStdoutAndWait(
+        payload,
+        timeoutMs,
+        writer => recordTestProcess('stdout-writer', writer.pid),
+      );
+      if (
+        discarded.stdout
+        || closedDest.stdout
+        || dest.destroyed
+        || !dest.writable
+      ) {
+        return false;
       }
+      deliveredBytes.stdout += payload.length;
+      notifyDeliveryWaiters('stdout');
+      return true;
+    } catch (error) {
+      if (isClosedDestinationError(error)) closedDest.stdout = true;
+      discardChannel('stdout');
+      try { dest.destroy(); } catch { /* already closed */ }
+      if (typeof hooks.onDestinationClose === 'function') {
+        hooks.onDestinationClose('stdout');
+      }
+      return false;
+    } finally {
+      pendingWrites = Math.max(0, pendingWrites - 1);
+      flushUninstall();
+    }
+  }
+
+  function write(dest, data) {
+    return writeAcknowledged(dest, data, PROTOCOL_STDIO_SETTLE_MS);
+  }
+
+  function waitForDelivery(name, bytes, timeoutMs) {
+    install();
+    const dest = destinations[name];
+    if (
+      !Number.isSafeInteger(bytes)
+      || bytes < 0
+      || discarded[name]
+      || closedDest[name]
+      || !dest
+      || dest.destroyed
+      || !dest.writable
+    ) {
+      return Promise.resolve(false);
+    }
+    if (deliveredBytes[name] >= bytes && !dest.writableNeedDrain) {
+      return Promise.resolve(true);
+    }
+
+    return new Promise((resolve) => {
+      const waiter = {
+        bytes,
+        resolve,
+        timer: undefined,
+      };
+      waiter.timer = setTimeout(() => {
+        deliveryWaiters[name] = deliveryWaiters[name].filter(
+          (candidate) => candidate !== waiter,
+        );
+        discardChannel(name);
+        try { dest.destroy(); } catch { /* already closed */ }
+        resolve(false);
+      }, Math.max(1, Math.floor(timeoutMs)));
+      deliveryWaiters[name].push(waiter);
+      notifyDeliveryWaiters(name);
     });
   }
 
@@ -980,20 +1492,53 @@ function createProtocolSink(hooks = {}) {
             }
             const end = Math.min(offset + 1024, chunk.length);
             const slice = chunk.subarray(offset, end);
-            offset = end;
+            let callbackComplete = false;
+            let drainComplete = true;
+            let writeReturned = false;
+            let completed = false;
+            const finishSlice = (error) => {
+              if (completed) return;
+              completed = true;
+              if (error) {
+                handleDestError(name, dest, error);
+                callback();
+                return;
+              }
+              binding.lastProgressAt = Date.now();
+              deliveredBytes[name] += slice.length;
+              notifyDeliveryWaiters(name);
+              offset = end;
+              writeNext();
+            };
+            const maybeFinishSlice = () => {
+              if (
+                writeReturned
+                && callbackComplete
+                && drainComplete
+              ) {
+                finishSlice();
+              }
+            };
             try {
-              dest.write(slice, (error) => {
+              const accepted = dest.write(slice, (error) => {
                 if (error) {
-                  handleDestError(name, dest, error);
-                  callback();
+                  finishSlice(error);
                   return;
                 }
-                binding.lastProgressAt = Date.now();
-                writeNext();
+                callbackComplete = true;
+                maybeFinishSlice();
               });
+              writeReturned = true;
+              if (!accepted) {
+                drainComplete = false;
+                dest.once('drain', () => {
+                  drainComplete = true;
+                  maybeFinishSlice();
+                });
+              }
+              maybeFinishSlice();
             } catch (error) {
-              handleDestError(name, dest, error);
-              callback();
+              finishSlice(error);
             }
           };
           writeNext();
@@ -1059,7 +1604,10 @@ function createProtocolSink(hooks = {}) {
     install,
     uninstall,
     write,
+    writeAcknowledged,
+    writeHostAcknowledged,
     attachChild,
+    waitForDelivery,
     settleOutputs,
     abandonOutputs,
     closeDestinations,
@@ -1094,10 +1642,34 @@ function releaseGenericChild(child) {
   try { child.unref(); } catch { /* handle already released */ }
 }
 
+function boundedHostDeliveryTimeout(request, deadlineAt) {
+  const requested = Math.max(1, Math.floor(request.timeoutMs));
+  if (!Number.isFinite(deadlineAt)) return requested;
+  const remaining = Math.max(
+    1,
+    deadlineAt - Date.now() - PROTOCOL_STDIO_SETTLE_MS,
+  );
+  return Math.min(requested, remaining);
+}
+
+function hostDeliveryAbortGraceMs(manifestHook, timeoutMs) {
+  if (!manifestHook || !Number.isFinite(manifestHook.timeoutMs)) return 0;
+  return Math.max(
+    0,
+    Math.min(
+      PROTOCOL_STDIO_SETTLE_MS,
+      manifestHook.timeoutMs - timeoutMs,
+    ),
+  );
+}
+
 function superviseGenericChild(targetPath, extraArgs) {
   let terminal = false;
+  const relayHostDelivery = process.env[HOST_DELIVERY_ACK_ENV] === '1';
   const child = spawn(process.execPath, [targetPath, ...extraArgs], {
-    stdio: 'inherit',
+    stdio: relayHostDelivery
+      ? ['inherit', 'inherit', 'inherit', 'ipc']
+      : 'inherit',
     env: {
       ...process.env,
       OMC_SESSION_OWNER_PID: process.env.OMC_SESSION_OWNER_PID || String(process.ppid),
@@ -1105,10 +1677,69 @@ function superviseGenericChild(targetPath, extraArgs) {
     windowsHide: true,
     detached: process.platform !== 'win32',
   });
+  recordTestExecutionRoute('generic-windows-supervisor');
+  recordTestProcess('generic-processor', child.pid);
   const childIdentity = child.pid ? captureProcessStartIdentity(child.pid) : null;
+  const relayToParent = message => {
+    if (
+      !relayHostDelivery
+      || (
+        !isHostDeliveryRequest(message)
+        && !isHostDeliveryProcess(message)
+        && !isHostProcessIdentityRequest(message)
+      )
+      || typeof process.send !== 'function'
+      || !process.connected
+    ) {
+      return;
+    }
+    if (
+      isHostProcessIdentityRequest(message)
+      && message.pid !== child.pid
+    ) {
+      try {
+        child.send(
+          hostProcessIdentityResult(
+            message,
+            null,
+            'process identity request did not match the supervised hook',
+          ),
+          () => {},
+        );
+      } catch {
+        // The child may already have exited.
+      }
+      return;
+    }
+    try { process.send(message, () => {}); } catch { /* parent already gone */ }
+  };
+  const relayToChild = message => {
+    if (
+      !relayHostDelivery
+      || (
+        !isHostDeliveryMessage(message, HOST_DELIVERY_RESULT)
+        && !isHostDeliveryAbort(message)
+        && !isHostProcessIdentityResult(message)
+      )
+      || typeof child.send !== 'function'
+      || !child.connected
+    ) {
+      return;
+    }
+    try { child.send(message, () => {}); } catch { /* child already gone */ }
+  };
+  if (relayHostDelivery) {
+    child.on('message', relayToParent);
+    process.on('message', relayToChild);
+  }
+  const detachRelay = () => {
+    child.off('message', relayToParent);
+    process.off('message', relayToChild);
+  };
   const finish = (status) => {
     if (terminal) return;
     terminal = true;
+    detachRelay();
     process.exitCode = status;
     if (process.connected) process.disconnect();
   };
@@ -1119,8 +1750,10 @@ function superviseGenericChild(targetPath, extraArgs) {
   process.once('disconnect', () => {
     if (terminal) return;
     terminal = true;
-    reapTree(child, childIdentity);
-    try { child.unref(); } catch { /* handle already released */ }
+    detachRelay();
+    void reapTree(child, childIdentity).finally(() => {
+      try { child.unref(); } catch { /* handle already released */ }
+    });
   });
   child.once('exit', code => finish(typeof code === 'number' ? code : 0));
   child.once('error', () => finish(0));
@@ -1128,13 +1761,17 @@ function superviseGenericChild(targetPath, extraArgs) {
 
 function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook, options = {}) {
   const deadlineAt = options.deadlineAt;
+  const hostDeliveryAck = options.hostDeliveryAck === true;
+  const identityBroker = hostDeliveryAck
+    ? createWindowsProcessIdentityBroker(deadlineAt)
+    : null;
   let child;
   let childIdentity = null;
-  let reaped = false;
+  let reapPromise;
   const reapOnce = () => {
-    if (reaped || !child) return;
-    reaped = true;
-    reapTree(child, childIdentity);
+    if (!child) return Promise.resolve();
+    if (!reapPromise) reapPromise = reapTree(child, childIdentity);
+    return reapPromise;
   };
   let destinationClosed = false;
   let startClosedDestinationCleanup = () => {};
@@ -1149,23 +1786,36 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook, options
   });
   sink.install();
   return new Promise(resolve => {
-    const protocolDeadline = Date.now() + timeoutMs;
+    const protocolDeadline = Number.isSafeInteger(deadlineAt)
+      ? deadlineAt
+      : Date.now() + timeoutMs;
     let terminal = false;
+    let finished = false;
     let settling = false;
     let timer;
     let closeCleanupStarted = false;
     let closeCleanupTimer;
+    let childExited = false;
+    let resolveChildExit;
+    const childExitPromise = new Promise((resolveChildExitPromise) => {
+      resolveChildExit = resolveChildExitPromise;
+    });
+    const deliveryRequests = new Set();
     const closeGraceMs = Math.min(timeoutMs, WINDOWS_GENERIC_STARTUP_MS + PROTOCOL_STDIO_SETTLE_MS);
     let detachHandlers = () => {};
     const finish = (status) => {
+      if (finished) return;
+      finished = true;
+      terminal = true;
       if (closeCleanupTimer) {
         clearTimeout(closeCleanupTimer);
         closeCleanupTimer = undefined;
       }
       sink.uninstall();
-      resolve(status);
+      void Promise.resolve(identityBroker?.close())
+        .finally(() => resolve(status));
     };
-    const finishClosedDestination = () => {
+    const finishClosedDestination = async () => {
       if (terminal) return;
       terminal = true;
       settling = false;
@@ -1174,7 +1824,7 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook, options
         closeCleanupTimer = undefined;
       }
       detachHandlers();
-      reapOnce();
+      await reapOnce();
       sink.abandonOutputs();
       detachProtocolStdio(child);
       releaseGenericChild(child);
@@ -1183,25 +1833,45 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook, options
     startClosedDestinationCleanup = () => {
       if (closeCleanupStarted || terminal) return;
       closeCleanupStarted = true;
-      closeCleanupTimer = setTimeout(finishClosedDestination, closeGraceMs);
+      closeCleanupTimer = setTimeout(() => {
+        void finishClosedDestination();
+      }, closeGraceMs);
+      if (hostDeliveryAck) return;
       if (settling) return;
       settling = true;
-      void sink.settleOutputs(closeGraceMs, PROTOCOL_SOURCE_IDLE_MS, false).then(() => {
+      // A destination close is observed only after the active child reaches
+      // that protocol channel. Keep the sibling channel for its existing idle
+      // grace, but do not wait the full startup allowance on an open source
+      // that has no buffered output.
+      void sink.settleOutputs(closeGraceMs, PROTOCOL_SOURCE_IDLE_MS).then(() => {
         settling = false;
-        finishClosedDestination();
+        void finishClosedDestination();
       });
     };
     try {
-      const childEnv = resolveChildEnv(targetPath);
+      const childEnv = resolveChildEnv(
+        targetPath,
+        hostDeliveryAck,
+        Number.isFinite(deadlineAt) ? deadlineAt : protocolDeadline,
+      );
       child = spawn(process.execPath, resolveGenericChildCommand(targetPath, extraArgs), {
-        stdio: resolveGenericChildStdio(),
         env: {
           ...childEnv,
           OMC_SESSION_OWNER_PID: childEnv.OMC_SESSION_OWNER_PID || String(process.ppid),
         },
+        stdio: resolveGenericChildStdio(process.platform, hostDeliveryAck),
         windowsHide: true,
         detached: true,
       });
+      if (process.platform !== 'win32') {
+        recordTestExecutionRoute('generic-child');
+      }
+      recordTestProcess(
+        process.platform === 'win32'
+          ? 'generic-supervisor'
+          : 'generic-processor',
+        child.pid,
+      );
     } catch (error) {
       writeSpawnErrorDiagnostic(targetPath, manifestHook, error);
       finish(hookFailureExitCode(manifestHook));
@@ -1209,28 +1879,84 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook, options
     }
     sink.attachChild(child);
     childIdentity = child.pid ? captureProcessStartIdentity(child.pid) : null;
+    const onHostDeliveryMessage = message => {
+      if (!hostDeliveryAck) return;
+      if (isHostDeliveryProcess(message)) {
+        recordTestProcess(message.role, message.pid);
+        return;
+      }
+      if (isHostProcessIdentityRequest(message)) {
+        void Promise.resolve(
+          identityBroker?.request(message.pid) ?? null,
+        ).then(identity => {
+          if (typeof child.send !== 'function' || !child.connected) return;
+          try {
+            child.send(
+              hostProcessIdentityResult(
+                message,
+                identity,
+                identity
+                  ? undefined
+                  : 'runner process identity broker was unavailable',
+              ),
+              () => {},
+            );
+          } catch {
+            // The child may already have exited.
+          }
+        });
+        return;
+      }
+      if (
+        !isHostDeliveryRequest(message)
+        || deliveryRequests.has(message.id)
+      ) return;
+      deliveryRequests.add(message.id);
+      const deliveryTimeoutMs = boundedHostDeliveryTimeout(
+        message,
+        protocolDeadline,
+      );
+      void sink.writeHostAcknowledged(
+        Buffer.from(message.payload, 'utf8'),
+        deliveryTimeoutMs,
+      ).then(ok => {
+        const response = hostDeliveryResult(
+          message,
+          ok,
+          ok ? undefined : 'host stdout delivery failed or timed out',
+        );
+        if (typeof child.send !== 'function' || !child.connected) return;
+        try { child.send(response, () => {}); } catch { /* child already gone */ }
+      });
+    };
+    if (hostDeliveryAck) child.on('message', onHostDeliveryMessage);
 
     detachHandlers = () => {
       clearTimeout(timer);
+      child.off('message', onHostDeliveryMessage);
       for (const signal of RUNNER_TERMINATION_SIGNALS) process.off(signal, onRunnerSignal);
-      process.off('exit', onRunnerExit);
+      process.off('beforeExit', onRunnerBeforeExit);
     };
     function onRunnerSignal() {
       if (terminal && !settling) return;
       terminal = true;
       settling = false;
       detachHandlers();
-      reapOnce();
-      sink.abandonOutputs();
-      detachProtocolStdio(child);
-      sink.uninstall();
-      process.exit(hookFailureExitCode(manifestHook));
+      void (async () => {
+        await reapOnce();
+        void identityBroker?.close();
+        sink.abandonOutputs();
+        detachProtocolStdio(child);
+        sink.uninstall();
+        process.exit(hookFailureExitCode(manifestHook));
+      })();
     }
-    function onRunnerExit() {
+    async function onRunnerBeforeExit() {
       if (terminal && !settling) return;
       terminal = true;
       settling = false;
-      reapOnce();
+      await reapOnce();
+      void identityBroker?.close();
       sink.abandonOutputs();
       detachProtocolStdio(child);
     }
@@ -1242,8 +1968,31 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook, options
       if (terminal) return;
       terminal = true;
       detachHandlers();
-      reapOnce();
-      void writeTimeoutDiagnostic(targetPath, manifestHook, timeoutMs, sink).finally(() => {
+      void (async () => {
+        const abortGraceMs = hostDeliveryAck
+          ? hostDeliveryAbortGraceMs(manifestHook, timeoutMs)
+          : 0;
+        if (
+          abortGraceMs > 0
+          && typeof child.send === 'function'
+          && child.connected
+        ) {
+          try {
+            child.send(
+              hostDeliveryAbort('runner timeout before host stdout delivery'),
+              () => {},
+            );
+          } catch {
+            // The child may have exited at the timeout boundary.
+          }
+          await Promise.race([
+            childExitPromise,
+            new Promise(resolveAbortGrace =>
+              setTimeout(resolveAbortGrace, abortGraceMs)),
+          ]);
+          }
+          if (!childExited) await reapOnce();
+          await writeTimeoutDiagnostic(targetPath, manifestHook, timeoutMs, sink);
         sink.abandonOutputs();
         detachProtocolStdio(child);
         releaseGenericChild(child);
@@ -1251,24 +2000,28 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook, options
           sink.closeDestinations();
         }
         finish(hookFailureExitCode(manifestHook));
-      });
+      })();
     }, timerDelayMs);
-
     child.once('exit', (code, signal) => {
+      childExited = true;
+      resolveChildExit();
       if (terminal) return;
-      if (destinationClosed) return;
+      if (destinationClosed) {
+        void finishClosedDestination();
+        return;
+      }
       settling = true;
       clearTimeout(timer);
       const remainingProtocolMs = Math.max(1, protocolDeadline - Date.now());
-      void sink.settleOutputs(remainingProtocolMs).then((complete) => {
+      void sink.settleOutputs(remainingProtocolMs).then(async (complete) => {
         settling = false;
         if (terminal) return;
         if (destinationClosed) {
-          finishClosedDestination();
+          void finishClosedDestination();
           return;
         }
         detachHandlers();
-        reapOnce();
+        await reapOnce();
         if (!complete && require.main === module) {
           sink.closeDestinations();
           releaseGenericChild(child);
@@ -1283,6 +2036,8 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook, options
       });
     });
     child.once('error', (error) => {
+      childExited = true;
+      resolveChildExit();
       if (terminal) return;
       terminal = true;
       detachHandlers();
@@ -1292,19 +2047,84 @@ function runGenericChild(targetPath, extraArgs, timeoutMs, manifestHook, options
     });
 
     for (const signal of RUNNER_TERMINATION_SIGNALS) process.on(signal, onRunnerSignal);
-    process.on('exit', onRunnerExit);
+    process.on('beforeExit', onRunnerBeforeExit);
   });
 }
 
-async function runWorker(targetPath, manifestHook, timeoutMs) {
+// A Worker created with `stdin: true` owns a stdio MessagePort that stays
+// referenced until its stdin reaches EOF, and the parent cannot release it from
+// the outside: ending or destroying `worker.stdin` leaves the worker-side
+// readable open, so the worker never exits. A hook that returns before touching
+// stdin — every `OMC_SKIP_HOOKS` / `DISABLE_OMC=1` early return — therefore
+// idled until the manifest budget expired and was reported as a bogus timeout
+// while the payload sat unread (#4086).
+//
+// This bootstrap runs the hook unchanged and, once its module evaluation has
+// settled, resumes stdin only when the hook provably never looked at it: not
+// flowing and no reader attached. Resuming drains the already-delivered payload
+// to EOF, which releases the port; destroying the stream instead would break
+// the EOF path and pin the worker forever. A hook that does read stdin attaches
+// its listeners synchronously inside `main()` before its first await, so it is
+// always observed as a consumer and keeps the untouched behaviour. Only
+// 'data'/'readable' count as a reader: Node attaches its own internal 'end'
+// listener to a worker stdin.
+//
+// `process.argv[1]` is restored to the hook path so entry guards of the form
+// `import.meta.url === pathToFileURL(process.argv[1]).href` still fire.
+const WORKER_STDIN_BOOTSTRAP = `
+const { workerData } = require('node:worker_threads');
+const { fileURLToPath } = require('node:url');
+const targetUrl = workerData.omcWorkerTarget;
+process.argv[1] = fileURLToPath(targetUrl);
+function drainUnreadStdin() {
+  const stdin = process.stdin;
+  if (!stdin || stdin.destroyed || stdin.readableEnded) return;
+  if (stdin.readableFlowing === true) return;
+  if (stdin.listenerCount('data') > 0 || stdin.listenerCount('readable') > 0) return;
+  try { stdin.resume(); } catch { /* already closed */ }
+}
+import(targetUrl).then(
+  () => { setImmediate(drainUnreadStdin); },
+  (error) => {
+    setImmediate(() => {
+      drainUnreadStdin();
+      throw error;
+    });
+  },
+);
+`;
+
+/**
+ * git-guardrails.mjs is a no-op when explicitly disabled; skip starting its
+ * worker entirely. Returns 0 to exit, or null to run the worker.
+ */
+function gitGuardrailsPreCheck() {
+  if (process.env.OMC_GIT_GUARDRAILS === '0') return 0;
+  return null;
+}
+
+async function runWorker(targetPath, manifestHook, timeoutMs, options = {}) {
   const { pathToFileURL } = require('url');
   const { Worker } = require('worker_threads');
   let worker;
   let terminal = false;
   let timer;
   let discardOutput = false;
+  let workerExited = false;
+  let resolveWorkerExit;
+  const workerExitPromise = new Promise((resolveWorkerExitPromise) => {
+    resolveWorkerExit = resolveWorkerExitPromise;
+  });
   const stdout = [];
   const stderr = [];
+  const deliveryRequests = new Set();
+  const deliveryDeadline = Number.isSafeInteger(options.deadlineAt)
+    ? options.deadlineAt
+    : RUNNER_STARTED_AT + timeoutMs;
+  const identityBroker = options.hostDeliveryAck === true
+    ? createWindowsProcessIdentityBroker(deliveryDeadline)
+    : null;
+  let deliveryChain = Promise.resolve();
   const sink = createProtocolSink();
   sink.install();
 
@@ -1316,8 +2136,97 @@ async function runWorker(targetPath, manifestHook, timeoutMs) {
   const waitForOutputEnd = stream => stream.readableEnded
     ? Promise.resolve()
     : new Promise(resolve => stream.once('end', resolve));
+  const sendDeliveryResult = (message, ok, error) => {
+    if (!worker) return;
+    try {
+      worker.postMessage(hostDeliveryResult(message, ok, error));
+    } catch {
+      // The Worker may have exited after its acknowledgement timeout.
+    }
+  };
+  const sendProcessIdentityResult = (message, identity, error) => {
+    if (!worker) return;
+    try {
+      worker.postMessage(
+        hostProcessIdentityResult(message, identity, error),
+      );
+    } catch {
+      // The Worker may have exited during the identity query.
+    }
+  };
+  const processDeliveryRequest = async message => {
+    if (
+      !isHostDeliveryRequest(message)
+      || deliveryRequests.has(message.id)
+    ) {
+      return;
+    }
+    deliveryRequests.add(message.id);
+    const requestTimeoutMs = boundedHostDeliveryTimeout(
+      message,
+      deliveryDeadline,
+    );
+    if (terminal) {
+      sendDeliveryResult(
+        message,
+        false,
+        'worker ended before host delivery could be acknowledged',
+      );
+      return;
+    }
+
+    const delivered = await sink.writeHostAcknowledged(
+      Buffer.from(message.payload, 'utf8'),
+      requestTimeoutMs,
+    );
+    sendDeliveryResult(
+      message,
+      delivered,
+      delivered ? undefined : 'host stdout delivery failed or timed out',
+    );
+  };
+  const onHostDeliveryMessage = message => {
+    if (isHostDeliveryProcess(message)) {
+      recordTestProcess(message.role, message.pid);
+      return;
+    }
+    if (isHostProcessIdentityRequest(message)) {
+      if (message.pid !== process.pid) {
+        sendProcessIdentityResult(
+          message,
+          null,
+          'process identity request did not match the Worker process',
+        );
+        return;
+      }
+      void Promise.resolve(
+        identityBroker?.request(message.pid) ?? null,
+      ).then(identity => {
+        sendProcessIdentityResult(
+          message,
+          identity,
+          identity
+            ? undefined
+            : 'runner process identity broker was unavailable',
+        );
+      });
+      return;
+    }
+    if (!isHostDeliveryRequest(message)) return;
+    deliveryChain = deliveryChain
+      .then(() => processDeliveryRequest(message))
+      .catch(() => {
+        sendDeliveryResult(
+          message,
+          false,
+          'host stdout delivery acknowledgement failed',
+        );
+      });
+  };
   const forwardBuffers = async (workerError) => {
-    if (stdout.length) await sink.write(process.stdout, Buffer.concat(stdout));
+    if (stdout.length) {
+      await sink.write(process.stdout, Buffer.concat(stdout));
+    }
     if (stderr.length) await sink.write(process.stderr, Buffer.concat(stderr));
     if (workerError) {
       const diagnostic = workerError.stack || workerError.message || String(workerError);
@@ -1336,42 +2245,89 @@ async function runWorker(targetPath, manifestHook, timeoutMs) {
         terminal = true;
         clearTimeout(timer);
         cleanupInput();
-        if (worker) await waitForWorkerOutput();
+        if (worker) {
+          await waitForWorkerOutput();
+        }
+        await deliveryChain;
         await forwardBuffers(workerError);
+        await identityBroker?.close();
         sink.uninstall();
         resolve(status);
       };
 
       timer = setTimeout(async () => {
         if (terminal) return;
-        discardOutput = true;
         terminal = true;
         cleanupInput();
-        try {
-          await worker.terminate();
-        } catch {
-          // Termination is best-effort; the hook must still fail open.
+        const abortGraceMs = options.hostDeliveryAck === true
+          ? hostDeliveryAbortGraceMs(manifestHook, timeoutMs)
+          : 0;
+        if (abortGraceMs > 0 && worker) {
+          try {
+            worker.postMessage(
+              hostDeliveryAbort('runner timeout before host stdout delivery'),
+            );
+          } catch {
+            // The Worker may have exited at the timeout boundary.
+          }
+          await Promise.race([
+            workerExitPromise,
+            new Promise(resolveAbortGrace =>
+              setTimeout(resolveAbortGrace, abortGraceMs)),
+          ]);
+        }
+        if (!workerExited) {
+          discardOutput = true;
+          try {
+            await worker.terminate();
+          } catch {
+            // Termination is best-effort; the hook must still fail open.
+          }
+        }
+        if (worker) {
+          await waitForWorkerOutput();
+        }
+        await deliveryChain;
+        if (stderr.length) {
+          await sink.write(process.stderr, Buffer.concat(stderr));
         }
         await writeTimeoutDiagnostic(targetPath, manifestHook, timeoutMs, sink, 'fail-open');
+        await identityBroker?.close();
         sink.uninstall();
         resolve(0);
-      }, timeoutMs);
+      }, Math.max(1, deliveryDeadline - Date.now()));
 
       try {
-        worker = new Worker(pathToFileURL(targetPath), {
+        worker = new Worker(WORKER_STDIN_BOOTSTRAP, {
+          eval: true,
           stdin: true,
           stdout: true,
           stderr: true,
-          env: resolveChildEnv(targetPath),
+          env: resolveChildEnv(
+            targetPath,
+            options.hostDeliveryAck === true,
+            deliveryDeadline,
+          ),
+          workerData: { omcWorkerTarget: pathToFileURL(targetPath).href },
+        });
+        recordTestExecutionRoute('worker');
+        recordTestProcess('worker-thread', process.pid, {
+          threadId: worker.threadId,
         });
         if (process.stdin.readableEnded) worker.stdin.end();
         else process.stdin.pipe(worker.stdin);
-        worker.stdout.on('data', chunk => { if (!discardOutput) stdout.push(chunk); });
+        worker.stdout.on('data', chunk => {
+          if (discardOutput) return;
+          stdout.push(chunk);
+        });
         worker.stderr.on('data', chunk => { if (!discardOutput) stderr.push(chunk); });
+        worker.on('message', onHostDeliveryMessage);
         worker.once('error', error => {
           void finish(1, error);
         });
         worker.once('exit', code => {
+          workerExited = true;
+          resolveWorkerExit();
           void finish(code ?? 0);
         });
       } catch (error) {
@@ -1436,12 +2392,30 @@ async function main() {
   }
 
   const workerManifestHook = resolveWorkerTarget(resolution, extraArgs);
-  if (workerManifestHook) {
+  const hostDeliveryAck = Boolean(
+    workerManifestHook
+    && basename(resolution.targetPath) === HOST_DELIVERY_SCRIPT
+  );
+  const forceGeneric = Boolean(
+    workerManifestHook
+    && forceTrustedWorkerGenericForTest()
+  );
+  if (workerManifestHook && !forceGeneric) {
+    if (
+      basename(resolution.targetPath) === 'git-guardrails.mjs'
+      && gitGuardrailsPreCheck() === 0
+    ) {
+      return 0;
+    }
     const workerTimeoutMs = resolveTrustedWorkerTimeoutMs(resolution.targetPath, workerManifestHook);
     return runWorker(
       resolution.targetPath,
       workerManifestHook,
       workerTimeoutMs,
+      {
+        deadlineAt: RUNNER_STARTED_AT + workerTimeoutMs,
+        hostDeliveryAck,
+      },
     );
   }
 
@@ -1457,14 +2431,18 @@ async function main() {
     return runWorker(resolution.targetPath, trustedSessionEndHook, timeoutMs);
   }
 
-  const manifestHook = resolveHookTimeoutMs(resolution.targetPath, extraArgs);
+  const manifestHook = workerManifestHook
+    || resolveHookTimeoutMs(resolution.targetPath, extraArgs);
   const timeoutMs = resolveGenericTimeoutMs(manifestHook);
   return runGenericChild(
     resolution.targetPath,
     extraArgs,
     timeoutMs,
     manifestHook,
-    { deadlineAt: RUNNER_STARTED_AT + timeoutMs },
+    {
+      deadlineAt: RUNNER_STARTED_AT + timeoutMs,
+      hostDeliveryAck,
+    },
   );
 }
 

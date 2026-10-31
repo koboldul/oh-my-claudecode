@@ -12,6 +12,7 @@ export interface ActionRunContext {
 export interface ActionRunResult {
     code: string;
     completed: boolean;
+    deliveryStarted?: boolean;
 }
 /** Each deferred action runs in its own detached process group. The manifest remains the only authority for claim/result transitions. */
 export declare function runSessionEndAction(context: ActionRunContext, _execute: () => Promise<void>): Promise<ActionRunResult>;

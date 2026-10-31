@@ -17,6 +17,11 @@ const FORCE_DELEGATION_DEFAULT_WINDOW_SECONDS = 120;
 const AWAITING_CONFIRMATION_TTL_MS = 2 * 60 * 1000;
 const STATE_STALE_MS = 2 * 60 * 60 * 1000;
 const TIER_ALIASES = new Set(['sonnet', 'opus', 'haiku', 'fable']);
+const JEV_MODEL_TIERS = new Set([
+    'haiku',
+    'sonnet',
+    'opus',
+]);
 const TIER_TO_DEFAULT_ENV_KEYS = {
     haiku: [
         'OMC_SUBAGENT_MODEL',
@@ -423,6 +428,62 @@ export function evaluateModelRouting(call, envelope, snapshot) {
     }
     return { warning: '' };
 }
+function asJevModelTier(model) {
+    return model === 'haiku' || model === 'sonnet' || model === 'opus'
+        ? model
+        : null;
+}
+function modelRoutingJevObservation(call, snapshot, evaluation) {
+    if (evaluation.denyReason
+        || !AGENT_HEAVY_TOOLS.has(call.canonicalName)
+        || !isRecord(call.input)) {
+        return undefined;
+    }
+    const originalInput = call.input;
+    const modifiedInput = evaluation.updatedInput ?? originalInput;
+    let selectedModel = nonEmptyString(modifiedInput.model);
+    if (!selectedModel) {
+        const agentType = getAgentType(originalInput);
+        if (agentType) {
+            selectedModel =
+                snapshot.modelRouting.agentDefinitionModels[normalizeAgentType(agentType)] ?? '';
+        }
+    }
+    const normalized = isTierAlias(selectedModel)
+        ? selectedModel.toLowerCase()
+        : normalizeToCcAlias(selectedModel);
+    const model = asJevModelTier(normalized);
+    if (!model)
+        return undefined;
+    return {
+        originalInput,
+        modifiedInput,
+        injected: evaluation.updatedInput !== undefined,
+        model,
+    };
+}
+function applyJevModelRoutingOverride(call, envelope, evaluation, observation, overrides) {
+    const choice = overrides[call.id];
+    if (envelope.host !== 'claude'
+        || evaluation.denyReason
+        || !observation
+        || !choice
+        || !JEV_MODEL_TIERS.has(choice)
+        || !isRecord(call.input)) {
+        return evaluation;
+    }
+    const updatedInput = evaluation.updatedInput ?? call.input;
+    if (nonEmptyString(updatedInput.model).toLowerCase() === choice) {
+        return evaluation;
+    }
+    return {
+        ...evaluation,
+        updatedInput: {
+            ...updatedInput,
+            model: choice,
+        },
+    };
+}
 function normalizeText(value) {
     return nonEmptyString(value).replace(/\s+/g, ' ').toLowerCase();
 }
@@ -702,8 +763,9 @@ function removeBenignSlopSpans(text) {
     }, text);
 }
 function generateSlopWarning(call, envelope) {
-    if (!SLOP_RISK_TOOL_NAMES.has(call.canonicalName))
-        return '';
+    if (!SLOP_RISK_TOOL_NAMES.has(call.canonicalName)) {
+        return { warned: false, message: '' };
+    }
     const promptValues = [
         ...(envelope.eventPayload.promptAliases ?? []),
         envelope.eventPayload.message,
@@ -712,25 +774,30 @@ function generateSlopWarning(call, envelope) {
         ...collectStringValues(call.input),
         ...collectStringValues(promptValues),
     ].join('\n');
-    if (!SLOP_FALLBACK_LANGUAGE_PATTERN.test(inspectedText))
-        return '';
+    if (!SLOP_FALLBACK_LANGUAGE_PATTERN.test(inspectedText)) {
+        return { warned: false, message: '' };
+    }
     const paths = collectLikelyPathValues(call.input);
     if (paths.some((value) => SLOP_SELF_REFERENCE_PATH_PATTERN.test(value))) {
-        return '';
+        return { warned: false, message: '' };
     }
-    if (paths.some((value) => SLOP_DOC_CONTEXT_PATTERN.test(value)))
-        return '';
+    if (paths.some((value) => SLOP_DOC_CONTEXT_PATTERN.test(value))) {
+        return { warned: false, message: '' };
+    }
     const hasAction = stripSlopQuotedAndCodeContexts(inspectedText)
         .split(/[\r\n!?;]+/)
         .map((segment) => segment.trim())
         .filter(Boolean)
         .some((segment) => SLOP_FALLBACK_ACTION_PATTERNS.some((pattern) => pattern.test(removeBenignSlopSpans(segment))));
     if (!hasAction)
-        return '';
-    return '[SLOP WARNING] Detected fallback/workaround language in this tool input. '
-        + 'Do not make potential slop: avoid ad-hoc fallback layers, workaround shims, or environment-specific patches unless explicitly justified. '
-        + 'For architecture concerns, consult the architect for a concrete design first. '
-        + 'If this seems environment-specific, ask the user to confirm constraints before proceeding.';
+        return { warned: false, message: '' };
+    return {
+        warned: true,
+        message: '[SLOP WARNING] Detected fallback/workaround language in this tool input. '
+            + 'Do not make potential slop: avoid ad-hoc fallback layers, workaround shims, or environment-specific patches unless explicitly justified. '
+            + 'For architecture concerns, consult the architect for a concrete design first. '
+            + 'If this seems environment-specific, ask the user to confirm constraints before proceeding.',
+    };
 }
 function generateAgentMessage(input, snapshot) {
     if (!input) {
@@ -829,7 +896,7 @@ function buildPreflightReason(snapshot) {
         + 'until context is reduced. Safe recovery: (1) pause new Task fan-out, (2) run /compact now, '
         + '(3) if compact fails, open a fresh session and continue from .omc/state + .omc/notepad.md.';
 }
-function deniedCallPlan(call, reason, effects, nextLedger, presentationKind = 'hook-deny', mutation) {
+function deniedCallPlan(call, reason, effects, nextLedger, presentationKind = 'hook-deny', mutation, jevObservations) {
     const evaluation = {
         callId: call.id,
         source: 'handler',
@@ -849,13 +916,14 @@ function deniedCallPlan(call, reason, effects, nextLedger, presentationKind = 'h
         evaluation,
         legacyPresentation,
         nextForceDelegationLedger: nextLedger,
+        ...(jevObservations ? { jevObservations } : {}),
     };
 }
 /**
  * Evaluate one canonical call without any filesystem, environment, clock,
  * subprocess, import, notification, or trace access.
  */
-export function evaluatePreToolCall(call, envelope, snapshot, ledger, readBudgetWarnings = snapshot.readBudget.warnings) {
+export function evaluatePreToolCall(call, envelope, snapshot, ledger, readBudgetWarnings = snapshot.readBudget.warnings, modelRoutingOverrides = {}) {
     if (snapshot.disabled) {
         return {
             call,
@@ -978,10 +1046,15 @@ export function evaluatePreToolCall(call, envelope, snapshot, ledger, readBudget
     if (ultragoalReason) {
         return deniedCallPlan(call, ultragoalReason, effects, ledger);
     }
-    const modelRouting = evaluateModelRouting(call, envelope, snapshot);
-    if (modelRouting.denyReason) {
-        return deniedCallPlan(call, modelRouting.denyReason, effects, ledger);
+    const baseModelRouting = evaluateModelRouting(call, envelope, snapshot);
+    if (baseModelRouting.denyReason) {
+        return deniedCallPlan(call, baseModelRouting.denyReason, effects, ledger);
     }
+    const modelRoutingObservation = modelRoutingJevObservation(call, snapshot, baseModelRouting);
+    const modelRouting = applyJevModelRoutingOverride(call, envelope, baseModelRouting, modelRoutingObservation, modelRoutingOverrides);
+    const routingObservations = modelRoutingObservation
+        ? { modelRouting: modelRoutingObservation }
+        : undefined;
     const mutation = modelRouting.updatedInput
         ? requiredMutation(call, modelRouting.updatedInput, Object.fromEntries(Object.entries(modelRouting.updatedInput).filter(([key, value]) => !isRecord(call.input) || call.input[key] !== value)))
         : undefined;
@@ -1002,13 +1075,18 @@ export function evaluatePreToolCall(call, envelope, snapshot, ledger, readBudget
     if (forceDelegation.effect)
         effects.push(forceDelegation.effect);
     if (forceDelegation.denyReason) {
-        return deniedCallPlan(call, forceDelegation.denyReason, effects, forceDelegation.nextLedger, 'hook-deny', mutation);
+        return deniedCallPlan(call, forceDelegation.denyReason, effects, forceDelegation.nextLedger, 'hook-deny', mutation, routingObservations);
     }
     if (AGENT_HEAVY_TOOLS.has(call.canonicalName)
         && snapshot.transcript.contextPercent >=
             snapshot.transcript.contextThreshold) {
-        return deniedCallPlan(call, buildPreflightReason(snapshot), effects, forceDelegation.nextLedger, 'raw-block', mutation);
+        return deniedCallPlan(call, buildPreflightReason(snapshot), effects, forceDelegation.nextLedger, 'raw-block', mutation, routingObservations);
     }
+    const slopWarning = generateSlopWarning(call, envelope);
+    const jevObservations = {
+        ...(routingObservations ?? {}),
+        slopWarning: slopWarning.warned,
+    };
     let advisoryCandidate;
     if (!BUILT_IN_TASK_LIST_TOOL_NAMES.has(call.canonicalName)) {
         const effectiveInput = modelRouting.updatedInput
@@ -1016,7 +1094,7 @@ export function evaluatePreToolCall(call, envelope, snapshot, ledger, readBudget
         const baseMessage = call.canonicalName === 'Task' || call.canonicalName === 'Agent'
             ? generateAgentMessage(effectiveInput, snapshot)
             : generateToolMessage(call.canonicalName, snapshot);
-        const message = combineMessages(modelRouting.warning, generateSlopWarning(call, envelope), baseMessage);
+        const message = combineMessages(modelRouting.warning, slopWarning.message, baseMessage);
         advisoryCandidate = buildAdvisoryCandidate(call, snapshot, message);
         if (advisoryCandidate)
             effects.push(advisoryCandidate.effect);
@@ -1070,6 +1148,7 @@ export function evaluatePreToolCall(call, envelope, snapshot, ledger, readBudget
         legacyPresentation,
         nextForceDelegationLedger: forceDelegation.nextLedger,
         ...(advisoryCandidate ? { advisoryCandidate } : {}),
+        jevObservations,
     };
 }
 function hasBatchSafetyIssue(envelope) {
@@ -1080,7 +1159,7 @@ function hasBatchSafetyIssue(envelope) {
  * Fold canonical calls in original host order while threading the virtual
  * force-delegation ledger. Duplicate advisory messages are claimed once.
  */
-export function planPreToolBatch(envelope, snapshot) {
+export function planPreToolBatch(envelope, snapshot, modelRoutingOverrides = {}) {
     if (hasBatchSafetyIssue(envelope)) {
         return {
             envelope,
@@ -1098,7 +1177,7 @@ export function planPreToolBatch(envelope, snapshot) {
     for (const call of [...envelope.toolCalls]
         .filter((candidate) => !candidate.malformed)
         .sort((left, right) => left.originalIndex - right.originalIndex)) {
-        let plan = evaluatePreToolCall(call, envelope, snapshot, ledger, readBudgetWarnings);
+        let plan = evaluatePreToolCall(call, envelope, snapshot, ledger, readBudgetWarnings, modelRoutingOverrides);
         ledger = plan.nextForceDelegationLedger;
         if (plan.evaluation.decision === 'pass'
             || plan.evaluation.decision === 'allow') {

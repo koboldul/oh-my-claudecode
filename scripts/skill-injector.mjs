@@ -23,6 +23,7 @@ import {
   loadHookRuntime,
   surfaceOptionalHookFailure,
 } from './lib/hook-runtime-loader.mjs';
+import { stripLeadingUtf8Bom } from './lib/utf8-bom.mjs';
 
 const skipHooks = (process.env.OMC_SKIP_HOOKS || '').split(',').map(token => token.trim());
 const isDisabled = process.env.DISABLE_OMC === '1' ||
@@ -312,7 +313,8 @@ function writeFallbackState(stateDir, statePath, state) {
 
 // Parse YAML frontmatter from skill file (fallback)
 function parseSkillFrontmatterFallback(content) {
-  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  const normalized = stripLeadingUtf8Bom(content);
+  const match = normalized.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
   if (!match) return null;
 
   const yamlContent = match[1];

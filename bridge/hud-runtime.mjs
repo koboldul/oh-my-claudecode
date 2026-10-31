@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 // src/hud/stdin.ts
-import { existsSync as existsSync2, readFileSync as readFileSync2, statSync as statSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2 } from "fs";
-import { dirname as dirname2, join as join3 } from "path";
+import { existsSync as existsSync2, readFileSync as readFileSync2, statSync as statSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, utimesSync } from "fs";
+import { dirname as dirname2 } from "path";
 
 // src/lib/worktree-paths.ts
 import { createHash } from "crypto";
@@ -981,9 +981,13 @@ function resolveSessionStatePath(stateName, sessionId, worktreeRoot) {
   const normalizedName = stateName.endsWith("-state") ? stateName : `${stateName}-state`;
   return resolveOmcPath(`state/sessions/${sessionId}/${normalizedName}.json`, worktreeRoot);
 }
-function resolveSessionStatePaths(stateName, sessionId, worktreeRoot, _opts) {
+function resolveSessionStatePaths(stateName, sessionId, worktreeRoot, opts) {
   const normalizedName = stateName.endsWith("-state") ? stateName : `${stateName}-state`;
-  const legacy = resolveStatePath(stateName, worktreeRoot);
+  const fileName = opts?.fileName ?? `${normalizedName}.json`;
+  if (opts?.fileName !== void 0 && (fileName.trim() !== fileName || !/^[A-Za-z0-9][A-Za-z0-9_-]*\.json$/.test(fileName))) {
+    throw new Error(`Invalid session state filename: ${fileName}`);
+  }
+  const legacy = opts?.fileName ? resolveOmcPath(`state/${fileName}`, worktreeRoot) : resolveStatePath(stateName, worktreeRoot);
   if (!sessionId) {
     return {
       sessionScoped: "",
@@ -993,7 +997,7 @@ function resolveSessionStatePaths(stateName, sessionId, worktreeRoot, _opts) {
     };
   }
   validateSessionId(sessionId);
-  const sessionScoped = resolveOmcPath(`state/sessions/${sessionId}/${normalizedName}.json`, worktreeRoot);
+  const sessionScoped = resolveOmcPath(`state/sessions/${sessionId}/${fileName}`, worktreeRoot);
   const effectiveRead = existsSync(sessionScoped) ? sessionScoped : legacy;
   return {
     sessionScoped,
@@ -1258,7 +1262,7 @@ function validateWorkingDirectory(workingDirectory) {
     } catch {
       throw new Error(`workingDirectory '${workingDirectory}' does not exist or is not accessible.`);
     }
-    if (providedRootReal !== trustedRootReal) {
+    if (!sameCanonicalPath(providedRootReal, trustedRootReal)) {
       console.error("[worktree] workingDirectory resolved to different git worktree root, using trusted root", {
         workingDirectory: resolved,
         providedRoot: providedRootReal,
@@ -1398,37 +1402,66 @@ function normalizeStatuslineStdin(payload) {
 // src/hud/stdin.ts
 var TRANSIENT_CONTEXT_PERCENT_TOLERANCE = 3;
 var SESSION_ID_ENV_VARS = ["CLAUDE_SESSION_ID", "CLAUDECODE_SESSION_ID"];
+var HUD_STDIN_CACHE_STATE_NAME = "hud-stdin-cache";
+var HUD_STDIN_CACHE_FILE_NAME = "hud-stdin-cache.json";
 function normalizeCandidate(value) {
   if (!value) return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
 }
-function getStdinCachePath() {
-  const root = getWorktreeRoot() || process.cwd();
+function getStdinCachePaths(stdin, root = getWorktreeRoot() || process.cwd()) {
   for (const envVar of SESSION_ID_ENV_VARS) {
     const candidate = normalizeCandidate(process.env[envVar]);
     if (!candidate) continue;
     try {
-      return join3(getSessionStateDir(candidate, root), "hud-stdin-cache.json");
+      return resolveSessionStatePaths(HUD_STDIN_CACHE_STATE_NAME, candidate, root, {
+        fileName: HUD_STDIN_CACHE_FILE_NAME
+      });
     } catch {
     }
   }
-  return resolveOmcPath("state/hud-stdin-cache.json", root);
+  const stdinSessionId = stdin ? normalizeCandidate(stdin.session_id) : null;
+  if (stdinSessionId) {
+    try {
+      return resolveSessionStatePaths(HUD_STDIN_CACHE_STATE_NAME, stdinSessionId, root, {
+        fileName: HUD_STDIN_CACHE_FILE_NAME
+      });
+    } catch {
+    }
+  }
+  return resolveSessionStatePaths(HUD_STDIN_CACHE_STATE_NAME, void 0, root, {
+    fileName: HUD_STDIN_CACHE_FILE_NAME
+  });
 }
 function writeStdinCache(stdin) {
   try {
-    const cachePath = getStdinCachePath();
+    const cachePath = getStdinCachePaths(stdin).effectiveWrite;
     const cacheDir = dirname2(cachePath);
     if (!existsSync2(cacheDir)) {
       mkdirSync2(cacheDir, { recursive: true });
     }
-    writeFileSync2(cachePath, JSON.stringify(stdin));
+    const newContent = JSON.stringify(stdin);
+    if (existsSync2(cachePath)) {
+      try {
+        const existingContent = readFileSync2(cachePath, "utf-8");
+        if (existingContent === newContent) {
+          const now = /* @__PURE__ */ new Date();
+          try {
+            utimesSync(cachePath, now, now);
+            return;
+          } catch {
+          }
+        }
+      } catch {
+      }
+    }
+    writeFileSync2(cachePath, newContent);
   } catch {
   }
 }
 function readStdinCache() {
   const root = getWorktreeRoot() || process.cwd();
-  const scopedPath = getStdinCachePath();
+  const paths = getStdinCachePaths(void 0, root);
   const tryRead = (p) => {
     try {
       if (!existsSync2(p)) return null;
@@ -1437,11 +1470,10 @@ function readStdinCache() {
       return null;
     }
   };
-  const legacyPath = resolveOmcPath("state/hud-stdin-cache.json", root);
-  if (scopedPath !== legacyPath) {
-    return tryRead(scopedPath);
+  if (paths.sessionScoped) {
+    return tryRead(paths.sessionScoped);
   }
-  return readMostRecentCache(root, legacyPath);
+  return readMostRecentCache(root, paths.legacy);
 }
 function parseCachedStdin(raw) {
   const parsed = JSON.parse(raw);
@@ -1464,7 +1496,9 @@ function readMostRecentCache(root, legacyPath) {
   for (const sid of sessionIds) {
     let candidate;
     try {
-      candidate = join3(getSessionStateDir(sid, root), "hud-stdin-cache.json");
+      candidate = resolveSessionStatePaths(HUD_STDIN_CACHE_STATE_NAME, sid, root, {
+        fileName: HUD_STDIN_CACHE_FILE_NAME
+      }).sessionScoped;
     } catch {
       continue;
     }
@@ -1626,6 +1660,9 @@ function getModelId(stdin) {
   const modelId = stdin.model?.id?.trim();
   return modelId || null;
 }
+function getEffortLevel(stdin) {
+  return stdin.effort?.level?.trim() || null;
+}
 function getModelName(stdin) {
   const displayName = stdin.model?.display_name?.trim();
   return displayName || getModelId(stdin);
@@ -1712,6 +1749,16 @@ var PERMISSION_TOOLS = [
 ];
 var PERMISSION_THRESHOLD_MS = 3e3;
 var pendingPermissionMap = /* @__PURE__ */ new Map();
+var taskToolStates = /* @__PURE__ */ new WeakMap();
+function getTaskToolState(latestTodos) {
+  let state = taskToolStates.get(latestTodos);
+  if (!state) {
+    state = { pendingCreates: /* @__PURE__ */ new Map(), byId: /* @__PURE__ */ new Map() };
+    taskToolStates.set(latestTodos, state);
+  }
+  return state;
+}
+var TASK_STATUSES = /* @__PURE__ */ new Set(["pending", "in_progress", "completed"]);
 var THINKING_PART_TYPES = ["thinking", "reasoning"];
 var THINKING_RECENCY_MS = 3e4;
 var transcriptCache = /* @__PURE__ */ new Map();
@@ -1907,6 +1954,16 @@ function readTailLines(filePath, fileSize, maxBytes) {
   }
   return lines;
 }
+function extractTaskIdFromTaskCreateResult(content) {
+  let text = "";
+  if (typeof content === "string") {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = content.map((b) => typeof b?.text === "string" ? b.text : "").join("\n");
+  }
+  const match = /Task #([^\s:]+) created/.exec(text);
+  return match ? match[1] : null;
+}
 function extractBackgroundAgentId(content) {
   const text = typeof content === "string" ? content : content.find((c) => c.type === "text")?.text || "";
   const match = text.match(/agentId:\s*([a-zA-Z0-9]+)/);
@@ -2046,6 +2103,7 @@ function processEntry(entry, agentMap, latestTodos, result, maxAgentMapSize = 50
         const input = block.input;
         if (input?.todos && Array.isArray(input.todos)) {
           latestTodos.length = 0;
+          taskToolStates.get(latestTodos)?.byId.clear();
           latestTodos.push(
             ...input.todos.map((t) => ({
               content: t.content,
@@ -2053,6 +2111,33 @@ function processEntry(entry, agentMap, latestTodos, result, maxAgentMapSize = 50
               activeForm: t.activeForm
             }))
           );
+        }
+      } else if (block.name === "TaskCreate" || block.name === "proxy_TaskCreate") {
+        const input = block.input;
+        if (block.id && typeof input?.subject === "string" && input.subject) {
+          getTaskToolState(latestTodos).pendingCreates.set(block.id, {
+            content: input.subject,
+            status: "pending",
+            ...input.activeForm ? { activeForm: input.activeForm } : {}
+          });
+        }
+      } else if (block.name === "TaskUpdate" || block.name === "proxy_TaskUpdate") {
+        const input = block.input;
+        const taskId = input?.taskId == null ? "" : String(input.taskId);
+        const state = getTaskToolState(latestTodos);
+        const item = taskId ? state.byId.get(taskId) : void 0;
+        if (input && item) {
+          if (input.status === "deleted") {
+            const idx = latestTodos.indexOf(item);
+            if (idx >= 0) latestTodos.splice(idx, 1);
+            state.byId.delete(taskId);
+          } else {
+            if (input.status && TASK_STATUSES.has(input.status)) {
+              item.status = input.status;
+            }
+            if (typeof input.subject === "string" && input.subject) item.content = input.subject;
+            if (typeof input.activeForm === "string" && input.activeForm) item.activeForm = input.activeForm;
+          }
         }
       } else if (block.name === "Skill" || block.name === "proxy_Skill") {
         result.skillCallCount++;
@@ -2077,6 +2162,19 @@ function processEntry(entry, agentMap, latestTodos, result, maxAgentMapSize = 50
     }
     if (block.type === "tool_result" && block.tool_use_id) {
       pendingPermissionMap.delete(block.tool_use_id);
+      const taskState = taskToolStates.get(latestTodos);
+      const pendingTask = taskState?.pendingCreates.get(block.tool_use_id);
+      if (taskState && pendingTask) {
+        taskState.pendingCreates.delete(block.tool_use_id);
+        const taskId = block.is_error || !block.content ? null : extractTaskIdFromTaskCreateResult(block.content);
+        if (taskId) {
+          const previous = taskState.byId.get(taskId);
+          const prevIdx = previous ? latestTodos.indexOf(previous) : -1;
+          if (prevIdx >= 0) latestTodos.splice(prevIdx, 1);
+          taskState.byId.set(taskId, pendingTask);
+          latestTodos.push(pendingTask);
+        }
+      }
       const agent = agentMap.get(block.tool_use_id);
       if (agent) {
         const blockContent = block.content;
@@ -2141,7 +2239,7 @@ function getNumericUsageValue(value) {
 
 // src/hud/state.ts
 import { existsSync as existsSync6, readFileSync as readFileSync7, mkdirSync as mkdirSync5, unlinkSync as unlinkSync5 } from "fs";
-import { join as join7 } from "path";
+import { join as join6 } from "path";
 
 // node_modules/jsonc-parser/lib/esm/impl/scanner.js
 var CharacterCodes;
@@ -2317,13 +2415,18 @@ var ParseErrorCode;
   ParseErrorCode2[ParseErrorCode2["InvalidCharacter"] = 16] = "InvalidCharacter";
 })(ParseErrorCode || (ParseErrorCode = {}));
 
+// scripts/lib/utf8-bom.mjs
+function stripLeadingUtf8Bom(content) {
+  return content.startsWith("\uFEFF") ? content.slice(1) : content;
+}
+
 // src/utils/jsonc.ts
 function parseJsonc(content) {
   const cleaned = stripJsoncComments(content);
   return JSON.parse(cleaned);
 }
 function stripJsoncComments(content) {
-  return stripTrailingCommas(stripComments2(content));
+  return stripTrailingCommas(stripComments2(stripLeadingUtf8Bom(content)));
 }
 function stripComments2(content) {
   let result = "";
@@ -2340,7 +2443,9 @@ function stripComments2(content) {
       while (i < content.length && !(content[i] === "*" && content[i + 1] === "/")) {
         i++;
       }
+      if (i >= content.length) throw new SyntaxError("Unterminated JSONC block comment");
       i += 2;
+      result += " ";
       continue;
     }
     if (content[i] === '"') {
@@ -2418,12 +2523,21 @@ import * as path from "path";
 import * as crypto from "crypto";
 
 // src/lib/file-identity.ts
+function fileIdentityOf(stats) {
+  return {
+    dev: BigInt(stats.dev),
+    ino: BigInt(stats.ino)
+  };
+}
 function identitiesEqual(left, right) {
-  if (!left || left.ino !== right.ino) return false;
-  if (left.dev === 0 || right.dev === 0) {
-    return left.ino !== 0 && (process.platform === "win32" || left.dev === right.dev);
+  if (!left) return false;
+  const leftIdentity = fileIdentityOf(left);
+  const rightIdentity = fileIdentityOf(right);
+  if (leftIdentity.ino !== rightIdentity.ino) return false;
+  if (leftIdentity.dev === 0n || rightIdentity.dev === 0n) {
+    return leftIdentity.ino !== 0n && (process.platform === "win32" || leftIdentity.dev === rightIdentity.dev);
   }
-  return left.dev === right.dev;
+  return leftIdentity.dev === rightIdentity.dev;
 }
 
 // src/lib/atomic-write.ts
@@ -2455,15 +2569,15 @@ function writeAllSync(fd, content, label) {
   }
 }
 function verifyPrivateTempFile(fd, tempPath, label, operations) {
-  const fdStats = fsSync.fstatSync(fd);
+  const fdStats = descriptorStats(fd, operations);
   let pathStats;
   try {
-    pathStats = (operations?.lstat ?? fsSync.lstatSync)(tempPath);
+    pathStats = pathnameStats(tempPath, operations);
   } catch {
     throw new Error(`${label} temporary file was replaced before rename`);
   }
   const isWindows2 = process.platform === "win32";
-  const isPrivateRegularSingleLink = (stats) => stats.isFile() && (isWindows2 ? stats.nlink <= 1 : stats.nlink === 1) && (isWindows2 || (stats.mode & 511) === 384);
+  const isPrivateRegularSingleLink = (stats) => stats.isFile() && (isWindows2 ? Number(stats.nlink) <= 1 : Number(stats.nlink) === 1) && (isWindows2 || (Number(stats.mode) & 511) === 384);
   if (!isPrivateRegularSingleLink(fdStats) || !isPrivateRegularSingleLink(pathStats)) {
     throw new Error(
       `${label} temporary file must be a private regular single-link file`
@@ -2474,10 +2588,10 @@ function verifyPrivateTempFile(fd, tempPath, label, operations) {
   }
 }
 function verifyPublishedFile(fd, filePath, label, operations) {
-  const fdStats = fsSync.fstatSync(fd);
+  const fdStats = descriptorStats(fd, operations);
   let pathStats;
   try {
-    pathStats = (operations?.lstat ?? fsSync.lstatSync)(filePath);
+    pathStats = pathnameStats(filePath, operations);
   } catch {
     throw new Error(`${label} target was replaced at publication`);
   }
@@ -2505,18 +2619,22 @@ function preservePriorTarget(filePath, operations) {
     return null;
   }
 }
+function descriptorStats(fd, operations) {
+  return operations ? fsSync.fstatSync(fd) : fsSync.fstatSync(fd, { bigint: true });
+}
+function pathnameStats(filePath, operations) {
+  return operations ? operations.lstat(filePath) : fsSync.lstatSync(filePath, { bigint: true });
+}
 function currentFileIdentity(filePath, operations) {
   try {
-    const stats = (operations?.lstat ?? fsSync.lstatSync)(filePath);
-    return { dev: stats.dev, ino: stats.ino };
+    return fileIdentityOf(pathnameStats(filePath, operations));
   } catch {
     return null;
   }
 }
-function descriptorIdentity(fd) {
+function descriptorIdentity(fd, operations) {
   try {
-    const stats = fsSync.fstatSync(fd);
-    return { dev: stats.dev, ino: stats.ino };
+    return fileIdentityOf(descriptorStats(fd, operations));
   } catch {
     return null;
   }
@@ -2563,7 +2681,7 @@ function atomicWriteFileSync(filePath, content, hooks, operations) {
     let publishedIdentity = null;
     try {
       verifyPublishedFile(fd, filePath, "atomic write", operations);
-      publishedIdentity = descriptorIdentity(fd);
+      publishedIdentity = descriptorIdentity(fd, operations);
       hooks?.afterRename?.();
       verifyPublishedFile(fd, filePath, "atomic write", operations);
     } catch (error) {
@@ -2620,7 +2738,7 @@ var ATOMIC_BATCH_MAX_CONTENT_BYTES = 1024 * 1024;
 
 // src/hud/mission-board.ts
 import { copyFileSync, existsSync as existsSync5, mkdirSync as mkdirSync4, readFileSync as readFileSync6, readdirSync as readdirSync3, renameSync as renameSync2, unlinkSync as unlinkSync4 } from "node:fs";
-import { join as join6 } from "node:path";
+import { join as join5 } from "node:path";
 
 // src/lib/file-lock.ts
 import {
@@ -2639,6 +2757,12 @@ import {
 } from "fs";
 import { randomUUID as randomUUID2 } from "crypto";
 import * as path2 from "path";
+
+// templates/hooks/lib/process-start-identity.mjs
+function normalizeProcessStartIdentity(identity) {
+  const ticks = /^ticks:(\d{1,19})$/.exec(identity);
+  return ticks ? `windows-dmtf-us:${(BigInt(ticks[1]) - 621355968000000000n) / 10n}` : identity;
+}
 
 // src/platform/index.ts
 import { readFileSync as readFileSync4 } from "fs";
@@ -2786,6 +2910,25 @@ function getProcessStartIdentitySync(pid) {
   }
   return identity;
 }
+function dmtfCreationDateToTicks(dmtf) {
+  const m = dmtf.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d{6})([+-])(\d{3})$/);
+  if (!m) return null;
+  const [, ys, mo, ds, hs, mins, ss, us, sign, off] = m;
+  const year = Number(ys), month = Number(mo), day = Number(ds);
+  const hour = Number(hs), minute = Number(mins), second = Number(ss);
+  const micros = Number(us);
+  const offsetMin = Number(off) * (sign === "-" ? -1 : 1);
+  if (![year, month, day, hour, minute, second, micros, offsetMin].every(Number.isFinite)) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) return null;
+  if (offsetMin < -840 || offsetMin > 840) return null;
+  const wholeUtcMs = Date.UTC(year, month - 1, day, hour, minute, second) - offsetMin * 6e4;
+  if (!Number.isFinite(wholeUtcMs)) return null;
+  const localMs = wholeUtcMs + offsetMin * 6e4;
+  const local = new Date(localMs);
+  if (local.getUTCFullYear() !== year || local.getUTCMonth() + 1 !== month || local.getUTCDate() !== day || local.getUTCHours() !== hour || local.getUTCMinutes() !== minute || local.getUTCSeconds() !== second) return null;
+  const ticks = BigInt(wholeUtcMs) * 10000n + BigInt(micros) * 10n + 621355968000000000n;
+  return `ticks:${ticks.toString()}`;
+}
 
 // src/platform/index.ts
 var PLATFORM = process.platform;
@@ -2811,6 +2954,7 @@ var RECLAMATION_GUARD_STALE_MS = 3e4;
 var RECLAMATION_RECOVERY_STALE_MS = 3e4;
 var MAX_LOCK_MTIME_FUTURE_SKEW_MS = 5 * 6e4;
 var RELEASE_GUARD_TIMEOUT_MS = 2e3;
+var WINDOWS_MAX_EPOCH_MICROSECONDS = 253402300799999999n;
 function identityForFd(fd) {
   const stat = fstatSync2(fd);
   return { dev: stat.dev, ino: stat.ino };
@@ -2840,6 +2984,33 @@ function parseObservedLock(raw) {
 function isAuthenticatedOwner(owner) {
   return owner.version === 2 && Number.isSafeInteger(owner.pid) && (owner.pid ?? 0) > 0 && typeof owner.processStartIdentity === "string" && owner.processStartIdentity.length > 0 && typeof owner.nonce === "string" && owner.nonce.length > 0 && Number.isFinite(owner.timestamp);
 }
+function processStartIdentitiesMatch(current, expected) {
+  if (current === expected) return true;
+  const normalize3 = (identity) => {
+    const legacyDmtf = /^dmtf:(.+)$/.exec(identity)?.[1];
+    const source = legacyDmtf ? dmtfCreationDateToTicks(legacyDmtf) : identity;
+    if (!source) return null;
+    const normalized = normalizeProcessStartIdentity(source);
+    const epochMicroseconds = /^windows-dmtf-us:(\d{1,18})$/.exec(normalized)?.[1];
+    if (epochMicroseconds) {
+      const value = BigInt(epochMicroseconds);
+      return value > 0n && value <= WINDOWS_MAX_EPOCH_MICROSECONDS ? `windows-dmtf-us:${value}` : null;
+    }
+    return /^(?:ticks:|windows-dmtf-us:|dmtf:)/.test(identity) ? null : identity;
+  };
+  const normalizedCurrent = normalize3(current);
+  const normalizedExpected = normalize3(expected);
+  if (normalizedCurrent === null || normalizedExpected === null) return null;
+  const currentIsWindows = normalizedCurrent.startsWith("windows-dmtf-us:");
+  const expectedIsWindows = normalizedExpected.startsWith("windows-dmtf-us:");
+  if (currentIsWindows !== expectedIsWindows) return null;
+  const currentExactTicks = /^ticks:(\d{1,19})$/.exec(current)?.[1];
+  const expectedExactTicks = /^ticks:(\d{1,19})$/.exec(expected)?.[1];
+  if (currentExactTicks && expectedExactTicks) {
+    return BigInt(currentExactTicks) === BigInt(expectedExactTicks);
+  }
+  return normalizedCurrent === normalizedExpected;
+}
 function staleLockObservation(lockPath, staleLockMs, requireAuthenticatedOwner = false) {
   try {
     const stat = lstatSync3(lockPath);
@@ -2868,7 +3039,11 @@ function staleLockObservation(lockPath, staleLockMs, requireAuthenticatedOwner =
     const currentStart = getProcessStartIdentitySync(pid);
     if (currentStart === "absent") return observation;
     if (currentStart === null) return null;
-    return currentStart === expectedStart ? null : observation;
+    const matches = processStartIdentitiesMatch(
+      currentStart,
+      expectedStart
+    );
+    return matches === null || matches ? null : observation;
   } catch {
     return null;
   }
@@ -3286,7 +3461,7 @@ function withFileLockSync(lockPath, fn, opts) {
   }
 }
 function sleep(ms) {
-  return new Promise((resolve6) => setTimeout(resolve6, ms));
+  return new Promise((resolve9) => setTimeout(resolve9, ms));
 }
 async function acquireFileLock(lockPath, opts) {
   const staleLockMs = opts?.staleLockMs ?? DEFAULT_STALE_LOCK_MS;
@@ -3374,7 +3549,7 @@ function stringWidth(str) {
 }
 function stripAnsi(str) {
   return str.replace(
-    /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g,
+    /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g,
     ""
   );
 }
@@ -3392,7 +3567,7 @@ function truncateToWidth(str, maxWidth, suffix = "...") {
 function truncateToWidthNoSuffix(str, maxWidth) {
   let width = 0;
   let result = "";
-  for (const char of str) {
+  for (const char of stripAnsi(str)) {
     const charWidth = getCharWidth(char);
     if (width + charWidth > maxWidth) break;
     result += char;
@@ -3533,7 +3708,7 @@ function maybeMigrateLegacyLocked(paths) {
   if (!existsSync5(paths.legacy)) return;
   const sentinel = `${paths.sessionScoped}.migrating.${process.pid}.${Date.now()}`;
   try {
-    const sessionDir = join6(paths.sessionScoped, "..");
+    const sessionDir = join5(paths.sessionScoped, "..");
     if (!existsSync5(sessionDir)) {
       mkdirSync4(sessionDir, { recursive: true });
     }
@@ -3586,7 +3761,7 @@ function withMissionStateLock(lockPath, update) {
 function updateState(directory, sessionId, update) {
   const paths = resolveSessionStatePaths("mission-state", sessionId, directory);
   const writePath = paths.effectiveWrite;
-  const stateDir = join6(writePath, "..");
+  const stateDir = join5(writePath, "..");
   if (!existsSync5(stateDir)) {
     mkdirSync4(stateDir, { recursive: true });
   }
@@ -3638,7 +3813,7 @@ function deriveWorkerStatus(workerStatus, task) {
   return "waiting";
 }
 function collectTeamMission(teamRoot, teamName, config) {
-  const teamConfig = readJsonSafe(join6(teamRoot, "config.json"));
+  const teamConfig = readJsonSafe(join5(teamRoot, "config.json"));
   if (!teamConfig) return null;
   const workers = canonicalizeWorkers((Array.isArray(teamConfig.workers) ? teamConfig.workers : []).map((worker, index) => ({
     name: worker.name ?? "",
@@ -3646,8 +3821,8 @@ function collectTeamMission(teamRoot, teamName, config) {
     role: worker.role ?? "worker",
     assigned_tasks: Array.isArray(worker.assigned_tasks) ? worker.assigned_tasks : []
   }))).workers;
-  const tasksDir = join6(teamRoot, "tasks");
-  const tasks = existsSync5(tasksDir) ? readdirSync3(tasksDir).filter((entry) => /^(?:task-)?\d+\.json$/i.test(entry)).map((entry) => readJsonSafe(join6(tasksDir, entry))).filter((task) => Boolean(task?.id)) : [];
+  const tasksDir = join5(teamRoot, "tasks");
+  const tasks = existsSync5(tasksDir) ? readdirSync3(tasksDir).filter((entry) => /^(?:task-)?\d+\.json$/i.test(entry)).map((entry) => readJsonSafe(join5(tasksDir, entry))).filter((task) => Boolean(task?.id)) : [];
   const taskById = new Map(tasks.map((task) => [task.id, task]));
   const taskCounts = {
     total: tasks.length,
@@ -3658,7 +3833,7 @@ function collectTeamMission(teamRoot, teamName, config) {
     failed: tasks.filter((task) => task.status === "failed").length
   };
   const timeline = [];
-  for (const event of readJsonLinesSafe(join6(teamRoot, "events.jsonl"))) {
+  for (const event of readJsonLinesSafe(join5(teamRoot, "events.jsonl"))) {
     if (!event.created_at || !event.type) continue;
     if (event.type === "task_completed" || event.type === "task_failed") {
       timeline.push({
@@ -3683,7 +3858,7 @@ function collectTeamMission(teamRoot, teamName, config) {
   for (const worker of workers) {
     const workerName = worker.name?.trim();
     if (!workerName) continue;
-    const mailbox = readJsonSafe(join6(teamRoot, "mailbox", `${workerName}.json`));
+    const mailbox = readJsonSafe(join5(teamRoot, "mailbox", `${workerName}.json`));
     for (const message of mailbox?.messages ?? []) {
       if (!message.created_at || !message.body) continue;
       timeline.push({
@@ -3699,8 +3874,8 @@ function collectTeamMission(teamRoot, teamName, config) {
   timeline.sort((left, right) => parseTime(left.at) - parseTime(right.at));
   const agents = workers.slice(0, config.maxAgentsPerMission).map((worker) => {
     const workerName = worker.name?.trim() || "worker";
-    const workerStatus = readJsonSafe(join6(teamRoot, "workers", workerName, "status.json"));
-    const heartbeat = readJsonSafe(join6(teamRoot, "workers", workerName, "heartbeat.json"));
+    const workerStatus = readJsonSafe(join5(teamRoot, "workers", workerName, "status.json"));
+    const heartbeat = readJsonSafe(join5(teamRoot, "workers", workerName, "heartbeat.json"));
     const ownedTasks = tasks.filter((task) => task.owner === workerName);
     const currentTask = (workerStatus?.current_task_id ? taskById.get(workerStatus.current_task_id) : void 0) || ownedTasks.find((task) => task.status === "in_progress") || ownedTasks.find((task) => task.status === "blocked") || (worker.assigned_tasks || []).map((taskId) => taskById.get(taskId)).find(Boolean) || void 0;
     const completedTask = [...ownedTasks].filter((task) => task.status === "completed" || task.status === "failed").sort((left, right) => parseTime(right.completed_at) - parseTime(left.completed_at))[0];
@@ -3755,8 +3930,8 @@ function mergeMissions(previous, teamMissions, config) {
 function refreshMissionBoardState(directory, rawConfig = DEFAULT_CONFIG, sessionId) {
   const effectiveSessionId = sessionId ?? getProcessSessionId();
   const config = resolveConfig(rawConfig);
-  const teamsRoot = join6(getOmcRoot(directory), "state", "team");
-  const teamMissions = existsSync5(teamsRoot) ? readdirSync3(teamsRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => collectTeamMission(join6(teamsRoot, entry.name), entry.name, config)).filter((mission) => Boolean(mission)) : [];
+  const teamsRoot = join5(getOmcRoot(directory), "state", "team");
+  const teamMissions = existsSync5(teamsRoot) ? readdirSync3(teamsRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => collectTeamMission(join5(teamsRoot, entry.name), entry.name, config)).filter((mission) => Boolean(mission)) : [];
   return updateState(directory, effectiveSessionId, (previous) => ({
     updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
     missions: mergeMissions(previous, teamMissions, config)
@@ -3856,6 +4031,7 @@ var DEFAULT_ELEMENT_ORDER = {
   main: [
     "omcLabel",
     "model",
+    "effort",
     "claudeLabel",
     "enterpriseCost",
     "rateLimits",
@@ -3901,6 +4077,8 @@ var DEFAULT_HUD_CONFIG = {
     // Show only when Claude Code statusline stdin provides a model
     modelFormat: "versioned",
     // Preserve model version by default
+    effort: true,
+    // Show effort level when Claude Code statusline stdin provides one
     omcLabel: true,
     updateNotification: true,
     // Preserve existing update prompt behavior by default
@@ -3976,6 +4154,7 @@ var PRESET_CONFIGS = {
     gitInfoPosition: "above",
     model: true,
     modelFormat: "versioned",
+    effort: true,
     omcLabel: true,
     updateNotification: true,
     rateLimits: true,
@@ -4019,6 +4198,7 @@ var PRESET_CONFIGS = {
     gitInfoPosition: "above",
     model: true,
     modelFormat: "versioned",
+    effort: true,
     omcLabel: true,
     updateNotification: true,
     rateLimits: true,
@@ -4063,6 +4243,7 @@ var PRESET_CONFIGS = {
     gitInfoPosition: "above",
     model: true,
     modelFormat: "versioned",
+    effort: true,
     omcLabel: true,
     updateNotification: true,
     rateLimits: true,
@@ -4107,6 +4288,7 @@ var PRESET_CONFIGS = {
     gitInfoPosition: "above",
     model: true,
     modelFormat: "versioned",
+    effort: true,
     omcLabel: true,
     updateNotification: true,
     rateLimits: false,
@@ -4150,6 +4332,7 @@ var PRESET_CONFIGS = {
     gitInfoPosition: "above",
     model: true,
     modelFormat: "versioned",
+    effort: true,
     omcLabel: true,
     updateNotification: true,
     rateLimits: true,
@@ -4229,7 +4412,8 @@ async function cleanupStaleBackgroundTasks(thresholdMs = STALE_TASK_THRESHOLD_MS
   });
   if (state.backgroundTasks.length > 20) {
     const running = state.backgroundTasks.filter((t) => t.status === "running");
-    const nonRunning = state.backgroundTasks.filter((t) => t.status !== "running").slice(-Math.max(0, 20 - running.length));
+    const historyCapacity = Math.max(0, 20 - running.length);
+    const nonRunning = historyCapacity === 0 ? [] : state.backgroundTasks.filter((t) => t.status !== "running").slice(-historyCapacity);
     state.backgroundTasks = [...running, ...nonRunning];
   }
   const removedCount = originalCount - state.backgroundTasks.length;
@@ -4279,12 +4463,12 @@ async function markOrphanedTasksAsStale(directory, sessionId) {
 // src/hud/state.ts
 function getLocalStateFilePath(directory) {
   const baseDir = validateWorkingDirectory(directory);
-  const omcStateDir = join7(getOmcRoot(baseDir), "state");
-  return join7(omcStateDir, "hud-state.json");
+  const omcStateDir = join6(getOmcRoot(baseDir), "state");
+  return join6(omcStateDir, "hud-state.json");
 }
 function getLegacyRootStateFilePath(directory) {
   const baseDir = validateWorkingDirectory(directory);
-  return join7(getOmcRoot(baseDir), "hud-state.json");
+  return join6(getOmcRoot(baseDir), "hud-state.json");
 }
 function getStateFilePath(directory, sessionId) {
   const baseDir = validateWorkingDirectory(directory);
@@ -4294,10 +4478,10 @@ function getStateFilePath(directory, sessionId) {
   return getLocalStateFilePath(baseDir);
 }
 function getSettingsFilePath() {
-  return join7(getClaudeConfigDir(), "settings.json");
+  return join6(getClaudeConfigDir(), "settings.json");
 }
 function getConfigFilePath() {
-  return join7(getClaudeConfigDir(), ".omc", "hud-config.json");
+  return join6(getClaudeConfigDir(), ".omc", "hud-config.json");
 }
 function readJsonFile(filePath) {
   if (!existsSync6(filePath)) {
@@ -4338,7 +4522,7 @@ function mergeMissionBoardConfig(primary, secondary) {
 }
 function ensureStateDir(directory) {
   const baseDir = validateWorkingDirectory(directory);
-  const omcStateDir = join7(getOmcRoot(baseDir), "state");
+  const omcStateDir = join6(getOmcRoot(baseDir), "state");
   if (!existsSync6(omcStateDir)) {
     mkdirSync5(omcStateDir, { recursive: true });
   }
@@ -4530,10 +4714,10 @@ async function initializeHUDState(directory, sessionId) {
 
 // src/hud/omc-state.ts
 import { existsSync as existsSync7, readFileSync as readFileSync8, statSync as statSync4, readdirSync as readdirSync4 } from "fs";
-import { join as join10 } from "path";
+import { join as join9 } from "path";
 
 // src/hooks/autopilot/named-workflow-resume-validator.ts
-import { basename as basename5, join as join9, parse as parse3, relative as relative2, resolve as resolve2, sep as sep3 } from "path";
+import { basename as basename6, join as join8, parse as parse4, relative as relative2, resolve as resolve3, sep as sep3 } from "path";
 
 // src/hooks/autopilot/pipeline.ts
 import { createHash as createHash2 } from "crypto";
@@ -4549,7 +4733,6 @@ var MODE_NAMES = {
   RALPH: "ralph",
   RALPLAN: "ralplan",
   DEEP_INTERVIEW: "deep-interview",
-  MERGE_READINESS: "merge-readiness",
   SELF_IMPROVE: "self-improve"
 };
 var ALL_MODE_NAMES = [
@@ -4559,7 +4742,6 @@ var ALL_MODE_NAMES = [
   MODE_NAMES.RALPH,
   MODE_NAMES.RALPLAN,
   MODE_NAMES.DEEP_INTERVIEW,
-  MODE_NAMES.MERGE_READINESS,
   MODE_NAMES.SELF_IMPROVE
 ];
 var MODE_STATE_FILE_MAP = {
@@ -4569,7 +4751,6 @@ var MODE_STATE_FILE_MAP = {
   [MODE_NAMES.RALPH]: "ralph-state.json",
   [MODE_NAMES.RALPLAN]: "ralplan-state.json",
   [MODE_NAMES.DEEP_INTERVIEW]: "deep-interview-state.json",
-  [MODE_NAMES.MERGE_READINESS]: "merge-readiness-state.json",
   [MODE_NAMES.SELF_IMPROVE]: "self-improve-state.json"
 };
 var SESSION_END_MODE_STATE_FILES = [
@@ -4588,7 +4769,6 @@ var SESSION_METRICS_MODE_FILES = [
   { file: MODE_STATE_FILE_MAP[MODE_NAMES.RALPH], mode: MODE_NAMES.RALPH },
   { file: MODE_STATE_FILE_MAP[MODE_NAMES.RALPLAN], mode: MODE_NAMES.RALPLAN },
   { file: MODE_STATE_FILE_MAP[MODE_NAMES.DEEP_INTERVIEW], mode: MODE_NAMES.DEEP_INTERVIEW },
-  { file: MODE_STATE_FILE_MAP[MODE_NAMES.MERGE_READINESS], mode: MODE_NAMES.MERGE_READINESS },
   { file: MODE_STATE_FILE_MAP[MODE_NAMES.SELF_IMPROVE], mode: MODE_NAMES.SELF_IMPROVE }
 ];
 
@@ -4660,13 +4840,61 @@ var KNOWN_AGENT_NAMES = [
   "documentSpecialist"
 ];
 
+// src/utils/semver-compare.ts
+function parseVersion(version) {
+  const withoutBuild = version.replace(/^v/, "").split("+", 1)[0];
+  const hyphen = withoutBuild.indexOf("-");
+  const coreText = hyphen === -1 ? withoutBuild : withoutBuild.slice(0, hyphen);
+  const prereleaseText = hyphen === -1 ? "" : withoutBuild.slice(hyphen + 1);
+  const parts = coreText.split(".").map((part) => {
+    const match = part.match(/^(\d+)/);
+    return match ? match[1] : "0";
+  });
+  return {
+    core: [parts[0] ?? "0", parts[1] ?? "0", parts[2] ?? "0"],
+    prerelease: prereleaseText === "" ? [] : prereleaseText.split(".")
+  };
+}
+function comparePrereleaseIdentifier(a, b) {
+  const aNumeric = /^\d+$/.test(a);
+  const bNumeric = /^\d+$/.test(b);
+  if (aNumeric && bNumeric) {
+    const aDigits = a.replace(/^0+(?=\d)/, "");
+    const bDigits = b.replace(/^0+(?=\d)/, "");
+    if (aDigits.length !== bDigits.length) {
+      return aDigits.length < bDigits.length ? -1 : 1;
+    }
+    return aDigits < bDigits ? -1 : aDigits > bDigits ? 1 : 0;
+  }
+  if (aNumeric) return -1;
+  if (bNumeric) return 1;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+function comparePrerelease(a, b) {
+  if (a.length === 0 && b.length === 0) return 0;
+  if (a.length === 0) return 1;
+  if (b.length === 0) return -1;
+  for (let i = 0; i < Math.min(a.length, b.length); i += 1) {
+    const delta = comparePrereleaseIdentifier(a[i], b[i]);
+    if (delta !== 0) return delta < 0 ? -1 : 1;
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+function compareVersions(a, b) {
+  const parsedA = parseVersion(a);
+  const parsedB = parseVersion(b);
+  for (let i = 0; i < 3; i += 1) {
+    const delta = comparePrereleaseIdentifier(parsedA.core[i], parsedB.core[i]);
+    if (delta !== 0) return delta < 0 ? -1 : 1;
+  }
+  return comparePrerelease(parsedA.prerelease, parsedB.prerelease);
+}
+
+// src/utils/plugin-cache-validation.ts
+import { basename as basename5, dirname as dirname5, isAbsolute as isAbsolute2, join as join7, parse as parse3, resolve as resolve2 } from "path";
+var PLUGIN_ROOT_REQUIREMENTS = [join7("hooks", "hooks.json"), join7("scripts", "run.cjs"), "scripts"];
+
 // src/utils/paths.ts
-import { join as join8, dirname as dirname5 } from "path";
-var PLUGIN_ROOT_REQUIREMENTS = [
-  join8("hooks", "hooks.json"),
-  join8("scripts", "run.cjs"),
-  "scripts"
-];
 var OCCUPIED_CODES = new Set(
   process.platform === "win32" ? ["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR", "EPERM", "EACCES"] : ["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR"]
 );
@@ -4690,10 +4918,14 @@ var BLOCKED_HOST_PATTERNS = [
   // Multicast, reserved
   /^\[?::1\]?$/,
   // IPv6 loopback
-  /^\[?fc00:/i,
-  // IPv6 unique local
-  /^\[?fe80:/i,
-  // IPv6 link-local
+  /^\[?f[cd][0-9a-f]{2}:/i,
+  // IPv6 unique local FC00::/7 (RFC 4193)
+  /^\[?fe[89ab][0-9a-f]:/i,
+  // IPv6 link-local FE80::/10 (RFC 4291)
+  /^\[?::\]?$/,
+  // IPv6 unspecified
+  /^\[?ff[0-9a-f]{2}:/i,
+  // IPv6 multicast FF00::/8
   /^\[?::ffff:/i,
   // IPv6-mapped IPv4 (all private ranges accessible via this prefix)
   /^\[?0{0,4}:{0,2}ffff:/i
@@ -5052,11 +5284,6 @@ var MODE_CONFIGS = {
     stateFile: MODE_STATE_FILE_MAP[MODE_NAMES.DEEP_INTERVIEW],
     activeProperty: "active"
   },
-  [MODE_NAMES.MERGE_READINESS]: {
-    name: "Merge Readiness",
-    stateFile: MODE_STATE_FILE_MAP[MODE_NAMES.MERGE_READINESS],
-    activeProperty: "active"
-  },
   [MODE_NAMES.SELF_IMPROVE]: {
     name: "Self Improve",
     stateFile: MODE_STATE_FILE_MAP[MODE_NAMES.SELF_IMPROVE],
@@ -5086,7 +5313,6 @@ var RESERVED_WORKFLOW_NAMES = /* @__PURE__ */ new Set([
   "qa",
   "autoresearch",
   "ultraqa",
-  "merge-readiness",
   "self-improve",
   "ultrawork",
   "ultragoal",
@@ -5220,7 +5446,7 @@ function validBoundaryShape(value, sessionId) {
     "sessionId",
     "byteOffset",
     "fileIdentity"
-  ]) || typeof sessionId !== "string" || value.sessionId !== sessionId || typeof value.transcriptRoot !== "string" || resolve2(value.transcriptRoot) !== value.transcriptRoot || typeof value.transcriptPath !== "string" || resolve2(value.transcriptPath) !== value.transcriptPath || basename5(value.transcriptPath) !== `${sessionId}.jsonl` || value.transcriptBasename !== `${sessionId}.jsonl` || !safeInteger(value.byteOffset) || !validFileIdentity(value.fileIdentity) || value.fileIdentity.size !== value.byteOffset)
+  ]) || typeof sessionId !== "string" || value.sessionId !== sessionId || typeof value.transcriptRoot !== "string" || resolve3(value.transcriptRoot) !== value.transcriptRoot || typeof value.transcriptPath !== "string" || resolve3(value.transcriptPath) !== value.transcriptPath || basename6(value.transcriptPath) !== `${sessionId}.jsonl` || value.transcriptBasename !== `${sessionId}.jsonl` || !safeInteger(value.byteOffset) || !validFileIdentity(value.fileIdentity) || value.fileIdentity.size !== value.byteOffset)
     return false;
   const relativePath = relative2(value.transcriptRoot, value.transcriptPath);
   return relativePath.length > 0 && relativePath !== ".." && !relativePath.startsWith(`..${sep3}`);
@@ -5284,18 +5510,18 @@ function isStateFileStale(filePath) {
 function resolveStatePath2(directory, filename, sessionId) {
   const omcRoot = getOmcRoot(directory);
   if (sessionId) {
-    const sessionPath = join10(omcRoot, "state", "sessions", sessionId, filename);
+    const sessionPath = join9(omcRoot, "state", "sessions", sessionId, filename);
     return existsSync7(sessionPath) ? sessionPath : null;
   }
   let bestPath = null;
   let bestMtime = 0;
-  const sessionsDir = join10(omcRoot, "state", "sessions");
+  const sessionsDir = join9(omcRoot, "state", "sessions");
   if (existsSync7(sessionsDir)) {
     try {
       const entries = readdirSync4(sessionsDir, { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
-        const sessionFile = join10(sessionsDir, entry.name, filename);
+        const sessionFile = join9(sessionsDir, entry.name, filename);
         if (existsSync7(sessionFile)) {
           try {
             const mtime = statSync4(sessionFile).mtimeMs;
@@ -5310,7 +5536,7 @@ function resolveStatePath2(directory, filename, sessionId) {
     } catch {
     }
   }
-  const newPath = join10(omcRoot, "state", filename);
+  const newPath = join9(omcRoot, "state", filename);
   if (existsSync7(newPath)) {
     try {
       const mtime = statSync4(newPath).mtimeMs;
@@ -5322,7 +5548,7 @@ function resolveStatePath2(directory, filename, sessionId) {
       if (!bestPath) bestPath = newPath;
     }
   }
-  const legacyPath = join10(omcRoot, filename);
+  const legacyPath = join9(omcRoot, filename);
   if (existsSync7(legacyPath)) {
     try {
       const mtime = statSync4(legacyPath).mtimeMs;
@@ -5361,9 +5587,9 @@ function readRalphStateForHud(directory, sessionId) {
   }
 }
 function readPrdStateForHud(directory) {
-  let prdPath = join10(directory, "prd.json");
+  let prdPath = join9(directory, "prd.json");
   if (!existsSync7(prdPath)) {
-    prdPath = join10(getOmcRoot(directory), "prd.json");
+    prdPath = join9(getOmcRoot(directory), "prd.json");
     if (!existsSync7(prdPath)) {
       return null;
     }
@@ -5448,7 +5674,7 @@ function readAutopilotStateForHud(directory, sessionId) {
 
 // src/hud/usage-api.ts
 import { existsSync as existsSync8, readFileSync as readFileSync9, writeFileSync as writeFileSync3, renameSync as renameSync3, unlinkSync as unlinkSync6, mkdirSync as mkdirSync6 } from "fs";
-import { join as join11, dirname as dirname6 } from "path";
+import { join as join10, dirname as dirname6 } from "path";
 import { execFileSync as execFileSync3 } from "child_process";
 import { createHash as createHash3 } from "crypto";
 import { userInfo } from "os";
@@ -5461,7 +5687,11 @@ var MAX_STALE_DATA_MS = 15 * 60 * 1e3;
 var TOKEN_REFRESH_URL_HOSTNAME = "platform.claude.com";
 var USAGE_CACHE_LOCK_OPTS = { staleLockMs: API_TIMEOUT_MS + 5e3 };
 var TOKEN_REFRESH_URL_PATH = "/v1/oauth/token";
+var OMC_USAGE_PROFILE_ID_FIELD = "omcUsageProfileId";
+var OMC_USAGE_PROFILE_TOKEN_HASH_FIELD = "omcUsageProfileTokenHash";
 var DEFAULT_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+var storedCredentialCache;
+var storedCredentialLookupGeneration = 0;
 function isEnterpriseUsageContext(options) {
   if (!options) return true;
   const subscriptionType = options.subscriptionType?.toLowerCase() ?? null;
@@ -5500,10 +5730,10 @@ function isKimiHost(urlString) {
 var KIMI_USAGE_HOSTNAMES = /* @__PURE__ */ new Set(["api.kimi.com", "kimi.com"]);
 var KIMI_USAGE_PATH = "/coding/v1/usages";
 function getLegacyCachePath() {
-  return join11(getClaudeConfigDir(), "plugins", "oh-my-claudecode", ".usage-cache.json");
+  return join10(getClaudeConfigDir(), "plugins", "oh-my-claudecode", ".usage-cache.json");
 }
 function getCachePath(source) {
-  return join11(getClaudeConfigDir(), "plugins", "oh-my-claudecode", `.usage-cache-${source}.json`);
+  return join10(getClaudeConfigDir(), "plugins", "oh-my-claudecode", `.usage-cache-${source}.json`);
 }
 function migrateLegacyCache(source) {
   try {
@@ -5639,11 +5869,125 @@ function clearRateLimitBackoff(cache, rateLimitIdentity) {
   delete backoffs[rateLimitIdentity ?? "anonymous"];
   return Object.keys(backoffs).length > 0 ? backoffs : void 0;
 }
-function getCredentialCacheIdentity(accessToken) {
-  return createHash3("sha256").update(accessToken).digest("hex");
+function hashCredentialIdentity(identity) {
+  return createHash3("sha256").update(identity).digest("hex");
+}
+function getOAuthAccountProfileIdentity(credentials) {
+  const nestedAccount = credentials.oauthAccount;
+  const account = typeof nestedAccount === "object" && nestedAccount !== null && !Array.isArray(nestedAccount) ? nestedAccount : {};
+  const firstString = (...values) => {
+    for (const value of values) {
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return void 0;
+  };
+  const credentialUuid = firstString(
+    credentials.accountUuid,
+    credentials.accountUUID,
+    account.accountUuid,
+    account.accountUUID,
+    account.uuid
+  );
+  if (credentialUuid) {
+    return hashCredentialIdentity(JSON.stringify(["oauth-account-uuid", credentialUuid.toLowerCase()]));
+  }
+  const credentialAccountId = firstString(
+    credentials.accountId,
+    credentials.userId,
+    credentials.userID,
+    account.accountId,
+    account.userId,
+    account.userID
+  );
+  const credentialEmail = firstString(
+    credentials.emailAddress,
+    credentials.email,
+    account.emailAddress,
+    account.email
+  );
+  let claudeJsonAccount = {};
+  const configDir = getClaudeConfigDir();
+  const claudeJsonPaths = /* @__PURE__ */ new Set([
+    join10(configDir, ".claude.json"),
+    join10(dirname6(configDir), ".claude.json")
+  ]);
+  for (const claudeJsonPath of claudeJsonPaths) {
+    let parsed;
+    try {
+      if (!existsSync8(claudeJsonPath)) continue;
+      parsed = JSON.parse(readFileSync9(claudeJsonPath, "utf-8"));
+    } catch {
+      return null;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+    const accountMetadata = parsed.oauthAccount;
+    if (accountMetadata == null) continue;
+    if (typeof accountMetadata === "object" && !Array.isArray(accountMetadata)) {
+      const candidate = accountMetadata;
+      if (firstString(
+        candidate.accountUuid,
+        candidate.accountUUID,
+        candidate.uuid,
+        candidate.accountId,
+        candidate.userId,
+        candidate.userID,
+        candidate.emailAddress,
+        candidate.email
+      )) {
+        claudeJsonAccount = candidate;
+        break;
+      }
+    } else {
+      return null;
+    }
+  }
+  const accountUuid = firstString(
+    claudeJsonAccount.accountUuid,
+    claudeJsonAccount.accountUUID,
+    claudeJsonAccount.uuid
+  );
+  const claudeJsonAccountId = firstString(
+    claudeJsonAccount.accountId,
+    claudeJsonAccount.userId,
+    claudeJsonAccount.userID
+  );
+  const claudeJsonEmail = firstString(claudeJsonAccount.emailAddress, claudeJsonAccount.email);
+  if (accountUuid) {
+    if (credentialAccountId) return null;
+    if (credentialEmail && (!claudeJsonEmail || credentialEmail.toLowerCase() !== claudeJsonEmail.toLowerCase())) {
+      return null;
+    }
+    return hashCredentialIdentity(JSON.stringify(["oauth-account-uuid", accountUuid.toLowerCase()]));
+  }
+  if (claudeJsonAccountId && credentialAccountId) {
+    if (claudeJsonAccountId !== credentialAccountId) return null;
+    return hashCredentialIdentity(JSON.stringify(["oauth-account", credentialAccountId]));
+  }
+  if (claudeJsonAccountId && credentialEmail || credentialAccountId && claudeJsonEmail) {
+    return null;
+  }
+  const accountId = credentialAccountId ?? claudeJsonAccountId;
+  if (accountId) return hashCredentialIdentity(JSON.stringify(["oauth-account", accountId]));
+  if (credentialEmail && claudeJsonEmail && credentialEmail.toLowerCase() !== claudeJsonEmail.toLowerCase()) {
+    return null;
+  }
+  const tokenMaterial = firstString(credentials.refreshToken, credentials.accessToken);
+  const tokenHash = tokenMaterial ? hashCredentialIdentity(tokenMaterial) : void 0;
+  const storedProfileIdentity = firstString(credentials[OMC_USAGE_PROFILE_ID_FIELD]);
+  const storedTokenHash = firstString(credentials[OMC_USAGE_PROFILE_TOKEN_HASH_FIELD]);
+  if (storedProfileIdentity && tokenHash && storedTokenHash === tokenHash) {
+    return storedProfileIdentity;
+  }
+  const emailAddress = credentialEmail ?? claudeJsonEmail;
+  if (emailAddress) {
+    return hashCredentialIdentity(JSON.stringify(["oauth-email", emailAddress.toLowerCase()]));
+  }
+  return tokenHash ?? null;
 }
 function isCacheForCredential(cache, credentialIdentity) {
-  return cache?.credentialIdentity === credentialIdentity;
+  if (!cache) return false;
+  if (credentialIdentity !== void 0) return cache.credentialIdentity === credentialIdentity;
+  return cache.credentialIdentity === void 0 && cache.data === null;
 }
 function isCacheValid(cache, pollIntervalMs, rateLimitIdentity) {
   if (cache.source === "anthropic") {
@@ -5737,6 +6081,14 @@ function getKeychainServiceName() {
 function isCredentialExpired(creds) {
   return creds.expiresAt != null && creds.expiresAt <= Date.now();
 }
+function isMissingKeychainItem(error) {
+  if (typeof error !== "object" || error === null) return false;
+  const details = error;
+  return /the specified item could not be found in the keychain/i.test(
+    `${String(details.message ?? "")}
+${String(details.stderr ?? "")}`
+  );
+}
 function readKeychainCredential(serviceName, account) {
   try {
     const args = account ? ["find-generic-password", "-s", serviceName, "-a", account, "-w"] : ["find-generic-password", "-s", serviceName, "-w"];
@@ -5745,25 +6097,31 @@ function readKeychainCredential(serviceName, account) {
       timeout: 2e3,
       stdio: ["pipe", "pipe", "pipe"]
     }).trim();
-    if (!result) return null;
+    if (!result) return { status: "unavailable" };
     const parsed = JSON.parse(result);
     const creds = parsed.claudeAiOauth || parsed;
-    if (!creds.accessToken) return null;
+    if (!creds.accessToken) return { status: "unavailable" };
+    const profileIdentity = getOAuthAccountProfileIdentity(creds);
     return {
-      accessToken: creds.accessToken,
-      expiresAt: creds.expiresAt,
-      refreshToken: creds.refreshToken,
-      source: "keychain",
-      keychainAccount: account ?? null,
-      subscriptionType: creds.subscriptionType,
-      rateLimitTier: creds.rateLimitTier
+      status: "found",
+      credentials: {
+        accessToken: creds.accessToken,
+        expiresAt: creds.expiresAt,
+        refreshToken: creds.refreshToken,
+        profileIdentity: profileIdentity ?? void 0,
+        profileIdentityUnavailable: profileIdentity === null,
+        source: "keychain",
+        keychainAccount: account ?? null,
+        subscriptionType: creds.subscriptionType,
+        rateLimitTier: creds.rateLimitTier
+      }
     };
-  } catch {
-    return null;
+  } catch (error) {
+    return isMissingKeychainItem(error) ? { status: "missing" } : { status: "unavailable" };
   }
 }
 function readKeychainCredentials() {
-  if (process.platform !== "darwin") return null;
+  if (process.platform !== "darwin") return { status: "missing" };
   const serviceName = getKeychainServiceName();
   const candidateAccounts = [];
   try {
@@ -5776,27 +6134,36 @@ function readKeychainCredentials() {
   candidateAccounts.push(void 0);
   let expiredFallback = null;
   for (const account of candidateAccounts) {
-    const creds = readKeychainCredential(serviceName, account);
-    if (!creds) continue;
+    const result = readKeychainCredential(serviceName, account);
+    if (result.status === "unavailable") {
+      if (expiredFallback) return { status: "found", credentials: expiredFallback };
+      return result;
+    }
+    if (result.status === "missing") continue;
+    const creds = result.credentials;
     if (!isCredentialExpired(creds)) {
-      return creds;
+      return result;
     }
     expiredFallback ??= creds;
   }
-  return expiredFallback;
+  if (expiredFallback) return { status: "found", credentials: expiredFallback };
+  return { status: "missing" };
 }
 function readFileCredentials() {
   try {
-    const credPath = join11(getClaudeConfigDir(), ".credentials.json");
+    const credPath = join10(getClaudeConfigDir(), ".credentials.json");
     if (!existsSync8(credPath)) return null;
     const content = readFileSync9(credPath, "utf-8");
     const parsed = JSON.parse(content);
     const creds = parsed.claudeAiOauth || parsed;
     if (creds.accessToken) {
+      const profileIdentity = getOAuthAccountProfileIdentity(creds);
       return {
         accessToken: creds.accessToken,
         expiresAt: creds.expiresAt,
         refreshToken: creds.refreshToken,
+        profileIdentity: profileIdentity ?? void 0,
+        profileIdentityUnavailable: profileIdentity === null,
         source: "file",
         subscriptionType: creds.subscriptionType,
         rateLimitTier: creds.rateLimitTier
@@ -5806,14 +6173,67 @@ function readFileCredentials() {
   }
   return null;
 }
-function getCredentials() {
-  const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
+function getStoredCredentialCacheKey() {
+  return JSON.stringify([process.env.CLAUDE_CONFIG_DIR ?? null, getClaudeConfigDir()]);
+}
+function getStoredCredentials(refresh = false) {
+  const configKey = getStoredCredentialCacheKey();
+  if (!refresh && storedCredentialCache?.configKey === configKey && Date.now() - storedCredentialCache.checkedAt < getUsagePollIntervalMs() + CACHE_TTL_FAILURE_MS) {
+    return storedCredentialCache.credentials;
+  }
+  const keychainLookup = readKeychainCredentials();
+  let credentials = null;
+  if (keychainLookup.status === "found") {
+    credentials = keychainLookup.credentials;
+  } else if (keychainLookup.status === "missing") {
+    credentials = readFileCredentials();
+  }
+  storedCredentialCache = { configKey, checkedAt: Date.now(), credentials };
+  storedCredentialLookupGeneration++;
+  return credentials;
+}
+function rememberStoredCredentials(credentials) {
+  storedCredentialCache = {
+    configKey: getStoredCredentialCacheKey(),
+    checkedAt: Date.now(),
+    credentials
+  };
+}
+function getCredentials(includeDirectOAuthToken = true, refreshStoredCredentials = false) {
+  const envToken = includeDirectOAuthToken ? process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim() : void 0;
   if (envToken) {
     return { accessToken: envToken, source: "env" };
   }
-  const keychainCreds = readKeychainCredentials();
-  if (keychainCreds) return keychainCreds;
-  return readFileCredentials();
+  return getStoredCredentials(refreshStoredCredentials);
+}
+function resolveUsageProfile(includeEnvironmentCredentials = true, refreshStoredCredentials = false) {
+  const baseUrl = includeEnvironmentCredentials ? process.env.ANTHROPIC_BASE_URL : void 0;
+  const authToken = includeEnvironmentCredentials ? process.env.ANTHROPIC_AUTH_TOKEN : void 0;
+  const isMinimax = baseUrl != null && isMinimaxHost(baseUrl);
+  const isKimi = baseUrl != null && isKimiHost(baseUrl);
+  const isZai = baseUrl != null && isZaiHost(baseUrl);
+  const minimaxApiKey = includeEnvironmentCredentials ? process.env.MINIMAX_API_KEY || authToken : void 0;
+  const kimiApiKey = includeEnvironmentCredentials ? process.env.KIMI_API_KEY || process.env.ANTHROPIC_API_KEY || authToken : void 0;
+  const currentSource = isMinimax ? "minimax" : isKimi ? "kimi" : isZai && authToken ? "zai" : "anthropic";
+  const previousLookupGeneration = storedCredentialLookupGeneration;
+  const credentials = currentSource === "anthropic" ? getCredentials(includeEnvironmentCredentials, refreshStoredCredentials) : null;
+  const providerCredential = currentSource === "minimax" ? minimaxApiKey : currentSource === "kimi" ? kimiApiKey : currentSource === "zai" ? authToken : void 0;
+  const credentialIdentity = credentials ? credentials.profileIdentityUnavailable ? void 0 : hashCredentialIdentity(JSON.stringify([
+    currentSource,
+    baseUrl ?? null,
+    credentials.profileIdentity ?? hashCredentialIdentity(
+      credentials.refreshToken ?? credentials.accessToken
+    )
+  ])) : providerCredential ? hashCredentialIdentity(JSON.stringify([currentSource, baseUrl ?? null, providerCredential])) : void 0;
+  return {
+    currentSource,
+    authToken,
+    minimaxApiKey,
+    kimiApiKey,
+    credentials,
+    credentialIdentity,
+    storedCredentialsRead: storedCredentialLookupGeneration !== previousLookupGeneration
+  };
 }
 function getSubscriptionInfo() {
   try {
@@ -5831,7 +6251,7 @@ function validateCredentials(creds) {
   return !isCredentialExpired(creds);
 }
 function refreshAccessToken(refreshToken) {
-  return new Promise((resolve6) => {
+  return new Promise((resolve9) => {
     const clientId = process.env.CLAUDE_CODE_OAUTH_CLIENT_ID || DEFAULT_OAUTH_CLIENT_ID;
     const body = new URLSearchParams({
       grant_type: "refresh_token",
@@ -5859,7 +6279,7 @@ function refreshAccessToken(refreshToken) {
             try {
               const parsed = JSON.parse(data);
               if (parsed.access_token) {
-                resolve6({
+                resolve9({
                   accessToken: parsed.access_token,
                   refreshToken: parsed.refresh_token || refreshToken,
                   expiresAt: parsed.expires_in ? Date.now() + parsed.expires_in * 1e3 : parsed.expires_at
@@ -5872,14 +6292,14 @@ function refreshAccessToken(refreshToken) {
           if (process.env.OMC_DEBUG) {
             console.error(`[usage-api] Token refresh failed: HTTP ${res.statusCode}`);
           }
-          resolve6(null);
+          resolve9(null);
         });
       }
     );
-    req.on("error", () => resolve6(null));
+    req.on("error", () => resolve9(null));
     req.on("timeout", () => {
       req.destroy();
-      resolve6(null);
+      resolve9(null);
     });
     req.end(body);
   });
@@ -5892,7 +6312,7 @@ function buildUserAgent(clientVersion) {
 }
 function fetchUsageFromApi(accessToken, clientVersion) {
   const userAgent = buildUserAgent(clientVersion);
-  return new Promise((resolve6) => {
+  return new Promise((resolve9) => {
     const req = https.request(
       {
         hostname: "api.anthropic.com",
@@ -5914,27 +6334,27 @@ function fetchUsageFromApi(accessToken, clientVersion) {
         res.on("end", () => {
           if (res.statusCode === 200) {
             try {
-              resolve6({ data: JSON.parse(data) });
+              resolve9({ data: JSON.parse(data) });
             } catch {
-              resolve6({ data: null });
+              resolve9({ data: null });
             }
           } else if (res.statusCode === 429) {
             if (process.env.OMC_DEBUG) {
               console.error(`[usage-api] Anthropic API returned 429 (rate limited)`);
             }
-            resolve6({ data: null, rateLimited: true });
+            resolve9({ data: null, rateLimited: true });
           } else if (res.statusCode === 403) {
-            fetchUsageViaRateLimitHeaders(accessToken, clientVersion).then(resolve6);
+            fetchUsageViaRateLimitHeaders(accessToken, clientVersion).then(resolve9);
           } else {
-            resolve6({ data: null });
+            resolve9({ data: null });
           }
         });
       }
     );
-    req.on("error", () => resolve6({ data: null }));
+    req.on("error", () => resolve9({ data: null }));
     req.on("timeout", () => {
       req.destroy();
-      resolve6({ data: null });
+      resolve9({ data: null });
     });
     req.end();
   });
@@ -5978,7 +6398,7 @@ function fetchUsageViaRateLimitHeaders(accessToken, clientVersion) {
     max_tokens: 1,
     messages: [{ role: "user", content: "." }]
   });
-  return new Promise((resolve6) => {
+  return new Promise((resolve9) => {
     const req = https.request(
       {
         hostname: "api.anthropic.com",
@@ -5999,34 +6419,34 @@ function fetchUsageViaRateLimitHeaders(accessToken, clientVersion) {
         });
         res.on("end", () => {
           if (res.statusCode === 200) {
-            resolve6({ data: rateLimitHeadersToUsage(res.headers) });
+            resolve9({ data: rateLimitHeadersToUsage(res.headers) });
           } else {
-            resolve6({ data: null, rateLimited: res.statusCode === 429 });
+            resolve9({ data: null, rateLimited: res.statusCode === 429 });
           }
         });
       }
     );
-    req.on("error", () => resolve6({ data: null }));
+    req.on("error", () => resolve9({ data: null }));
     req.on("timeout", () => {
       req.destroy();
-      resolve6({ data: null });
+      resolve9({ data: null });
     });
     req.write(body);
     req.end();
   });
 }
 function fetchUsageFromZai() {
-  return new Promise((resolve6) => {
+  return new Promise((resolve9) => {
     const baseUrl = process.env.ANTHROPIC_BASE_URL;
     const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
     if (!baseUrl || !authToken) {
-      resolve6({ data: null });
+      resolve9({ data: null });
       return;
     }
     const validation = validateAnthropicBaseUrl(baseUrl);
     if (!validation.allowed) {
       console.error(`[SSRF Guard] Blocking usage API call: ${validation.reason}`);
-      resolve6({ data: null });
+      resolve9({ data: null });
       return;
     }
     try {
@@ -6054,29 +6474,29 @@ function fetchUsageFromZai() {
           res.on("end", () => {
             if (res.statusCode === 200) {
               try {
-                resolve6({ data: JSON.parse(data) });
+                resolve9({ data: JSON.parse(data) });
               } catch {
-                resolve6({ data: null });
+                resolve9({ data: null });
               }
             } else if (res.statusCode === 429) {
               if (process.env.OMC_DEBUG) {
                 console.error(`[usage-api] z.ai API returned 429 (rate limited)`);
               }
-              resolve6({ data: null, rateLimited: true });
+              resolve9({ data: null, rateLimited: true });
             } else {
-              resolve6({ data: null });
+              resolve9({ data: null });
             }
           });
         }
       );
-      req.on("error", () => resolve6({ data: null }));
+      req.on("error", () => resolve9({ data: null }));
       req.on("timeout", () => {
         req.destroy();
-        resolve6({ data: null });
+        resolve9({ data: null });
       });
       req.end();
     } catch {
-      resolve6({ data: null });
+      resolve9({ data: null });
     }
   });
 }
@@ -6098,13 +6518,9 @@ function writeKeychainCredentials(creds) {
     }
     if (existing.claudeAiOauth && typeof existing.claudeAiOauth === "object") {
       const inner = existing.claudeAiOauth;
-      inner.accessToken = creds.accessToken;
-      if (creds.expiresAt != null) inner.expiresAt = creds.expiresAt;
-      if (creds.refreshToken) inner.refreshToken = creds.refreshToken;
+      updateStoredOAuthCredentialFields(inner, creds);
     } else {
-      existing.accessToken = creds.accessToken;
-      if (creds.expiresAt != null) existing.expiresAt = creds.expiresAt;
-      if (creds.refreshToken) existing.refreshToken = creds.refreshToken;
+      updateStoredOAuthCredentialFields(existing, creds);
     }
     const newJson = JSON.stringify(existing);
     const writeArgs = account ? ["add-generic-password", "-s", serviceName, "-a", account, "-w", newJson, "-U"] : ["add-generic-password", "-s", serviceName, "-w", newJson, "-U"];
@@ -6119,6 +6535,17 @@ function writeKeychainCredentials(creds) {
     }
   }
 }
+function updateStoredOAuthCredentialFields(record, creds) {
+  record.accessToken = creds.accessToken;
+  if (creds.expiresAt != null) record.expiresAt = creds.expiresAt;
+  if (creds.refreshToken) record.refreshToken = creds.refreshToken;
+  if (creds.profileIdentity) {
+    record[OMC_USAGE_PROFILE_ID_FIELD] = creds.profileIdentity;
+    record[OMC_USAGE_PROFILE_TOKEN_HASH_FIELD] = hashCredentialIdentity(
+      creds.refreshToken ?? creds.accessToken
+    );
+  }
+}
 function writeBackCredentials(creds) {
   if (creds.source === "keychain") {
     writeKeychainCredentials(creds);
@@ -6126,26 +6553,14 @@ function writeBackCredentials(creds) {
   }
   if (creds.source === "env") return;
   try {
-    const credPath = join11(getClaudeConfigDir(), ".credentials.json");
+    const credPath = join10(getClaudeConfigDir(), ".credentials.json");
     if (!existsSync8(credPath)) return;
     const content = readFileSync9(credPath, "utf-8");
     const parsed = JSON.parse(content);
     if (parsed.claudeAiOauth) {
-      parsed.claudeAiOauth.accessToken = creds.accessToken;
-      if (creds.expiresAt != null) {
-        parsed.claudeAiOauth.expiresAt = creds.expiresAt;
-      }
-      if (creds.refreshToken) {
-        parsed.claudeAiOauth.refreshToken = creds.refreshToken;
-      }
+      updateStoredOAuthCredentialFields(parsed.claudeAiOauth, creds);
     } else {
-      parsed.accessToken = creds.accessToken;
-      if (creds.expiresAt != null) {
-        parsed.expiresAt = creds.expiresAt;
-      }
-      if (creds.refreshToken) {
-        parsed.refreshToken = creds.refreshToken;
-      }
+      updateStoredOAuthCredentialFields(parsed, creds);
     }
     const tmpPath = `${credPath}.tmp.${process.pid}`;
     try {
@@ -6347,16 +6762,16 @@ function parseZaiResponse(response) {
   return result;
 }
 function fetchUsageFromMinimax(apiKey) {
-  return new Promise((resolve6) => {
+  return new Promise((resolve9) => {
     const baseUrl = process.env.ANTHROPIC_BASE_URL;
     if (!baseUrl) {
-      resolve6({ data: null });
+      resolve9({ data: null });
       return;
     }
     const validation = validateAnthropicBaseUrl(baseUrl);
     if (!validation.allowed) {
       console.error(`[SSRF Guard] Blocking usage API call: ${validation.reason}`);
-      resolve6({ data: null });
+      resolve9({ data: null });
       return;
     }
     try {
@@ -6383,29 +6798,29 @@ function fetchUsageFromMinimax(apiKey) {
           res.on("end", () => {
             if (res.statusCode === 200) {
               try {
-                resolve6({ data: JSON.parse(data) });
+                resolve9({ data: JSON.parse(data) });
               } catch {
-                resolve6({ data: null });
+                resolve9({ data: null });
               }
             } else if (res.statusCode === 429) {
               if (process.env.OMC_DEBUG) {
                 console.error(`[usage-api] MiniMax API returned 429 (rate limited)`);
               }
-              resolve6({ data: null, rateLimited: true });
+              resolve9({ data: null, rateLimited: true });
             } else {
-              resolve6({ data: null });
+              resolve9({ data: null });
             }
           });
         }
       );
-      req.on("error", () => resolve6({ data: null }));
+      req.on("error", () => resolve9({ data: null }));
       req.on("timeout", () => {
         req.destroy();
-        resolve6({ data: null });
+        resolve9({ data: null });
       });
       req.end();
     } catch {
-      resolve6({ data: null });
+      resolve9({ data: null });
     }
   });
 }
@@ -6445,16 +6860,16 @@ function parseMinimaxResponse(response) {
   };
 }
 function fetchUsageFromKimi(apiKey) {
-  return new Promise((resolve6) => {
+  return new Promise((resolve9) => {
     const baseUrl = process.env.ANTHROPIC_BASE_URL;
     if (!baseUrl) {
-      resolve6({ data: null });
+      resolve9({ data: null });
       return;
     }
     const validation = validateAnthropicBaseUrl(baseUrl);
     if (!validation.allowed) {
       console.error(`[SSRF Guard] Blocking usage API call: ${validation.reason}`);
-      resolve6({ data: null });
+      resolve9({ data: null });
       return;
     }
     try {
@@ -6465,7 +6880,7 @@ function fetchUsageFromKimi(apiKey) {
             `[usage-api] Refusing to send Kimi credentials to non-canonical host '${hostname2}'`
           );
         }
-        resolve6({ data: null });
+        resolve9({ data: null });
         return;
       }
       const req = https.request(
@@ -6481,37 +6896,37 @@ function fetchUsageFromKimi(apiKey) {
         },
         (res) => {
           let data = "";
-          res.on("error", () => resolve6({ data: null }));
-          res.on("aborted", () => resolve6({ data: null }));
+          res.on("error", () => resolve9({ data: null }));
+          res.on("aborted", () => resolve9({ data: null }));
           res.on("data", (chunk) => {
             data += chunk;
           });
           res.on("end", () => {
             if (res.statusCode === 200) {
               try {
-                resolve6({ data: JSON.parse(data) });
+                resolve9({ data: JSON.parse(data) });
               } catch {
-                resolve6({ data: null });
+                resolve9({ data: null });
               }
             } else if (res.statusCode === 429) {
               if (process.env.OMC_DEBUG) {
                 console.error(`[usage-api] Kimi API returned 429 (rate limited)`);
               }
-              resolve6({ data: null, rateLimited: true });
+              resolve9({ data: null, rateLimited: true });
             } else {
-              resolve6({ data: null });
+              resolve9({ data: null });
             }
           });
         }
       );
-      req.on("error", () => resolve6({ data: null }));
+      req.on("error", () => resolve9({ data: null }));
       req.on("timeout", () => {
         req.destroy();
-        resolve6({ data: null });
+        resolve9({ data: null });
       });
       req.end();
     } catch {
-      resolve6({ data: null });
+      resolve9({ data: null });
     }
   });
 }
@@ -6688,24 +7103,50 @@ async function fetchAndCacheUsage(opts) {
   });
   return { rateLimits: usage };
 }
-async function getUsage(opts) {
+function getWarmAnthropicUsageCache(pollIntervalMs, rateLimitIdentity) {
   const baseUrl = process.env.ANTHROPIC_BASE_URL;
-  const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
-  const isMinimax = baseUrl != null && isMinimaxHost(baseUrl);
-  const isKimi = baseUrl != null && isKimiHost(baseUrl);
-  const isZai = baseUrl != null && isZaiHost(baseUrl);
-  const minimaxApiKey = process.env.MINIMAX_API_KEY || authToken;
-  const kimiApiKey = process.env.KIMI_API_KEY || process.env.ANTHROPIC_API_KEY || authToken;
-  const currentSource = isMinimax ? "minimax" : isKimi ? "kimi" : isZai && authToken ? "zai" : "anthropic";
-  const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim();
-  const credentialIdentity = currentSource === "anthropic" && envToken ? getCredentialCacheIdentity(envToken) : void 0;
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim() || process.env.ANTHROPIC_AUTH_TOKEN?.trim() || process.env.MINIMAX_API_KEY?.trim() || process.env.KIMI_API_KEY?.trim() || process.env.ANTHROPIC_API_KEY?.trim() || baseUrl != null && (isMinimaxHost(baseUrl) || isKimiHost(baseUrl) || isZaiHost(baseUrl))) {
+    return void 0;
+  }
+  const profileIdentity = getOAuthAccountProfileIdentity({});
+  if (!profileIdentity) return void 0;
+  const credentialIdentity = hashCredentialIdentity(JSON.stringify([
+    "anthropic",
+    baseUrl ?? null,
+    profileIdentity
+  ]));
+  migrateLegacyCache("anthropic");
+  const cache = readCache("anthropic");
+  const hasCacheOutcome = !!cache?.data || cache?.error === true || getRateLimitBackoff(cache, rateLimitIdentity) !== null;
+  if (!cache || !hasCacheOutcome || cache.source !== "anthropic" || !isCacheForCredential(cache, credentialIdentity) || !isCacheValid(cache, pollIntervalMs, rateLimitIdentity)) {
+    return void 0;
+  }
+  return getCachedUsageResult(cache, rateLimitIdentity);
+}
+async function getUsage(opts) {
   const pollIntervalMs = getUsagePollIntervalMs();
-  const rateLimitIdentity = currentSource === "anthropic" ? buildUserAgent(opts?.clientVersion) ?? "anonymous" : void 0;
+  const anthropicRateLimitIdentity = buildUserAgent(opts?.clientVersion) ?? "anonymous";
+  const warmCachedUsage = opts?.skipWarmCache ? void 0 : getWarmAnthropicUsageCache(pollIntervalMs, anthropicRateLimitIdentity);
+  if (warmCachedUsage) return warmCachedUsage;
+  let profile = resolveUsageProfile();
+  const { currentSource, authToken, minimaxApiKey, kimiApiKey } = profile;
+  let credentials = profile.credentials;
+  let credentialIdentity = profile.credentialIdentity;
+  const rateLimitIdentity = currentSource === "anthropic" ? anthropicRateLimitIdentity : void 0;
   migrateLegacyCache(currentSource);
   const initialCache = readCache(currentSource);
-  const initialMatchingCache = isCacheForCredential(initialCache, credentialIdentity) ? initialCache : null;
+  let initialMatchingCache = isCacheForCredential(initialCache, credentialIdentity) ? initialCache : null;
   if (initialMatchingCache && isCacheValid(initialMatchingCache, pollIntervalMs, rateLimitIdentity) && initialMatchingCache.source === currentSource) {
     return getCachedUsageResult(initialMatchingCache, rateLimitIdentity);
+  }
+  if (currentSource === "anthropic" && credentials?.source !== "env" && !profile.storedCredentialsRead) {
+    profile = resolveUsageProfile(true, true);
+    credentials = profile.credentials;
+    credentialIdentity = profile.credentialIdentity;
+    initialMatchingCache = isCacheForCredential(initialCache, credentialIdentity) ? initialCache : null;
+    if (initialMatchingCache && isCacheValid(initialMatchingCache, pollIntervalMs, rateLimitIdentity) && initialMatchingCache.source === currentSource) {
+      return getCachedUsageResult(initialMatchingCache, rateLimitIdentity);
+    }
   }
   try {
     return await withFileLock(lockPathFor(getCachePath(currentSource)), async () => {
@@ -6714,9 +7155,9 @@ async function getUsage(opts) {
       if (matchingCache && isCacheValid(matchingCache, pollIntervalMs, rateLimitIdentity) && matchingCache.source === currentSource) {
         return getCachedUsageResult(matchingCache, rateLimitIdentity);
       }
-      if (isMinimax) {
+      if (currentSource === "minimax") {
         if (!minimaxApiKey) {
-          writeCache({ data: null, error: true, source: "minimax", errorReason: "no_credentials" });
+          writeCache({ data: null, error: true, source: "minimax", errorReason: "no_credentials", credentialIdentity });
           return { rateLimits: null, error: "no_credentials" };
         }
         return fetchAndCacheUsage({
@@ -6724,12 +7165,13 @@ async function getUsage(opts) {
           fetchFn: () => fetchUsageFromMinimax(minimaxApiKey),
           parseFn: parseMinimaxResponse,
           cache: matchingCache,
-          pollIntervalMs
+          pollIntervalMs,
+          credentialIdentity
         });
       }
-      if (isKimi) {
+      if (currentSource === "kimi") {
         if (!kimiApiKey) {
-          writeCache({ data: null, error: true, source: "kimi", errorReason: "no_credentials" });
+          writeCache({ data: null, error: true, source: "kimi", errorReason: "no_credentials", credentialIdentity });
           return { rateLimits: null, error: "no_credentials" };
         }
         return fetchAndCacheUsage({
@@ -6737,26 +7179,35 @@ async function getUsage(opts) {
           fetchFn: () => fetchUsageFromKimi(kimiApiKey),
           parseFn: parseKimiResponse,
           cache: matchingCache,
-          pollIntervalMs
+          pollIntervalMs,
+          credentialIdentity
         });
       }
-      if (isZai && authToken) {
+      if (currentSource === "zai" && authToken) {
         return fetchAndCacheUsage({
           source: "zai",
           fetchFn: () => fetchUsageFromZai(),
           parseFn: parseZaiResponse,
           cache: matchingCache,
-          pollIntervalMs
+          pollIntervalMs,
+          credentialIdentity
         });
       }
-      let creds = getCredentials();
+      let creds = credentials;
       if (creds) {
         if (!validateCredentials(creds)) {
           if (creds.refreshToken) {
             const refreshed = await refreshAccessToken(creds.refreshToken);
             if (refreshed) {
-              creds = { ...creds, ...refreshed };
+              creds = {
+                ...creds,
+                ...refreshed,
+                profileIdentity: creds.profileIdentity ?? hashCredentialIdentity(
+                  creds.refreshToken ?? creds.accessToken
+                )
+              };
               writeBackCredentials(creds);
+              if (creds.source !== "env") rememberStoredCredentials(creds);
             } else {
               writeCache({
                 data: null,
@@ -6816,12 +7267,13 @@ async function getUsage(opts) {
 
 // src/hud/custom-rate-provider.ts
 import { spawn } from "child_process";
+import { createHash as createHash4 } from "node:crypto";
 import { existsSync as existsSync9, readFileSync as readFileSync10, writeFileSync as writeFileSync4, mkdirSync as mkdirSync7 } from "fs";
-import { join as join12, dirname as dirname7 } from "path";
+import { join as join11, dirname as dirname7 } from "path";
 var CACHE_TTL_MS = 3e4;
 var DEFAULT_TIMEOUT_MS = 800;
 function getCachePath2() {
-  return join12(
+  return join11(
     getClaudeConfigDir(),
     "plugins",
     "oh-my-claudecode",
@@ -6837,12 +7289,12 @@ function readCache2() {
     return null;
   }
 }
-function writeCache2(buckets) {
+function writeCache2(buckets, identity) {
   try {
     const p = getCachePath2();
     const dir = dirname7(p);
     if (!existsSync9(dir)) mkdirSync7(dir, { recursive: true });
-    const cache = { timestamp: Date.now(), buckets };
+    const cache = { timestamp: Date.now(), buckets, identity };
     writeFileSync4(p, JSON.stringify(cache, null, 2));
   } catch {
   }
@@ -6851,7 +7303,7 @@ function isCacheValid2(cache) {
   return Date.now() - cache.timestamp < CACHE_TTL_MS;
 }
 function spawnWithTimeout(cmd, timeoutMs) {
-  return new Promise((resolve6, reject) => {
+  return new Promise((resolve9, reject) => {
     const [executable, ...args] = Array.isArray(cmd) ? cmd : ["sh", "-c", cmd];
     const child = spawn(executable, args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -6868,6 +7320,8 @@ function spawnWithTimeout(cmd, timeoutMs) {
       } catch {
       }
     };
+    child.stderr.on("data", () => {
+    });
     let stdout = "";
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString();
@@ -6887,7 +7341,7 @@ function spawnWithTimeout(cmd, timeoutMs) {
       if (!timedOut && escalationTimer) clearTimeout(escalationTimer);
       if (!timedOut) {
         if (code === 0) {
-          resolve6(stdout);
+          resolve9(stdout);
         } else {
           reject(new Error(`Command exited with code ${code}`));
         }
@@ -6926,7 +7380,12 @@ function parseOutput(raw, periods) {
   return buckets;
 }
 async function executeCustomProvider(config) {
-  const cache = readCache2();
+  const identity = createHash4("sha256").update(JSON.stringify({
+    command: config.command,
+    periods: [...new Set(config.periods ?? [])].sort()
+  })).digest("hex");
+  const storedCache = readCache2();
+  const cache = storedCache?.identity === identity ? storedCache : null;
   if (cache && isCacheValid2(cache)) {
     return { buckets: cache.buckets, stale: false };
   }
@@ -6941,7 +7400,7 @@ async function executeCustomProvider(config) {
       if (cache) return { buckets: cache.buckets, stale: true };
       return { buckets: [], stale: false, error: "invalid output" };
     }
-    writeCache2(buckets);
+    writeCache2(buckets, identity);
     return { buckets, stale: false };
   } catch (err) {
     if (process.env.OMC_DEBUG) {
@@ -6976,6 +7435,9 @@ function red(text) {
 function cyan(text) {
   return `${CYAN}${text}${RESET}`;
 }
+function magenta(text) {
+  return `${MAGENTA}${text}${RESET}`;
+}
 function dim(text) {
   return `${DIM}${text}${RESET}`;
 }
@@ -6999,14 +7461,14 @@ function getDurationColor(durationMs) {
 
 // src/lib/version.ts
 import { readFileSync as readFileSync11, existsSync as existsSync10, lstatSync as lstatSync4, realpathSync as realpathSync2 } from "fs";
-import { join as join13, dirname as dirname8 } from "path";
+import { join as join12, dirname as dirname8 } from "path";
 import { fileURLToPath } from "url";
 function getRuntimePackageVersion() {
   try {
     const __filename2 = fileURLToPath(import.meta.url);
     const __dirname2 = dirname8(__filename2);
     for (let i = 0; i < 5; i++) {
-      const candidate = join13(__dirname2, ...Array(i + 1).fill(".."), "package.json");
+      const candidate = join12(__dirname2, ...Array(i + 1).fill(".."), "package.json");
       try {
         const pkg = JSON.parse(readFileSync11(candidate, "utf-8"));
         if (pkg.name && pkg.version) {
@@ -7034,15 +7496,15 @@ function isRuntimePackageLocal() {
     const __dirname2 = dirname8(__filename2);
     let pkgRoot = null;
     for (let i = 0; i < 5; i++) {
-      const candidate = join13(__dirname2, ...Array(i + 1).fill(".."));
-      if (existsSync10(join13(candidate, "package.json"))) {
+      const candidate = join12(__dirname2, ...Array(i + 1).fill(".."));
+      if (existsSync10(join12(candidate, "package.json"))) {
         pkgRoot = candidate;
         break;
       }
     }
     if (!pkgRoot) return false;
-    if (existsSync10(join13(pkgRoot, ".git"))) return true;
-    if (existsSync10(join13(pkgRoot, "src"))) return true;
+    if (existsSync10(join12(pkgRoot, ".git"))) return true;
+    if (existsSync10(join12(pkgRoot, "src"))) return true;
     try {
       const real = realpathSync2(pkgRoot);
       const norm = (p) => p.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -7930,7 +8392,7 @@ function renderSession(session) {
 // src/cli/utils/formatting.ts
 function formatTokenCount(tokens) {
   if (tokens < 1e3) return `${tokens}`;
-  if (tokens < 1e6) return `${(tokens / 1e3).toFixed(1)}k`;
+  if (tokens < 999950) return `${(tokens / 1e3).toFixed(1)}k`;
   return `${(tokens / 1e6).toFixed(2)}M`;
 }
 
@@ -8082,16 +8544,20 @@ function renderAutopilot(state, _thresholds) {
 
 // src/hud/elements/cwd.ts
 import { homedir as homedir3 } from "node:os";
-import { basename as basename6, dirname as dirname9 } from "node:path";
+import { basename as basename7, dirname as dirname9, resolve as resolve4, sep as sep4 } from "node:path";
+import { pathToFileURL as pathToFileURL2 } from "node:url";
 function osc8Link(url, text) {
   return `\x1B]8;;${url}\x1B\\${text}\x1B]8;;\x1B\\`;
 }
 function pathToFileUrl(absPath) {
-  const normalized = absPath.replace(/\\/g, "/");
-  if (/^[A-Za-z]:\//.test(normalized)) {
-    return `file:///${normalized}`;
+  if (process.platform !== "win32" && /^[A-Za-z]:[\\/]/.test(absPath)) {
+    const segments = absPath.replace(/\\/g, "/").split("/");
+    return `file:///${segments.map((segment, index) => index === 0 ? segment : encodeURIComponent(segment)).join("/")}`;
   }
-  return `file://${normalized}`;
+  const normalized = resolve4(absPath);
+  if (normalized.endsWith(sep4)) return pathToFileURL2(normalized).href;
+  const url = pathToFileURL2(`${normalized}${sep4}`).href;
+  return url.slice(0, -1);
 }
 function renderCwd(cwd, format2 = "relative", useHyperlinks = false) {
   if (!cwd) return null;
@@ -8113,15 +8579,19 @@ function renderCwd(cwd, format2 = "relative", useHyperlinks = false) {
       displayPath = cwd;
       break;
     case "folder": {
-      const parent = basename6(dirname9(cwd));
-      const folder = basename6(cwd);
+      const parent = basename7(dirname9(cwd));
+      const folder = basename7(cwd);
       displayPath = parent ? `${parent}/${folder}` : folder;
       break;
     }
     default:
       displayPath = cwd;
   }
-  const rendered = `${dim(displayPath)}`;
+  const safeDisplayPath = displayPath.replace(
+    /[\x00-\x1f\x7f-\x9f]/g,
+    (character) => `\\x${character.charCodeAt(0).toString(16).padStart(2, "0")}`
+  );
+  const rendered = `${dim(safeDisplayPath)}`;
   if (useHyperlinks) {
     const url = pathToFileUrl(cwd);
     return osc8Link(url, rendered);
@@ -8142,7 +8612,14 @@ function renderHostname() {
 // src/hud/elements/git.ts
 import { execFileSync as execFileSync4 } from "node:child_process";
 import { realpathSync as realpathSync3 } from "node:fs";
-import { resolve as resolve3, basename as basename7 } from "node:path";
+import { resolve as resolve5, basename as basename8 } from "node:path";
+
+// src/utils/url.ts
+function stripTrailingSlashes(value) {
+  return value.replace(/\/+$/, "");
+}
+
+// src/hud/elements/git.ts
 var CACHE_TTL_MS2 = 3e4;
 var repoCache = /* @__PURE__ */ new Map();
 var branchCache = /* @__PURE__ */ new Map();
@@ -8158,7 +8635,7 @@ function git(args, cwd) {
   }).trim();
 }
 function getGitRepoName(cwd) {
-  const key = cwd ? resolve3(cwd) : process.cwd();
+  const key = cwd ? resolve5(cwd) : process.cwd();
   const cached = repoCache.get(key);
   if (cached && Date.now() < cached.expiresAt) {
     return cached.value;
@@ -8169,7 +8646,8 @@ function getGitRepoName(cwd) {
     if (!url) {
       result = null;
     } else {
-      const match = url.match(/\/([^/]+?)(?:\.git)?$/) || url.match(/:([^/]+?)(?:\.git)?$/);
+      const normalizedUrl = stripTrailingSlashes(url);
+      const match = normalizedUrl.match(/\/([^/]+?)(?:\.git)?$/) || normalizedUrl.match(/:([^/]+?)(?:\.git)?$/);
       result = match ? match[1].replace(/\.git$/, "") : null;
     }
   } catch {
@@ -8179,7 +8657,7 @@ function getGitRepoName(cwd) {
   return result;
 }
 function getGitBranch(cwd) {
-  const key = cwd ? resolve3(cwd) : process.cwd();
+  const key = cwd ? resolve5(cwd) : process.cwd();
   const cached = branchCache.get(key);
   if (cached && Date.now() < cached.expiresAt) {
     return cached.value;
@@ -8195,7 +8673,7 @@ function getGitBranch(cwd) {
   return result;
 }
 function getWorktreeInfo(cwd) {
-  const key = cwd ? resolve3(cwd) : process.cwd();
+  const key = cwd ? resolve5(cwd) : process.cwd();
   const cached = worktreeCache.get(key);
   if (cached && Date.now() < cached.expiresAt) {
     return cached.value;
@@ -8204,8 +8682,8 @@ function getWorktreeInfo(cwd) {
   try {
     const gitDir = git(["rev-parse", "--git-dir"], cwd);
     const gitCommonDir = git(["rev-parse", "--git-common-dir"], cwd);
-    let resolvedGitDir = resolve3(key, gitDir);
-    let resolvedCommonDir = resolve3(key, gitCommonDir);
+    let resolvedGitDir = resolve5(key, gitDir);
+    let resolvedCommonDir = resolve5(key, gitCommonDir);
     try {
       resolvedGitDir = realpathSync3(resolvedGitDir);
     } catch {
@@ -8215,7 +8693,7 @@ function getWorktreeInfo(cwd) {
     } catch {
     }
     if (resolvedGitDir !== resolvedCommonDir) {
-      result = { isWorktree: true, worktreeName: basename7(resolvedGitDir) };
+      result = { isWorktree: true, worktreeName: basename8(resolvedGitDir) };
     }
   } catch {
   }
@@ -8237,7 +8715,7 @@ function renderGitBranch(cwd) {
   return `${dim("branch:")}${cyan(branch)}`;
 }
 function getGitStatusCounts(cwd) {
-  const key = cwd ? resolve3(cwd) : process.cwd();
+  const key = cwd ? resolve5(cwd) : process.cwd();
   const cached = statusCache.get(key);
   if (cached && Date.now() < cached.expiresAt) {
     return cached.value;
@@ -8292,7 +8770,7 @@ function renderGitStatus(cwd, labels = DEFAULT_HUD_LABELS) {
 // src/hud/elements/multi-repo.ts
 import { execFileSync as execFileSync5 } from "node:child_process";
 import { existsSync as existsSync11, readdirSync as readdirSync5, statSync as statSync5 } from "node:fs";
-import { basename as basename8, join as join14, resolve as resolve4 } from "node:path";
+import { basename as basename9, join as join13, resolve as resolve6 } from "node:path";
 var ACTIVITY_WINDOW_MS = 5 * 60 * 1e3;
 var SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 var CACHE_TTL_MS3 = 3e4;
@@ -8312,10 +8790,10 @@ function isGitRepo(dir) {
   }
 }
 function looksLikeRepo(entryPath) {
-  return existsSync11(join14(entryPath, ".git"));
+  return existsSync11(join13(entryPath, ".git"));
 }
 function countActiveSessions(cwd) {
-  const sessionsDir = join14(getOmcRoot(cwd), "state", "sessions");
+  const sessionsDir = join13(getOmcRoot(cwd), "state", "sessions");
   if (!existsSync11(sessionsDir)) return 0;
   const now = Date.now();
   let active = 0;
@@ -8324,7 +8802,7 @@ function countActiveSessions(cwd) {
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       if (!SESSION_ID_PATTERN.test(entry.name)) continue;
-      const dirPath = join14(sessionsDir, entry.name);
+      const dirPath = join13(sessionsDir, entry.name);
       let fresh = false;
       try {
         if (now - statSync5(dirPath).mtimeMs < ACTIVITY_WINDOW_MS) {
@@ -8332,7 +8810,7 @@ function countActiveSessions(cwd) {
         } else {
           for (const f of readdirSync5(dirPath)) {
             try {
-              if (now - statSync5(join14(dirPath, f)).mtimeMs < ACTIVITY_WINDOW_MS) {
+              if (now - statSync5(join13(dirPath, f)).mtimeMs < ACTIVITY_WINDOW_MS) {
                 fresh = true;
                 break;
               }
@@ -8350,7 +8828,7 @@ function countActiveSessions(cwd) {
   return active;
 }
 function detectMultiRepo(cwd) {
-  const key = cwd ? resolve4(cwd) : process.cwd();
+  const key = cwd ? resolve6(cwd) : process.cwd();
   const cached = multiRepoCache.get(key);
   if (cached && Date.now() < cached.expiresAt) {
     return cached.value;
@@ -8367,7 +8845,7 @@ function detectMultiRepo(cwd) {
       for (const entry of entries) {
         if (!entry.isDirectory()) continue;
         if (entry.name.startsWith(".")) continue;
-        if (looksLikeRepo(join14(key, entry.name))) subrepoCount++;
+        if (looksLikeRepo(join13(key, entry.name))) subrepoCount++;
       }
     } catch {
     }
@@ -8375,12 +8853,12 @@ function detectMultiRepo(cwd) {
       multiRepoCache.set(key, { value: null, expiresAt: Date.now() + CACHE_TTL_MS3 });
       return null;
     }
-    const hasMarker = existsSync11(join14(key, ".omc-workspace"));
+    const hasMarker = existsSync11(join13(key, ".omc-workspace"));
     const activeSessions = hasMarker ? countActiveSessions(key) : 0;
     result = {
       isMultiRepo: true,
       hasMarker,
-      parentName: basename8(key),
+      parentName: basename9(key),
       subrepoCount,
       activeSessions
     };
@@ -8441,9 +8919,28 @@ function renderModel(modelId, format2 = "versioned", labels = DEFAULT_HUD_LABELS
   return cyan(`${labels.model}: ${name}`);
 }
 
+// src/hud/elements/effort.ts
+function renderEffort(level) {
+  if (!level) return null;
+  const label = `effort:${level}`;
+  switch (level) {
+    case "low":
+      return dim(label);
+    case "high":
+      return yellow(label);
+    case "xhigh":
+      return magenta(label);
+    case "max":
+      return bold(magenta(label));
+    case "medium":
+    default:
+      return cyan(label);
+  }
+}
+
 // src/hud/elements/api-key-source.ts
 import { existsSync as existsSync12, readFileSync as readFileSync12 } from "fs";
-import { join as join15 } from "path";
+import { join as join14 } from "path";
 function settingsFileHasApiKey(filePath) {
   try {
     if (!existsSync12(filePath)) return false;
@@ -8458,10 +8955,10 @@ function settingsFileHasApiKey(filePath) {
 }
 function detectApiKeySource(cwd) {
   if (cwd) {
-    const projectSettings = join15(cwd, ".claude", "settings.local.json");
+    const projectSettings = join14(cwd, ".claude", "settings.local.json");
     if (settingsFileHasApiKey(projectSettings)) return "project";
   }
-  const globalSettings = join15(getClaudeConfigDir(), "settings.json");
+  const globalSettings = join14(getClaudeConfigDir(), "settings.json");
   if (settingsFileHasApiKey(globalSettings)) return "global";
   if (process.env.ANTHROPIC_API_KEY) return "env";
   return null;
@@ -8702,6 +9199,10 @@ async function render(context, config) {
       hudLabels
     );
     if (modelElement) rendered.set("model", modelElement);
+  }
+  if (enabledElements.effort) {
+    const effortElement = renderEffort(context.effortLevel);
+    if (effortElement) rendered.set("effort", effortElement);
   }
   if (enabledElements.updateNotification !== false && context.claudeCodeUpdateAvailable) {
     const versionTag = context.claudeCodeVersion ? `#${context.claudeCodeVersion}` : "";
@@ -9006,6 +9507,7 @@ var PAYLOAD_WARNING_BYTES = 22e6;
 var PAYLOAD_CRITICAL_BYTES = 26e6;
 var COMPACT_BOUNDARY_MARKER = "compact_boundary";
 var COMPACT_BOUNDARY_MARKER_BYTES = Buffer.from(COMPACT_BOUNDARY_MARKER);
+var LOCAL_API_REQUEST_PREFIX = Buffer.from('{"type":"api-request');
 var SCAN_CHUNK_BYTES = 64 * 1024;
 var MAX_BOUNDARY_LINE_BYTES = 256 * 1024;
 function toPressure(bytes) {
@@ -9117,12 +9619,52 @@ function findLastCompactBoundaryEndOffset(transcriptPath, size) {
   }
   return null;
 }
+function countLocalApiRequestRecordBytes(transcriptPath, start, end) {
+  if (end <= start) return 0;
+  const fd = openSync5(transcriptPath, "r");
+  try {
+    const chunk = Buffer.allocUnsafe(SCAN_CHUNK_BYTES);
+    const prefix = Buffer.allocUnsafe(LOCAL_API_REQUEST_PREFIX.length);
+    let excludedBytes = 0;
+    let lineStart = start;
+    const countLine = (lineEndExclusive) => {
+      const lineLength = lineEndExclusive - lineStart;
+      if (lineLength >= prefix.length) {
+        const bytesRead = readSync4(fd, prefix, 0, prefix.length, lineStart);
+        if (bytesRead === prefix.length && prefix.equals(LOCAL_API_REQUEST_PREFIX)) {
+          excludedBytes += lineLength;
+        }
+      }
+      lineStart = lineEndExclusive;
+    };
+    let position = start;
+    while (position < end) {
+      const length = Math.min(SCAN_CHUNK_BYTES, end - position);
+      readSync4(fd, chunk, 0, length, position);
+      const view = chunk.subarray(0, length);
+      let newline = view.indexOf(10);
+      while (newline !== -1) {
+        countLine(position + newline + 1);
+        newline = view.indexOf(10, newline + 1);
+      }
+      position += length;
+    }
+    if (lineStart < end) countLine(end);
+    return excludedBytes;
+  } finally {
+    closeSync5(fd);
+  }
+}
 function estimateTranscriptPayloadBytes(transcriptPath, size) {
   const boundaryEndOffset = findLastCompactBoundaryEndOffset(
     transcriptPath,
     size
   );
-  return boundaryEndOffset === null ? size : Math.max(0, size - boundaryEndOffset);
+  const start = boundaryEndOffset ?? 0;
+  return Math.max(
+    0,
+    size - start - countLocalApiRequestRecordBytes(transcriptPath, start, size)
+  );
 }
 function estimatePayloadFromTranscriptPath(transcriptPath) {
   if (!transcriptPath || !existsSync13(transcriptPath)) return null;
@@ -9138,30 +9680,30 @@ function estimatePayloadFromTranscriptPath(transcriptPath) {
 }
 
 // src/features/auto-update.ts
-import { join as join19, dirname as dirname12 } from "path";
+import { join as join18, dirname as dirname12, resolve as resolve8 } from "path";
 
 // src/installer/index.ts
-import { join as join18, dirname as dirname11, resolve as resolve5, isAbsolute as isAbsolute2, basename as basename10, relative as relative3, sep as sep4 } from "path";
+import { join as join17, dirname as dirname11, resolve as resolve7, isAbsolute as isAbsolute3, basename as basename11, relative as relative3, sep as sep5 } from "path";
 
 // src/installer/hooks.ts
-import { join as join16, dirname as dirname10 } from "path";
+import { join as join15, dirname as dirname10 } from "path";
 import { readFileSync as readFileSync13, existsSync as existsSync14 } from "fs";
 import { fileURLToPath as fileURLToPath2 } from "url";
 import { homedir as homedir4 } from "os";
 function getPackageDir() {
   if (typeof __dirname !== "undefined") {
-    return join16(__dirname, "..");
+    return join15(__dirname, "..");
   }
   try {
     const __filename2 = fileURLToPath2(import.meta.url);
     const __dirname2 = dirname10(__filename2);
-    return join16(__dirname2, "..", "..");
+    return join15(__dirname2, "..", "..");
   } catch {
     return process.cwd();
   }
 }
 function loadTemplate(filename) {
-  const templatePath = join16(getPackageDir(), "templates", "hooks", filename);
+  const templatePath = join15(getPackageDir(), "templates", "hooks", filename);
   if (!existsSync14(templatePath)) {
     return "";
   }
@@ -9174,19 +9716,19 @@ function normalizePath(value) {
   return value.replace(/\\/g, "/").replace(/\/+$/, "");
 }
 function isDefaultClaudeConfigDir() {
-  return normalizePath(getClaudeConfigDir()) === normalizePath(join16(homedir4(), ".claude"));
+  return normalizePath(getClaudeConfigDir()) === normalizePath(join15(homedir4(), ".claude"));
 }
 function quoteCommandPath(path3) {
   return `"${path3.replace(/"/g, '\\"')}"`;
 }
 function buildHookCommand(filename) {
   if (isWindows()) {
-    return `node ${quoteCommandPath(join16(getClaudeConfigDir(), "hooks", filename).replace(/\\/g, "/"))}`;
+    return `node ${quoteCommandPath(join15(getClaudeConfigDir(), "hooks", filename).replace(/\\/g, "/"))}`;
   }
   if (isDefaultClaudeConfigDir()) {
     return `node "\${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/${filename}"`;
   }
-  return `node ${quoteCommandPath(join16(getClaudeConfigDir(), "hooks", filename).replace(/\\/g, "/"))}`;
+  return `node ${quoteCommandPath(join15(getClaudeConfigDir(), "hooks", filename).replace(/\\/g, "/"))}`;
 }
 var KEYWORD_DETECTOR_SCRIPT_NODE = loadTemplate(
   "keyword-detector.mjs"
@@ -9267,6 +9809,21 @@ var HOOKS_SETTINGS_CONFIG_NODE = {
           }
         ]
       }
+    ],
+    // SessionEnd chain enqueuer (software factory third link). Must delegate to
+    // the bridge (--hook=session-end) — the only entry that runs
+    // processSessionEnd → planChainEnqueue. async:true per issue #3240
+    // (Windows shutdown kills synchronous SessionEnd hooks).
+    SessionEnd: [
+      {
+        hooks: [
+          {
+            type: "command",
+            command: buildHookCommand("session-end.mjs"),
+            async: true
+          }
+        ]
+      }
     ]
   }
 };
@@ -9279,9 +9836,9 @@ var OMC_PLUGIN_MARKETPLACE_REL = `plugins/marketplaces/${OMC_PLUGIN_MARKETPLACE_
 var OMC_CONFIG_FILE_REL = ".omc-config.json";
 
 // src/utils/user-skill-compat.ts
-import { basename as basename9, join as join17 } from "path";
-var CLAUDE_SKILLS_DIR = join17(getClaudeConfigDir(), "skills");
-var OMC_LEARNED_DIR = join17(CLAUDE_SKILLS_DIR, "omc-learned");
+import { basename as basename10, join as join16 } from "path";
+var CLAUDE_SKILLS_DIR = join16(getClaudeConfigDir(), "skills");
+var OMC_LEARNED_DIR = join16(CLAUDE_SKILLS_DIR, "omc-learned");
 
 // src/installer/claude-md-transaction.ts
 var CLAUDE_MD_IMPORT_START = "<!-- OMC:IMPORT:START -->";
@@ -9504,13 +10061,13 @@ var builtin_skill_entitlements_default = {
 
 // src/installer/index.ts
 var CLAUDE_CONFIG_DIR = getClaudeConfigDir();
-var AGENTS_DIR = join18(CLAUDE_CONFIG_DIR, "agents");
-var COMMANDS_DIR = join18(CLAUDE_CONFIG_DIR, "commands");
-var SKILLS_DIR = join18(CLAUDE_CONFIG_DIR, "skills");
-var HOOKS_DIR = join18(CLAUDE_CONFIG_DIR, "hooks");
-var HUD_DIR = join18(CLAUDE_CONFIG_DIR, "hud");
-var SETTINGS_FILE = join18(CLAUDE_CONFIG_DIR, "settings.json");
-var VERSION_FILE = join18(CLAUDE_CONFIG_DIR, ".omc-version.json");
+var AGENTS_DIR = join17(CLAUDE_CONFIG_DIR, "agents");
+var COMMANDS_DIR = join17(CLAUDE_CONFIG_DIR, "commands");
+var SKILLS_DIR = join17(CLAUDE_CONFIG_DIR, "skills");
+var HOOKS_DIR = join17(CLAUDE_CONFIG_DIR, "hooks");
+var HUD_DIR = join17(CLAUDE_CONFIG_DIR, "hud");
+var SETTINGS_FILE = join17(CLAUDE_CONFIG_DIR, "settings.json");
+var VERSION_FILE = join17(CLAUDE_CONFIG_DIR, ".omc-version.json");
 var VERSION = getRuntimePackageVersion();
 var SKININTHEGAMEBROS_ONLY_SKILLS = new Set(
   builtin_skill_entitlements_default.skininthegamebrosOnlySkills.map((skill) => skill.trim().toLowerCase())
@@ -9537,28 +10094,17 @@ var REPO_NAME = "oh-my-claudecode";
 var GITHUB_API_URL = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}`;
 var GITHUB_RAW_URL = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}`;
 var CLAUDE_CONFIG_DIR2 = getClaudeConfigDir();
-var VERSION_FILE2 = join19(CLAUDE_CONFIG_DIR2, ".omc-version.json");
-var CONFIG_FILE = join19(CLAUDE_CONFIG_DIR2, OMC_CONFIG_FILE_REL);
-function compareVersions(a, b) {
-  const cleanA = a.replace(/^v/, "");
-  const cleanB = b.replace(/^v/, "");
-  const partsA = cleanA.split(".").map((n) => parseInt(n, 10) || 0);
-  const partsB = cleanB.split(".").map((n) => parseInt(n, 10) || 0);
-  const maxLength = Math.max(partsA.length, partsB.length);
-  for (let i = 0; i < maxLength; i++) {
-    const numA = partsA[i] || 0;
-    const numB = partsB[i] || 0;
-    if (numA < numB) return -1;
-    if (numA > numB) return 1;
-  }
-  return 0;
+var VERSION_FILE2 = join18(CLAUDE_CONFIG_DIR2, ".omc-version.json");
+var CONFIG_FILE = join18(CLAUDE_CONFIG_DIR2, OMC_CONFIG_FILE_REL);
+function compareVersions2(a, b) {
+  return compareVersions(a, b);
 }
-var SILENT_UPDATE_STATE_FILE = join19(CLAUDE_CONFIG_DIR2, ".omc-silent-update.json");
+var SILENT_UPDATE_STATE_FILE = join18(CLAUDE_CONFIG_DIR2, ".omc-silent-update.json");
 
 // src/hud/index.ts
 import { writeFileSync as writeFileSync5, mkdirSync as mkdirSync8, existsSync as existsSync15, readFileSync as readFileSync14 } from "fs";
 import { access, readFile } from "fs/promises";
-import { join as join20, basename as basename11, dirname as dirname13 } from "path";
+import { join as join19, basename as basename12, dirname as dirname13 } from "path";
 import { spawn as spawn2 } from "child_process";
 import { fileURLToPath as fileURLToPath3 } from "url";
 function extractSessionIdFromPath(transcriptPath) {
@@ -9566,20 +10112,43 @@ function extractSessionIdFromPath(transcriptPath) {
   const match = transcriptPath.match(/([0-9a-f-]{36})(?:\.jsonl)?$/i);
   return match ? match[1] : null;
 }
+var SAME_WINDOW_TOLERANCE_MS = 60 * 1e3;
+function pickFresherPercent(stdinPercent, stdinResetsAt, apiPercent, apiResetsAt) {
+  if (stdinPercent == null || apiPercent == null || !stdinResetsAt || !apiResetsAt) {
+    return stdinPercent;
+  }
+  const isSameWindow = Math.abs(stdinResetsAt.getTime() - apiResetsAt.getTime()) <= SAME_WINDOW_TOLERANCE_MS;
+  return isSameWindow ? Math.max(stdinPercent, apiPercent) : stdinPercent;
+}
 function mergeStdinRateLimits(stdinRateLimits, usageResult) {
   if (!stdinRateLimits) {
     return usageResult;
   }
+  const apiRateLimits = usageResult?.rateLimits ?? {};
+  const merged = { ...apiRateLimits, ...stdinRateLimits };
+  if (stdinRateLimits.fiveHourPercent != null) {
+    merged.fiveHourPercent = pickFresherPercent(
+      stdinRateLimits.fiveHourPercent,
+      stdinRateLimits.fiveHourResetsAt,
+      apiRateLimits.fiveHourPercent,
+      apiRateLimits.fiveHourResetsAt
+    );
+  }
+  if (stdinRateLimits.weeklyPercent != null) {
+    merged.weeklyPercent = pickFresherPercent(
+      stdinRateLimits.weeklyPercent,
+      stdinRateLimits.weeklyResetsAt,
+      apiRateLimits.weeklyPercent,
+      apiRateLimits.weeklyResetsAt
+    );
+  }
   return {
     ...usageResult ?? {},
-    rateLimits: {
-      ...usageResult?.rateLimits ?? {},
-      ...stdinRateLimits
-    }
+    rateLimits: merged
   };
 }
 function readSessionSummary(stateDir, sessionId) {
-  const statePath = join20(stateDir, `session-summary-${sessionId}.json`);
+  const statePath = join19(stateDir, `session-summary-${sessionId}.json`);
   if (!existsSync15(statePath)) return null;
   try {
     return JSON.parse(readFileSync14(statePath, "utf-8"));
@@ -9612,8 +10181,8 @@ function spawnSessionSummaryScript(transcriptPath, stateDir, sessionId) {
   lastSummarySpawnTimestamp = now;
   const thisDir = dirname13(fileURLToPath3(import.meta.url));
   const scriptPath = [
-    join20(thisDir, "..", "..", "scripts", "session-summary.mjs"),
-    join20(thisDir, "..", "scripts", "session-summary.mjs")
+    join19(thisDir, "..", "..", "scripts", "session-summary.mjs"),
+    join19(thisDir, "..", "scripts", "session-summary.mjs")
   ].find((candidate) => existsSync15(candidate));
   if (!scriptPath) {
     if (process.env.OMC_DEBUG) {
@@ -9656,8 +10225,8 @@ function showDiagnostic() {
   const configDir = getClaudeConfigDir();
   const isCopilot = process.env.OMC_HOST?.toLowerCase() === "copilot";
   const hostName = isCopilot ? "GitHub Copilot CLI" : "Claude Code";
-  const hudScript = join20(configDir, "hud", "omc-hud.mjs");
-  const settingsFile = join20(configDir, "settings.json");
+  const hudScript = join19(configDir, "hud", "omc-hud.mjs");
+  const settingsFile = join19(configDir, "settings.json");
   const hudExists = existsSync15(hudScript);
   let statusLineOk = false;
   try {
@@ -9770,13 +10339,13 @@ async function mainImpl(watchMode = false, skipInit = false) {
       await access(updateCacheFile);
       const content = await readFile(updateCacheFile, "utf-8");
       const cached = JSON.parse(content);
-      if (cached?.latestVersion && omcVersion && compareVersions(omcVersion, cached.latestVersion) < 0) {
+      if (cached?.latestVersion && omcVersion && compareVersions2(omcVersion, cached.latestVersion) < 0) {
         updateAvailable = cached.latestVersion;
       }
       if (cached?.source === "npm" || cached?.source === "marketplace") {
         omcUpdateSource = cached.source;
       }
-      if (cached?.claudeCodeLatestVersion && claudeCodeVersion && compareVersions(claudeCodeVersion, cached.claudeCodeLatestVersion) < 0) {
+      if (cached?.claudeCodeLatestVersion && claudeCodeVersion && compareVersions2(claudeCodeVersion, cached.claudeCodeLatestVersion) < 0) {
         claudeCodeUpdateAvailable = cached.claudeCodeLatestVersion;
       }
     } catch (error) {
@@ -9790,7 +10359,7 @@ async function mainImpl(watchMode = false, skipInit = false) {
     let sessionSummary = null;
     const sessionSummaryEnabled = config.elements.sessionSummary ?? false;
     if (sessionSummaryEnabled && resolvedTranscriptPath && currentSessionId) {
-      const omcStateDir = join20(getOmcRoot(cwd), "state");
+      const omcStateDir = join19(getOmcRoot(cwd), "state");
       sessionSummary = readSessionSummary(omcStateDir, currentSessionId);
       const shouldSpawn = !sessionSummary?.generatedAt || Date.now() - new Date(sessionSummary.generatedAt).getTime() > 6e4;
       if (shouldSpawn) {
@@ -9818,6 +10387,7 @@ async function mainImpl(watchMode = false, skipInit = false) {
       contextDisplayScope: currentSessionId ?? cwd,
       modelName: getModelName(stdin),
       modelId: getModelId(stdin),
+      effortLevel: getEffortLevel(stdin),
       ralph,
       ultrawork: null,
       prd,
@@ -9848,7 +10418,7 @@ async function mainImpl(watchMode = false, skipInit = false) {
       apiKeyMode: detectApiKeySource(cwd) !== null,
       subscriptionType: subscriptionInfo.subscriptionType,
       rateLimitTier: subscriptionInfo.rateLimitTier,
-      profileName: process.env.CLAUDE_CONFIG_DIR ? basename11(process.env.CLAUDE_CONFIG_DIR).replace(/^\./, "") : null,
+      profileName: process.env.CLAUDE_CONFIG_DIR ? basename12(process.env.CLAUDE_CONFIG_DIR).replace(/^\./, "") : null,
       sessionSummary,
       lastToolName: transcriptData.lastToolName,
       payloadEstimate
@@ -9865,9 +10435,9 @@ async function mainImpl(watchMode = false, skipInit = false) {
     }
     if (context.contextAvailable !== false && config.contextLimitWarning.autoCompact && context.contextPercent >= config.contextLimitWarning.threshold) {
       try {
-        const omcStateDir = join20(getOmcRoot(cwd), "state");
+        const omcStateDir = join19(getOmcRoot(cwd), "state");
         mkdirSync8(omcStateDir, { recursive: true });
-        const triggerFile = join20(omcStateDir, "compact-requested.json");
+        const triggerFile = join19(omcStateDir, "compact-requested.json");
         writeFileSync5(
           triggerFile,
           JSON.stringify({

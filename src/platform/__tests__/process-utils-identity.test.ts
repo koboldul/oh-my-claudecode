@@ -1,25 +1,35 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as childProcess from 'node:child_process';
-import { dmtfCreationDateToTicks, getProcessStartIdentitySync, terminateOwnedProcessGroup } from '../process-utils.js';
+import {
+  dmtfCreationDateToTicks,
+  getProcessStartIdentitySync,
+  parseWindowsProcessStartIdentity,
+  terminateOwnedProcessGroup,
+} from '../process-utils.js';
 
 vi.mock('node:child_process', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:child_process')>();
-  return { ...original, spawnSync: vi.fn(original.spawnSync) };
+  return { ...original, execFileSync: vi.fn(original.execFileSync) };
+});
+
+afterEach(() => {
+  vi.doUnmock('child_process');
+  vi.doUnmock('node:child_process');
+  vi.restoreAllMocks();
+  vi.resetModules();
 });
 
 it('pins the Darwin identity probe locale despite an inherited non-English locale', () => {
   const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
-  const spawn = vi.spyOn(childProcess, 'spawnSync').mockReturnValue({
-    pid: 123, status: 0, signal: null, output: [], stdout: 'Thu Sep 10 12:00:00 2026\n', stderr: '',
-  });
+  const execFileSync = vi.mocked(childProcess.execFileSync)
+    .mockReturnValueOnce('Thu Sep 10 12:00:00 2026\n');
   vi.stubEnv('LC_ALL', 'fr_FR.UTF-8');
   try {
     expect(getProcessStartIdentitySync(123)).toBe(String(new Date('Thu Sep 10 12:00:00 2026').getTime()));
-    expect(spawn).toHaveBeenCalledWith('ps', ['-p', '123', '-o', 'lstart='], expect.objectContaining({
+    expect(execFileSync).toHaveBeenCalledWith('ps', ['-p', '123', '-o', 'lstart='], expect.objectContaining({
       env: expect.objectContaining({ LC_ALL: 'C' }),
     }));
   } finally {
-    spawn.mockRestore();
     platform.mockRestore();
     vi.unstubAllEnvs();
   }
@@ -116,5 +126,184 @@ describe('launch-owned process-group termination authority', () => {
     } finally {
       platform.mockRestore();
     }
+  });
+});
+
+describe('Windows cross-domain process identity authority', () => {
+  it('compares exact ticks with synchronous microseconds and fails closed', async () => {
+    const actualChildProcess = await vi.importActual<
+      typeof import('node:child_process')
+    >('node:child_process');
+    const platform = vi.spyOn(process, 'platform', 'get')
+      .mockReturnValue('win32');
+    const dmtf = '20260101000000.123456+000';
+    const expected = parseWindowsProcessStartIdentity(dmtf);
+    const nextExpected = parseWindowsProcessStartIdentity(
+      '20260101000000.123457+000',
+    );
+    const converted = dmtfCreationDateToTicks(dmtf);
+    if (!expected || !nextExpected || !converted) {
+      throw new Error('test Windows identity is invalid');
+    }
+    const exactTicks = BigInt(converted.slice('ticks:'.length)) + 7n;
+    const outcomes: Array<string | Error> = [
+      exactTicks.toString(),
+      exactTicks.toString(),
+      exactTicks.toString(),
+      exactTicks.toString(),
+    ];
+    const execFile = vi.fn((...args: unknown[]) => {
+      const callback = args.at(-1);
+      if (typeof callback !== 'function') {
+        throw new TypeError('execFile callback missing');
+      }
+      const outcome = outcomes.shift();
+      queueMicrotask(() => {
+        if (outcome instanceof Error) callback(outcome, '', '');
+        else callback(null, `${outcome ?? ''}\n`, '');
+      });
+      return { pid: 4321 };
+    });
+    vi.doMock('child_process', () => ({
+      ...actualChildProcess,
+      execFile,
+    }));
+    vi.resetModules();
+    const { isProcessIdentityLive } = await import('../process-utils.js');
+    const deadline = () => Date.now() + 1_000;
+
+    await expect(isProcessIdentityLive(
+      process.pid,
+      expected,
+      deadline(),
+    )).resolves.toBe('live');
+    await expect(isProcessIdentityLive(
+      process.pid,
+      nextExpected,
+      deadline(),
+    )).resolves.toBe('mismatch');
+    await expect(isProcessIdentityLive(
+      process.pid,
+      `dmtf:${dmtf}`,
+      deadline(),
+    )).resolves.toBe('live');
+    await expect(isProcessIdentityLive(
+      process.pid,
+      `ticks:${exactTicks + 1n}`,
+      deadline(),
+    )).resolves.toBe('mismatch');
+
+    const callsBeforeMalformed = execFile.mock.calls.length;
+    for (const unverifiableExpected of [
+      '',
+      '   ',
+      'unsupported-owner-identity',
+      'windows-dmtf-us:not-a-number',
+    ]) {
+      await expect(isProcessIdentityLive(
+        process.pid,
+        unverifiableExpected,
+        deadline(),
+      )).resolves.toBe('unknown');
+    }
+    expect(execFile).toHaveBeenCalledTimes(callsBeforeMalformed);
+
+    outcomes.push(
+      Object.assign(new Error('pwsh unavailable'), { code: 'ENOENT' }),
+      Object.assign(new Error('powershell unavailable'), { code: 'ENOENT' }),
+      Object.assign(new Error('wmic unavailable'), { code: 'ENOENT' }),
+    );
+    await expect(isProcessIdentityLive(
+      process.pid,
+      expected,
+      deadline(),
+    )).resolves.toBe('unknown');
+    platform.mockRestore();
+  });
+
+  it('terminates with one native cross-domain revalidation', async () => {
+    const actualChildProcess = await vi.importActual<
+      typeof import('node:child_process')
+    >('node:child_process');
+    const platform = vi.spyOn(process, 'platform', 'get')
+      .mockReturnValue('win32');
+    const dmtf = '20260101000000.123456+000';
+    const expected = parseWindowsProcessStartIdentity(dmtf);
+    const converted = dmtfCreationDateToTicks(dmtf);
+    if (!expected || !converted) {
+      throw new Error('test Windows identity is invalid');
+    }
+    const minimum = BigInt(converted.slice('ticks:'.length));
+    const maximum = minimum + 9n;
+    const outcomes: Array<'terminated' | 'mismatch' | 'unknown'> = [
+      'terminated',
+      'mismatch',
+      'unknown',
+    ];
+    const commands: string[] = [];
+    const execFile = vi.fn((...args: unknown[]) => {
+      const command = args[1];
+      const callback = args.at(-1);
+      if (!Array.isArray(command) || typeof callback !== 'function') {
+        throw new TypeError('execFile contract missing');
+      }
+      commands.push(String(command.at(-1)));
+      const outcome = outcomes.shift();
+      queueMicrotask(() => {
+        if (outcome === 'terminated') callback(null, '', '');
+        else callback(
+          Object.assign(new Error(outcome), {
+            status: outcome === 'mismatch' ? 3 : 4,
+          }),
+          '',
+          '',
+        );
+      });
+      return { pid: 4322 };
+    });
+    vi.doMock('child_process', () => ({
+      ...actualChildProcess,
+      execFile,
+    }));
+    vi.resetModules();
+    const { terminateOwnedProcessTree } = await import(
+      '../process-utils.js'
+    );
+    const deadlineAt = () => new Date(Date.now() + 1_000).toISOString();
+
+    await expect(terminateOwnedProcessTree({
+      pid: process.pid,
+      expectedStartIdentity: expected,
+      deadlineAt: deadlineAt(),
+      force: true,
+    })).resolves.toBe('terminated');
+    expect(execFile).toHaveBeenCalledTimes(1);
+    expect(commands[0]).toContain(
+      `$rootTicks -lt ${minimum} -or $rootTicks -gt ${maximum}`,
+    );
+
+    await expect(terminateOwnedProcessTree({
+      pid: process.pid,
+      expectedStartIdentity: expected,
+      deadlineAt: deadlineAt(),
+      force: true,
+    })).resolves.toBe('identity-mismatch');
+
+    const callsBeforeMalformed = execFile.mock.calls.length;
+    await expect(terminateOwnedProcessTree({
+      pid: process.pid,
+      expectedStartIdentity: 'windows-dmtf-us:not-a-number',
+      deadlineAt: deadlineAt(),
+      force: true,
+    })).resolves.toBe('unknown');
+    expect(execFile).toHaveBeenCalledTimes(callsBeforeMalformed);
+
+    await expect(terminateOwnedProcessTree({
+      pid: process.pid,
+      expectedStartIdentity: expected,
+      deadlineAt: deadlineAt(),
+      force: true,
+    })).resolves.toBe('unknown');
+    platform.mockRestore();
   });
 });

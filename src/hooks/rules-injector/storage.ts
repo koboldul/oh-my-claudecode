@@ -17,6 +17,9 @@ import {
   lockPathFor,
   withFileLockSync,
 } from '../../lib/file-lock.js';
+import {
+  warmCurrentProcessStartIdentitySyncCache,
+} from '../../platform/process-utils.js';
 import { RULES_INJECTOR_STORAGE } from './constants.js';
 import type {
   InjectedRuleReservation,
@@ -34,6 +37,22 @@ interface RulesState {
   contentHashes: Set<string>;
   realPaths: Set<string>;
   reservations: InjectedRuleReservation[];
+}
+
+export interface RulesStorageInitializationOptions {
+  deadlineAt?: number;
+  signal?: AbortSignal;
+  onIdentityProbeSpawn?: (pid: number) => void;
+}
+
+export function initializeRulesStorage(
+  options: RulesStorageInitializationOptions = {},
+): Promise<boolean> {
+  return warmCurrentProcessStartIdentitySyncCache({
+    deadlineAt: options.deadlineAt,
+    signal: options.signal,
+    onProbeSpawn: options.onIdentityProbeSpawn,
+  });
 }
 
 function getStoragePath(sessionId: string): string {

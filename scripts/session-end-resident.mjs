@@ -21,6 +21,7 @@ const ipc = require('./lib/session-end-ipc.cjs');
 
 const BOOTSTRAP_ARG = '--bootstrap';
 const PROCESSING_RETRY_MS = 250;
+const PROCESSING_RETRY_TRANSITION_ATTEMPTS = 8;
 const RECOVERY_SCAN_MS = 1_000;
 const MANIFEST_SCAN_MS = 500;
 const ADMISSION_IDLE_MS = 1_000;
@@ -306,19 +307,30 @@ function returnClaimForRetry(context, work, error) {
   }
   const attempts = Number.isInteger(claim?.attempts) ? claim.attempts : 1;
   if (attempts >= 3) return;
-  setTimeout(() => {
-    try {
-      if (
-        existsSync(work.paths.processingPath)
-        && !existsSync(work.paths.readyPath)
-      ) {
-        renameSync(work.paths.processingPath, work.paths.readyPath);
-        ipc.fsyncDirectory(context.readyDir);
+  let transitionsRemaining = PROCESSING_RETRY_TRANSITION_ATTEMPTS;
+  const retryTransition = () => {
+    setTimeout(() => {
+      try {
+        if (
+          existsSync(work.paths.processingPath)
+          && !existsSync(work.paths.readyPath)
+        ) {
+          renameSync(work.paths.processingPath, work.paths.readyPath);
+          ipc.fsyncDirectory(context.readyDir);
+        }
+      } catch {
+        transitionsRemaining -= 1;
+        if (
+          transitionsRemaining > 0
+          && existsSync(work.paths.processingPath)
+          && !existsSync(work.paths.readyPath)
+        ) {
+          retryTransition();
+        }
       }
-    } catch {
-      // Next SessionStart can recover the durable processing frame.
-    }
-  }, PROCESSING_RETRY_MS).unref();
+    }, PROCESSING_RETRY_MS).unref();
+  };
+  retryTransition();
 }
 
 async function processClaim({

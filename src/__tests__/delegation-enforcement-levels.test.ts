@@ -114,17 +114,17 @@ describe('delegation-enforcement-levels', () => {
     }
 
     const extensionToAgent: [string, string][] = [
-      ['file.ts', 'executor-low (simple) or executor (complex)'],
-      ['file.tsx', 'designer-low (simple) or designer (complex UI)'],
-      ['file.js', 'executor-low'],
-      ['file.jsx', 'designer-low'],
-      ['file.py', 'executor-low (simple) or executor (complex)'],
+      ['file.ts', 'executor (use model="haiku" for simple changes)'],
+      ['file.tsx', 'designer (use model="haiku" for simple changes)'],
+      ['file.js', 'executor'],
+      ['file.jsx', 'designer'],
+      ['file.py', 'executor (use model="haiku" for simple changes)'],
       ['file.vue', 'designer'],
       ['file.svelte', 'designer'],
-      ['file.css', 'designer-low'],
-      ['file.scss', 'designer-low'],
-      ['file.md', 'writer (documentation)'],
-      ['file.json', 'executor-low'],
+      ['file.css', 'designer'],
+      ['file.scss', 'designer'],
+      ['file.md', 'writer'],
+      ['file.json', 'executor'],
     ];
 
     it.each(extensionToAgent)(
@@ -179,13 +179,13 @@ describe('delegation-enforcement-levels', () => {
       // Local config exists with 'off', global has 'strict'
       mockExistsSync.mockImplementation((p: unknown) => {
         const s = String(p);
-        if (s.endsWith('/.omc/config.json')) return true;
+        if (/[\\/]\.omc[\\/]config\.json$/.test(s)) return true;
         if (/[\\/]mock[\\/]home[\\/]\.claude[\\/]\.omc-config\.json$/.test(s)) return true;
         return false;
       });
       mockReadFileSync.mockImplementation((p: unknown) => {
         const s = String(p);
-        if (s.endsWith('/.omc/config.json')) {
+        if (/[\\/]\.omc[\\/]config\.json$/.test(s)) {
           return JSON.stringify({ delegationEnforcementLevel: 'off' });
         }
         if (/[\\/]mock[\\/]home[\\/]\.claude[\\/]\.omc-config\.json$/.test(s)) {
@@ -255,7 +255,7 @@ describe('delegation-enforcement-levels', () => {
     it('supports enforcementLevel key as alternative', () => {
       mockExistsSync.mockImplementation((p: unknown) => {
         const s = String(p);
-        if (s.endsWith('/.omc/config.json')) return true;
+        if (/[\\/]\.omc[\\/]config\.json$/.test(s)) return true;
         return false;
       });
       mockReadFileSync.mockImplementation(() => {
@@ -374,7 +374,7 @@ describe('delegation-enforcement-levels', () => {
         toolInput: { filePath: 'src/component.tsx' },
         directory: '/tmp/test-project',
       });
-      expect(result.message).toContain('Suggested agent: designer-low (simple) or designer (complex UI)');
+      expect(result.message).toContain('Suggested agent: designer (use model="haiku" for simple changes)');
     });
 
     it('handles filePath in different input keys', () => {
@@ -623,19 +623,20 @@ describe('delegation-enforcement-levels', () => {
       expect(isAllowedPath('.claude/settings.json')).toBe(true);
     });
 
-    it('returns true for temporary and scratchpad paths', () => {
-      expect(isAllowedPath('/tmp/test.py')).toBe(true);
-      expect(isAllowedPath('/private/tmp/claude-501/project/session/scratchpad/test.py')).toBe(true);
-      expect(isAllowedPath('/var/tmp/script.sh')).toBe(true);
+    it('allows only host-native temporary and scratchpad paths', () => {
+      const isPosixHost = process.platform !== 'win32';
+      expect(isAllowedPath('/tmp/test.py')).toBe(isPosixHost);
+      expect(isAllowedPath('/private/tmp/claude-501/project/session/scratchpad/test.py')).toBe(isPosixHost);
+      expect(isAllowedPath('/var/tmp/script.sh')).toBe(isPosixHost);
     });
 
     it.each([
-      ['/tmp/test.py', '/home/project', true],
-      ['/private/tmp/test.py', '/home/project', true],
-      ['/var/tmp/test.py', '/home/project', true],
-      ['/private/var/tmp/test.py', '/home/project', true],
+      ['/tmp/test.py', '/home/project', process.platform !== 'win32'],
+      ['/private/tmp/test.py', '/home/project', process.platform !== 'win32'],
+      ['/var/tmp/test.py', '/home/project', process.platform !== 'win32'],
+      ['/private/var/tmp/test.py', '/home/project', process.platform !== 'win32'],
       ['/tmp/project/src/app.ts', '/tmp/project', false],
-      ['/tmp/project2/src/app.ts', '/tmp/project', true],
+      ['/tmp/project2/src/app.ts', '/tmp/project', process.platform !== 'win32'],
       ['/tmpfoo/src/app.ts', '/home/project', false],
       ['scratchpad/src/app.ts', '/home/project', false],
       ['C:\\Windows\\Temp\\fixture.ts', '/home/project', process.platform === 'win32'],

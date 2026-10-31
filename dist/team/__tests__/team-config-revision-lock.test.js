@@ -7,7 +7,9 @@ import { absPath, TeamPaths } from '../state-paths.js';
 import { withProcessIdentityFileLock, withProcessIdentityFileLockSync } from '../process-identity-lock.js';
 import { currentProcessStartIdentity } from '../team-owner-epoch.js';
 import { teamCreateTask, teamReadConfig, teamReadManifest, withTaskClaimLock } from '../team-ops.js';
-import { buildTeamInstancePendingConfig, createTeamInstanceBinding, reserveTeamInstance, withTeamInstanceLifecycleLock } from '../team-instance.js';
+import { buildTeamInstancePendingConfig, createTeamInstanceBinding, listTeamScaleUpWorktreeRecoveryEvidence, publishTeamScaleUpWorktreeRecoveryEvidence, reserveTeamInstance, withTeamInstanceLifecycleLock, } from '../team-instance.js';
+import { getBranchName, getWorktreePath } from '../git-worktree.js';
+import { recoverFailedScaleUpWorktreeUnderLock } from '../scaling.js';
 let cwd;
 let previousHome;
 let previousUserProfile;
@@ -76,6 +78,319 @@ afterEach(() => {
     rmSync(cwd, { recursive: true, force: true });
 });
 describe('team config revision transaction', () => {
+    it('rejects foreign or malformed scale-up worktree cleanup authority', () => {
+        const workerName = 'worker-2';
+        const truncatingAlias = `worker-${'x'.repeat(50)}`;
+        const receipt = {
+            worker_name: workerName,
+            path: getWorktreePath(cwd, teamName, workerName),
+            branch: getBranchName(teamName, workerName),
+            mode: 'named',
+            created: true,
+            reused: false,
+            effect_scope: 'created_before_worker_persist',
+        };
+        const config = {
+            ...initialConfig(),
+            active_recovery: undefined,
+            instance_id: instanceA,
+            leader_cwd: cwd,
+            active_scale_up: {
+                instance_id: instanceA,
+                operation_id: 'scale-up-receipt-a',
+                phase: 'failed',
+                pid: process.pid,
+                process_started_at: deadProcessStart,
+                state_revision: 1,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                baseline_worker_names: ['worker-1'],
+                cleanup_failures: [`${workerName}:pending-worktree:${receipt.path}`],
+                worktree_cleanup_receipts: [receipt],
+            },
+        };
+        expect(validateRevisionedTeamConfig(config, teamName, cwd)).toBe(config);
+        for (const invalidReceipt of [
+            { ...receipt, path: getWorktreePath(cwd, teamName, 'worker-3') },
+            { ...receipt, branch: getBranchName(teamName, 'worker-3') },
+            { ...receipt, mode: 'detached', branch: receipt.branch },
+            { ...receipt, created: false, reused: true },
+            { ...receipt, effect_scope: 'foreign_scope' },
+            {
+                ...receipt,
+                worker_name: 'worker-2!',
+                path: getWorktreePath(cwd, teamName, 'worker-2!'),
+                branch: getBranchName(teamName, 'worker-2!'),
+            },
+            {
+                ...receipt,
+                worker_name: truncatingAlias,
+                path: getWorktreePath(cwd, teamName, truncatingAlias),
+                branch: getBranchName(teamName, truncatingAlias),
+            },
+        ]) {
+            expect(validateRevisionedTeamConfig({
+                ...config,
+                active_scale_up: {
+                    ...config.active_scale_up,
+                    worktree_cleanup_receipts: [invalidReceipt],
+                },
+            }, teamName, cwd)).toBeNull();
+        }
+    });
+    it('rejects noncanonical worker names in external scale-up recovery evidence', async () => {
+        const recoveryTeamName = 'config-recovery-worker-alias';
+        const operationId = 'scale-up-worker-alias';
+        const binding = createTeamInstanceBinding({
+            teamName: recoveryTeamName,
+            cwd,
+            instanceId: instanceA,
+        });
+        await reserveTeamInstance({
+            teamName: recoveryTeamName,
+            cwd,
+            instanceId: instanceA,
+        });
+        const evidencePath = absPath(cwd, TeamPaths.teamInstanceScaleUpRecoveryEvidence(binding.workspace_hash, recoveryTeamName, instanceA, operationId));
+        const canonicalWorkerName = 'worker-2';
+        mkdirSync(join(evidencePath, '..'), { recursive: true });
+        writeFileSync(evidencePath, JSON.stringify({
+            schema_version: 1,
+            kind: 'team-scale-up-worktree-recovery',
+            instance_id: instanceA,
+            team_name: recoveryTeamName,
+            cwd: binding.cwd,
+            workspace_hash: binding.workspace_hash,
+            state_root: binding.state_root,
+            operation_id: operationId,
+            evidence_path: evidencePath,
+            receipt: {
+                worker_name: 'worker-2!',
+                path: getWorktreePath(cwd, recoveryTeamName, canonicalWorkerName),
+                branch: getBranchName(recoveryTeamName, canonicalWorkerName),
+                mode: 'named',
+                created: true,
+                reused: false,
+                effect_scope: 'created_before_worker_persist',
+            },
+            original_error: 'metadata publication cleanup failed',
+            cleanup_error: 'branch lock',
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+        }));
+        await expect(listTeamScaleUpWorktreeRecoveryEvidence(binding))
+            .rejects.toThrow('scale_up_recovery_evidence_invalid');
+    });
+    it('rejects disagreement between config and external scale-up recovery authority before cleanup', async () => {
+        const recoveryTeamName = 'config-recovery-disagreement';
+        const binding = createTeamInstanceBinding({
+            teamName: recoveryTeamName,
+            cwd,
+            instanceId: instanceA,
+        });
+        await reserveTeamInstance({
+            teamName: recoveryTeamName,
+            cwd,
+            instanceId: instanceA,
+        });
+        const operationId = 'scale-up-recovery-disagreement';
+        const externalReceipt = {
+            worker_name: 'worker-2',
+            path: getWorktreePath(cwd, recoveryTeamName, 'worker-2'),
+            branch: getBranchName(recoveryTeamName, 'worker-2'),
+            mode: 'named',
+            created: true,
+            reused: false,
+            effect_scope: 'created_before_worker_persist',
+        };
+        const configReceipt = {
+            worker_name: 'worker-3',
+            path: getWorktreePath(cwd, recoveryTeamName, 'worker-3'),
+            branch: getBranchName(recoveryTeamName, 'worker-3'),
+            mode: 'named',
+            created: true,
+            reused: false,
+            effect_scope: 'created_before_worker_persist',
+        };
+        const externalSentinel = join(externalReceipt.path, 'external-sentinel.txt');
+        const configSentinel = join(configReceipt.path, 'config-sentinel.txt');
+        mkdirSync(externalReceipt.path, { recursive: true });
+        mkdirSync(configReceipt.path, { recursive: true });
+        writeFileSync(externalSentinel, 'external');
+        writeFileSync(configSentinel, 'config');
+        await publishTeamScaleUpWorktreeRecoveryEvidence(binding, operationId, externalReceipt, {
+            originalError: 'metadata publication cleanup failed',
+            cleanupError: 'branch lock',
+        });
+        const recoveryConfig = {
+            ...initialConfig(),
+            name: recoveryTeamName,
+            active_recovery: undefined,
+            instance_id: instanceA,
+            leader_cwd: cwd,
+            team_state_root: binding.state_root,
+            active_scale_up: {
+                instance_id: instanceA,
+                operation_id: operationId,
+                phase: 'failed',
+                pid: process.pid,
+                process_started_at: deadProcessStart,
+                state_revision: 1,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                baseline_worker_names: ['worker-1'],
+                cleanup_failures: [
+                    `${configReceipt.worker_name}:pending-worktree:${configReceipt.path}`,
+                ],
+                worktree_cleanup_receipts: [configReceipt],
+            },
+        };
+        const recoveryConfigPath = absPath(cwd, TeamPaths.config(recoveryTeamName));
+        mkdirSync(join(recoveryConfigPath, '..'), { recursive: true });
+        writeFileSync(recoveryConfigPath, JSON.stringify(recoveryConfig));
+        await expect(withTeamInstanceLifecycleLock(cwd, recoveryTeamName, async () => {
+            const current = await readRevisionedTeamConfig(recoveryTeamName, cwd);
+            if (!current)
+                throw new Error('missing recovery config');
+            await recoverFailedScaleUpWorktreeUnderLock(binding, current);
+        })).rejects.toThrow('scale_up_recovery_receipt_mismatch');
+        expect(readFileSync(externalSentinel, 'utf8')).toBe('external');
+        expect(readFileSync(configSentinel, 'utf8')).toBe('config');
+    });
+    it('does not promote effects-phase config receipts into cleanup authority without external evidence', async () => {
+        const recoveryTeamName = 'config-recovery-effects-only';
+        const workerName = 'worker-2';
+        const binding = createTeamInstanceBinding({
+            teamName: recoveryTeamName,
+            cwd,
+            instanceId: instanceA,
+        });
+        await reserveTeamInstance({
+            teamName: recoveryTeamName,
+            cwd,
+            instanceId: instanceA,
+        });
+        const receipt = {
+            worker_name: workerName,
+            path: getWorktreePath(cwd, recoveryTeamName, workerName),
+            branch: getBranchName(recoveryTeamName, workerName),
+            mode: 'named',
+            created: true,
+            reused: false,
+            effect_scope: 'created_before_worker_persist',
+        };
+        const sentinel = join(receipt.path, 'sentinel.txt');
+        mkdirSync(receipt.path, { recursive: true });
+        writeFileSync(sentinel, 'preserve');
+        const recoveryConfig = {
+            ...initialConfig(),
+            name: recoveryTeamName,
+            active_recovery: undefined,
+            instance_id: instanceA,
+            leader_cwd: cwd,
+            team_state_root: binding.state_root,
+            active_scale_up: {
+                instance_id: instanceA,
+                operation_id: 'scale-up-effects-only',
+                phase: 'effects',
+                pid: process.pid,
+                process_started_at: deadProcessStart,
+                state_revision: 1,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                baseline_worker_names: ['worker-1'],
+                worktree_cleanup_receipts: [receipt],
+            },
+        };
+        const recoveryConfigPath = absPath(cwd, TeamPaths.config(recoveryTeamName));
+        mkdirSync(join(recoveryConfigPath, '..'), { recursive: true });
+        writeFileSync(recoveryConfigPath, JSON.stringify(recoveryConfig));
+        await expect(withTeamInstanceLifecycleLock(cwd, recoveryTeamName, async () => {
+            const current = await readRevisionedTeamConfig(recoveryTeamName, cwd);
+            if (!current)
+                throw new Error('missing recovery config');
+            await recoverFailedScaleUpWorktreeUnderLock(binding, current);
+        })).rejects.toThrow('scale_up_recovery_effects_unverified');
+        expect(readFileSync(sentinel, 'utf8')).toBe('preserve');
+    });
+    it('retains the config fence and external evidence when recovery release CAS loses', async () => {
+        const recoveryTeamName = 'config-recovery-release-race';
+        const operationId = 'scale-up-recovery-release-race';
+        const workerName = 'worker-2';
+        const binding = createTeamInstanceBinding({
+            teamName: recoveryTeamName,
+            cwd,
+            instanceId: instanceA,
+        });
+        await reserveTeamInstance({
+            teamName: recoveryTeamName,
+            cwd,
+            instanceId: instanceA,
+        });
+        const receipt = {
+            worker_name: workerName,
+            path: getWorktreePath(cwd, recoveryTeamName, workerName),
+            branch: 'HEAD',
+            mode: 'detached',
+            created: true,
+            reused: false,
+            effect_scope: 'created_before_worker_persist',
+        };
+        await publishTeamScaleUpWorktreeRecoveryEvidence(binding, operationId, receipt, {
+            originalError: 'metadata publication cleanup failed',
+            cleanupError: 'worktree cleanup failed',
+        });
+        const recoveryConfig = {
+            ...initialConfig(),
+            name: recoveryTeamName,
+            active_recovery: undefined,
+            instance_id: instanceA,
+            leader_cwd: cwd,
+            team_state_root: binding.state_root,
+            state_revision: 1,
+            active_scale_up: {
+                instance_id: instanceA,
+                operation_id: operationId,
+                phase: 'failed',
+                pid: process.pid,
+                process_started_at: deadProcessStart,
+                state_revision: 1,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                failure_reason: 'metadata publication cleanup failed',
+                baseline_worker_names: ['worker-1'],
+                cleanup_failures: [`${workerName}:pending-worktree:${receipt.path}`],
+                worktree_cleanup_receipts: [receipt],
+            },
+        };
+        const persistedConfig = {
+            ...recoveryConfig,
+            state_revision: 2,
+            active_scale_up: {
+                ...recoveryConfig.active_scale_up,
+                state_revision: 2,
+            },
+        };
+        const recoveryConfigPath = absPath(cwd, TeamPaths.config(recoveryTeamName));
+        mkdirSync(join(recoveryConfigPath, '..'), { recursive: true });
+        writeFileSync(recoveryConfigPath, JSON.stringify(persistedConfig));
+        await expect(withTeamInstanceLifecycleLock(cwd, recoveryTeamName, async () => recoverFailedScaleUpWorktreeUnderLock(binding, {
+            config: recoveryConfig,
+            stateRevision: 1,
+        }))).rejects.toThrow('scale_up_recovery_fence_release_failed');
+        expect(await listTeamScaleUpWorktreeRecoveryEvidence(binding)).toHaveLength(1);
+        const after = await readRevisionedTeamConfig(recoveryTeamName, cwd);
+        expect(after).toMatchObject({
+            stateRevision: 2,
+            config: {
+                active_scale_up: {
+                    operation_id: operationId,
+                    phase: 'failed',
+                    worktree_cleanup_receipts: [receipt],
+                },
+            },
+        });
+    });
     it.each(['active_scale_up', 'active_scale_down', 'shutdown_attempt'])('rejects malformed or cross-instance identity in %s', family => {
         const attempt = {
             instance_id: instanceA, operation_id: 'operation-a', nonce: 'shutdown-a', phase: 'effects',

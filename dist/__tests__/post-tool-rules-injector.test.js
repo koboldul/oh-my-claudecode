@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, resolve, join } from 'node:path';
+import { dirname, relative, resolve, join } from 'node:path';
 import * as esbuild from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { stageHookRuntimeSupport } from './helpers/staged-hook-runtime.js';
 const NODE = process.execPath;
 const REPO_ROOT = resolve(join(__dirname, '..', '..'));
 let tempRoot;
@@ -15,8 +16,7 @@ beforeAll(async () => {
     pluginRoot = join(tempRoot, 'plugin');
     workspace = join(tempRoot, 'workspace');
     scriptPath = join(pluginRoot, 'scripts', 'post-tool-rules-injector.mjs');
-    mkdirSync(join(pluginRoot, 'scripts'), { recursive: true });
-    cpSync(join(REPO_ROOT, 'scripts', 'lib'), join(pluginRoot, 'scripts', 'lib'), { recursive: true });
+    stageHookRuntimeSupport(pluginRoot, REPO_ROOT);
     copyFileSync(join(REPO_ROOT, 'scripts', 'post-tool-rules-injector.mjs'), scriptPath);
     writeFileSync(join(pluginRoot, 'package.json'), JSON.stringify({ type: 'module' }), 'utf8');
     execFileSync(NODE, [
@@ -68,6 +68,27 @@ function runHook(input, extraEnv) {
         timeout: 15000,
     }).trim();
     return JSON.parse(raw);
+}
+function runCopilotHook(root, filePath, sessionId) {
+    return runHook({
+        sessionId,
+        cwd: root,
+        toolName: 'Read',
+        toolArgs: JSON.stringify({ file_path: filePath }),
+        toolResult: {
+            textResultForLlm: '# fixture',
+            resultType: 'success',
+        },
+    }, {
+        CLAUDE_CONFIG_DIR: join(root, 'config'),
+        HOME: join(root, 'home'),
+        OMC_HOST: 'copilot',
+        USERPROFILE: join(root, 'home'),
+    });
+}
+function writeAlwaysRule(path, body) {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `---\nalwaysApply: true\n---\n${body}`, 'utf8');
 }
 describe('post-tool-rules-injector.mjs skip guards (DISABLE_OMC / OMC_SKIP_HOOKS)', () => {
     // A payload with a file_path drives the hook into its rules-processing path, so a
@@ -134,6 +155,71 @@ describe('post-tool-rules-injector.mjs skip guards (DISABLE_OMC / OMC_SKIP_HOOKS
     });
     it('preserves context when DISABLE_OMC=false', () => {
         expectInjectedContext({ DISABLE_OMC: 'false', OMC_SKIP_HOOKS: '' });
+    });
+});
+describe('post-tool-rules-injector.mjs bounded delivery records', () => {
+    it('omits a later Copilot rule rather than truncating the aggregate context', () => {
+        const root = mkdtempSync(join(tmpdir(), 'omc-rules-aggregate-bound-'));
+        const filePath = join(root, 'src', 'fixture.ts');
+        const firstRule = join(root, 'src', '.claude', 'rules', 'first.md');
+        const secondRule = join(root, '.claude', 'rules', 'second.md');
+        mkdirSync(dirname(filePath), { recursive: true });
+        mkdirSync(join(root, 'home'), { recursive: true });
+        writeFileSync(join(root, '.git'), 'gitdir: placeholder', 'utf8');
+        writeFileSync(filePath, 'export {};\n', 'utf8');
+        writeAlwaysRule(firstRule, `FIRST-BOUNDARY\n${'a'.repeat(4_000)}\nFIRST-BOUNDARY-END`);
+        writeAlwaysRule(secondRule, `SECOND-BOUNDARY\n${'b'.repeat(2_500)}\nSECOND-BOUNDARY-END`);
+        try {
+            const sessionId = `aggregate-bound-${Date.now()}`;
+            const first = runCopilotHook(root, filePath, sessionId);
+            expect(first.additionalContext).toContain('FIRST-BOUNDARY-END');
+            expect(first.additionalContext).not.toContain('SECOND-BOUNDARY');
+            expect(first.additionalContext).not.toContain('…');
+            const second = runCopilotHook(root, filePath, sessionId);
+            expect(second.additionalContext).toContain('SECOND-BOUNDARY-END');
+            expect(second.additionalContext).not.toContain('FIRST-BOUNDARY');
+        }
+        finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+    it('does not commit an omitted rule whose formatted text is embedded in another rule', () => {
+        const root = mkdtempSync(join(tmpdir(), 'omc-rules-embedded-record-'));
+        const filePath = join(root, 'src', 'fixture.ts');
+        const firstRule = join(root, 'src', '.claude', 'rules', 'first.md');
+        const secondRule = join(root, '.claude', 'rules', 'second.md');
+        mkdirSync(dirname(filePath), { recursive: true });
+        mkdirSync(join(root, 'home'), { recursive: true });
+        writeFileSync(join(root, '.git'), 'gitdir: placeholder', 'utf8');
+        writeFileSync(filePath, 'export {};\n', 'utf8');
+        const secondBody = 'SECOND-EMBEDDED-RECORD';
+        const secondContext = `[Rule: ${relative(root, secondRule)}]\n`
+            + '[Match: alwaysApply]\n'
+            + secondBody;
+        const firstHeader = `[Rule: ${relative(root, firstRule)}]\n`
+            + '[Match: alwaysApply]\n';
+        const firstPrefix = 'FIRST-CONTAINS-SECOND\n';
+        const paddingLength = 5_950
+            - firstHeader.length
+            - firstPrefix.length
+            - 1
+            - secondContext.length;
+        expect(paddingLength).toBeGreaterThan(0);
+        const firstBody = `${firstPrefix}${'x'.repeat(paddingLength)}\n${secondContext}`;
+        expect(`${firstHeader}${firstBody}`).toHaveLength(5_950);
+        writeAlwaysRule(firstRule, firstBody);
+        writeAlwaysRule(secondRule, secondBody);
+        try {
+            const sessionId = `embedded-record-${Date.now()}`;
+            const first = runCopilotHook(root, filePath, sessionId);
+            expect(first.additionalContext).toHaveLength(5_950);
+            expect(first.additionalContext).toContain(secondContext);
+            const second = runCopilotHook(root, filePath, sessionId);
+            expect(second.additionalContext).toBe(secondContext);
+        }
+        finally {
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 });
 //# sourceMappingURL=post-tool-rules-injector.test.js.map

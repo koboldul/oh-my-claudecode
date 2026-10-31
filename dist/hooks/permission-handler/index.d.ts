@@ -47,7 +47,6 @@ export interface BackgroundPermissionFallbackResult {
 export declare function getBackgroundTaskPermissionFallback(directory: string, subagentType?: string): BackgroundPermissionFallbackResult;
 export declare function getBackgroundBashPermissionFallback(directory: string, command?: string): BackgroundPermissionFallbackResult;
 export declare function isSafeRepoInspectionCommand(command: string, cwd: string): boolean;
-export declare function isSafeTargetedLocalTestCommand(command: string, cwd: string): boolean;
 export declare function isSafeAutoApprovedCommand(command: string, cwd: string, shellDialect?: 'posix' | 'powershell'): boolean;
 /**
  * Match a deliberately small set of external executable invocations using
@@ -59,18 +58,6 @@ export declare function isSafePowerShellCommand(command: string): boolean;
  * Check if a command matches safe patterns
  */
 export declare function isSafeCommand(command: string): boolean;
-/**
- * Check if a command is a heredoc command with a safe base command.
- * Issue #608: Heredoc commands contain shell metacharacters (<<, \n, $, etc.)
- * that cause isSafeCommand() to reject them. When they fall through to Claude
- * Code's native permission flow and the user approves "Always allow", the entire
- * heredoc body (potentially hundreds of lines) gets stored in settings.local.json.
- *
- * The opener must terminate the first command line, the base command is limited
- * to a non-chained git commit/tag invocation, and the delimiter must be followed
- * only by the command-substitution close. Anything after that remains native.
- */
-export declare function isHeredocWithSafeBase(command: string): boolean;
 /**
  * Check if an active supported mode is running
  */

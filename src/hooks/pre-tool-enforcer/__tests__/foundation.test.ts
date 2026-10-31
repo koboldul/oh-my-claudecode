@@ -651,6 +651,122 @@ describe('transactional PreToolUse foundation', () => {
     expect(source).not.toMatch(/notifyOnce|appendReplayEventOnce|writeFileSync/);
   });
 
+  it('exposes pure Jev observations for slop and model routing', () => {
+    const input = {
+      subagent_type: 'general-purpose',
+      description: 'Implement a fallback',
+      prompt: 'Add a workaround if the normal architecture is hard.',
+      model: 'haiku',
+    };
+    const envelope = claudeEnvelope('Task', input, 'jev-observation');
+    const plan = planPreToolBatch(envelope, makeSnapshot());
+
+    expect(plan.calls[0].jevObservations).toEqual({
+      slopWarning: true,
+      modelRouting: {
+        originalInput: input,
+        modifiedInput: input,
+        injected: false,
+        model: 'haiku',
+      },
+    });
+  });
+
+  it('applies an active Claude Jev tier through a required mutation', () => {
+    const envelope = claudeEnvelope('Task', {
+      subagent_type: 'general-purpose',
+      description: 'Implement the requested change',
+      prompt: 'Build the feature',
+      model: 'haiku',
+    }, 'jev-active-claude');
+    const snapshot = makeSnapshot({ quietLevel: 2 });
+    const plan = planPreToolBatch(envelope, snapshot, {
+      'jev-active-claude': 'opus',
+    });
+    const reduction = reduceHookEvaluations(envelope, plan.evaluations);
+
+    expect(plan.evaluations[0].mutation).toMatchObject({
+      requirement: 'required',
+      input: {
+        subagent_type: 'general-purpose',
+        description: 'Implement the requested change',
+        prompt: 'Build the feature',
+        model: 'opus',
+      },
+      retryHint: {
+        patch: { model: 'opus' },
+      },
+    });
+    expect(reduction.mutations[0].input).toMatchObject({ model: 'opus' });
+    expect(plan.legacyPresentations[0]).toMatchObject({
+      kind: 'suppressed-with-mutation',
+      updatedInput: { model: 'opus' },
+    });
+  });
+
+  it.each([
+    {
+      name: 'explicit provider model',
+      input: {
+        agent_type: 'oh-my-claudecode:executor',
+        model: 'gpt-6.1-sol',
+        reasoning_effort: 'max',
+      },
+      snapshot: makeSnapshot(),
+      expectedMutation: undefined,
+    },
+    {
+      name: 'explicit tier choice',
+      input: {
+        agent_type: 'oh-my-claudecode:executor',
+        model: 'sonnet',
+        reasoning_effort: 'max',
+      },
+      snapshot: makeSnapshot(),
+      expectedMutation: undefined,
+    },
+    {
+      name: 'configured agent provider model',
+      input: {
+        agent_type: 'oh-my-claudecode:executor',
+      },
+      snapshot: makeSnapshot({
+        modelRouting: {
+          ...makeSnapshot().modelRouting,
+          configuredAgentModels: {
+            executor: 'gpt-6.1-sol',
+          },
+        },
+      }),
+      expectedMutation: {
+        input: {
+          agent_type: 'oh-my-claudecode:executor',
+          model: 'gpt-6.1-sol',
+          reasoning_effort: 'max',
+        },
+      },
+    },
+  ])(
+    'does not let a Claude-tier Jev answer replace a Copilot $name',
+    ({ input, snapshot, expectedMutation }) => {
+      const envelope = copilotEnvelope([{
+        id: 'jev-protected-copilot',
+        name: 'agent',
+        args: input,
+      }]);
+      const plan = planPreToolBatch(envelope, snapshot, {
+        'jev-protected-copilot': 'opus',
+      });
+
+      if (expectedMutation) {
+        expect(plan.evaluations[0].mutation).toMatchObject(expectedMutation);
+      } else {
+        expect(plan.evaluations[0].mutation).toBeUndefined();
+      }
+      expect(envelope.toolCalls[0].input).toEqual(input);
+    },
+  );
+
   it.each(['agent_type', 'subagent_type'])(
     'denies a canonical skill passed via native Copilot %s before routing',
     (field) => {

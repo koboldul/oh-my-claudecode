@@ -9,8 +9,8 @@
  * - File-based scaling lock prevents concurrent scale operations
  * - 'draining' worker status for graceful transitions during scale_down
  */
-import { join, resolve } from 'path';
-import { mkdir, readFile, rm } from 'fs/promises';
+import { resolve } from 'path';
+import { mkdir, readFile, readdir, rm } from 'fs/promises';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { buildWorkerArgv, clearResolvedPathCache, getWorkerEnv as getModelWorkerEnv, getPromptModeArgs, isPromptModeAgent, resolveDefaultWorkerModel, assertHeadlessSupported, resolveValidatedBinaryPath, validateWorkerLaunchDescriptor, } from './model-contract.js';
@@ -21,16 +21,16 @@ import { teamReadConfig, teamWriteWorkerIdentity, teamReadWorkerStatus, teamAppe
 import { isValidTmuxServerIdentity, } from './types.js';
 import { withScalingLock, migrateTeamConfigRevision, readRevisionedTeamConfig, saveTeamConfigAtRevision } from './monitor.js';
 import { adoptWorkerPaneOwnership, sanitizeName, getOwnedWorkerLiveness, killOwnedWorkerPane, spawnOwnedWorkerInPane, splitTeamWorkerPaneWithEvidence, workerPaneBelongsToOwnedProviderTarget, waitForPaneReady, } from './tmux-session.js';
-import { TeamPaths, absPath, canonicalTeamCwd, canonicalTeamStatePath, teamStateRoot as resolveTeamStateRoot, } from './state-paths.js';
+import { TeamPaths, absPath, canonicalTeamCwd, canonicalTeamStatePath, teamStateRoot as resolveTeamStateRoot, withTeamStatePathScope, } from './state-paths.js';
 import { composeInitialInbox, generatePromptModeStartupPrompt, writeWorkerOverlay, } from './worker-bootstrap.js';
 import { cliWorkerOutputFilePath, renderCliWorkerOutputContract, shouldInjectContract, } from './cli-worker-contract.js';
 import { resolveCopilotModel, resolveCopilotReasoningEffort } from '../config/models.js';
-import { ensureWorkerWorktree, installWorktreeRootAgents, prepareWorkerWorktreeForRemoval, removeWorkerWorktree, restoreWorktreeRootAgents, } from './git-worktree.js';
-import { getOmcRoot } from '../lib/worktree-paths.js';
+import { assertWorkerWorktreeRemovalReceiptBinding, ensureWorkerWorktree, isWorktreeMetadataPublicationFailure, installWorktreeRootAgents, removeWorkerWorktree, } from './git-worktree.js';
+import { isCanonicalWorkerName, isSafeScaleUpOperationId } from './contracts.js';
 import { currentProcessStartIdentity, isProcessIdentityDead } from './team-owner-epoch.js';
 import { resolveRuntimeCliPath } from './runtime-owner-client.js';
 import { loadWorkerLaunchAttempt, retireAndCleanupCurrentWorkerLaunchAttempt } from './worker-launch-ack.js';
-import { assertTeamInstanceUnderLock, createTeamInstanceBinding, TeamInstanceError, withTeamInstanceLifecycleLock, } from './team-instance.js';
+import { assertTeamInstanceUnderLock, assertNoTeamScaleUpWorktreeRecoveryEvidence, createTeamInstanceBinding, listTeamScaleUpWorktreeRecoveryEvidence, publishTeamScaleUpWorktreeRecoveryEvidence, retireTeamScaleUpWorktreeRecoveryEvidenceUnderLock, TeamInstanceError, withTeamInstanceLifecycleLock, } from './team-instance.js';
 // ── Environment gate ──────────────────────────────────────────────────────────
 const OMC_TEAM_SCALING_ENABLED_ENV = 'OMC_TEAM_SCALING_ENABLED';
 const CLI_AGENT_TYPES = new Set(['claude', 'codex', 'gemini', 'grok', 'cursor', 'antigravity', 'copilot']);
@@ -45,6 +45,37 @@ function assertScalingEnabled(env = process.env) {
     if (!isScalingEnabled(env)) {
         throw new Error(`Dynamic scaling is disabled. Set ${OMC_TEAM_SCALING_ENABLED_ENV}=1 to enable.`);
     }
+}
+function workerWorktreeRemovalReceipt(worker) {
+    if (!worker.worktree_path || !worker.worktree_branch)
+        return null;
+    if (typeof worker.worktree_created !== 'boolean'
+        || typeof worker.worktree_detached !== 'boolean')
+        return null;
+    return {
+        path: worker.worktree_path,
+        branch: worker.worktree_branch,
+        mode: worker.worktree_detached ? 'detached' : 'named',
+        created: worker.worktree_created,
+        reused: !worker.worktree_created,
+    };
+}
+function mergeScaleUpWorktreeCleanupReceipts(existing, incoming) {
+    const merged = new Map();
+    for (const receipt of existing ?? [])
+        merged.set(receipt.worker_name, receipt);
+    for (const receipt of incoming) {
+        const current = merged.get(receipt.worker_name);
+        if (current && (current.path !== receipt.path
+            || current.branch !== receipt.branch
+            || current.mode !== receipt.mode
+            || current.created !== receipt.created
+            || current.reused !== receipt.reused
+            || current.effect_scope !== receipt.effect_scope))
+            return null;
+        merged.set(receipt.worker_name, receipt);
+    }
+    return [...merged.values()];
 }
 function asCliAgentType(agentType) {
     if (CLI_AGENT_TYPES.has(agentType)) {
@@ -167,6 +198,163 @@ export function scaleUpFenceBlocks(config) {
         return false;
     return true;
 }
+function sameScaleUpWorktreeCleanupReceipt(left, right) {
+    return left.worker_name === right.worker_name
+        && left.path === right.path
+        && left.branch === right.branch
+        && left.mode === right.mode
+        && left.created === right.created
+        && left.reused === right.reused
+        && left.effect_scope === right.effect_scope;
+}
+function hasExactWorkerBaseline(config, baselineWorkerNames) {
+    const actual = config.workers.map(worker => worker.name).sort();
+    const expected = [...baselineWorkerNames].sort();
+    if (!actual.every(isCanonicalWorkerName) || !expected.every(isCanonicalWorkerName))
+        return false;
+    return JSON.stringify(actual) === JSON.stringify(expected);
+}
+function assertScaleUpWorktreeCleanupReceiptAuthority(teamName, cwd, receipt) {
+    if (!isCanonicalWorkerName(receipt.worker_name)
+        || receipt.created !== true
+        || receipt.reused !== false
+        || receipt.effect_scope !== 'created_before_worker_persist') {
+        throw new Error('scale_up_recovery_receipt_invalid');
+    }
+    try {
+        assertWorkerWorktreeRemovalReceiptBinding(teamName, receipt.worker_name, cwd, receipt);
+    }
+    catch (error) {
+        throw new Error('scale_up_recovery_receipt_invalid', { cause: error });
+    }
+}
+/**
+ * Retry one instance-bound pre-worker-persistence worktree rollback while the
+ * caller holds the team lifecycle lock. No other partial scale-up effect is
+ * inferred or cleaned by this recovery path.
+ */
+export async function recoverFailedScaleUpWorktreeUnderLock(instance, current) {
+    await assertTeamInstanceUnderLock(instance);
+    if (!current.config.instance_id
+        || current.config.instance_id.toLowerCase() !== instance.instance_id.toLowerCase()) {
+        throw new Error('team_instance_mismatch');
+    }
+    const evidenceRecords = await listTeamScaleUpWorktreeRecoveryEvidence(instance);
+    const attempt = current.config.active_scale_up;
+    const persistedReceipts = attempt?.worktree_cleanup_receipts ?? [];
+    if (evidenceRecords.length > 1 || persistedReceipts.length > 1) {
+        throw new Error('scale_up_recovery_evidence_ambiguous');
+    }
+    const evidence = evidenceRecords[0];
+    const persistedReceipt = persistedReceipts[0];
+    if (!evidence && !persistedReceipt)
+        return current;
+    if (evidence && persistedReceipt
+        && !sameScaleUpWorktreeCleanupReceipt(evidence.receipt, persistedReceipt)) {
+        throw new Error('scale_up_recovery_receipt_mismatch');
+    }
+    const receipt = evidence?.receipt ?? persistedReceipt;
+    assertScaleUpWorktreeCleanupReceiptAuthority(instance.team_name, instance.cwd, receipt);
+    const expectedCleanupFailure = `${receipt.worker_name}:pending-worktree:${receipt.path}`;
+    let authoritative = current;
+    if (!evidence) {
+        if (!attempt
+            || attempt.phase !== 'failed'
+            || !attempt.instance_id
+            || attempt.instance_id.toLowerCase() !== instance.instance_id.toLowerCase()
+            || !isSafeScaleUpOperationId(attempt.operation_id)
+            || typeof attempt.failure_reason !== 'string'
+            || attempt.failure_reason.length === 0
+            || !attempt.baseline_worker_names
+            || !hasExactWorkerBaseline(current.config, attempt.baseline_worker_names)
+            || current.config.workers.some(worker => worker.name === receipt.worker_name)
+            || !attempt.cleanup_failures
+            || attempt.cleanup_failures.length !== 1
+            || attempt.cleanup_failures[0] !== expectedCleanupFailure) {
+            throw new Error('scale_up_recovery_effects_unverified');
+        }
+    }
+    else if (attempt) {
+        if (attempt.operation_id !== evidence.operation_id
+            || !attempt.instance_id
+            || attempt.instance_id.toLowerCase() !== instance.instance_id.toLowerCase()) {
+            throw new Error('scale_up_recovery_operation_mismatch');
+        }
+        if ((attempt.phase !== 'effects' && attempt.phase !== 'failed')
+            || !attempt.baseline_worker_names
+            || !hasExactWorkerBaseline(current.config, attempt.baseline_worker_names)
+            || current.config.workers.some(worker => worker.name === receipt.worker_name)) {
+            throw new Error('scale_up_recovery_effects_unverified');
+        }
+        if (attempt.cleanup_failures !== undefined
+            && (attempt.cleanup_failures.length !== 1
+                || attempt.cleanup_failures[0] !== expectedCleanupFailure)) {
+            throw new Error('scale_up_recovery_effects_unverified');
+        }
+        if (attempt.phase !== 'failed'
+            || persistedReceipts.length === 0
+            || attempt.cleanup_failures === undefined) {
+            const nextRevision = current.stateRevision + 1;
+            const nextAttempt = {
+                ...attempt,
+                phase: 'failed',
+                failure_reason: attempt.failure_reason ?? evidence.original_error,
+                cleanup_failures: [expectedCleanupFailure],
+                worktree_cleanup_receipts: [receipt],
+                state_revision: nextRevision,
+                updated_at: new Date().toISOString(),
+            };
+            const next = {
+                ...current.config,
+                state_revision: nextRevision,
+                active_scale_up: nextAttempt,
+            };
+            if (!await saveTeamConfigAtRevision(next, current.stateRevision, instance.cwd)) {
+                throw new Error('scale_up_recovery_receipt_backfill_failed');
+            }
+            authoritative = { config: next, stateRevision: nextRevision };
+        }
+    }
+    else if (current.config.workers.some(worker => worker.name === receipt.worker_name)) {
+        throw new Error('scale_up_recovery_worker_still_persisted');
+    }
+    const workerDir = absPath(instance.cwd, TeamPaths.workerDir(instance.team_name, receipt.worker_name));
+    if (existsSync(workerDir) && (await readdir(workerDir)).length > 0) {
+        throw new Error('scale_up_recovery_worker_effects_present');
+    }
+    removeWorkerWorktree(instance.team_name, receipt.worker_name, instance.cwd, receipt);
+    if (existsSync(receipt.path))
+        throw new Error('scale_up_recovery_worktree_still_present');
+    if (existsSync(workerDir))
+        await rm(workerDir, { recursive: true, force: true });
+    if (existsSync(workerDir))
+        throw new Error('scale_up_recovery_worker_state_remove_failed');
+    if (authoritative.config.active_scale_up) {
+        const nextRevision = authoritative.stateRevision + 1;
+        const next = {
+            ...authoritative.config,
+            state_revision: nextRevision,
+            active_scale_up: undefined,
+        };
+        if (!await saveTeamConfigAtRevision(next, authoritative.stateRevision, instance.cwd, undefined, { release: { active_scale_up: true } })) {
+            throw new Error('scale_up_recovery_fence_release_failed');
+        }
+        authoritative = { config: next, stateRevision: nextRevision };
+    }
+    if (evidence) {
+        await retireTeamScaleUpWorktreeRecoveryEvidenceUnderLock(instance, {
+            protocol: 'team-scale-up-worktree-recovery-settled-v1',
+            operation_id: evidence.operation_id,
+            worktree: 'absent',
+            worker_state: 'absent',
+            worker_config: 'absent',
+            provider_effects: 'absent',
+            pane_effects: 'absent',
+            scale_up_fence: 'released',
+        });
+    }
+    return authoritative;
+}
 // ── Scale Up ──────────────────────────────────────────────────────────────────
 /**
  * Add workers to a running team mid-session.
@@ -192,6 +380,11 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
         if (!config.instance_id)
             return { ok: false, error: 'team_instance_authority_missing' };
         let originalInstanceId = config.instance_id;
+        let scaleUpInstance = createTeamInstanceBinding({
+            teamName: sanitized,
+            cwd: leaderCwd,
+            instanceId: originalInstanceId,
+        });
         if (config.active_recovery || config.active_scale_down)
             return { ok: false, error: 'team_mutation_busy' };
         if (config.lifecycle_state === 'shutting_down' || config.lifecycle_state === 'stopped') {
@@ -232,6 +425,8 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                     try {
                         const binding = await assertScalingInstanceUnderLock(current.config, sanitized, leaderCwd, originalInstanceId);
                         originalInstanceId = binding.instance_id;
+                        scaleUpInstance = binding;
+                        await assertNoTeamScaleUpWorktreeRecoveryEvidence(binding);
                     }
                     catch (error) {
                         throw new Error(scaleInstanceError(error));
@@ -266,6 +461,7 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                         // Keep the immutable incarnation on the operation fence.  A later
                         // same-name config can never be adopted by this operation.
                         instance_id: originalInstanceId,
+                        baseline_worker_names: current.config.workers.map(worker => worker.name),
                     }) };
                 // Replacing an existing fence (dead reserved, or reconciling committed) is foreign install.
                 if (!await saveScaleUpConfig(next, current.stateRevision, existing ? { reclaim: { active_scale_up: true } } : undefined))
@@ -277,7 +473,7 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
         catch (error) {
             return { ok: false, error: scaleInstanceError(error) };
         }
-        const releaseScaleUpReservation = async (failureReason) => withTeamInstanceLifecycleLock(leaderCwd, sanitized, async () => {
+        const releaseScaleUpReservation = async (failureReason, failureState) => withTeamInstanceLifecycleLock(leaderCwd, sanitized, async () => {
             const current = await readRevisionedTeamConfig(sanitized, leaderCwd);
             const reservation = current ? scaleUpAttempt(current.config) : undefined;
             if (!current || !reservation || reservation.operation_id !== operationId
@@ -298,9 +494,25 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                 return false;
             }
             const nextRevision = current.stateRevision + 1;
+            const worktreeCleanupReceipts = failureState
+                ? mergeScaleUpWorktreeCleanupReceipts(reservation.worktree_cleanup_receipts, failureState.worktreeCleanupReceipts)
+                : [...(reservation.worktree_cleanup_receipts ?? [])];
+            if (worktreeCleanupReceipts === null)
+                return false;
             const next = { ...current.config, state_revision: nextRevision,
-                ...(failureReason ? { active_scale_up: { ...reservation, phase: 'failed', failure_reason: failureReason,
-                        state_revision: nextRevision, updated_at: new Date().toISOString() } } : { active_scale_up: undefined }) };
+                ...(failureReason ? { active_scale_up: {
+                        ...reservation,
+                        phase: 'failed',
+                        failure_reason: failureReason,
+                        ...(failureState ? {
+                            cleanup_failures: [...failureState.cleanupFailures],
+                            ...(worktreeCleanupReceipts.length > 0
+                                ? { worktree_cleanup_receipts: worktreeCleanupReceipts }
+                                : {}),
+                        } : {}),
+                        state_revision: nextRevision,
+                        updated_at: new Date().toISOString(),
+                    } } : { active_scale_up: undefined }) };
             const saveOpts = failureReason
                 ? undefined // same-owner phase transition reserved/effects/committed → failed
                 : { release: { active_scale_up: true } };
@@ -308,7 +520,7 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                 return false;
             config = next;
             configRevision = nextRevision;
-            return !failureReason;
+            return true;
         });
         const reserveScaleUpEffects = async () => withTeamInstanceLifecycleLock(leaderCwd, sanitized, async () => {
             const current = await readRevisionedTeamConfig(sanitized, leaderCwd);
@@ -375,17 +587,52 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
         const paneWorkerNames = new Map();
         const pendingPanes = new Map();
         const paneOwnerships = new Map();
-        const cleanupScaledWorkerWorktree = (workerName, created) => {
-            if (created) {
-                removeWorkerWorktree(sanitized, workerName, leaderCwd);
-            }
-            else {
-                const restored = restoreWorktreeRootAgents(sanitized, workerName, leaderCwd);
-                if (restored.reason === 'agents_dirty') {
-                    throw new Error(`agents_dirty: preserving modified worktree root AGENTS.md for ${workerName}`);
-                }
-            }
+        const worktreeReceiptPersistenceFailures = new Set();
+        const worktreeRecoveryEvidence = new Map();
+        const worktreeRecoveryEvidencePublicationFailures = new Map();
+        const recoveryEvidenceDiagnostics = () => [
+            ...[...worktreeRecoveryEvidence.values()]
+                .map(record => `scale_up_recovery_evidence:${record.evidence_path}`),
+            ...[...worktreeRecoveryEvidencePublicationFailures.entries()]
+                .map(([workerName, failure]) => `scale_up_recovery_evidence_publish_failed:${workerName}:${failure}`),
+        ];
+        const cleanupScaledWorkerWorktree = (workerName, receipt) => {
+            removeWorkerWorktree(sanitized, workerName, leaderCwd, receipt);
         };
+        const persistScaleUpWorktreeCleanupReceipt = async (receipt) => withTeamInstanceLifecycleLock(leaderCwd, sanitized, async () => {
+            const current = await readRevisionedTeamConfig(sanitized, leaderCwd);
+            const reservation = current ? scaleUpAttempt(current.config) : undefined;
+            if (!current || !reservation || reservation.operation_id !== operationId
+                || reservation.phase !== 'effects'
+                || reservation.pid !== process.pid || reservation.process_started_at !== processStartedAt)
+                return false;
+            try {
+                await assertScalingInstanceUnderLock(current.config, sanitized, leaderCwd, originalInstanceId);
+            }
+            catch {
+                return false;
+            }
+            if (!reservation.instance_id
+                || reservation.instance_id.toLowerCase() !== originalInstanceId.toLowerCase())
+                return false;
+            const worktreeCleanupReceipts = mergeScaleUpWorktreeCleanupReceipts(reservation.worktree_cleanup_receipts, [receipt]);
+            if (!worktreeCleanupReceipts)
+                return false;
+            const nextRevision = current.stateRevision + 1;
+            const next = withScaleUpFenceRevision({
+                ...current.config,
+                active_scale_up: {
+                    ...reservation,
+                    worktree_cleanup_receipts: worktreeCleanupReceipts,
+                    updated_at: new Date().toISOString(),
+                },
+            }, nextRevision);
+            if (!await saveScaleUpConfig(next, current.stateRevision))
+                return false;
+            config = next;
+            configRevision = nextRevision;
+            return true;
+        });
         const rollbackScaleUp = async (error, paneId, orphanFailure) => {
             const cleanupFailures = orphanFailure ? [orphanFailure] : [];
             let authorityFailure;
@@ -414,7 +661,9 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                 // replacement team's resources during rollback.
                 return {
                     ok: false,
-                    error: `${error}; rollback incomplete (instance_authority_unverified:${authorityFailure})`,
+                    error: `${error}; rollback incomplete (instance_authority_unverified:${authorityFailure}${recoveryEvidenceDiagnostics().length > 0
+                        ? `, ${recoveryEvidenceDiagnostics().join(', ')}`
+                        : ''})`,
                 };
             }
             const cleanedWorktrees = new Set();
@@ -490,22 +739,29 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                 if (worker.pane_id)
                     await cleanupPane(worker.pane_id, worker.name, worker.name);
                 if (worker.worktree_path) {
+                    const receipt = workerWorktreeRemovalReceipt(worker);
                     if (preserveIdentity.has(worker.name)) {
                         cleanupFailures.push(`${worker.name}:worktree_authority_unverified:${worker.worktree_path}`);
+                    }
+                    else if (!receipt) {
+                        cleanupFailures.push(`${worker.name}:worktree_ownership_incomplete:${worker.worktree_path}`);
+                        preserveIdentity.add(worker.name);
                     }
                     else {
                         let cleaned = false;
                         for (let attempt = 0; attempt < 2 && !cleaned; attempt++) {
                             try {
-                                cleanupScaledWorkerWorktree(worker.name, worker.worktree_created === true);
+                                cleanupScaledWorkerWorktree(worker.name, receipt);
                                 cleaned = true;
                             }
                             catch { /* retry */ }
                         }
                         if (cleaned)
                             cleanedWorktrees.add(worker.name);
-                        if (!cleaned || existsSync(worker.worktree_path))
+                        if (!cleaned || (receipt.created && existsSync(worker.worktree_path))) {
                             cleanupFailures.push(`${worker.name}:worktree:${worker.worktree_path}`);
+                            preserveIdentity.add(worker.name);
+                        }
                     }
                 }
                 await cleanupIdentity(worker.name);
@@ -514,19 +770,21 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
             }
             for (const pending of pendingWorktrees) {
                 if (preserveIdentity.has(pending.workerName)) {
-                    cleanupFailures.push(`${pending.workerName}:pending_worktree_authority_unverified:${pending.path}`);
+                    cleanupFailures.push(`${pending.workerName}:pending_worktree_authority_unverified:${pending.receipt.path}`);
                 }
                 else if (!cleanedWorktrees.has(pending.workerName)) {
                     let cleaned = false;
                     for (let attempt = 0; attempt < 2 && !cleaned; attempt++) {
                         try {
-                            cleanupScaledWorkerWorktree(pending.workerName, pending.created);
+                            cleanupScaledWorkerWorktree(pending.workerName, pending.receipt);
                             cleaned = true;
                         }
                         catch { /* retry */ }
                     }
-                    if (!cleaned || existsSync(pending.path))
-                        cleanupFailures.push(`${pending.workerName}:pending-worktree:${pending.path}`);
+                    if (!cleaned || (pending.receipt.created && existsSync(pending.receipt.path))) {
+                        cleanupFailures.push(`${pending.workerName}:pending-worktree:${pending.receipt.path}`);
+                        preserveIdentity.add(pending.workerName);
+                    }
                 }
                 await cleanupIdentity(pending.workerName);
             }
@@ -581,16 +839,89 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                 }
             }
             if (cleanupFailures.length > 0) {
-                await releaseScaleUpReservation(error).catch(() => false);
+                const worktreeCleanupReceipts = pendingWorktrees
+                    .filter(pending => preserveIdentity.has(pending.workerName)
+                    && pending.receipt.created && !pending.receipt.reused)
+                    .map((pending) => ({
+                    worker_name: pending.workerName,
+                    path: pending.receipt.path,
+                    branch: pending.receipt.branch,
+                    mode: pending.receipt.mode,
+                    created: true,
+                    reused: false,
+                    effect_scope: 'created_before_worker_persist',
+                }));
+                const failureStatePersisted = await releaseScaleUpReservation(error, {
+                    cleanupFailures,
+                    worktreeCleanupReceipts,
+                }).catch(() => false);
+                if (!failureStatePersisted) {
+                    for (const receipt of worktreeCleanupReceipts) {
+                        if (worktreeReceiptPersistenceFailures.has(receipt.worker_name)) {
+                            cleanupFailures.push(`scale_up_worktree_receipt_persist_failed:${receipt.worker_name}`);
+                        }
+                    }
+                    cleanupFailures.push('scale_up_failure_state_persist_failed');
+                }
                 const evidencePath = absPath(leaderCwd, TeamPaths.scalingRollbackFailure(sanitized, Date.now()));
                 await writeAtomic(evidencePath, JSON.stringify({ schema_version: 1, team_name: sanitized,
                     instance_id: originalInstanceId,
-                    error, cleanup_failures: cleanupFailures, recorded_at: new Date().toISOString() }, null, 2));
-                return { ok: false, error: `${error}; rollback incomplete (${cleanupFailures.join(', ')}) evidence=${evidencePath}` };
+                    operation_id: operationId,
+                    error,
+                    cleanup_failures: cleanupFailures,
+                    ...(worktreeCleanupReceipts.length > 0
+                        ? { worktree_cleanup_receipts: worktreeCleanupReceipts }
+                        : {}),
+                    recovery_evidence: recoveryEvidenceDiagnostics(),
+                    recorded_at: new Date().toISOString() }, null, 2));
+                return {
+                    ok: false,
+                    error: `${error}; rollback incomplete (${[
+                        ...cleanupFailures,
+                        ...recoveryEvidenceDiagnostics(),
+                    ].join(', ')}) evidence=${evidencePath}`,
+                };
             }
-            if (!await releaseScaleUpReservation())
-                return { ok: false, error: `${error}; scale_up_fence_release_failed` };
-            return { ok: false, error };
+            if (!await releaseScaleUpReservation()) {
+                return {
+                    ok: false,
+                    error: `${error}; scale_up_fence_release_failed${recoveryEvidenceDiagnostics().length > 0
+                        ? `; ${recoveryEvidenceDiagnostics().join(', ')}`
+                        : ''}`,
+                };
+            }
+            if (worktreeRecoveryEvidence.size > 0) {
+                try {
+                    await withTeamInstanceLifecycleLock(leaderCwd, sanitized, async () => {
+                        for (const record of worktreeRecoveryEvidence.values()) {
+                            await retireTeamScaleUpWorktreeRecoveryEvidenceUnderLock(scaleUpInstance, {
+                                protocol: 'team-scale-up-worktree-recovery-settled-v1',
+                                operation_id: record.operation_id,
+                                worktree: 'absent',
+                                worker_state: 'absent',
+                                worker_config: 'absent',
+                                provider_effects: 'absent',
+                                pane_effects: 'absent',
+                                scale_up_fence: 'released',
+                            });
+                        }
+                    });
+                }
+                catch (retireError) {
+                    return {
+                        ok: false,
+                        error: `${error}; scale_up_recovery_evidence_retire_failed:${scaleInstanceError(retireError)}`,
+                    };
+                }
+            }
+            const evidenceFailures = recoveryEvidenceDiagnostics()
+                .filter(diagnostic => diagnostic.startsWith('scale_up_recovery_evidence_publish_failed:'));
+            return {
+                ok: false,
+                error: evidenceFailures.length > 0
+                    ? `${error}; ${evidenceFailures.join(', ')}`
+                    : error,
+            };
         };
         for (let i = 0; i < count; i++) {
             if (!await assertScaleUpEffectsAuthority()) {
@@ -658,7 +989,6 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                     : null;
                 let workerAgentType = cliAgentType;
                 let workerModel;
-                let workerReasoningEffort;
                 // Only override caller's agentType when the worker's inferred role came
                 // from an explicit `task.role` (user opt-in). Pre-patch semantics: callers
                 // passing `--agent-type codex` stay on codex regardless of task text.
@@ -672,6 +1002,7 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                 const routedPair = canonical && hasExplicitOwnedRole && (hasConfiguredRoute || workerAgentType === 'claude')
                     ? resolvedRoute
                     : undefined;
+                let workerReasoningEffort;
                 if (routedPair) {
                     const { primary } = routedPair;
                     const primaryProvider = primary.provider;
@@ -711,16 +1042,64 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                 await mkdir(workerDirPath, { recursive: true });
                 let worktree = null;
                 if (worktreeMode !== 'disabled') {
-                    const pending = { workerName, created: true,
-                        path: join(getOmcRoot(leaderCwd), 'team', sanitized, 'worktrees', workerName) };
-                    pendingWorktrees.push(pending);
-                    worktree = ensureWorkerWorktree(sanitized, workerName, leaderCwd, {
-                        mode: worktreeMode,
-                        requireCleanLeader: true,
-                    });
+                    try {
+                        worktree = ensureWorkerWorktree(sanitized, workerName, leaderCwd, {
+                            mode: worktreeMode,
+                            requireCleanLeader: true,
+                        });
+                    }
+                    catch (error) {
+                        if (isWorktreeMetadataPublicationFailure(error) && !error.cleanupVerified) {
+                            const receipt = {
+                                path: error.worktreePath,
+                                branch: error.worktreeBranch,
+                                mode: error.worktreeMode,
+                                created: true,
+                                reused: false,
+                            };
+                            pendingWorktrees.push({
+                                workerName,
+                                receipt,
+                            });
+                            const cleanupReceipt = {
+                                worker_name: workerName,
+                                path: receipt.path,
+                                branch: receipt.branch,
+                                mode: receipt.mode,
+                                created: true,
+                                reused: false,
+                                effect_scope: 'created_before_worker_persist',
+                            };
+                            const cleanupError = error.cleanupError instanceof Error
+                                ? error.cleanupError.message
+                                : String(error.cleanupError ?? error.message);
+                            try {
+                                const evidence = await publishTeamScaleUpWorktreeRecoveryEvidence(scaleUpInstance, operationId, cleanupReceipt, {
+                                    originalError: error.message,
+                                    cleanupError,
+                                });
+                                worktreeRecoveryEvidence.set(workerName, evidence);
+                            }
+                            catch (evidenceError) {
+                                worktreeRecoveryEvidencePublicationFailures.set(workerName, scaleInstanceError(evidenceError));
+                            }
+                            const persisted = await persistScaleUpWorktreeCleanupReceipt(cleanupReceipt).catch(() => false);
+                            if (!persisted)
+                                worktreeReceiptPersistenceFailures.add(workerName);
+                        }
+                        throw error;
+                    }
                     if (worktree) {
-                        pending.created = worktree.created;
-                        pending.path = worktree.path;
+                        pendingWorktrees.push({
+                            workerName,
+                            receipt: {
+                                path: worktree.path,
+                                branch: worktree.branch,
+                                mode: worktree.mode,
+                                created: worktree.created,
+                                reused: worktree.reused,
+                            },
+                        });
                     }
                 }
                 const workerCwd = worktree?.path ?? leaderCwd;
@@ -823,7 +1202,7 @@ export async function scaleUpOwned(teamName, count, agentType, tasks, cwd, env =
                 reservedLaunchDescriptors.set(workerName, launchDescriptor);
                 // Rebuild env using the final agentType (fallback may have swapped it).
                 const extraEnv = {
-                    ...getModelWorkerEnv(sanitized, workerName, workerAgentType, env),
+                    ...getModelWorkerEnv(sanitized, workerName, workerAgentType, env, canonical && hasExplicitOwnedRole ? canonical : undefined),
                     OMC_TEAM_STATE_ROOT: teamStateRoot,
                     OMC_TEAM_LEADER_CWD: leaderCwd,
                     ...(worktree ? { OMC_TEAM_WORKTREE_PATH: worktree.path, OMC_TEAM_WORKER_CWD: workerCwd } : {}),
@@ -1489,12 +1868,11 @@ export async function scaleDownOwned(teamName, cwd, options = {}, env = process.
         for (const w of targetWorkers) {
             if (w.worktree_path) {
                 try {
-                    if (w.worktree_created) {
-                        removeWorkerWorktree(sanitized, w.name, leaderCwd);
+                    const receipt = workerWorktreeRemovalReceipt(w);
+                    if (!receipt) {
+                        throw new Error(`worktree_ownership_incomplete: cannot retire ${w.name}`);
                     }
-                    else {
-                        prepareWorkerWorktreeForRemoval(sanitized, w.name, leaderCwd, w.worktree_path);
-                    }
+                    removeWorkerWorktree(sanitized, w.name, leaderCwd, receipt);
                 }
                 catch (err) {
                     const reason = `Failed to remove worktree for ${w.name}: ${err instanceof Error ? err.message : String(err)}`;
@@ -1554,17 +1932,42 @@ export async function scaleDownOwned(teamName, cwd, options = {}, env = process.
 }
 /** Public scale facade; the owned algorithm applies the recovery exclusion under its existing lock. */
 export async function scaleUp(teamName, count, agentType, tasks, cwd, env = process.env) {
-    return scaleUpOwned(teamName, count, agentType, tasks, cwd, env);
+    return withTeamStatePathScope(cwd, () => scaleUpOwned(teamName, count, agentType, tasks, cwd, env));
 }
 /** Public scale-down facade; force and drain behavior are delegated unchanged. */
 export async function scaleDown(teamName, cwd, options = {}, env = process.env) {
-    return scaleDownOwned(teamName, cwd, options, env);
+    return withTeamStatePathScope(cwd, () => scaleDownOwned(teamName, cwd, options, env));
 }
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function resolveWorkerReadyTimeoutMs(env) {
+const DECIMAL_INTEGER_TEXT = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+function parseExactInteger(raw) {
+    const trimmed = raw.trim();
+    if (!trimmed)
+        return null;
+    const negative = trimmed.startsWith('-');
+    const magnitude = negative || trimmed.startsWith('+') ? trimmed.slice(1) : trimmed;
+    const match = DECIMAL_INTEGER_TEXT.exec(magnitude);
+    if (!match)
+        return null;
+    const integerDigits = match[1] ?? '';
+    const fractionDigits = match[2] ?? match[3] ?? '';
+    const exponent = match[4] === undefined ? 0 : Number(match[4]);
+    const shift = fractionDigits.length - exponent;
+    if (shift > 0) {
+        const significand = integerDigits + fractionDigits;
+        if (/[1-9]/.test(significand)) {
+            const trailingZeros = significand.length - significand.replace(/0+$/, '').length;
+            if (trailingZeros < shift)
+                return null;
+        }
+    }
+    const parsed = (negative ? -1 : 1) * Number(magnitude);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+}
+export function resolveWorkerReadyTimeoutMs(env) {
     const raw = env.OMC_TEAM_READY_TIMEOUT_MS;
-    const parsed = Number.parseInt(String(raw ?? ''), 10);
-    if (Number.isFinite(parsed) && parsed >= 5_000)
+    const parsed = raw == null || String(raw).trim() === '' ? null : parseExactInteger(String(raw));
+    if (parsed !== null && parsed >= 5_000)
         return parsed;
     return 45_000;
 }

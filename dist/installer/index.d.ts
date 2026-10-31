@@ -48,6 +48,8 @@ export interface InstallOptions {
     refreshHooksInPlugin?: boolean;
     skipHud?: boolean;
     noPlugin?: boolean;
+    /** Skip payload repair only when update reconciliation already copied it. */
+    skipPluginPayloadSync?: boolean;
     /**
      * Dev plugin-dir mode: skip copying agents and bundled skills into
      * `<configDir>` because the user is launching OMC via
@@ -124,7 +126,19 @@ export declare function isRunningAsPlugin(): boolean;
  * @returns true if running as a project-scoped plugin, false otherwise
  */
 export declare function isProjectScopedPlugin(): boolean;
+export type HookEntry = {
+    type: string;
+    command: string;
+};
+export type HookGroup = {
+    hooks: HookEntry[];
+};
 export declare function provisionStandaloneStateLockBridge(packageDir: string, targetPath: string): void;
+export declare function mergeHookGroups(eventType: string, existingGroups: HookGroup[], newOmcGroups: HookGroup[], options: {
+    force?: boolean;
+    forceHooks?: boolean;
+    allowPluginHookRefresh?: boolean;
+}, log: (msg: string) => void, result: InstallResult): HookGroup[];
 /**
  * Remove stale OMC agents only when their exact raw bytes match the bounded,
  * release-authenticated historical inventory and their basename is absent from

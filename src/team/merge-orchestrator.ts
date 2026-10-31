@@ -334,13 +334,14 @@ function preflightMergerWorktree(mergerPath: string, leaderBranch: string): void
   });
 }
 
+// Every unmerged status `git status --porcelain` can report, including
+// modify/delete (UD, DU) and add conflicts (AU, UA).
+const UNMERGED_STATUS = /^(?:DD|AU|UD|UA|DU|AA|UU) /;
+
 function parseUUFiles(porcelainOutput: string): string[] {
   const files: string[] = [];
   for (const line of porcelainOutput.split('\n')) {
-    if (line.startsWith('UU ')) {
-      files.push(line.slice(3).trim());
-    } else if (line.startsWith('AA ') || line.startsWith('DD ')) {
-      // Both-modified variants count as conflicts too.
+    if (UNMERGED_STATUS.test(line)) {
       files.push(line.slice(3).trim());
     }
   }
@@ -795,6 +796,45 @@ export async function startMergeOrchestrator(
 
       const start = Date.now();
       const unmerged: Array<{ workerName: string; reason: string }> = [];
+      // The final worker commit can land between poll ticks. Refresh branch
+      // heads before choosing drain candidates so shutdown does not silently
+      // skip work that the periodic poller has not observed yet.
+      for (const entry of workers.values()) {
+        if (pausedWorkers.has(entry.workerName)) continue;
+        try {
+          const currentSha = gitRevParseHead(config.repoRoot, entry.workerBranch);
+          if (currentSha && currentSha !== entry.lastObservedSha) {
+            entry.lastObservedSha = currentSha;
+            try {
+              persistState();
+            } catch {
+              // best-effort persistence
+            }
+            try {
+              await appendEvent(config.repoRoot, config.teamName, {
+                type: 'commit_observed',
+                worker: entry.workerName,
+                data: { sha: currentSha },
+              });
+            } catch {
+              // best-effort event logging
+            }
+          }
+        } catch (err) {
+          entry.consecutiveFailures += 1;
+          const reason = err instanceof Error ? err.message : String(err);
+          try {
+            await appendEvent(config.repoRoot, config.teamName, {
+              type: 'commit_observed',
+              worker: entry.workerName,
+              reason: `rev_parse_failed:${reason}`,
+            });
+          } catch {
+            // best-effort event logging
+          }
+        }
+      }
+
       const candidates = Array.from(workers.values()).filter(
         (w) => w.lastObservedSha && w.lastObservedSha !== w.lastMergedSha,
       );
@@ -829,6 +869,13 @@ export async function startMergeOrchestrator(
 
       // Audit any unmerged drain residue.
       if (unmerged.length > 0) {
+        try {
+          process.stderr.write(
+            `[team/merge-orchestrator] WARNING: auto-merge left worker commits unmerged at shutdown: ${unmerged.map((u) => `${u.workerName}:${u.reason}`).join(', ')}\n`,
+          );
+        } catch {
+          // best-effort warning
+        }
         const auditPath = teardownAuditPath(config.repoRoot, config.teamName);
         await mkdir(dirname(auditPath), { recursive: true });
         for (const u of unmerged) {

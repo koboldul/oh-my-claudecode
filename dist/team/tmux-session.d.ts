@@ -25,6 +25,17 @@ export declare function buildDetachedTmuxServerKeepaliveArgs(socketPath: string)
  */
 export declare function buildPrivateTmuxSocketPath(): string;
 /**
+ * @internal Exported for testing only.
+ */
+export declare function shellQuote(value: string): string;
+/**
+ * Quote a string for PowerShell invocation using single-quoted literals.
+ * Single quotes in PowerShell prevent variable expansion and subexpression evaluation.
+ * Literal apostrophes are escaped by doubling them.
+ * @internal Exported for testing only.
+ */
+export declare function powershellQuote(value: string): string;
+/**
  * Capture the selected tmux server's endpoint and strict process incarnation.
  *
  * With no endpoint argument the ambient tmux context is queried once. When an
@@ -46,6 +57,36 @@ export interface TmuxServerIdentityGuardOptions {
  * condition. Returns a process exit status (0 success, 1 fail closed).
  */
 export declare function runTmuxServerIdentityGuard(expected: TmuxServerIdentity, formattedActualServerPid: string, formattedActualSocket?: string, options?: TmuxServerIdentityGuardOptions): 0 | 1;
+/**
+ * Distinguish a POSIX tmux session from native psmux on Windows. psmux also
+ * exports TMUX, but identifies its socket namespace under `/tmp/psmux-*`.
+ * @internal Exported for testing only.
+ */
+export declare function isPosixTmuxSession(): boolean;
+/**
+ * Generate the tmux server identity guard condition for the native shell.
+ * On native Windows and native psmux, generates PowerShell syntax even when
+ * OMC's parent process runs under MSYS/Git Bash; psmux independently chooses
+ * PowerShell for its `if-shell` implementation. POSIX tmux uses POSIX syntax.
+ * @internal Exported for testing only.
+ */
+export declare function tmuxServerGuardCondition(identity: TmuxServerIdentity): string;
+/**
+ * Generate POSIX shell syntax for the guard condition.
+ * Uses `env -i` to create a clean environment and `< /dev/null` for stdin safety.
+ * @internal Exported for testing only.
+ */
+export declare function tmuxServerGuardConditionPosix(nodePath: string, runtimePath: string, encodedIdentity: string): string;
+/**
+ * Generate PowerShell syntax for the guard condition.
+ * Uses the `&` call operator for invocation in a clean environment.
+ * Clears NODE_OPTIONS and other Node-related startup variables to prevent
+ * unauthorized module loading before the identity guard runs.
+ * Note: The tmux format expansion placeholder `#{pid}` is preserved as-is
+ * for tmux to expand it before passing to PowerShell.
+ * @internal Exported for testing only.
+ */
+export declare function tmuxServerGuardConditionPowerShell(nodePath: string, runtimePath: string, encodedIdentity: string): string;
 export type TeamMultiplexerContext = 'tmux' | 'cmux' | 'none';
 export declare function detectTeamMultiplexerContext(env?: NodeJS.ProcessEnv): TeamMultiplexerContext;
 /**
@@ -57,6 +98,8 @@ export declare function applyMainVerticalLayout(teamTarget: string, options?: {
     required?: boolean;
     tmuxServerIdentity?: TmuxServerIdentity;
 }): Promise<void>;
+export declare const TMUX_MAILBOX_PANE_ID: RegExp;
+export declare const TMUX_MAILBOX_TARGET: RegExp;
 type MailboxOwnershipCommand = (args: string[]) => Promise<{
     stdout: string;
     stderr: string;
@@ -176,6 +219,15 @@ export interface WaitForShellReadyOptions {
     pollIntervalMs?: number;
     tmuxServerIdentity?: TmuxServerIdentity;
 }
+export declare function resolveTeamShellReadyTimeoutMs(env?: NodeJS.ProcessEnv, explicitTimeoutMs?: number): number;
+export declare function resolveTeamStartSubmitTimeoutMs(env?: NodeJS.ProcessEnv, explicitTimeoutMs?: number): number;
+export interface WorkerPaneShell {
+    /** Shell command argv appended to new-session/new-window/split-window. */
+    args: string[];
+    /** Private file carrying passthrough values; the pane shell sources and deletes it. */
+    envFile: string | null;
+}
+export declare function workerPaneShellCommand(): WorkerPaneShell;
 export declare function buildWorkerStartCommand(config: WorkerPaneConfig): string;
 /** Validate tmux is available. Throws with install instructions if not. */
 export declare function validateTmux(hasTmuxContext?: boolean): void;
@@ -283,6 +335,12 @@ export declare function workerPaneBelongsToOwnedProviderTarget(input: {
 }): Promise<boolean>;
 export declare function splitTeamWorkerPaneWithEvidence(splitTarget: string, direction: 'right' | 'down', cwd: string, provider?: WorkerPaneSplitEvidence['provider'], tmuxServerIdentity?: TmuxServerIdentity, serverIdentityDependencies?: TmuxServerIdentityDependencies): Promise<WorkerPaneSplitEvidence>;
 export declare function splitTeamWorkerPane(splitTarget: string, direction: 'right' | 'down', cwd: string): Promise<string | null>;
+/**
+ * Darwin strict identity comes only from the contained-fs native addon (no
+ * sysctl/ps fallback), so a missing addon is the common cause of an unavailable
+ * probe there. Name it and the build command instead of a bare error code.
+ */
+export declare function strictIdentityUnavailableError(platform: NodeJS.Platform, loadNative?: () => unknown): Error;
 export declare function createTeamSession(teamName: string, workerCount: number, cwd: string, options?: CreateTeamSessionOptions): Promise<TeamSession>;
 /**
  * Spawn a CLI agent in a specific pane.
@@ -299,15 +357,25 @@ export type PaneCaptureObservation = {
     error: string;
 };
 export declare function captureTeamPane(paneId: string, options?: {
+    joinWrappedLines?: boolean;
     tmuxServerIdentity?: TmuxServerIdentity;
 }): Promise<string>;
 /** Capture an owned pane only while the original tmux incarnation matches. */
-export declare function captureOwnedTeamPane(ownership: WorkerPaneOwnership): Promise<string>;
+export declare function captureOwnedTeamPane(ownership: WorkerPaneOwnership, options?: {
+    joinWrappedLines?: boolean;
+}): Promise<string>;
 export declare function sendTeamPaneKey(paneId: string, key: string, tmuxServerIdentity?: TmuxServerIdentity): Promise<void>;
 export declare function killTeamPane(paneId: string): Promise<void>;
 export declare function killOwnedWorkerPane(ownership: WorkerPaneOwnership): Promise<void>;
+/**
+ * @internal Exported for testing only.
+ */
+export type PaneTrustPromptKind = 'directory' | 'claude_directory' | 'codex_directory' | 'codex_hooks' | 'cursor_workspace_trust';
+/**
+ * @internal Exported for testing only.
+ */
+export declare function detectPaneTrustPromptKind(captured: string, provider?: CliAgentType): PaneTrustPromptKind | null;
 export declare function paneHasTrustPrompt(captured: string, provider?: CliAgentType): boolean;
-export declare function paneHasCursorWorkspaceTrustPrompt(captured: string): boolean;
 export declare function paneHasActiveTask(captured: string, provider?: CliAgentType): boolean;
 export declare function paneLooksReady(captured: string, provider?: CliAgentType): boolean;
 export interface WaitForPaneReadyOptions {
@@ -322,7 +390,7 @@ export type StartupPaneReadyResult = {
     ok: true;
 } | {
     ok: false;
-    reason: 'attempt_inactive' | 'ownership_mismatch' | 'copy_mode' | 'copy_mode_unknown' | 'capture_failed' | 'selector_unsupported' | 'selector_persistent' | 'cursor_workspace_untrusted' | 'pane_busy' | 'readiness_timeout';
+    reason: 'attempt_inactive' | 'ownership_mismatch' | 'copy_mode' | 'copy_mode_unknown' | 'capture_failed' | 'selector_unsupported' | 'selector_persistent' | 'cursor_workspace_untrusted' | 'codex_workspace_untrusted' | 'pane_busy' | 'readiness_timeout';
 };
 export declare function waitForStartupPaneReady(context: StartupPaneContext, opts?: WaitForPaneReadyOptions): Promise<StartupPaneReadyResult>;
 export declare function deliverStartupInbox(context: StartupPaneContext, message: string, options?: {
@@ -389,11 +457,12 @@ export declare function getWorkerLiveness(paneId: string): Promise<WorkerPaneLiv
  * Liveness bound to the original tmux server. A positively dead original
  * process means its panes are absent without querying a replacement server.
  */
-export declare function getOwnedWorkerLiveness(ownership: WorkerPaneOwnership): Promise<WorkerPaneLiveness>;
+export declare function getOwnedWorkerLiveness(ownership: WorkerPaneOwnership, dependencies?: TmuxServerIdentityDependencies): Promise<WorkerPaneLiveness>;
 export declare function isWorkerAlive(paneId: string): Promise<boolean>;
 /**
  * Normalize only the response form published for a detached session.  A
- * detached `new-session -P` record is represented as `session:0`, while
+ * detached `new-session -P` record is represented as `session:<window_index>`
+ * (the real first window, which follows the user's tmux base-index), while
  * session inventory stores the native session name without a window suffix.
  * Split/dedicated-window callers must not use this normalization.
  */

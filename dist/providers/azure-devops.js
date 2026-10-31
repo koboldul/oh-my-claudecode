@@ -2,15 +2,18 @@ import { execFileSync } from 'node:child_process';
 function stripRefPrefix(ref) {
     return ref.replace(/^refs\/heads\//, '');
 }
+export function isAzureDevOpsHost(host) {
+    const normalized = host.toLowerCase().replace(/\.$/, '');
+    return normalized === 'dev.azure.com' || normalized === 'ssh.dev.azure.com' || normalized.endsWith('.visualstudio.com');
+}
 export class AzureDevOpsProvider {
     name = 'azure-devops';
     displayName = 'Azure DevOps';
     prTerminology = 'PR';
     prRefspec = null;
     detectFromRemote(url) {
-        return (url.includes('dev.azure.com') ||
-            url.includes('ssh.dev.azure.com') ||
-            url.includes('visualstudio.com'));
+        const host = url.match(/^(?:https?:\/\/(?:[^@/?#]+@)?|ssh:\/\/[^@/?#]*@|[^@/:?#]+@)([^/:?#]+)/i)?.[1];
+        return !!host && isAzureDevOpsHost(host);
     }
     viewPR(number) {
         if (!Number.isInteger(number) || number < 1)

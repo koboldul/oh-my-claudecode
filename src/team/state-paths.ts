@@ -1,8 +1,29 @@
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { lstatSync, readlinkSync, realpathSync } from 'node:fs';
 import { lstat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
-import { getOmcRoot } from '../lib/worktree-paths.js';
+import { getOmcRoot, withProjectIdentifierScope } from '../lib/worktree-paths.js';
+
+interface TeamStatePathScope {
+  rawOmcRoot: string;
+  canonicalOmcRoot: string;
+}
+
+const teamStatePathScope = new AsyncLocalStorage<TeamStatePathScope>();
+
+/** Reuse one canonical storage anchor within a complete team operation. */
+export function withTeamStatePathScope<T>(cwd: string, fn: () => T): T {
+  if (teamStatePathScope.getStore()) return fn();
+  const canonicalCwd = canonicalTeamCwd(cwd);
+  return withProjectIdentifierScope(() => {
+    const rawOmcRoot = resolve(getOmcRoot(canonicalCwd));
+    return teamStatePathScope.run({
+      rawOmcRoot,
+      canonicalOmcRoot: canonicalStoragePath(rawOmcRoot),
+    }, fn);
+  });
+}
 
 /**
  * Typed path builders for all team state files.
@@ -266,6 +287,31 @@ export const TeamPaths = {
     `.omc/state/team-recovery/team-instances/${workspaceHash}/${teamName}/${instanceId}`,
   teamInstanceCleanupReceipt: (workspaceHash: string, teamName: string, instanceId: string) =>
     `.omc/state/team-recovery/team-instances/${workspaceHash}/${teamName}/${instanceId}/cleanup.json`,
+  teamInstanceScaleUpRecoveryRoot: (workspaceHash: string, teamName: string, instanceId: string) =>
+    `.omc/state/team-recovery/team-instances/${workspaceHash}/${teamName}/scale-up/${instanceId}`,
+  teamInstanceScaleUpRecoveryOperationRoot: (
+    workspaceHash: string,
+    teamName: string,
+    instanceId: string,
+    operationId: string,
+  ) => `${TeamPaths.teamInstanceScaleUpRecoveryRoot(workspaceHash, teamName, instanceId)}/${operationId}`,
+  teamInstanceScaleUpRecoveryEvidence: (
+    workspaceHash: string,
+    teamName: string,
+    instanceId: string,
+    operationId: string,
+  ) => `${TeamPaths.teamInstanceScaleUpRecoveryOperationRoot(
+    workspaceHash,
+    teamName,
+    instanceId,
+    operationId,
+  )}/recovery.json`,
+  teamInstanceScaleUpRecoveryRetiredOperationRoot: (
+    workspaceHash: string,
+    teamName: string,
+    instanceId: string,
+    operationId: string,
+  ) => `.omc/state/team-recovery/team-instances/${workspaceHash}/${teamName}/scale-up-retired/${instanceId}/${operationId}`,
   teamInstanceDetachedRoot: (workspaceHash: string, teamName: string, instanceId: string) =>
     `.omc/state/team-recovery/team-instances/${workspaceHash}/${teamName}/${instanceId}/detached`,
   recoveryRequestPending: (requestId: string) =>
@@ -289,13 +335,17 @@ export const TeamPaths = {
 export function absPath(cwd: string, relativePath: string): string {
   if (isAbsolute(relativePath)) return relativePath;
   if (relativePath === '.omc' || relativePath.startsWith('.omc/')) {
-    return join(getOmcRoot(cwd), relativePath.slice('.omc'.length).replace(/^\//, ''));
+    const scope = teamStatePathScope.getStore();
+    const root = scope?.canonicalOmcRoot ?? getOmcRoot(cwd);
+    return join(root, relativePath.slice('.omc'.length).replace(/^\//, ''));
   }
   return join(cwd, relativePath);
 }
 
 /** Canonical OMC storage root, with symlink aliases collapsed when possible. */
 export function canonicalTeamOmcRoot(cwd: string): string {
+  const scope = teamStatePathScope.getStore();
+  if (scope) return scope.canonicalOmcRoot;
   return canonicalStoragePath(getOmcRoot(canonicalTeamCwd(cwd)));
 }
 
@@ -307,10 +357,15 @@ export function canonicalTeamOmcRoot(cwd: string): string {
 export function canonicalTeamStatePath(cwd: string, relativePath: string): string {
   if (isAbsolute(relativePath)) {
     const target = resolve(relativePath);
-    const rawAnchor = resolve(getOmcRoot(canonicalTeamCwd(cwd)));
-    const suffix = relative(rawAnchor, target);
-    if (suffix !== '..' && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix)) {
-      return join(canonicalTeamOmcRoot(cwd), suffix);
+    const scope = teamStatePathScope.getStore();
+    const anchors = scope
+      ? [scope.canonicalOmcRoot, scope.rawOmcRoot]
+      : [resolve(getOmcRoot(canonicalTeamCwd(cwd)))];
+    for (const anchor of anchors) {
+      const suffix = relative(anchor, target);
+      if (suffix !== '..' && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix)) {
+        return join(scope?.canonicalOmcRoot ?? canonicalTeamOmcRoot(cwd), suffix);
+      }
     }
     return target;
   }
@@ -417,7 +472,7 @@ export function assertTeamStatePathSafeSync(cwd: string, path: string): void {
  * New writes always use this canonical path.
  */
 export function getTaskStoragePath(cwd: string, teamName: string, taskId?: string): string {
-  const tasksRoot = join(getOmcRoot(cwd), 'state', 'team', teamName, 'tasks');
+  const tasksRoot = absPath(cwd, TeamPaths.tasks(teamName));
   if (taskId !== undefined) {
     return join(tasksRoot, normalizeTaskFileStem(taskId) + '.json');
   }

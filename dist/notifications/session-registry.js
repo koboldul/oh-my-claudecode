@@ -8,9 +8,10 @@
  * Registry location: XDG-aware global OMC state (legacy ~/.omc/state fallback for reads)
  * File permissions: 0600 (owner read/write only)
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync, openSync, closeSync, writeSync, unlinkSync, statSync, constants, } from 'fs';
+import { existsSync, readFileSync, mkdirSync, openSync, closeSync, writeSync, unlinkSync, statSync, constants, } from 'fs';
 import { join, dirname } from 'path';
 import { randomUUID } from 'crypto';
+import { atomicWriteFileSync } from '../lib/atomic-write.js';
 import { isProcessAlive } from '../platform/index.js';
 import { getGlobalOmcStateCandidates, getGlobalOmcStateRoot } from '../utils/paths.js';
 // ============================================================================
@@ -373,12 +374,9 @@ export function pruneStale() {
  */
 function rewriteRegistryUnsafe(mappings) {
     ensureRegistryDir();
-    if (mappings.length === 0) {
-        // Empty registry - write empty file
-        writeFileSync(getRegistryPath(), '', { mode: SECURE_FILE_MODE });
-        return;
-    }
-    const content = mappings.map(m => JSON.stringify(m)).join('\n') + '\n';
-    writeFileSync(getRegistryPath(), content, { mode: SECURE_FILE_MODE });
+    const content = mappings.length === 0
+        ? ''
+        : mappings.map(m => JSON.stringify(m)).join('\n') + '\n';
+    atomicWriteFileSync(getRegistryPath(), content);
 }
 //# sourceMappingURL=session-registry.js.map

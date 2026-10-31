@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { detectProvider, parseRemoteUrl } from '../../providers/index.js';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { detectProvider, parseRemoteUrl, parseRemoteFromCwd, resetProviderCache } from '../../providers/index.js';
 describe('detectProvider', () => {
     it('detects GitHub from HTTPS URL', () => {
         expect(detectProvider('https://github.com/user/repo.git')).toBe('github');
@@ -84,6 +88,25 @@ describe('parseRemoteUrl', () => {
             repo: 'repo',
         });
     });
+    it.each([
+        ['HTTPS://DEV.AZURE.COM/Org/Project/_git/Repo.GIT', 'dev.azure.com'],
+        ['git@SSH.DEV.AZURE.COM:v3/Org/Project/Repo.GIT', 'dev.azure.com'],
+        ['HTTPS://Org.VISUALSTUDIO.COM/Project/_git/Repo.GIT', 'Org.visualstudio.com'],
+    ])('parses Azure host and scheme case without changing path case: %s', (url, host) => {
+        expect(parseRemoteUrl(url)).toEqual({
+            provider: 'azure-devops', host, owner: 'Org/Project', repo: 'Repo.GIT',
+        });
+    });
+    it('detects and parses Azure DevOps HTTPS URLs with userinfo', () => {
+        const url = 'https://build-user:pat@dev.azure.com/org/project/_git/repo';
+        expect(detectProvider(url)).toBe('azure-devops');
+        expect(parseRemoteUrl(url)).toEqual({
+            provider: 'azure-devops',
+            host: 'dev.azure.com',
+            owner: 'org/project',
+            repo: 'repo',
+        });
+    });
     it('parses Azure DevOps SSH URL', () => {
         const result = parseRemoteUrl('git@ssh.dev.azure.com:v3/org/project/repo');
         expect(result).toEqual({
@@ -118,6 +141,52 @@ describe('parseRemoteUrl', () => {
     it('handles URLs without .git suffix', () => {
         const result = parseRemoteUrl('https://github.com/user/my-repo');
         expect(result?.repo).toBe('my-repo');
+    });
+    it('parses a GitHub HTTPS URL with a trailing slash', () => {
+        expect(parseRemoteUrl('https://github.com/user/repo.git/')).toEqual({
+            provider: 'github',
+            host: 'github.com',
+            owner: 'user',
+            repo: 'repo',
+        });
+    });
+    it('parses multiple trailing slashes on HTTPS and SSH URL-style remotes', () => {
+        expect(parseRemoteUrl('https://github.com/user/repo.git///')).toEqual({
+            provider: 'github',
+            host: 'github.com',
+            owner: 'user',
+            repo: 'repo',
+        });
+        expect(parseRemoteUrl('ssh://git@github.com/user/repo.git///')).toEqual({
+            provider: 'github',
+            host: 'github.com',
+            owner: 'user',
+            repo: 'repo',
+        });
+    });
+    it('parses a browser URL with a trailing slash and no .git suffix', () => {
+        expect(parseRemoteUrl('https://github.com/user/my-repo/')).toEqual({
+            provider: 'github',
+            host: 'github.com',
+            owner: 'user',
+            repo: 'my-repo',
+        });
+    });
+    it('parses an SSH URL with a trailing slash', () => {
+        expect(parseRemoteUrl('git@github.com:user/repo.git/')).toEqual({
+            provider: 'github',
+            host: 'github.com',
+            owner: 'user',
+            repo: 'repo',
+        });
+    });
+    it('parses an Azure DevOps URL with a trailing slash', () => {
+        expect(parseRemoteUrl('https://dev.azure.com/org/project/_git/repo/')).toEqual({
+            provider: 'azure-devops',
+            host: 'dev.azure.com',
+            owner: 'org/project',
+            repo: 'repo',
+        });
     });
     it('returns null for invalid URLs', () => {
         expect(parseRemoteUrl('not-a-url')).toBeNull();
@@ -176,6 +245,68 @@ describe('parseRemoteUrl', () => {
             owner: 'group/subgroup',
             repo: 'repo',
         });
+    });
+    it('parses an SSH URL-style .git URL with multiple trailing slashes', () => {
+        expect(parseRemoteUrl('ssh://git@gitlab.com/group/subgroup/repo.git///')).toEqual({
+            provider: 'gitlab',
+            host: 'gitlab.com',
+            owner: 'group/subgroup',
+            repo: 'repo',
+        });
+    });
+});
+describe('Azure provider hostname identity', () => {
+    it.each([
+        'https://dev.azure.com.evil.invalid/org/proj/_git/repo',
+        'https://notdev.azure.com/org/proj/_git/repo',
+        'git@notssh.dev.azure.com:v3/org/proj/repo',
+    ])('does not classify a lookalike host as Azure DevOps: %s', (url) => {
+        expect(detectProvider(url)).toBe('unknown');
+        expect(parseRemoteUrl(url)?.provider).toBe('unknown');
+    });
+});
+describe('HTTPS authority delimiters and Azure DNS root dots', () => {
+    it.each(['https://evil.invalid?x@github.com/org/repo', 'https://evil.invalid#x@dev.azure.com/org/project/_git/repo'])('does not consume query or fragment text as userinfo: %s', (url) => {
+        expect(detectProvider(url)).toBe('unknown');
+        expect(parseRemoteUrl(url)?.provider).not.toBe('github');
+        expect(parseRemoteUrl(url)?.provider).not.toBe('azure-devops');
+    });
+    it.each([
+        ['https://dev.azure.com./Org/Project/_git/Repo', 'Org/Project'],
+        ['git@ssh.dev.azure.com.:v3/Org/Project/Repo', 'Org/Project'],
+        ['https://Org.visualstudio.com./Project/_git/Repo', 'Org/Project'],
+    ])('recognizes Azure absolute DNS remote %s', (url, owner) => {
+        expect(detectProvider(url)).toBe('azure-devops');
+        expect(parseRemoteUrl(url)).toMatchObject({ provider: 'azure-devops', owner, repo: 'Repo' });
+    });
+});
+describe('remote URL cache cwd identity', () => {
+    it('resolves the same relative path against the current working directory', () => {
+        const originalCwd = process.cwd();
+        const tempRoot = mkdtempSync(join(tmpdir(), 'omc-provider-cache-'));
+        const firstParent = join(tempRoot, 'first');
+        const secondParent = join(tempRoot, 'second');
+        resetProviderCache();
+        try {
+            for (const [parent, remote] of [
+                [firstParent, 'https://github.com/one/first.git'],
+                [secondParent, 'https://gitlab.com/two/second.git'],
+            ]) {
+                const repoDir = join(parent, 'project');
+                mkdirSync(repoDir, { recursive: true });
+                execFileSync('git', ['init', '--quiet'], { cwd: repoDir });
+                execFileSync('git', ['remote', 'add', 'origin', remote], { cwd: repoDir });
+            }
+            process.chdir(firstParent);
+            expect(parseRemoteFromCwd('project')).toMatchObject({ provider: 'github', owner: 'one', repo: 'first' });
+            process.chdir(secondParent);
+            expect(parseRemoteFromCwd('project')).toMatchObject({ provider: 'gitlab', owner: 'two', repo: 'second' });
+        }
+        finally {
+            process.chdir(originalCwd);
+            resetProviderCache();
+            rmSync(tempRoot, { recursive: true, force: true });
+        }
     });
 });
 //# sourceMappingURL=detection.test.js.map

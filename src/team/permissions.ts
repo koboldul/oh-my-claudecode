@@ -8,7 +8,7 @@
  * prompts as instructions for the LLM to follow.
  */
 
-import { relative, resolve } from 'node:path';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 
 export interface WorkerPermissions {
   workerName: string;
@@ -113,10 +113,13 @@ export function isPathAllowed(
 ): boolean {
   // Normalize to relative path
   const absPath = resolve(workingDirectory, filePath);
-  const relPath = relative(workingDirectory, absPath);
+  const nativeRelPath = relative(workingDirectory, absPath);
 
   // If path escapes working directory, always deny
-  if (relPath.startsWith('..')) return false;
+  if (nativeRelPath === '..' || nativeRelPath.startsWith(`..${sep}`) || isAbsolute(nativeRelPath)) {
+    return false;
+  }
+  const relPath = nativeRelPath.split(sep).join('/');
 
   // Check denied paths first (they override)
   for (const pattern of permissions.deniedPaths) {
@@ -253,10 +256,14 @@ export function findPermissionViolations(
     if (!isPathAllowed(permissions, filePath, cwd)) {
       // Determine which deny pattern matched for the reason
       const absPath = resolve(cwd, filePath);
-      const relPath = relative(cwd, absPath);
+      const nativeRelPath = relative(cwd, absPath);
+      const escaped = nativeRelPath === '..'
+        || nativeRelPath.startsWith(`..${sep}`)
+        || isAbsolute(nativeRelPath);
+      const relPath = nativeRelPath.split(sep).join('/');
 
       let reason: string;
-      if (relPath.startsWith('..')) {
+      if (escaped) {
         reason = `Path escapes working directory: ${relPath}`;
       } else {
         // Find which deny pattern matched

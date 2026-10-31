@@ -131,7 +131,7 @@ Farklı kullanım senaryoları için birden fazla strateji — Team destekli ork
 
 ### Geliştirici Deneyimi
 
-- **Sihirli anahtar kelimeler** — Açık kontrol için `ralph`, `ulw`, `eco`, `plan`
+- **Sihirli anahtar kelimeler** — Açık kontrol için `ralph`, `ulw`, `plan`
 - **HUD statusline** — Durum çubuğunuzda gerçek zamanlı orkestrasyon metrikleri
   - Claude Code'u doğrudan `claude --plugin-dir <path>` ile başlatıyorsanız (`omc` shim'i atlayarak), shell'de `OMC_PLUGIN_ROOT=<path>` dışa aktarın, böylece HUD paketi plugin yükleyici ile aynı checkout'a çözülür. Ayrıntılar için [REFERENCE.md'deki Plugin directory flags bölümüne](./docs/REFERENCE.md#plugin-directory-flags) bakın.
 
@@ -184,7 +184,7 @@ server.py:42'deki handler'ı try/except ClientDisconnectedError ile sarın...
 | `autopilot`    | Tam otonom yürütme                       | `autopilot: build a todo app`                                   |
 | `ralph`        | Kalıcılık modu                           | `ralph: refactor auth`                                          |
 | `ulw`          | Maksimum paralellik                      | `ulw fix all errors`                                            |
-| `eco`          | Token-verimli yürütme                    | `eco: migrate database`                                         |
+
 | `plan`         | Planlama mülakatı                        | `plan the API`                                                  |
 | `ralplan`      | Yinelemeli planlama uzlaşısı             | `ralplan this feature`                                          |
 | `swarm`        | Eski anahtar kelime (Team'e yönlendirir) | `swarm 5 agents: fix lint errors`                               |

@@ -131,7 +131,7 @@ Team работает как поэтапный pipeline:
 
 ### Опыт разработчика
 
-- **Магические ключевые слова** — `ralph`, `ulw`, `eco`, `plan` для явного управления
+- **Магические ключевые слова** — `ralph`, `ulw`, `plan` для явного управления
 - **HUD statusline** — Метрики оркестрации в реальном времени в строке состояния
   - Если вы запускаете Claude Code напрямую с `claude --plugin-dir <path>` (минуя shim `omc`), экспортируйте `OMC_PLUGIN_ROOT=<path>` в своей оболочке, чтобы пакет HUD разрешался в то же место, что и загрузчик плагина. Подробнее см. [раздел Plugin directory flags в REFERENCE.md](./docs/REFERENCE.md#plugin-directory-flags).
 
@@ -184,7 +184,7 @@ source: extracted
 | `autopilot`    | Полностью автономное выполнение                 | `autopilot: build a todo app`                                   |
 | `ralph`        | Режим настойчивости                             | `ralph: refactor auth`                                          |
 | `ulw`          | Максимальный параллелизм                        | `ulw fix all errors`                                            |
-| `eco`          | Токен-эффективное выполнение                    | `eco: migrate database`                                         |
+
 | `plan`         | Интервью для планирования                       | `plan the API`                                                  |
 | `ralplan`      | Итеративный консенсус планирования              | `ralplan this feature`                                          |
 | `swarm`        | Устаревшее ключевое слово (направляется в Team) | `swarm 5 agents: fix lint errors`                               |

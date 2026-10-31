@@ -3,15 +3,8 @@ import * as path from 'path';
 import { getOmcRoot, probeGitTopLevel } from '../../lib/worktree-paths.js';
 import { getClaudeConfigDir } from '../../utils/config-dir.js';
 const SAFE_PATTERNS = [
-    /^git (status|diff|log|branch|show|fetch)/,
-    /^npm run (lint|build|check|typecheck)/,
-    /^pnpm (lint|build|check|typecheck|run (lint|build|check|typecheck))/,
-    /^yarn (lint|build|check|typecheck|run (lint|build|check|typecheck))/,
-    /^tsc( |$)/,
-    /^gh (issue|pr) (view|list|status)\b/,
-    /^eslint /,
-    /^prettier /,
-    /^cargo (check|clippy|build)/,
+    /^git status$/,
+    /^gh (issue|pr) (view|list|status)(?=$|\s)/,
     /^ls( |$)/,
     // REMOVED: cat, head, tail - they allow reading arbitrary files
 ];
@@ -20,9 +13,6 @@ const SAFE_PATTERNS = [
 // Note: Quotes ("') intentionally excluded - they're needed for paths with spaces
 // and command substitution is already caught by $ detection
 const DANGEROUS_SHELL_CHARS = /[;&|`$()<>\n\r\t\0\\{}\[\]*?~!#]/;
-// Exact first-line shape emitted for safe POSIX git commit/tag message heredocs.
-// The git arguments before -m/--message are restricted to non-shell token chars.
-const SAFE_POSIX_HEREDOC_FIRST_LINE = /^git[ \t]+(?:commit|tag)(?:[ \t]+[A-Za-z0-9_./:@%+=,-]+)*[ \t]+(?:-m|--message)[ \t]+"\$\(cat[ \t]+<<(-?)[ \t]*(['"])([A-Za-z_][A-Za-z0-9_]*)\2$/;
 const DANGEROUS_POWERSHELL_CHARS = /[;&|`$(){}<>\n\r\t\0\[\]*?!#@,]/;
 const SAFE_POWERSHELL_TOKEN = /^[A-Za-z0-9_./=+-]+$/;
 const POWERSHELL_PROVIDER_PATH = /^[A-Za-z][A-Za-z0-9_-]*:/;
@@ -451,40 +441,6 @@ function isSafeRipgrepInspectionCommand(tokens, cwd) {
     const searchPaths = tokens.slice(index + 1);
     return areSafeRepoPaths(cwd, searchPaths, { allowDirectory: false });
 }
-function isSafeTargetedVitestCommand(tokens, cwd) {
-    const supportedPrefixes = [
-        ['vitest', 'run'],
-        ['pnpm', 'vitest', 'run'],
-        ['yarn', 'vitest', 'run'],
-    ];
-    const matchedPrefix = supportedPrefixes.find(prefix => prefix.every((part, index) => tokens[index] === part));
-    if (!matchedPrefix) {
-        return false;
-    }
-    const remaining = tokens.slice(matchedPrefix.length);
-    return remaining.length === 1 && isSafeRepoPath(cwd, remaining[0], { allowDirectory: false });
-}
-function isSafeTargetedPackageManagerTestCommand(tokens, cwd) {
-    const supportedPrefixes = [
-        ['npm', 'test', '--', '--run'],
-        ['npm', 'run', 'test', '--', '--run'],
-        ['pnpm', 'test', '--', '--run'],
-        ['pnpm', 'run', 'test', '--', '--run'],
-        ['yarn', 'test', '--run'],
-    ];
-    const matchedPrefix = supportedPrefixes.find(prefix => prefix.every((part, index) => tokens[index] === part));
-    if (!matchedPrefix) {
-        return false;
-    }
-    const remaining = tokens.slice(matchedPrefix.length);
-    return remaining.length === 1 && isSafeRepoPath(cwd, remaining[0], { allowDirectory: false });
-}
-function isSafeTargetedNodeTestCommand(tokens, cwd) {
-    return tokens[0] === 'node'
-        && tokens[1] === '--test'
-        && tokens.length === 3
-        && isSafeRepoPath(cwd, tokens[2], { allowDirectory: false });
-}
 export function isSafeRepoInspectionCommand(command, cwd) {
     const trimmed = command.trim();
     if (!trimmed || DANGEROUS_SHELL_CHARS.test(trimmed)) {
@@ -499,27 +455,12 @@ export function isSafeRepoInspectionCommand(command, cwd) {
         || isSafeSedInspectionCommand(tokens, cwd)
         || isSafeRipgrepInspectionCommand(tokens, cwd);
 }
-export function isSafeTargetedLocalTestCommand(command, cwd) {
-    const trimmed = command.trim();
-    if (!trimmed || DANGEROUS_SHELL_CHARS.test(trimmed)) {
-        return false;
-    }
-    const tokens = tokenizeShellCommand(trimmed);
-    if (!tokens) {
-        return false;
-    }
-    return isSafeTargetedVitestCommand(tokens, cwd)
-        || isSafeTargetedPackageManagerTestCommand(tokens, cwd)
-        || isSafeTargetedNodeTestCommand(tokens, cwd);
-}
 export function isSafeAutoApprovedCommand(command, cwd, shellDialect = 'posix') {
     if (shellDialect === 'powershell') {
         return isSafePowerShellCommand(command);
     }
     return isSafeCommand(command)
-        || isSafeRepoInspectionCommand(command, cwd)
-        || isSafeTargetedLocalTestCommand(command, cwd)
-        || isHeredocWithSafeBase(command);
+        || isSafeRepoInspectionCommand(command, cwd);
 }
 function normalizePowerShellExecutable(token) {
     const normalized = token.toLowerCase();
@@ -669,44 +610,6 @@ export function isSafeCommand(command) {
     return SAFE_PATTERNS.some(pattern => pattern.test(trimmed));
 }
 /**
- * Check if a command is a heredoc command with a safe base command.
- * Issue #608: Heredoc commands contain shell metacharacters (<<, \n, $, etc.)
- * that cause isSafeCommand() to reject them. When they fall through to Claude
- * Code's native permission flow and the user approves "Always allow", the entire
- * heredoc body (potentially hundreds of lines) gets stored in settings.local.json.
- *
- * The opener must terminate the first command line, the base command is limited
- * to a non-chained git commit/tag invocation, and the delimiter must be followed
- * only by the command-substitution close. Anything after that remains native.
- */
-export function isHeredocWithSafeBase(command) {
-    const trimmed = command.trim();
-    const lines = trimmed.split(/\r?\n/);
-    if (lines.length < 3) {
-        return false;
-    }
-    const opener = lines[0].trim().match(SAFE_POSIX_HEREDOC_FIRST_LINE);
-    if (!opener) {
-        return false;
-    }
-    const stripsTabs = opener[1] === '-';
-    const delimiter = opener[3];
-    if (!delimiter) {
-        return false;
-    }
-    let closingIndex = -1;
-    for (let index = 1; index < lines.length; index += 1) {
-        const line = stripsTabs ? lines[index].replace(/^\t*/, '') : lines[index];
-        if (line === delimiter) {
-            closingIndex = index;
-            break;
-        }
-    }
-    return closingIndex > 0
-        && closingIndex === lines.length - 2
-        && lines[closingIndex + 1].trim() === ')"';
-}
-/**
  * Check if an active supported mode is running
  */
 export function isActiveModeRunning(directory) {
@@ -804,20 +707,15 @@ export function processPermissionRequest(input) {
     }
     const { cwd, command, shellDialect } = shellRequest;
     const shouldAskBashPermission = hasClaudePermissionAsk(cwd, 'Bash', command);
-    const isSafeHeredoc = shellDialect === 'posix'
-        && isHeredocWithSafeBase(command);
     if (!shouldAskBashPermission
         && isSafeAutoApprovedCommand(command, cwd, shellDialect)) {
-        const reason = isSafeHeredoc
-            ? 'Safe command with heredoc content'
-            : 'Safe read-only or test command';
         return {
             continue: true,
             hookSpecificOutput: {
                 hookEventName: 'PermissionRequest',
                 decision: {
                     behavior: 'allow',
-                    reason,
+                    reason: 'Safe read-only command',
                 },
             },
         };
