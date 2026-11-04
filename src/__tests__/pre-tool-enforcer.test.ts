@@ -2680,11 +2680,17 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     return output.modifiedArgs as Record<string, unknown> | undefined;
   }
 
-  it('defaults the executor to its GPT-6.1 Terra profile with max reasoning', () => {
+  it.each([
+    ['executor', 'gpt-6.1-terra'],
+    ['test-engineer', 'gpt-6.1-luna'],
+    ['code-reviewer', 'gpt-6.1-sol'],
+    ['architect', 'gpt-6-astra'],
+    ['security-reviewer', 'gpt-6-astra'],
+  ])('defaults %s to its agent profile with max reasoning', (agent, expectedModel) => {
     const output = run({
       tool_name: 'Task',
       toolInput: {
-        subagent_type: 'oh-my-claudecode:executor',
+        subagent_type: `oh-my-claudecode:${agent}`,
         prompt: 'Implement the change',
         description: 'Implement change',
       },
@@ -2692,16 +2698,20 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     });
 
     expect(updatedInput(output)).toMatchObject({
-      model: 'gpt-6.1-terra',
+      model: expectedModel,
       reasoning_effort: 'max',
     });
   });
 
-  it('uses the executor profile for Agent payloads and the deprecated executor alias', () => {
+  it.each([
+    ['deep-executor', 'gpt-6.1-terra'],
+    ['tdd-guide', 'gpt-6.1-luna'],
+    ['api-reviewer', 'gpt-6.1-sol'],
+  ])('uses the canonical profile for Agent payloads with the %s alias', (agent, expectedModel) => {
     const output = run({
       tool_name: 'Agent',
       toolInput: {
-        agent_type: 'oh-my-claudecode:deep-executor',
+        agent_type: `oh-my-claudecode:${agent}`,
         prompt: 'Implement the change',
         description: 'Implement change',
       },
@@ -2709,7 +2719,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     });
 
     expect(updatedInput(output)).toMatchObject({
-      model: 'gpt-6.1-terra',
+      model: expectedModel,
       reasoning_effort: 'max',
     });
   });
@@ -2746,19 +2756,19 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     });
     expect(updatedInput(output)).toMatchObject({
       agent_type: 'oh-my-claudecode:explore',
-      model: 'gpt-5.6-sol',
+      model: 'gpt-6.1-sol',
       reasoning_effort: 'max',
     });
     expect(output.additionalContext).toContain(
-      'Spawning agent: oh-my-claudecode:explore (gpt-5.6-sol) [BACKGROUND]',
+      'Spawning agent: oh-my-claudecode:explore (gpt-6.1-sol) [BACKGROUND]',
     );
   });
 
-  it('preserves explicit per-call model and reasoning effort', () => {
+  it.each(['executor', 'test-engineer'])('preserves explicit per-call model and reasoning effort for %s', (agent) => {
     const output = run({
       tool_name: 'Agent',
       toolInput: {
-        agent_type: 'oh-my-claudecode:executor',
+        agent_type: `oh-my-claudecode:${agent}`,
         model: 'gpt-5.5',
         reasoning_effort: 'high',
         prompt: 'Review the design',
@@ -2770,11 +2780,14 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     expect(updatedInput(output)).toBeUndefined();
   });
 
-  it('fills only the missing field when one explicit choice is present', () => {
+  it.each([
+    ['executor', 'gpt-6.1-terra'],
+    ['test-engineer', 'gpt-6.1-luna'],
+  ])('fills only the missing field when one explicit choice is present for %s', (agent, expectedModel) => {
     const modelExplicit = run({
       tool_name: 'Task',
       toolInput: {
-        subagent_type: 'oh-my-claudecode:executor',
+        subagent_type: `oh-my-claudecode:${agent}`,
         model: 'gpt-5.5',
         prompt: 'Implement',
         description: 'Implement',
@@ -2784,7 +2797,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     const effortExplicit = run({
       tool_name: 'Task',
       toolInput: {
-        subagent_type: 'oh-my-claudecode:executor',
+        subagent_type: `oh-my-claudecode:${agent}`,
         reasoning_effort: 'high',
         prompt: 'Implement',
         description: 'Implement',
@@ -2797,7 +2810,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
       reasoning_effort: 'max',
     });
     expect(updatedInput(effortExplicit)).toMatchObject({
-      model: 'gpt-6.1-terra',
+      model: expectedModel,
       reasoning_effort: 'high',
     });
   });
@@ -2853,17 +2866,21 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
   });
 
   it.each([
-    ['gpt-6-astra', 'gpt-6-astra'],
-    ['inherit', 'gpt-5.6-terra'],
-  ])('respects the executor per-agent model setting %s', (configuredModel, expectedModel) => {
+    ['executor', 'executor', 'gpt-6-astra', 'gpt-6-astra'],
+    ['executor', 'executor', 'inherit', 'gpt-5.6-terra'],
+    ['test-engineer', 'testEngineer', 'gpt-6-astra', 'gpt-6-astra'],
+    ['test-engineer', 'testEngineer', 'inherit', 'gpt-5.6-terra'],
+    ['code-reviewer', 'codeReviewer', 'gpt-6.1-luna', 'gpt-6.1-luna'],
+    ['code-reviewer', 'codeReviewer', 'inherit', 'gpt-5.6-terra'],
+  ])('respects %s per-agent model setting agents.%s.model=%s', (agent, configKey, configuredModel, expectedModel) => {
     writeJson(join(tempDir, '.claude', 'omc.jsonc'), {
-      agents: { executor: { model: configuredModel } },
+      agents: { [configKey]: { model: configuredModel } },
     });
 
     const output = run({
       tool_name: 'Task',
       toolInput: {
-        subagent_type: 'oh-my-claudecode:executor',
+        subagent_type: `oh-my-claudecode:${agent}`,
         prompt: 'Implement',
         description: 'Implement',
       },

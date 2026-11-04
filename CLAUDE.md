@@ -63,7 +63,7 @@ Kill switches: `DISABLE_OMC`, `OMC_SKIP_HOOKS` (comma-separated).
 </cancellation>
 
 <host_isolation>
-Under GitHub Copilot CLI (`OMC_HOST=copilot`, or `COPILOT_CLI`/`COPILOT_AGENT_SESSION_ID` set), do not require or diagnose `~/.claude`, HUD/statusLine, or `/omc-setup` unless the user explicitly asks to configure Claude Code too. Bundled `oh-my-claudecode:*` agents use the Copilot-specific profiles above. Delegated executor calls use `gpt-6.1-terra` unless overridden per call, per agent, or through explicit provider configuration; other delegated Task/Agent calls retain the Copilot provider default `gpt-5.6-sol`. All retain `max` effort unless explicitly overridden. Use Copilot's plugin manager (`copilot plugin update oh-my-claudecode`) and `/env` to verify/update instead.
+Under GitHub Copilot CLI (`OMC_HOST=copilot`, or `COPILOT_CLI`/`COPILOT_AGENT_SESSION_ID` set), do not require or diagnose `~/.claude`, HUD/statusLine, or `/omc-setup` unless the user explicitly asks to configure Claude Code too. Bundled `oh-my-claudecode:*` agents use the Copilot-specific profiles above, including delegated Task/Agent calls, unless overridden per call, per agent, or through explicit provider configuration. Agents configured with `model: inherit` or lacking a profile model use the Copilot provider default `gpt-5.6-sol`. All retain `max` effort unless explicitly overridden. Use Copilot's plugin manager (`copilot plugin update oh-my-claudecode`) and `/env` to verify/update instead.
 </host_isolation>
 
 <worktree_paths>

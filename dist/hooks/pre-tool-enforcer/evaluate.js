@@ -329,7 +329,7 @@ export function evaluateModelRouting(call, envelope, snapshot) {
             const canonicalAgent = normalizeAgentType(agentType);
             const configuredModel = snapshot.modelRouting.configuredAgentModels[canonicalAgent];
             const defaults = snapshot.modelRouting.copilotDefaults;
-            const model = canonicalAgent === 'executor' && configuredModel !== 'inherit'
+            const model = configuredModel !== 'inherit'
                 ? configuredModel
                     || defaults.modelOverride
                     || snapshot.modelRouting.agentDefinitionModels[canonicalAgent]
