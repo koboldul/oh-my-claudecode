@@ -4,7 +4,6 @@ description: Strategic planning consultant with interview workflow
 model: gpt-6-sol
 reasoning-effort: max
 target: github-copilot
-level: 4
 ---
 
 <Agent_Prompt>

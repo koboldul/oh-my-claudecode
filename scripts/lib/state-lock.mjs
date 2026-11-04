@@ -468,6 +468,19 @@ function boundedBusyTimeoutMs(timeoutMs, operationDeadline) {
   return Math.min(configuredTimeoutMs, Math.floor(remainingOperationTimeoutMs(operationDeadline)));
 }
 
+/**
+ * Reacquire the write transaction after an out-of-transaction owner probe. The
+ * probe consumed part of the operation budget, so the busy timeout is rebounded
+ * to what remains. False means the deadline has already passed; a busy timeout
+ * throws SQLITE_BUSY to the caller's retry handling.
+ */
+function beginWithinDeadline(db, busyTimeoutMs, operationDeadline) {
+  if (remainingOperationTimeoutMs(operationDeadline) <= 0) return false;
+  db.pragma(`busy_timeout = ${boundedBusyTimeoutMs(busyTimeoutMs, operationDeadline)}`);
+  db.exec('BEGIN IMMEDIATE');
+  return true;
+}
+
 function remainingProcessProbeMs(deadline, operationDeadline = null, testHooks) {
   return Math.max(0, Math.min(deadline - wallClockNowMs(testHooks), remainingOperationTimeoutMs(operationDeadline)));
 }
@@ -679,9 +692,16 @@ function acquireStateFileLockAtPathWithDeadline(lockPath, attempts, requireExclu
     return acquireFileLock(lockPath, attempts, processProbeDeadline, operationDeadline, testHooks);
   }
 
-  const db = openMutationDb(lockPath, bypassTestOverride, boundedBusyTimeoutMs(busyTimeoutMs, operationDeadline));
+  const openBusyTimeoutMs = boundedBusyTimeoutMs(busyTimeoutMs, operationDeadline);
+  const openStartedAt = process.hrtime.bigint();
+  const db = openMutationDb(lockPath, bypassTestOverride, openBusyTimeoutMs);
   if (!db) {
-    if (lastLockFailure === 'contention') return null;
+    // Concurrent first-time setup (journal_mode/CREATE) can return SQLITE_BUSY
+    // without running the busy handler; retry that while attempts remain. A BUSY
+    // that waited out the busy timeout, or one on the last attempt, is terminal.
+    if (lastLockFailure === 'contention') {
+      return attempts > 1 && Number(process.hrtime.bigint() - openStartedAt) / 1_000_000 < openBusyTimeoutMs ? retryAcquisition() : null;
+    }
     if (sqliteBindingLoadError) return acquireFileLock(lockPath, attempts, processProbeDeadline, operationDeadline, testHooks);
     if (attempts <= 1) {
       recordFailure('unverifiable');
@@ -720,22 +740,33 @@ function acquireStateFileLockAtPathWithDeadline(lockPath, attempts, requireExclu
       return null;
     }
     if (observedRow !== 'absent') {
+      // Issue #4727: probe outside BEGIN IMMEDIATE so Windows process identity
+      // checks do not serialize every waiter behind a PowerShell invocation.
       db.exec('ROLLBACK');
       const live = ownerLive(
         observedRow,
         remainingProcessProbeMs(processProbeDeadline, operationDeadline, testHooks),
         testHooks,
       );
-      if (live === null || live) {
+      if (live === null) {
         db.close();
-        if (live === null || attempts <= 1) {
-          recordFailure(live === null ? 'unverifiable' : 'contention');
+        if (attempts <= 1) {
+          recordFailure('unverifiable');
           return null;
         }
         return retryAcquisition();
       }
-
-      db.exec('BEGIN IMMEDIATE');
+      if (live) {
+        db.close();
+        recordFailure('contention');
+        if (attempts <= 1) return null;
+        return retryAcquisition();
+      }
+      if (!beginWithinDeadline(db, busyTimeoutMs, operationDeadline)) {
+        db.close();
+        recordFailure('contention');
+        return null;
+      }
       const currentRow = mutationRowOwner(
         db.prepare('SELECT version, pid, process_start, created_at, nonce FROM state_mutation_locks WHERE lock_key = ?').get(key),
       );
@@ -746,6 +777,31 @@ function acquireStateFileLockAtPathWithDeadline(lockPath, attempts, requireExclu
         return null;
       }
       if (currentRow === 'absent' || !sameOwner(currentRow, observedRow)) {
+        db.exec('ROLLBACK');
+        db.close();
+        if (attempts > 1) return retryAcquisition();
+        recordFailure('contention');
+        return null;
+      }
+      db.prepare('DELETE FROM state_mutation_locks WHERE lock_key = ?').run(key);
+      // Commit stale-row removal separately because the owner-file probe below
+      // also runs outside the write transaction.
+      db.exec('COMMIT');
+      if (!beginWithinDeadline(db, busyTimeoutMs, operationDeadline)) {
+        db.close();
+        recordFailure('contention');
+        return null;
+      }
+      const claimedRow = mutationRowOwner(
+        db.prepare('SELECT version, pid, process_start, created_at, nonce FROM state_mutation_locks WHERE lock_key = ?').get(key),
+      );
+      if (claimedRow === null) {
+        db.exec('ROLLBACK');
+        db.close();
+        recordFailure('unverifiable');
+        return null;
+      }
+      if (claimedRow !== 'absent') {
         db.exec('ROLLBACK');
         db.close();
         if (attempts > 1) return retryAcquisition();
@@ -769,27 +825,39 @@ function acquireStateFileLockAtPathWithDeadline(lockPath, attempts, requireExclu
       recordFailure('contention');
       return null;
     }
-
-    if (
-      observedArtifact.status === 'present' &&
-      (observedRow === 'absent' || !sameOwner(observedArtifact.owner, observedRow))
-    ) {
+    if (observedArtifact.status === 'present') {
+      // Probe outside BEGIN IMMEDIATE, then require the exact owner record and
+      // BigInt file identity to survive until reclamation.
       db.exec('ROLLBACK');
       const live = ownerLive(
         observedArtifact.owner,
         remainingProcessProbeMs(processProbeDeadline, operationDeadline, testHooks),
         testHooks,
       );
-      if (live === null || live) {
+      if (live === null) {
         db.close();
-        if (live === null || attempts <= 1) {
-          recordFailure(live === null ? 'unverifiable' : 'contention');
+        if (attempts <= 1) {
+          recordFailure('unverifiable');
           return null;
         }
         return retryAcquisition();
       }
-
-      db.exec('BEGIN IMMEDIATE');
+      if (live) {
+        db.close();
+        recordFailure('contention');
+        if (attempts <= 1) {
+          return null;
+        }
+        return retryAcquisition();
+      }
+      // Owner is dead. Reclaim under the write lock, and only the exact owner
+      // file that was probed: another waiter may have reclaimed it and published
+      // a live owner while the probe ran without the lock.
+      if (!beginWithinDeadline(db, busyTimeoutMs, operationDeadline)) {
+        db.close();
+        recordFailure('contention');
+        return null;
+      }
       const currentRow = mutationRowOwner(
         db.prepare('SELECT version, pid, process_start, created_at, nonce FROM state_mutation_locks WHERE lock_key = ?').get(key),
       );
@@ -799,17 +867,6 @@ function acquireStateFileLockAtPathWithDeadline(lockPath, attempts, requireExclu
         recordFailure('unverifiable');
         return null;
       }
-      const rowChanged = observedRow === 'absent'
-        ? currentRow !== 'absent'
-        : currentRow === 'absent' || !sameOwner(currentRow, observedRow);
-      if (rowChanged) {
-        db.exec('ROLLBACK');
-        db.close();
-        if (attempts > 1) return retryAcquisition();
-        recordFailure('contention');
-        return null;
-      }
-
       const currentArtifact = ownerArtifactSnapshot(lockPath);
       if (currentArtifact.status === 'invalid') {
         db.exec('ROLLBACK');
@@ -818,6 +875,7 @@ function acquireStateFileLockAtPathWithDeadline(lockPath, attempts, requireExclu
         return null;
       }
       if (
+        currentRow !== 'absent' ||
         currentArtifact.status !== 'present' ||
         !sameOwner(currentArtifact.owner, observedArtifact.owner) ||
         !sameArtifactIdentity(currentArtifact.identity, observedArtifact.identity)
@@ -828,12 +886,6 @@ function acquireStateFileLockAtPathWithDeadline(lockPath, attempts, requireExclu
         recordFailure('contention');
         return null;
       }
-    }
-
-    if (observedRow !== 'absent') {
-      db.prepare('DELETE FROM state_mutation_locks WHERE lock_key = ?').run(key);
-    }
-    if (observedArtifact.status === 'present') {
       const reclaimed = reclaimDeadOwner(lockPath, observedArtifact.owner, observedArtifact.identity);
       if (reclaimed !== 'removed') {
         db.exec('ROLLBACK');

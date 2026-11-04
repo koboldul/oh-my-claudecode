@@ -26,6 +26,9 @@ const {
 const { tmpdir } = require('os');
 const path = require('path');
 const { join, basename, dirname } = path;
+const { hardenWindowsExeSearch } = require('./lib/windows-search.cjs');
+
+hardenWindowsExeSearch();
 
 let spawnInvocationCount = 0;
 function spawnProcess(...args) {

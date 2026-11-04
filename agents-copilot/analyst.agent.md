@@ -5,7 +5,6 @@ model: gpt-6-sol
 reasoning-effort: max
 target: github-copilot
 tools: [execute, read, search, agent, web, todo]
-level: 3
 
 ---
 

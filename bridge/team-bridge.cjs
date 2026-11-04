@@ -2304,6 +2304,21 @@ __export(bridge_entry_exports, {
   validateConfigPath: () => validateConfigPath
 });
 module.exports = __toCommonJS(bridge_entry_exports);
+
+// src/utils/windows-search.ts
+var VARIABLE = "NoDefaultCurrentDirectoryInExePath";
+function isVariable(key) {
+  return key.toUpperCase() === VARIABLE.toUpperCase();
+}
+function hardenWindowsExeSearch() {
+  if (process.platform !== "win32") return;
+  for (const key of Object.keys(process.env)) {
+    if (isVariable(key)) delete process.env[key];
+  }
+  process.env[VARIABLE] = "1";
+}
+
+// src/team/bridge-entry.ts
 var import_fs22 = require("fs");
 var import_path22 = require("path");
 var import_os6 = require("os");
@@ -8154,6 +8169,7 @@ ${violationSummary}`
 init_worktree_paths();
 init_config_dir();
 init_tmux_session();
+hardenWindowsExeSearch();
 function validateConfigPath(configPath2, homeDir, claudeConfigDir) {
   const resolved = (0, import_path22.resolve)(configPath2);
   const isUnderHome = resolved.startsWith(homeDir + "/") || resolved === homeDir;

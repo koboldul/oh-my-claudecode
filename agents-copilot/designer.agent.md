@@ -4,7 +4,6 @@ description: UI/UX Designer-Developer for stunning interfaces
 model: gpt-6-luna
 reasoning-effort: max
 target: github-copilot
-level: 2
 ---
 
 <Agent_Prompt>

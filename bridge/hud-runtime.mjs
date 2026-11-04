@@ -1,5 +1,18 @@
 #!/usr/bin/env node
 
+// src/utils/windows-search.ts
+var VARIABLE = "NoDefaultCurrentDirectoryInExePath";
+function isVariable(key) {
+  return key.toUpperCase() === VARIABLE.toUpperCase();
+}
+function hardenWindowsExeSearch() {
+  if (process.platform !== "win32") return;
+  for (const key of Object.keys(process.env)) {
+    if (isVariable(key)) delete process.env[key];
+  }
+  process.env[VARIABLE] = "1";
+}
+
 // src/hud/stdin.ts
 import { existsSync as existsSync2, readFileSync as readFileSync2, statSync as statSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, utimesSync } from "fs";
 import { dirname as dirname2 } from "path";
@@ -2737,7 +2750,7 @@ function atomicWriteJsonSync(filePath, data, hooks, operations) {
 var ATOMIC_BATCH_MAX_CONTENT_BYTES = 1024 * 1024;
 
 // src/hud/mission-board.ts
-import { copyFileSync, existsSync as existsSync5, mkdirSync as mkdirSync4, readFileSync as readFileSync6, readdirSync as readdirSync3, renameSync as renameSync2, unlinkSync as unlinkSync4 } from "node:fs";
+import { copyFileSync, existsSync as existsSync5, mkdirSync as mkdirSync4, readFileSync as readFileSync6, readdirSync as readdirSync3, renameSync as renameSync2, statSync as statSync4, unlinkSync as unlinkSync4 } from "node:fs";
 import { join as join5 } from "node:path";
 
 // src/lib/file-lock.ts
@@ -3927,11 +3940,14 @@ function mergeMissions(previous, teamMissions, config) {
     return parseTime(right.updatedAt) - parseTime(left.updatedAt);
   }).slice(0, config.maxMissions);
 }
+function collectTeamMissions(directory, config) {
+  const teamsRoot = join5(getOmcRoot(directory), "state", "team");
+  return existsSync5(teamsRoot) ? readdirSync3(teamsRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => collectTeamMission(join5(teamsRoot, entry.name), entry.name, config)).filter((mission) => Boolean(mission)) : [];
+}
 function refreshMissionBoardState(directory, rawConfig = DEFAULT_CONFIG, sessionId) {
   const effectiveSessionId = sessionId ?? getProcessSessionId();
   const config = resolveConfig(rawConfig);
-  const teamsRoot = join5(getOmcRoot(directory), "state", "team");
-  const teamMissions = existsSync5(teamsRoot) ? readdirSync3(teamsRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => collectTeamMission(join5(teamsRoot, entry.name), entry.name, config)).filter((mission) => Boolean(mission)) : [];
+  const teamMissions = collectTeamMissions(directory, config);
   return updateState(directory, effectiveSessionId, (previous) => ({
     updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
     missions: mergeMissions(previous, teamMissions, config)
@@ -4713,7 +4729,7 @@ async function initializeHUDState(directory, sessionId) {
 }
 
 // src/hud/omc-state.ts
-import { existsSync as existsSync7, readFileSync as readFileSync8, statSync as statSync4, readdirSync as readdirSync4 } from "fs";
+import { existsSync as existsSync7, readFileSync as readFileSync8, statSync as statSync5, readdirSync as readdirSync4 } from "fs";
 import { join as join9 } from "path";
 
 // src/hooks/autopilot/named-workflow-resume-validator.ts
@@ -5500,7 +5516,7 @@ function validateNamedWorkflowStateStructure(state, sessionId) {
 var MAX_STATE_AGE_MS = 2 * 60 * 60 * 1e3;
 function isStateFileStale(filePath) {
   try {
-    const stat = statSync4(filePath);
+    const stat = statSync5(filePath);
     const age = Date.now() - stat.mtimeMs;
     return age > MAX_STATE_AGE_MS;
   } catch {
@@ -5524,7 +5540,7 @@ function resolveStatePath2(directory, filename, sessionId) {
         const sessionFile = join9(sessionsDir, entry.name, filename);
         if (existsSync7(sessionFile)) {
           try {
-            const mtime = statSync4(sessionFile).mtimeMs;
+            const mtime = statSync5(sessionFile).mtimeMs;
             if (mtime > bestMtime) {
               bestMtime = mtime;
               bestPath = sessionFile;
@@ -5539,7 +5555,7 @@ function resolveStatePath2(directory, filename, sessionId) {
   const newPath = join9(omcRoot, "state", filename);
   if (existsSync7(newPath)) {
     try {
-      const mtime = statSync4(newPath).mtimeMs;
+      const mtime = statSync5(newPath).mtimeMs;
       if (mtime > bestMtime) {
         bestMtime = mtime;
         bestPath = newPath;
@@ -5551,7 +5567,7 @@ function resolveStatePath2(directory, filename, sessionId) {
   const legacyPath = join9(omcRoot, filename);
   if (existsSync7(legacyPath)) {
     try {
-      const mtime = statSync4(legacyPath).mtimeMs;
+      const mtime = statSync5(legacyPath).mtimeMs;
       if (mtime > bestMtime) {
         bestPath = legacyPath;
       }
@@ -8769,7 +8785,7 @@ function renderGitStatus(cwd, labels = DEFAULT_HUD_LABELS) {
 
 // src/hud/elements/multi-repo.ts
 import { execFileSync as execFileSync5 } from "node:child_process";
-import { existsSync as existsSync11, readdirSync as readdirSync5, statSync as statSync5 } from "node:fs";
+import { existsSync as existsSync11, readdirSync as readdirSync5, statSync as statSync6 } from "node:fs";
 import { basename as basename9, join as join13, resolve as resolve6 } from "node:path";
 var ACTIVITY_WINDOW_MS = 5 * 60 * 1e3;
 var SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -8805,12 +8821,12 @@ function countActiveSessions(cwd) {
       const dirPath = join13(sessionsDir, entry.name);
       let fresh = false;
       try {
-        if (now - statSync5(dirPath).mtimeMs < ACTIVITY_WINDOW_MS) {
+        if (now - statSync6(dirPath).mtimeMs < ACTIVITY_WINDOW_MS) {
           fresh = true;
         } else {
           for (const f of readdirSync5(dirPath)) {
             try {
-              if (now - statSync5(join13(dirPath, f)).mtimeMs < ACTIVITY_WINDOW_MS) {
+              if (now - statSync6(join13(dirPath, f)).mtimeMs < ACTIVITY_WINDOW_MS) {
                 fresh = true;
                 break;
               }
@@ -9501,7 +9517,7 @@ function sanitizeOutput(output) {
 }
 
 // src/hud/payload-estimate.ts
-import { closeSync as closeSync5, existsSync as existsSync13, openSync as openSync5, readSync as readSync4, statSync as statSync6 } from "fs";
+import { closeSync as closeSync5, existsSync as existsSync13, openSync as openSync5, readSync as readSync4, statSync as statSync7 } from "fs";
 var ANTHROPIC_REQUEST_PAYLOAD_LIMIT_BYTES = 32e6;
 var PAYLOAD_WARNING_BYTES = 22e6;
 var PAYLOAD_CRITICAL_BYTES = 26e6;
@@ -9669,7 +9685,7 @@ function estimateTranscriptPayloadBytes(transcriptPath, size) {
 function estimatePayloadFromTranscriptPath(transcriptPath) {
   if (!transcriptPath || !existsSync13(transcriptPath)) return null;
   try {
-    const stat = statSync6(transcriptPath);
+    const stat = statSync7(transcriptPath);
     if (!stat.isFile()) return null;
     return createPayloadEstimate(
       estimateTranscriptPayloadBytes(transcriptPath, stat.size)
@@ -10107,6 +10123,7 @@ import { access, readFile } from "fs/promises";
 import { join as join19, basename as basename12, dirname as dirname13 } from "path";
 import { spawn as spawn2 } from "child_process";
 import { fileURLToPath as fileURLToPath3 } from "url";
+hardenWindowsExeSearch();
 function extractSessionIdFromPath(transcriptPath) {
   if (!transcriptPath) return null;
   const match = transcriptPath.match(/([0-9a-f-]{36})(?:\.jsonl)?$/i);
@@ -10371,7 +10388,7 @@ async function mainImpl(watchMode = false, skipInit = false) {
       }
     }
     const missionBoardEnabled = config.missionBoard?.enabled ?? config.elements.missionBoard ?? false;
-    const missionBoard = missionBoardEnabled ? await refreshMissionBoardState(cwd, config.missionBoard) : null;
+    const missionBoard = missionBoardEnabled ? await refreshMissionBoardState(cwd, config.missionBoard, currentSessionId ?? void 0) : null;
     const contextPercent = getContextPercent(stdin);
     const payloadEstimate = estimatePayloadFromTranscriptPath(resolvedTranscriptPath);
     const subscriptionInfo = (() => {

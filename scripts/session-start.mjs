@@ -720,8 +720,6 @@ async function loadProjectMemoryModules() {
 
     return {
       loadProjectMemory: projectMemoryStorage.loadProjectMemory,
-      saveProjectMemory: projectMemoryStorage.saveProjectMemory,
-      shouldRescan: projectMemoryStorage.shouldRescan,
       detectProjectEnvironment: projectMemoryDetector.detectProjectEnvironment,
       formatContextSummary: projectMemoryFormatter.formatContextSummary,
       findProjectRoot: rulesFinder.findProjectRoot,
@@ -784,8 +782,6 @@ async function resolveProjectMemorySummary(directory, projectMemoryModules) {
     findProjectRoot,
     formatContextSummary,
     loadProjectMemory,
-    saveProjectMemory,
-    shouldRescan,
   } = projectMemoryModules;
 
   const projectRoot = findProjectRoot?.(directory);
@@ -793,18 +789,10 @@ async function resolveProjectMemorySummary(directory, projectMemoryModules) {
     return '';
   }
 
+  // project-memory-session.mjs owns rescans and saves; a second writer here raced it and dropped hotPaths.
   let memory = await loadProjectMemory?.(projectRoot);
-
-  if ((!memory || shouldRescan?.(memory)) && detectProjectEnvironment && saveProjectMemory) {
-    const existing = memory;
+  if (!memory && detectProjectEnvironment) {
     memory = await detectProjectEnvironment(projectRoot);
-
-    if (existing) {
-      memory.customNotes = existing.customNotes;
-      memory.userDirectives = existing.userDirectives;
-    }
-
-    await saveProjectMemory(projectRoot, memory);
   }
 
   if (!hasProjectMemoryContent(memory)) {

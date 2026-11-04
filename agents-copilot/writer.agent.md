@@ -4,7 +4,6 @@ description: Technical documentation writer for README, API docs, and comments
 model: gpt-6-sol
 reasoning-effort: max
 target: github-copilot
-level: 2
 ---
 
 <Agent_Prompt>

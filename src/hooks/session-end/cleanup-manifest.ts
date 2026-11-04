@@ -277,13 +277,16 @@ export function readSessionEndJob(directory: string, sessionId: string): Session
 }
 
 /** Locked expected-revision CAS with an exact post-write reread. */
-export function mutateSessionEndJob(directory: string, sessionId: string, expectedRevision: number, mutate: (job: SessionEndJobV1) => void): SessionEndJobV1 | null {
+export function mutateSessionEndJob(directory: string, sessionId: string, expectedRevision: number, mutate: (job: SessionEndJobV1) => void): SessionEndJobV1 | null { const result = casSessionEndJob(directory, sessionId, expectedRevision, mutate); return result === 'revision-mismatch' ? null : result; }
+/** Like mutateSessionEndJob, but tells revision drift apart from every final failure (lock timeout, rejected mutation). */
+function casSessionEndJob(directory: string, sessionId: string, expectedRevision: number, mutate: (job: SessionEndJobV1) => void): SessionEndJobV1 | 'revision-mismatch' | null {
   let terminal = false;
   try {
     const jobPath = sessionEndJobPath(directory, sessionId);
-    const result = withLock(jobPath, () => {
+    const result = withLock(jobPath, (): SessionEndJobV1 | 'revision-mismatch' | null => {
       const current = readPath(jobPath);
-      if (!current || current.revision !== expectedRevision) return null;
+      if (!current) return null;
+      if (current.revision !== expectedRevision) return 'revision-mismatch';
       mutate(current);
       const next: SessionEndJobV1 = { ...current, revision: current.revision + 1, updatedAt: nowIso() };
       if (isManifestTerminal(next) && next.phase !== 'complete') { next.phase = 'complete'; next.completion = { completedAt: next.updatedAt, terminalDigest: digest({ producers: next.producers, actions: next.actions }), terminalRevision: next.revision }; }
@@ -317,8 +320,8 @@ function mutateLatest(directory: string, sessionId: string, mutate: (job: Sessio
   for (let attempt = 0; attempt < 16; attempt++) {
     const current = readSessionEndJob(directory, sessionId);
     if (!current) return null;
-    const result = mutateSessionEndJob(directory, sessionId, current.revision, mutate);
-    if (result) return result;
+    const result = casSessionEndJob(directory, sessionId, current.revision, mutate);
+    if (result !== 'revision-mismatch') return result;
     Atomics.wait(LOCK_WAIT, 0, 0, Math.min(20, attempt + 1));
   }
   return null;
@@ -531,6 +534,7 @@ function recordSessionEndActionResult(
 /**
  * Releasing ownership without reaching `complete` is the one path that leaves a
  * job non-terminal, so the caller's reason is persisted with it (issue #4076).
+ * Claims this owner reserved but never started are undone, so a later owner can run them.
  */
 export function releaseSessionEndJob(
   directory: string,
@@ -571,8 +575,8 @@ export function releaseSessionEndJob(
       ) {
         continue;
       }
-      action.status = 'pending';
       action.attempts = Math.max(0, action.attempts - 1);
+      action.status = action.attempts > 0 ? 'retryable' : 'pending';
       action.claimantNonce = undefined;
       action.claimedAt = undefined;
       action.lastOutcomeCode = 'runner-not-started';
@@ -585,7 +589,7 @@ export function releaseSessionEndJob(
     }
   });
 }
-export function updateSessionEndJob(directory: string, sessionId: string, expectedOwner: string, mutate: (job: SessionEndJobV1) => void): SessionEndJobV1 | null { const current = readSessionEndJob(directory, sessionId); if (!current) return null; return mutateSessionEndJob(directory, sessionId, current.revision, (job) => { if (job.owner?.nonce !== expectedOwner || job.phase === 'complete') throw new Error('owner-conflict'); mutate(job); }); }
+export function updateSessionEndJob(directory: string, sessionId: string, expectedOwner: string, mutate: (job: SessionEndJobV1) => void): SessionEndJobV1 | null { return mutateLatest(directory, sessionId, (job) => { if (job.owner?.nonce !== expectedOwner || job.phase === 'complete') throw new Error('owner-conflict'); mutate(job); }); }
 export function claimSessionEndAction(directory: string, sessionId: string, ownerNonce: string, name: SessionEndActionName, deadlineAt: number): SessionEndJobV1 | null { return updateSessionEndJob(directory, sessionId, ownerNonce, (job) => { const action = job.actions[name]; if (!action || !['pending', 'retryable'].includes(action.status) || action.claimantNonce) throw new Error('action-claim-conflict'); if (action.class === 'best-effort' && action.attempts > 0) { action.status = 'expired'; action.lastOutcomeCode = 'delivery-attempted'; return; } if ((action.class === 'required' && (action.attempts >= REQUIRED_ACTION_MAX_ATTEMPTS || Date.now() >= Date.parse(job.bestEffortDeadlineAt))) || (action.class === 'best-effort' && Date.now() >= Date.parse(job.bestEffortDeadlineAt))) { action.status = 'expired'; action.lastOutcomeCode = action.class === 'required' ? action.attempts >= REQUIRED_ACTION_MAX_ATTEMPTS ? 'required-attempt-limit' : 'required-deadline-expired' : 'deadline-expired'; return; } action.status = 'claimed'; action.attempts++; action.claimantNonce = ownerNonce; action.claimedAt = nowIso(); action.runner = { attempt: action.attempts, runnerNonce: randomUUID(), phase: 'reserved', deadlineAt: new Date(deadlineAt).toISOString() }; }); }
 export function markSessionEndActionRunner(directory: string, sessionId: string, ownerNonce: string, name: SessionEndActionName, runnerNonce: string, phase: 'started' | 'armed' | 'result-recorded'): SessionEndJobV1 | null { return updateSessionEndJob(directory, sessionId, ownerNonce, (job) => { const action = job.actions[name]; if (action.status !== 'claimed' || action.runner?.runnerNonce !== runnerNonce) throw new Error('runner-phase-conflict'); action.runner.phase = phase; }); }
 export function finishSessionEndAction(directory: string, sessionId: string, ownerNonce: string, name: SessionEndActionName, runnerNonce: string, completed: boolean, code: string, deliveryStarted = true): SessionEndJobV1 | null { return updateSessionEndJob(directory, sessionId, ownerNonce, (job) => { const action = job.actions[name]; if (action.status !== 'claimed' || action.claimantNonce !== ownerNonce || action.runner?.runnerNonce !== runnerNonce) throw new Error('action-result-conflict'); recordSessionEndActionResult(action, completed, code, deliveryStarted); }); }

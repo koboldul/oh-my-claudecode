@@ -4,7 +4,6 @@ description: Simplifies and refines code for clarity, consistency, and maintaina
 model: gpt-6-sol
 reasoning-effort: max
 target: github-copilot
-level: 3
 ---
 
 <Agent_Prompt>

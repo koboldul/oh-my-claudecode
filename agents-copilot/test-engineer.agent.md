@@ -4,7 +4,6 @@ description: Test strategy, integration/e2e coverage, flaky test hardening, TDD 
 model: gpt-6-luna
 reasoning-effort: max
 target: github-copilot
-level: 3
 ---
 
 <Agent_Prompt>

@@ -3,7 +3,7 @@
 /**
  * SessionStart Hook: runs reconciler.
  *
- * Reports completed unattended runs whose closeout was never written.
+ * Reports ended unattended runs whose closeout was never written.
  * Advisory only: it never mutates state or re-runs work.
  */
 
@@ -83,7 +83,7 @@ async function processRunsReconciler(data) {
   }
 
   const lines = [
-    `[RUN RECONCILIATION] ${findings.length} completed unattended run(s) never wrote their closeout — the run's friction was not captured:`,
+    `[RUN RECONCILIATION] ${findings.length} unattended run(s) ended without a notepad closeout — the run's friction was not captured:`,
     ...findings.map(
       (entry) =>
         `- ${entry.run}${entry.sessionId ? ` (session ${entry.sessionId})` : ''}: ended ${entry.ts} without a notepad closeout`,

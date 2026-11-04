@@ -58,10 +58,22 @@ export interface CliBinaryValidation {
 
 const resolvedPathCache = new Map<string, string>();
 
+const DEFAULT_PATHEXT = '.COM;.EXE;.BAT;.CMD';
+
+function windowsPathExtensions(): Set<string> {
+  return new Set(
+    (process.env.PATHEXT ?? DEFAULT_PATHEXT)
+      .split(';')
+      .map(extension => extension.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
 function selectResolvedBinaryPath(stdout: string): string | undefined {
   const candidates = stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (process.platform !== 'win32') return candidates[0];
-  return candidates.find(candidate => /\.(exe|com|cmd|bat)$/i.test(candidate));
+  return candidates.find(candidate => windowsPathExtensions().has(win32Path.extname(candidate).toLowerCase()))
+    ?? candidates[0];
 }
 
 function platformPath(): typeof posixPath {
@@ -133,7 +145,9 @@ export function resolveCliBinaryPath(binary: string): string {
   if (cached) return cached;
 
   const finder = process.platform === 'win32' ? 'where' : 'which';
-  const result = spawnSync(finder, [binary], {
+  // On Windows, use $PATH: prefix to exclude cwd from search (security: #4728)
+  const searchTarget = process.platform === 'win32' ? `$PATH:${binary}` : binary;
+  const result = spawnSync(finder, [searchTarget], {
     timeout: 5000,
     env: process.env,
   });
@@ -143,13 +157,13 @@ export function resolveCliBinaryPath(binary: string): string {
   }
 
   const stdout = result.stdout?.toString().trim() ?? '';
-  const firstLine = selectResolvedBinaryPath(stdout) ?? '';
-  if (!firstLine) {
+  const selected = selectResolvedBinaryPath(stdout);
+  if (!selected) {
     throw new Error(`CLI binary '${binary}' not found in PATH`);
   }
 
   const path = platformPath();
-  const resolvedPath = path.normalize(firstLine);
+  const resolvedPath = path.normalize(selected);
   if (!path.isAbsolute(resolvedPath)) {
     throw new Error(`Resolved CLI binary '${binary}' to relative path`);
   }
@@ -398,7 +412,9 @@ function resolveBinaryPath(binary: string): string {
 
   try {
     const resolver = process.platform === 'win32' ? 'where' : 'which';
-    const result = spawnSync(resolver, [binary], { timeout: 5000, encoding: 'utf8' });
+    // On Windows, use $PATH: prefix to exclude cwd from search (security: #4728)
+    const searchTarget = process.platform === 'win32' ? `$PATH:${binary}` : binary;
+    const result = spawnSync(resolver, [searchTarget], { timeout: 5000, encoding: 'utf8' });
     if (result.status !== 0) return binary;
 
     const firstPath = selectResolvedBinaryPath(result.stdout ?? '');

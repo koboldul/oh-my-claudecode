@@ -1,27 +1,50 @@
-# oh-my-claudecode v5.7.19: Faster reconciliation and safer reinstalls
+# oh-my-claudecode v5.7.31: let model-routing choose
 
 ## Release Notes
 
-This release makes interactive updates more reliable on slow-I/O hosts, repairs reinstalls when a hook library is a dangling symlink, and reduces unnecessary work during successful update reconciliation. Thanks to @kaneyxx for #4629 and the #4630 report, and to @iyoda for #4631.
+Release with **1 new feature**, **11 bug fixes**, **8 other changes** across **23 merged PRs**.
+
+### Highlights
+
+- **feat(jev): let model-routing choose subagent effort** (#4810)
+
+### New Features
+
+- **feat(jev): let model-routing choose subagent effort** (#4810)
 
 ### Bug Fixes
 
-- **fix(update): wait up to 600 seconds for interactive update reconciliation while keeping silent auto-updates bounded to 60 seconds, and name the recovery command on timeout** (#4629, fixes #4628; @kaneyxx)
-- **fix(installer): replace dangling `hooks/lib/stdin.mjs` symlinks before copying so reinstalls recover hook imports** (#4631, @iyoda)
+- **fix(jev): use the full effort range in model-routing** (#4820)
+- **fix(jev): consume active-mode answers in plugin hook scripts** (#4808)
+- **fix(ralph): exclude vitest's Start at clock from failure signatures** (#4819)
+- **fix(jev): map the context-pruning staleness score and keep CRITICAL at the threshold** (#4818)
+- **fix(jev): extract primitive heuristics for comparability - Fixes #4806** (#4809)
+- **fix(hooks): don't flag a run awaiting confirmation as crashed** (#4799)
+- **fix(hooks): correct Jev context-pruning answer gate and mapping (issue #4804)** (#4807)
+- **fix(ralph): stop fingerprinting pytest progress dots as failures** (#4800)
+- **fix(ralph): normalize pytest (m:ss) durations in feedback signatures** (#4801)
+- **fix(ralph): exclude pytest all-pass summaries from failure signatures** (#4802)
+- **fix(hooks): keep the plugin and standalone helper copies identical** (#4784)
 
-### Performance Improvements
+### Documentation
 
-- **perf(update): sync the plugin payload once per target during reconciliation, cutting measured reconcile time by about 67%** (#4634, fixes #4630; reported by @kaneyxx)
+- **docs(migration): document the team entry-point exports removed with the bridge**
+- **docs(team): drop skill guidance that calls the removed bridge APIs**
 
 ### Other Changes
 
-- **ci: authorize generated files for sync PR #4632 during the superseded v5.7.18 sync attempt** (#4633)
-- **chore(sync): merge main's v5.7.18 release into dev** (#4635)
-- **ci: authorize generated artifacts for sync PR #4635** (#4636)
+- **chore(auth): authorize generated artifacts for main→dev sync #4792** (#4793)
+- **chore(sync): rebuild generated artifacts and inventory after main→dev merge**
+- **chore(auth): move the team bridge removal authorization from #4758 to #4788** (#4789)
+- **chore(auth): re-pin the #4758 authorization after merging dev** (#4787)
+- **chore(inventory): regenerate after merging dev**
+- **chore(auth): authorize generated artifacts for #4758 (team bridge removal)** (#4786)
+- **chore: remove build outputs of the deleted team bridge modules**
+- **chore(team): remove the MCP team bridge that nothing spawns**
 
 ### Stats
 
-- **6 PRs merged** | **0 new features** | **2 bug fixes** | **1 performance improvement** | **0 security/hardening improvements** | **3 other changes**
+- **23 PRs merged** | **1 new feature** | **11 bug fixes** | **0 security/hardening improvements** | **8 other changes**
 
 ### Install / Update
 
@@ -30,7 +53,7 @@ The npm CLI and the Claude Code marketplace/plugin are separate install tracks, 
 **CLI / runtime:**
 
 ```bash
-npm install -g oh-my-claude-sisyphus@5.7.19
+npm install -g oh-my-claude-sisyphus@5.7.31
 ```
 
 **Claude Code plugin:**
@@ -39,10 +62,4 @@ npm install -g oh-my-claude-sisyphus@5.7.19
 /plugin marketplace update omc
 ```
 
-**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v5.7.18...v5.7.19
-
-## Contributors
-
-Thank you to all contributors who made this release possible!
-
-@kaneyxx @iyoda @Yeachan-Heo
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-claudecode/compare/v5.7.30...v5.7.31

@@ -50,7 +50,7 @@ export { VERIFIED_COPILOT_CLI_VERSION, assessCopilotCliVersion, detectCopilotCli
 export type { WorkerBootstrapParams } from './worker-bootstrap.js';
 export { generateWorkerOverlay, composeInitialInbox, appendToInbox, getWorkerEnv, ensureWorkerStateDir, writeWorkerOverlay, } from './worker-bootstrap.js';
 export type { WorkerLaunchAttempt, WorkerLaunchBootstrapSpec, WorkerLaunchAcceptance, WorkerLaunchBootstrapResult, WorkerLaunchContext, ProviderSpawnInvocation, } from './worker-launch-ack.js';
-export { prepareWorkerLaunchAttempt, loadWorkerLaunchAttempt, loadCurrentWorkerLaunchAttempt, buildWorkerLaunchBootstrapSpec, revokeWorkerLaunchAttempt, awaitWorkerLaunchAcknowledgement, isWorkerLaunchAttemptAccepted, runWorkerLaunchBootstrap, isWorkerLaunchProviderStarted, isWorkerLaunchAttemptCurrent, withWorkerLaunchAttemptFence, buildProviderSpawnInvocation, } from './worker-launch-ack.js';
+export { prepareWorkerLaunchAttempt, loadWorkerLaunchAttempt, loadCurrentWorkerLaunchAttempt, buildWorkerLaunchBootstrapSpec, revokeWorkerLaunchAttempt, awaitWorkerLaunchAcknowledgement, isWorkerLaunchAttemptAccepted, runWorkerLaunchBootstrap, isWorkerLaunchProviderStarted, isWorkerLaunchAttemptCurrent, withWorkerLaunchAttemptFence, buildProviderSpawnInvocation, buildProviderSpawnEnvironment, } from './worker-launch-ack.js';
 export { sendTmuxTrigger, queueInboxInstruction, queueDirectMessage, queueBroadcastMessage, readMailbox, } from './tmux-comm.js';
 export { LayoutStabilizer } from './layout-stabilizer.js';
 export type { LayoutStabilizerOptions } from './layout-stabilizer.js';

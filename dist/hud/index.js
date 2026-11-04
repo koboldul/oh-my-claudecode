@@ -5,6 +5,7 @@
  * Statusline command that visualizes oh-my-claudecode state.
  * Receives normalized host statusline stdin and outputs the formatted HUD.
  */
+import { hardenWindowsExeSearch } from "../utils/windows-search.js";
 import { readStdin, writeStdinCache, readStdinCache, getContextPercent, getModelId, getEffortLevel, getModelName, getRateLimitsFromStdin, stabilizeContextPercent, } from "./stdin.js";
 import { parseTranscript } from "./transcript.js";
 import { readHudState, readHudConfig, getRunningTasks, writeHudState, initializeHUDState, } from "./state.js";
@@ -27,6 +28,7 @@ import { fileURLToPath } from "url";
 import { getOmcRoot } from "../lib/worktree-paths.js";
 import { getClaudeConfigDir, getUpdateCheckCachePath } from "../utils/config-dir.js";
 import { parseJsonc } from "../utils/jsonc.js";
+hardenWindowsExeSearch();
 /**
  * Extract session ID (UUID) from a transcript path.
  */
@@ -374,7 +376,7 @@ async function mainImpl(watchMode = false, skipInit = false) {
         }
         const missionBoardEnabled = config.missionBoard?.enabled ?? config.elements.missionBoard ?? false;
         const missionBoard = missionBoardEnabled
-            ? await refreshMissionBoardState(cwd, config.missionBoard)
+            ? await refreshMissionBoardState(cwd, config.missionBoard, currentSessionId ?? undefined)
             : null;
         const contextPercent = getContextPercent(stdin);
         const payloadEstimate = estimatePayloadFromTranscriptPath(resolvedTranscriptPath);

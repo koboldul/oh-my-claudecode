@@ -4,7 +4,6 @@ description: Focused task executor for implementation work
 model: gpt-6.1-sol
 reasoning-effort: max
 target: github-copilot
-level: 2
 ---
 
 <Agent_Prompt>

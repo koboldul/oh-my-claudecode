@@ -189,25 +189,34 @@ function loadSkillFromFile(skillPath, skillName, content) {
  */
 function loadSkillsFromDirectory() {
     if (!existsSync(SKILLS_DIR)) {
+        cachedSkillPaths = new Map();
         return [];
     }
     const skills = [];
+    const skillPaths = new Map();
     try {
         const registrations = readBuiltinSkillRegistrations();
         for (const registration of registrations) {
             const registeredNames = new Set(registration.registeredNames.map((name) => name.toLowerCase()));
-            skills.push(...loadSkillFromFile(registration.skillPath, registration.skillName, registration.content).filter((skill) => registeredNames.has(skill.name.toLowerCase())));
+            const registeredSkills = loadSkillFromFile(registration.skillPath, registration.skillName, registration.content).filter((skill) => registeredNames.has(skill.name.toLowerCase()));
+            for (const skill of registeredSkills) {
+                skillPaths.set(skill.name.toLowerCase(), registration.skillPath);
+                skills.push(skill);
+            }
         }
     }
     catch {
         // Return empty array if directory read fails
+        cachedSkillPaths = new Map();
         return [];
     }
+    cachedSkillPaths = skillPaths;
     return skills;
 }
 // Cache loaded skills to avoid repeated file reads
 let cachedSkills = null;
 let cachedSkillsKey = null;
+let cachedSkillPaths = null;
 function getBuiltinSkillsCacheKey() {
     return JSON.stringify({
         deepInterviewAmbiguityThreshold: getDeepInterviewAmbiguityThresholdResolution(),
@@ -234,6 +243,11 @@ export function getBuiltinSkill(name) {
     const skills = createBuiltinSkills();
     return skills.find(s => s.name.toLowerCase() === name.toLowerCase());
 }
+/** Resolve a builtin skill name, including its frontmatter aliases, to its source file. */
+export function getBuiltinSkillPath(name) {
+    createBuiltinSkills();
+    return cachedSkillPaths?.get(name.toLowerCase());
+}
 /**
  * List all builtin skill names
  */
@@ -247,5 +261,6 @@ export function listBuiltinSkillNames(options) {
 export function clearSkillsCache() {
     cachedSkills = null;
     cachedSkillsKey = null;
+    cachedSkillPaths = null;
 }
 //# sourceMappingURL=skills.js.map

@@ -121,6 +121,7 @@ export declare function reapStaleSessionEndOwner(directory: string, sessionId: s
 /**
  * Releasing ownership without reaching `complete` is the one path that leaves a
  * job non-terminal, so the caller's reason is persisted with it (issue #4076).
+ * Claims this owner reserved but never started are undone, so a later owner can run them.
  */
 export declare function releaseSessionEndJob(directory: string, sessionId: string, nonce: string, generation: number, reason?: string, actionResult?: {
     name: SessionEndActionName;

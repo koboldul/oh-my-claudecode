@@ -244,6 +244,7 @@ export {
   isWorkerLaunchAttemptCurrent,
   withWorkerLaunchAttemptFence,
   buildProviderSpawnInvocation,
+  buildProviderSpawnEnvironment,
 } from './worker-launch-ack.js';
 
 // tmux-comm

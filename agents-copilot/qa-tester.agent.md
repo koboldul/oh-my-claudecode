@@ -4,7 +4,6 @@ description: Interactive CLI testing specialist using tmux for session managemen
 model: gpt-6-luna
 reasoning-effort: max
 target: github-copilot
-level: 3
 ---
 
 <Agent_Prompt>

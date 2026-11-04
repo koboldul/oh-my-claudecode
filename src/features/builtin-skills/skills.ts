@@ -250,10 +250,12 @@ function loadSkillFromFile(
  */
 function loadSkillsFromDirectory(): BuiltinSkill[] {
   if (!existsSync(SKILLS_DIR)) {
+    cachedSkillPaths = new Map();
     return [];
   }
 
   const skills: BuiltinSkill[] = [];
+  const skillPaths = new Map<string, string>();
 
   try {
     const registrations = readBuiltinSkillRegistrations();
@@ -261,23 +263,30 @@ function loadSkillsFromDirectory(): BuiltinSkill[] {
       const registeredNames = new Set(
         registration.registeredNames.map((name) => name.toLowerCase()),
       );
-      skills.push(...loadSkillFromFile(
+      const registeredSkills = loadSkillFromFile(
         registration.skillPath,
         registration.skillName,
         registration.content,
-      ).filter((skill) => registeredNames.has(skill.name.toLowerCase())));
+      ).filter((skill) => registeredNames.has(skill.name.toLowerCase()));
+      for (const skill of registeredSkills) {
+        skillPaths.set(skill.name.toLowerCase(), registration.skillPath);
+        skills.push(skill);
+      }
     }
   } catch {
     // Return empty array if directory read fails
+    cachedSkillPaths = new Map();
     return [];
   }
 
+  cachedSkillPaths = skillPaths;
   return skills;
 }
 
 // Cache loaded skills to avoid repeated file reads
 let cachedSkills: BuiltinSkill[] | null = null;
 let cachedSkillsKey: string | null = null;
+let cachedSkillPaths: Map<string, string> | null = null;
 
 function getBuiltinSkillsCacheKey(): string {
   return JSON.stringify({
@@ -308,6 +317,12 @@ export function getBuiltinSkill(name: string): BuiltinSkill | undefined {
   return skills.find(s => s.name.toLowerCase() === name.toLowerCase());
 }
 
+/** Resolve a builtin skill name, including its frontmatter aliases, to its source file. */
+export function getBuiltinSkillPath(name: string): string | undefined {
+  createBuiltinSkills();
+  return cachedSkillPaths?.get(name.toLowerCase());
+}
+
 export interface ListBuiltinSkillNamesOptions {
   includeAliases?: boolean;
 }
@@ -330,4 +345,5 @@ export function listBuiltinSkillNames(options?: ListBuiltinSkillNamesOptions): s
 export function clearSkillsCache(): void {
   cachedSkills = null;
   cachedSkillsKey = null;
+  cachedSkillPaths = null;
 }

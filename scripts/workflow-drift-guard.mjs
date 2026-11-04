@@ -9,6 +9,7 @@
  * This guard uses only deterministic Stop-hook signals and intentionally
  * fails open for ambiguous/free-form cases.
  */
+import { hardenWindowsExeSearch } from './lib/windows-search.mjs';
 import { execFileSync } from 'child_process';
 import {
   closeSync,
@@ -24,6 +25,8 @@ import {
   surfaceCriticalHookFailure,
 } from './lib/hook-runtime-loader.mjs';
 import { readStdin } from './lib/stdin.mjs';
+
+hardenWindowsExeSearch();
 
 const HOOK_NAME = 'workflow-drift-guard';
 const COPILOT_TRANSCRIPT_TAIL_BYTES = 256 * 1024;

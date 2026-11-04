@@ -280,14 +280,18 @@ export function readSessionEndJob(directory, sessionId) {
     }
 }
 /** Locked expected-revision CAS with an exact post-write reread. */
-export function mutateSessionEndJob(directory, sessionId, expectedRevision, mutate) {
+export function mutateSessionEndJob(directory, sessionId, expectedRevision, mutate) { const result = casSessionEndJob(directory, sessionId, expectedRevision, mutate); return result === 'revision-mismatch' ? null : result; }
+/** Like mutateSessionEndJob, but tells revision drift apart from every final failure (lock timeout, rejected mutation). */
+function casSessionEndJob(directory, sessionId, expectedRevision, mutate) {
     let terminal = false;
     try {
         const jobPath = sessionEndJobPath(directory, sessionId);
         const result = withLock(jobPath, () => {
             const current = readPath(jobPath);
-            if (!current || current.revision !== expectedRevision)
+            if (!current)
                 return null;
+            if (current.revision !== expectedRevision)
+                return 'revision-mismatch';
             mutate(current);
             const next = { ...current, revision: current.revision + 1, updatedAt: nowIso() };
             if (isManifestTerminal(next) && next.phase !== 'complete') {
@@ -325,8 +329,8 @@ function mutateLatest(directory, sessionId, mutate) {
         const current = readSessionEndJob(directory, sessionId);
         if (!current)
             return null;
-        const result = mutateSessionEndJob(directory, sessionId, current.revision, mutate);
-        if (result)
+        const result = casSessionEndJob(directory, sessionId, current.revision, mutate);
+        if (result !== 'revision-mismatch')
             return result;
         Atomics.wait(LOCK_WAIT, 0, 0, Math.min(20, attempt + 1));
     }
@@ -593,6 +597,7 @@ function recordSessionEndActionResult(action, completed, code, deliveryStarted =
 /**
  * Releasing ownership without reaching `complete` is the one path that leaves a
  * job non-terminal, so the caller's reason is persisted with it (issue #4076).
+ * Claims this owner reserved but never started are undone, so a later owner can run them.
  */
 export function releaseSessionEndJob(directory, sessionId, nonce, generation, reason = 'worker-released', actionResult) {
     return mutateLatest(directory, sessionId, (job) => {
@@ -612,8 +617,8 @@ export function releaseSessionEndJob(directory, sessionId, nonce, generation, re
                 || action.runner?.phase !== 'reserved') {
                 continue;
             }
-            action.status = 'pending';
             action.attempts = Math.max(0, action.attempts - 1);
+            action.status = action.attempts > 0 ? 'retryable' : 'pending';
             action.claimantNonce = undefined;
             action.claimedAt = undefined;
             action.lastOutcomeCode = 'runner-not-started';
@@ -626,8 +631,7 @@ export function releaseSessionEndJob(directory, sessionId, nonce, generation, re
         }
     });
 }
-export function updateSessionEndJob(directory, sessionId, expectedOwner, mutate) { const current = readSessionEndJob(directory, sessionId); if (!current)
-    return null; return mutateSessionEndJob(directory, sessionId, current.revision, (job) => { if (job.owner?.nonce !== expectedOwner || job.phase === 'complete')
+export function updateSessionEndJob(directory, sessionId, expectedOwner, mutate) { return mutateLatest(directory, sessionId, (job) => { if (job.owner?.nonce !== expectedOwner || job.phase === 'complete')
     throw new Error('owner-conflict'); mutate(job); }); }
 export function claimSessionEndAction(directory, sessionId, ownerNonce, name, deadlineAt) { return updateSessionEndJob(directory, sessionId, ownerNonce, (job) => { const action = job.actions[name]; if (!action || !['pending', 'retryable'].includes(action.status) || action.claimantNonce)
     throw new Error('action-claim-conflict'); if (action.class === 'best-effort' && action.attempts > 0) {

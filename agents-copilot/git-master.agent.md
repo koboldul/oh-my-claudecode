@@ -4,7 +4,6 @@ description: Git expert for atomic commits, rebasing, and history management wit
 model: gpt-6-luna
 reasoning-effort: max
 target: github-copilot
-level: 3
 ---
 
 <Agent_Prompt>

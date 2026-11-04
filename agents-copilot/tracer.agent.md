@@ -4,7 +4,6 @@ description: Evidence-driven causal tracing with competing hypotheses, evidence 
 model: gpt-6-luna
 reasoning-effort: max
 target: github-copilot
-level: 3
 ---
 
 <Agent_Prompt>
