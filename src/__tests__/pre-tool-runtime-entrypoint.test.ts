@@ -665,7 +665,7 @@ describe('shipped PreToolUse canonical runtime entrypoint', () => {
   });
 
   it.each([
-    ['present', 'gpt-6.1-sol'],
+    ['present', 'gpt-6.1-terra'],
     ['missing', 'gpt-5.6-sol'],
   ])('encodes a representable Copilot singleton mutation (%s executor profile)', (profile, expectedModel) => {
     const staged = stagePlugin();
@@ -723,7 +723,7 @@ describe('shipped PreToolUse canonical runtime entrypoint', () => {
     expect(output.permissionDecision).toBe('deny');
     expect(output).not.toHaveProperty('modifiedArgs');
     for (const patch of [
-      'call agent-a: model=gpt-6.1-sol, reasoning_effort=max',
+      'call agent-a: model=gpt-6.1-terra, reasoning_effort=max',
       'call agent-b: model=gpt-5.6-sol, reasoning_effort=max',
     ]) {
       expect(output.permissionDecisionReason).toContain(

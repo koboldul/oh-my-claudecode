@@ -1,7 +1,7 @@
 ---
 name: qa-tester
 description: Interactive CLI testing specialist using tmux for session management
-model: gpt-6-luna
+model: gpt-6.1-luna
 reasoning-effort: max
 target: github-copilot
 ---

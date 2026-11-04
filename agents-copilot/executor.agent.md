@@ -1,7 +1,7 @@
 ---
 name: executor
 description: Focused task executor for implementation work
-model: gpt-6.1-sol
+model: gpt-6.1-terra
 reasoning-effort: max
 target: github-copilot
 ---

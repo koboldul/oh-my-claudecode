@@ -47,10 +47,12 @@ describe('Copilot-specific agent profiles', () => {
       const generated = readFileSync(join(COPILOT_DIR, outputFile), 'utf8');
       const sourceModel = source.match(/^model:\s*(\S+)/m)?.[1] ?? '';
       const expectedModel = sourceFile === 'executor.md'
-        ? 'gpt-6.1-sol'
-        : sourceModel.toLowerCase().includes('sonnet')
-          ? 'gpt-6-luna'
-          : 'gpt-6-sol';
+        ? 'gpt-6.1-terra'
+        : ['architect.md', 'security-reviewer.md'].includes(sourceFile)
+          ? 'gpt-6-astra'
+          : sourceModel.toLowerCase().includes('sonnet')
+            ? 'gpt-6.1-luna'
+            : 'gpt-6.1-sol';
 
       expect(generated).toBe(beforeGeneration[outputFile]);
       expect(generated).toMatch(new RegExp(`^model: ${expectedModel}$`, 'm'));

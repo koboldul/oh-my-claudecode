@@ -1,7 +1,7 @@
 ---
 name: code-simplifier
 description: Simplifies and refines code for clarity, consistency, and maintainability while preserving all functionality. Focuses on recently modified code unless instructed otherwise.
-model: gpt-6-sol
+model: gpt-6.1-sol
 reasoning-effort: max
 target: github-copilot
 ---

@@ -1,7 +1,7 @@
 ---
 name: debugger
 description: Root-cause analysis, regression isolation, stack trace analysis, build/compilation error resolution
-model: gpt-6-luna
+model: gpt-6.1-luna
 reasoning-effort: max
 target: github-copilot
 ---

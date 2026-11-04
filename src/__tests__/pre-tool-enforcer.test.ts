@@ -2680,7 +2680,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     return output.modifiedArgs as Record<string, unknown> | undefined;
   }
 
-  it('defaults the executor to its GPT-6.1 Sol profile with max reasoning', () => {
+  it('defaults the executor to its GPT-6.1 Terra profile with max reasoning', () => {
     const output = run({
       tool_name: 'Task',
       toolInput: {
@@ -2692,7 +2692,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     });
 
     expect(updatedInput(output)).toMatchObject({
-      model: 'gpt-6.1-sol',
+      model: 'gpt-6.1-terra',
       reasoning_effort: 'max',
     });
   });
@@ -2709,7 +2709,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     });
 
     expect(updatedInput(output)).toMatchObject({
-      model: 'gpt-6.1-sol',
+      model: 'gpt-6.1-terra',
       reasoning_effort: 'max',
     });
   });
@@ -2728,7 +2728,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     });
 
     expect(updatedInput(output)).toMatchObject({
-      model: 'gpt-6.1-sol',
+      model: 'gpt-6.1-terra',
       reasoning_effort: 'max',
     });
   });
@@ -2797,7 +2797,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
       reasoning_effort: 'max',
     });
     expect(updatedInput(effortExplicit)).toMatchObject({
-      model: 'gpt-6.1-sol',
+      model: 'gpt-6.1-terra',
       reasoning_effort: 'high',
     });
   });
@@ -2959,7 +2959,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     );
 
     expect(updatedInput(output)).toMatchObject({
-      model: 'gpt-6.1-sol',
+      model: 'gpt-6.1-terra',
       reasoning_effort: 'max',
     });
   });

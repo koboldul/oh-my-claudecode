@@ -14,13 +14,16 @@ import { fileURLToPath } from 'node:url';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SOURCE_DIR = join(ROOT, 'agents');
 const OUTPUT_DIR = join(ROOT, 'agents-copilot');
-const COPILOT_SOL_MODEL = 'gpt-6-sol';
-const COPILOT_LUNA_MODEL = 'gpt-6-luna';
+const COPILOT_SOL_MODEL = 'gpt-6.1-sol';
+const COPILOT_LUNA_MODEL = 'gpt-6.1-luna';
 const COPILOT_REASONING_EFFORT = 'max';
 
 function getCopilotModel(frontmatter) {
   if (/^name:\s*executor\s*$/m.test(frontmatter)) {
-    return 'gpt-6.1-sol';
+    return 'gpt-6.1-terra';
+  }
+  if (/^name:\s*(?:architect|security-reviewer)\s*$/m.test(frontmatter)) {
+    return 'gpt-6-astra';
   }
   const sourceModel = frontmatter.match(/^model:\s*(\S+)/m)?.[1] ?? '';
   return sourceModel.toLowerCase().includes('sonnet')

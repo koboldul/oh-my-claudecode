@@ -1,7 +1,7 @@
 ---
 name: architect
 description: Strategic Architecture & Debugging Advisor (READ-ONLY)
-model: gpt-6-sol
+model: gpt-6-astra
 reasoning-effort: max
 target: github-copilot
 tools: [execute, read, search, agent, web, todo]

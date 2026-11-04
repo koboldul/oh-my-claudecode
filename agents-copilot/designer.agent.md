@@ -1,7 +1,7 @@
 ---
 name: designer
 description: UI/UX Designer-Developer for stunning interfaces
-model: gpt-6-luna
+model: gpt-6.1-luna
 reasoning-effort: max
 target: github-copilot
 ---

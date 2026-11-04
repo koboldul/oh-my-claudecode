@@ -1,7 +1,7 @@
 ---
 name: document-specialist
 description: External Documentation & Reference Specialist
-model: gpt-6-luna
+model: gpt-6.1-luna
 reasoning-effort: max
 target: github-copilot
 tools: [execute, read, search, agent, web, todo]
