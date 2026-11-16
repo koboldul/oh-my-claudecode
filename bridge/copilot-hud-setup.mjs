@@ -1947,6 +1947,21 @@ var builtin_skill_entitlements_default = {
   skininthegamebrosOnlySkills: []
 };
 
+// scripts/lib/hook-command-normalizer.mjs
+var ROOT = String.raw`(?:\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT)`;
+var legacyFindNodePattern = new RegExp(
+  String.raw`^sh "${ROOT}\/scripts\/find-node\.sh" "${ROOT}\/scripts\/([^"\s]+)"?(.*)$`
+);
+var currentFindNodePattern = new RegExp(
+  String.raw`^(?:"\/bin\/sh"|sh) "${ROOT}"\/scripts\/find-node\.sh "${ROOT}"\/scripts\/run\.cjs "${ROOT}"\/scripts\/([^"\s]+)"?(.*)$`
+);
+var directRunCjsPattern = new RegExp(
+  String.raw`^node\s+"${ROOT}"\/scripts\/run\.cjs\s+"${ROOT}"\/scripts\/([^"\s]+)"?(.*)$`
+);
+var absoluteNodeRunCjsPattern = new RegExp(
+  String.raw`^"([^"]*\/node|[A-Za-z]:\\[^"]*\\node(?:\.exe)?)"\s+"${ROOT}"\/scripts\/run\.cjs\s+"${ROOT}"\/scripts\/([^"\s]+)"?(.*)$`
+);
+
 // src/installer/index.ts
 var CLAUDE_CONFIG_DIR = getClaudeConfigDir();
 var AGENTS_DIR = join8(CLAUDE_CONFIG_DIR, "agents");

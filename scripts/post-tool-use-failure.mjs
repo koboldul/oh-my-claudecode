@@ -279,6 +279,28 @@ async function processPostToolUseFailure(data) {
   const isInterrupt = data.interrupted || false;
   const directory = data.directory || process.cwd();
 
+  const hookData = {
+    ...data,
+    tool_name: data.shellDialect === 'powershell' ? 'PowerShell' : toolName,
+    tool_input: toolInput,
+    tool_response: data.toolOutput,
+    error,
+  };
+  if (process.env.OMC_SHELL_CHECKS === '1' && (hookData.tool_name === 'Bash' || hookData.tool_name === 'PowerShell')) {
+    try {
+      const { hasShellToolError, recordShellToolErrors } = await import('./lib/shell-checks.mjs');
+      if (hasShellToolError(hookData)) {
+        const stateRoot = await resolveOmcStateRoot(directory);
+        recordShellToolErrors('post-tool-use-failure', hookData, { logDir: join(stateRoot, 'state', 'shell-checks') });
+      }
+    } catch { /* best-effort */ }
+  }
+  if ((process.env.OMC_JEV || '').includes('compaction') && !isInterrupt) {
+    try {
+      (await import('./lib/jev-compaction-state.mjs')).recordCompactionState('failure', hookData);
+    } catch { /* never breaks the hook */ }
+  }
+
   // Ignore user interrupts
   if (isInterrupt) {
     return { continue: true, suppressOutput: true };

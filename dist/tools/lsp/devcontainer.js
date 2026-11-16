@@ -157,17 +157,13 @@ export function containerUriToHostUri(uri, context) {
     if (!context || !uri.startsWith('file://')) {
         return uri;
     }
-    try {
-        const parsed = new URL(uri);
-        if (parsed.protocol !== 'file:' || parsed.hostname || /%2f|%5c/i.test(parsed.pathname)) {
-            return uri;
-        }
-        const containerPath = decodeURIComponent(parsed.pathname);
-        return pathToFileURL(containerPathToHostPath(containerPath, context)).href;
-    }
-    catch {
+    const containerPath = containerFileUriToPath(uri);
+    if (containerPath === null) {
         return uri;
     }
+    const hostPath = containerPathToHostPath(containerPath, context);
+    // A path outside the workspace mount has no host equivalent.
+    return hostPath === containerPath ? uri : pathToFileURL(hostPath).href;
 }
 function resolveDevContainerConfigPath(workspaceRoot) {
     let dir = workspaceRoot;
@@ -319,14 +315,14 @@ function scoreContainerMatch(inspect, hostWorkspaceRoot, configFilePath) {
         ? deriveHostDevContainerRoot(configFilePath)
         : resolve(hostWorkspaceRoot);
     for (const label of DEVCONTAINER_LOCAL_FOLDER_LABELS) {
-        if (labels[label] && resolve(labels[label]) === expectedLocalFolder) {
+        if (labels[label] && isSameHostPath(labels[label], expectedLocalFolder)) {
             score += 4;
             hasDevContainerLabelMatch = true;
         }
     }
     if (configFilePath) {
         for (const label of DEVCONTAINER_CONFIG_FILE_LABELS) {
-            if (labels[label] && resolve(labels[label]) === configFilePath) {
+            if (labels[label] && isSameHostPath(labels[label], configFilePath)) {
                 score += 3;
                 hasDevContainerLabelMatch = true;
             }
@@ -338,6 +334,11 @@ function scoreContainerMatch(inspect, hostWorkspaceRoot, configFilePath) {
     }
     return score;
 }
+// The devcontainer CLI lowercases the drive letter in its labels on Windows,
+// and path.relative() ignores case there.
+function isSameHostPath(left, right) {
+    return relative(resolve(left), resolve(right)) === '';
+}
 function normalizeContainerPath(filePath) {
     return posix.normalize(filePath.replace(/\\/g, '/'));
 }
@@ -348,6 +349,20 @@ function containerPathToFileUri(filePath) {
         .map(segment => encodeURIComponent(segment))
         .join('/');
     return `file://${encodedPath.startsWith('/') ? encodedPath : `/${encodedPath}`}`;
+}
+// fileURLToPath() applies host rules, and on Windows it rejects a POSIX
+// container path for having no drive letter.
+function containerFileUriToPath(uri) {
+    try {
+        const parsed = new URL(uri);
+        if (parsed.protocol !== 'file:' || parsed.hostname || /%2f|%5c/i.test(parsed.pathname)) {
+            return null;
+        }
+        return normalizeContainerPath(decodeURIComponent(parsed.pathname));
+    }
+    catch {
+        return null;
+    }
 }
 function runDocker(args) {
     const result = spawnSync('docker', args, {

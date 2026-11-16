@@ -124,19 +124,21 @@ function restoreEnvironment(name: 'DISABLE_OMC' | 'OMC_SKIP_HOOKS', value: strin
 describe('workflow-drift-guard Stop hook', () => {
   it('has one exact Stop registration', () => {
     const manifest = JSON.parse(readFileSync(join(ROOT, 'hooks', 'hooks.json'), 'utf8')) as {
-      hooks: Record<string, Array<{ hooks?: Array<{ type?: string; command?: string; timeout?: number }> }>>;
+      hooks: Record<string, Array<{ hooks?: Array<{ type?: string; command?: string; args?: string[]; timeout?: number }> }>>;
     };
-    const registrations: Array<{ event: string; type?: string; command?: string; timeout?: number }> = [];
+    const registrations: Array<{ event: string; type?: string; command?: string; args?: string[]; timeout?: number }> = [];
 
     for (const [event, groups] of Object.entries(manifest.hooks)) {
       for (const group of groups) {
         for (const hook of group.hooks || []) {
-          if (hook.command?.includes('workflow-drift-guard.mjs')) {
+          const text = [hook.command, ...(hook.args ?? [])].join(' ');
+          if (text.includes('workflow-drift-guard.mjs')) {
             registrations.push({
               event,
               type: hook.type,
               command: hook.command,
               timeout: hook.timeout,
+              args: hook.args,
             });
           }
         }
@@ -146,8 +148,12 @@ describe('workflow-drift-guard Stop hook', () => {
     expect(registrations).toEqual([{
       event: 'Stop',
       type: 'command',
-      command: 'node "${CLAUDE_PLUGIN_ROOT}"/scripts/run.cjs "${CLAUDE_PLUGIN_ROOT}"/scripts/workflow-drift-guard.mjs',
+      command: 'node',
       timeout: 3,
+      args: [
+        '${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs',
+        '${CLAUDE_PLUGIN_ROOT}/scripts/workflow-drift-guard.mjs',
+      ],
     }]);
   });
 

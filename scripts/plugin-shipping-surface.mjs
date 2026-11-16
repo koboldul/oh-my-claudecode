@@ -224,14 +224,16 @@ function collectHookManifestEntrypoints(
     for (const entry of entries) {
       const hooks = Array.isArray(entry?.hooks) ? entry.hooks : [entry];
       for (const hook of hooks) {
-        for (const [field, value] of Object.entries({
-          command: hook?.command,
-          bash: hook?.bash,
-          powershell: hook?.powershell,
-        })) {
+        const values = [
+          hook?.command,
+          hook?.bash,
+          hook?.powershell,
+          ...(Array.isArray(hook?.args) ? hook.args : []),
+        ];
+        for (const value of values) {
           for (const repoPath of pluginRootPaths(
             value,
-            `${hooksPath} ${field}`,
+            `${hooksPath} command`,
           )) {
             paths.add(repoPath);
           }

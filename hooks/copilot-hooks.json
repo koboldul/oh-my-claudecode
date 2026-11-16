@@ -58,7 +58,7 @@
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/pre-tool-enforcer.mjs",
-        "timeout": 10,
+        "timeout": 60,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-tool-enforcer.mjs\"",
         "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-tool-enforcer.mjs\""
       },
@@ -84,7 +84,7 @@
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/post-tool-verifier.mjs",
-        "timeout": 5,
+        "timeout": 10,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-verifier.mjs\"",
         "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-verifier.mjs\""
       },
@@ -185,7 +185,7 @@
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/persistent-mode.mjs",
-        "timeout": 10,
+        "timeout": 20,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/persistent-mode.mjs\"",
         "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/persistent-mode.mjs\""
       },
@@ -199,7 +199,7 @@
       {
         "type": "command",
         "command": "node \"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.cjs \"${CLAUDE_PLUGIN_ROOT}\"/scripts/code-simplifier.mjs",
-        "timeout": 5,
+        "timeout": 10,
         "bash": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/code-simplifier.mjs\"",
         "powershell": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs\" \"${CLAUDE_PLUGIN_ROOT}/scripts/code-simplifier.mjs\""
       }

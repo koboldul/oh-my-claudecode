@@ -1,10 +1,15 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -40,6 +45,7 @@ type SkillEntry = {
   transformations: string[];
   copySupportFiles?: boolean;
   supportFileModes?: Record<string, "100644" | "100755">;
+  verbatimSupportDirectories?: string[];
   supportFileChannels?: Record<
     string,
     {
@@ -429,7 +435,10 @@ describe("Copilot prompt asset generation", () => {
         expect(materializedMode(sourcePath), entry.source).toBe(expectedMode);
         expect(materializedMode(outputPath), entry.output).toBe(expectedMode);
 
-        if (!sourcePath.endsWith(".md")) {
+        const verbatim = (entry.verbatimSupportDirectories ?? []).some(
+          (directory) => supportPath.startsWith(`${directory}/`),
+        );
+        if (!sourcePath.endsWith(".md") || verbatim) {
           expect(readFileSync(outputPath).equals(readFileSync(sourcePath))).toBe(
             true,
           );
@@ -441,6 +450,110 @@ describe("Copilot prompt asset generation", () => {
           );
         }
       }
+    }
+  });
+
+  it("adapts upstream workflows without changing Copilot host boundaries", () => {
+    const skill = (name: string) =>
+      readFileSync(join(ROOT, "skills-copilot", name, "SKILL.md"), "utf8");
+
+    expect(skill("architect")).toContain(
+      'Task(agent_type="oh-my-claudecode:architect"',
+    );
+    expect(skill("how")).toContain(
+      'Task(agent_type="oh-my-claudecode:explore"',
+    );
+    expect(skill("arena")).toContain("do not override or\nassume their model families");
+    expect(skill("interrogate")).toContain(
+      "If an external CLI team was started",
+    );
+    expect(skill("interrogate")).toContain(
+      "otherwise state that it was not established",
+    );
+    expect(skill("babysit")).toContain(
+      "`skills-copilot/babysit/SKILL.md` path",
+    );
+    expect(skill("figure-it-out")).toContain(
+      "`skills-copilot/figure-it-out/SKILL.md` path",
+    );
+    expect(skill("figure-it-out")).toContain(
+      '--skills-root "$(dirname "$(dirname "$checker")")/skills-copilot"',
+    );
+    expect(skill("figure-it-out")).toContain(
+      "the checker would prefer that\narchive to the projected body",
+    );
+    for (const name of ["architect", "how", "why", "arena", "interrogate", "reflect"]) {
+      expect(skill(name), name).not.toMatch(/\bmodel\s*=/);
+    }
+
+    expect(skill("sdd")).toContain("then ask the user directly: approve or revise");
+    expect(
+      readFileSync(join(ROOT, "skills-copilot", "sdd", "phases", "rules.md"), "utf8"),
+    ).toContain("**MUST** ask the user directly");
+    expect(skill("personal-mode")).toContain(
+      "~/.agents/skills/personal-mode-profile/SKILL.md",
+    );
+    expect(skill("create-verification-skill")).toContain(
+      ".agents/skills/verify/SKILL.md",
+    );
+    expect(skill("create-verification-skill")).toContain(
+      ".github/skills/verify/SKILL.md",
+    );
+    expect(skill("create-verification-skill")).toContain(
+      ".claude/skills/verify/SKILL.md",
+    );
+    expect(skill("models")).toContain(
+      "not configure in-session Copilot Task agents or their local agent profiles",
+    );
+    expect(skill("models")).toContain("`antigravity` | `copilot`");
+    expect(skill("ralph")).not.toContain("Bash(omc ralph verify:*)");
+
+    expect(skill("statechart")).toContain('sh "<skill dir>/scripts/statechart"');
+    expect(matrix.skills.find(({ id }) => id === "statechart")).toMatchObject({
+      supportFileModes: {
+        "scripts/statechart": "100755",
+        "scripts/test/java.ts": "100755",
+      },
+      verbatimSupportDirectories: ["scripts/test/corpus"],
+    });
+  });
+
+  it("validates playbook anchors against Copilot skill bodies", () => {
+    const root = mkdtempSync(join(tmpdir(), "copilot-playbook-"));
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      OMC_DISABLE_MULTIREPO: "1",
+    };
+    delete env.OMC_STATE_DIR;
+
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: root });
+      const playbooks = join(root, ".omc", "playbooks");
+      mkdirSync(playbooks, { recursive: true });
+      writeFileSync(
+        join(playbooks, "copilot.md"),
+        '---\nextends: team\nwhen: Copilot validation\n---\n\n**After** "## Copilot coordination reference" use the host surface.\n',
+      );
+      const validate = (skillsRoot: string) =>
+        execFileSync(
+          process.execPath,
+          [
+            join(ROOT, "scripts", "check-omc-playbooks.mjs"),
+            root,
+            "--skills-root",
+            skillsRoot,
+          ],
+          { cwd: root, env, encoding: "utf8", stdio: "pipe" },
+        );
+
+      expect(validate(join(ROOT, "skills-copilot"))).toContain(
+        "1 project playbook(s) valid",
+      );
+      expect(() => validate(join(ROOT, "skills"))).toThrow(
+        /does not appear in any extended skill/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

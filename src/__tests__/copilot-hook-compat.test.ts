@@ -106,6 +106,7 @@ interface HookCommand {
   type?: string;
   matcher?: string;
   command?: string;
+  args?: string[];
   bash?: string;
   powershell?: string;
   timeout?: number;
@@ -170,7 +171,24 @@ function projectClaudeManifestToNativeCopilot(
       .flatMap((group) =>
         (group.hooks ?? [])
           .map((hook) => {
-            const { async: _async, matcher: _matcher, ...nativeHook } = hook;
+            const { async: _async, matcher: _matcher, args, ...nativeHook } = hook;
+            if (args) {
+              const command = hook.command;
+              nativeHook.command = [
+                command,
+                ...args.map((arg) => arg.replace(
+                  '${CLAUDE_PLUGIN_ROOT}',
+                  '"${CLAUDE_PLUGIN_ROOT}"',
+                )),
+              ].join(' ');
+              nativeHook.bash = [
+                command,
+                ...args.map((arg) => arg.startsWith('${CLAUDE_PLUGIN_ROOT}/')
+                  ? `"${arg}"`
+                  : arg),
+              ].join(' ');
+              nativeHook.powershell = nativeHook.bash;
+            }
             return copilotEvent === 'permissionRequest'
               ? { ...nativeHook, matcher: 'bash|powershell' }
               : nativeHook;

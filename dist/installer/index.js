@@ -31,6 +31,7 @@ import { analyzeLegacyClaudeMd, OMC_END_MARKER, OMC_START_MARKER, parseClaudeMdM
 import { executeClaudeMdTransaction, isClaudeMdEnabledInConfig } from './claude-md-transaction.js';
 import { HISTORICAL_AGENT_OWNERSHIP } from './historical-agent-ownership.js';
 import entitlementManifest from '../config/builtin-skill-entitlements.json' with { type: 'json' };
+import { parseHookInvocation } from '../../scripts/lib/hook-command-normalizer.mjs';
 /** Claude Code configuration directory */
 export const CLAUDE_CONFIG_DIR = getClaudeConfigDir();
 export const AGENTS_DIR = join(CLAUDE_CONFIG_DIR, 'agents');
@@ -482,6 +483,16 @@ export function isProjectScopedPlugin() {
 function isObjectRecord(value) {
     return !!value && typeof value === 'object' && !Array.isArray(value);
 }
+/** Same script, whether the manifest still uses a shell string or exec `args`. */
+function installedHookIdentity(entry) {
+    if (typeof entry.command !== 'string')
+        return '';
+    const parsed = parseHookInvocation(entry);
+    if (!parsed)
+        return entry.command;
+    const tail = parsed.extra.length > 0 ? ` ${parsed.extra.join(' ')}` : '';
+    return `omc:${parsed.script}${tail}`;
+}
 function filterSettingsPluginDuplicateHooks(hooks, commandsByEvent) {
     const filteredHooks = Object.create(null);
     const removedByEvent = new Map();
@@ -505,7 +516,7 @@ function filterSettingsPluginDuplicateHooks(hooks, commandsByEvent) {
                 const hook = entry;
                 const isDuplicate = hook.type === 'command'
                     && typeof hook.command === 'string'
-                    && eventCommands.has(hook.command);
+                    && eventCommands.has(installedHookIdentity(hook));
                 if (isDuplicate) {
                     removed++;
                     removedByEvent.set(eventType, (removedByEvent.get(eventType) ?? 0) + 1);
@@ -1507,7 +1518,7 @@ function collectPluginHookManifestSnapshot() {
                             diagnostics: [`${root}: hooks.${eventType} contains a command hook without a string command`],
                         };
                     }
-                    commands.add(entry.command);
+                    commands.add(installedHookIdentity(entry));
                 }
             }
             if (commands.size > 0)
@@ -1672,7 +1683,7 @@ function renderCompactPluginSkillShim(skillDirName, content) {
     const fullBodyRelPath = `../../${PLUGIN_FULL_SKILL_BODIES_DIR}/${skillDirName}/SKILL.md`;
     frontmatter = upsertYamlStringField(frontmatter, 'description', description);
     frontmatter = upsertYamlStringField(frontmatter, 'omc-full-body', fullBodyRelPath);
-    return `---\n${frontmatter.trim()}\n---\n\n${PLUGIN_COMPACT_SKILL_SHIM_MARKER}\n\n# ${skillDirName}\n\nThis is a compact Claude Code plugin registry shim. It keeps startup skill descriptions small while preserving the full OMC skill body for on-demand invocation.\n\nWhen this skill is invoked, read and follow the full bundled instructions from the active plugin root:\n\n\`${'${CLAUDE_PLUGIN_ROOT:-${OMC_PLUGIN_ROOT}}'}/${PLUGIN_FULL_SKILL_BODIES_DIR}/${skillDirName}/SKILL.md\`\n\nThe plugin root is the directory containing both \`skills/\` and \`${PLUGIN_FULL_SKILL_BODIES_DIR}/\`. Do not resolve \`${PLUGIN_FULL_SKILL_BODIES_DIR}/${skillDirName}/SKILL.md\` under this shim's \`skills/${skillDirName}/\` directory; \`${PLUGIN_FULL_SKILL_BODIES_DIR}/\` is a direct child of the plugin root. The same archived body path is recorded in frontmatter as \`omc-full-body: ${fullBodyRelPath}\` for hosts that understand plugin-root-relative metadata.\n`;
+    return `---\n${frontmatter.trim()}\n---\n\n${PLUGIN_COMPACT_SKILL_SHIM_MARKER}\nRead and follow the full skill body at \`${'${CLAUDE_PLUGIN_ROOT:-${OMC_PLUGIN_ROOT}}'}/${PLUGIN_FULL_SKILL_BODIES_DIR}/${skillDirName}/SKILL.md\`.\nThe plugin root is the directory containing both \`skills/\` and \`${PLUGIN_FULL_SKILL_BODIES_DIR}/\`. Do not resolve \`${PLUGIN_FULL_SKILL_BODIES_DIR}/${skillDirName}/SKILL.md\` under this shim's \`skills/${skillDirName}/\` directory.\n`;
 }
 export function compactPluginSkillPayload(targetRoot) {
     const skillsDir = join(targetRoot, 'skills');
@@ -1786,6 +1797,9 @@ export function syncInstalledPluginPayload() {
     const sourceResolution = resolveBestPluginSyncSource(targetRoots);
     const sourceRoot = sourceResolution.sourceRoot;
     if (!sourceRoot) {
+        // If all target roots have complete plugin payloads, we can skip sync
+        // and return without errors. Complete payloads don't need to be repaired
+        // from a source; they just need deduplication cleanup which happens separately.
         if (targetRoots.every(root => validatePluginSyncPayload(root).length === 0)) {
             return { synced: false, errors: [], sourceRoot: null, targetRoots };
         }
@@ -2447,8 +2461,9 @@ export function install(options = {}) {
                     runningAsPlugin,
                 });
                 // 3. Persist the detected node binary path into .omc-config.json so that
-                //    find-node.sh (used in hooks/hooks.json) can locate it at hook runtime
-                //    even when node is not on PATH (nvm/fnm users, issue #892).
+                //    find-node.sh can locate it at hook runtime on Unix, where a published
+                //    cache rewrites hooks to the sh bootstrap (nvm/fnm, issue #892).
+                //    The shipped hooks.json spawns node directly and does not call it.
                 try {
                     const configPath = join(CLAUDE_CONFIG_DIR, OMC_CONFIG_FILE_REL);
                     let omcConfig = {};

@@ -292,7 +292,7 @@ describe('pre-tool-enforcer slop-warning judgment wiring (ticket 16)', () => {
       }
     }, 15_000);
 
-    it('logs bounded original and modified routing inputs', () => {
+    it('logs bounded original and modified routing inputs separately', () => {
       const prompt = 'p'.repeat(700);
       runEnforcer({
         cwd,
@@ -308,12 +308,14 @@ describe('pre-tool-enforcer slop-warning judgment wiring (ticket 16)', () => {
       }, {
         TYPESAFE_API_KEY: 'test-key',
         OMC_JEV: 'model-routing',
+        OMC_JEV_EXCERPT_CHARS_MODEL_ROUTING: '500',
         OMC_JEV_LOG_DIR: tmp,
         OMC_JEV_ENDPOINT: 'http://127.0.0.1:9',
       });
 
       const entry = waitForShadowEntry('model-routing') as {
-        heuristic: {
+        heuristic: string;
+        heuristicDetails: {
           originalInput: Record<string, unknown>;
           modifiedInput: Record<string, unknown>;
           injected: boolean;
@@ -321,7 +323,8 @@ describe('pre-tool-enforcer slop-warning judgment wiring (ticket 16)', () => {
         };
         state: Record<string, unknown>;
       };
-      expect(entry.heuristic).toMatchObject({
+      expect(entry.heuristic).toBe('haiku');
+      expect(entry.heuristicDetails).toMatchObject({
         injected: false,
         model: 'haiku',
         originalInput: {
@@ -335,9 +338,9 @@ describe('pre-tool-enforcer slop-warning judgment wiring (ticket 16)', () => {
           run_in_background: true,
         },
       });
-      expect(String(entry.heuristic.originalInput.prompt)).toHaveLength(500);
-      expect(String(entry.heuristic.modifiedInput.description)).toHaveLength(500);
-      expect(entry.heuristic.originalInput).not.toHaveProperty('ignored');
+      expect(String(entry.heuristicDetails.originalInput.prompt)).toHaveLength(500);
+      expect(String(entry.heuristicDetails.modifiedInput.description)).toHaveLength(500);
+      expect(entry.heuristicDetails.originalInput).not.toHaveProperty('ignored');
       const task = entry.state.task;
       expect(task).toEqual(expect.any(String));
       expect(String(task).length).toBeGreaterThan(0);

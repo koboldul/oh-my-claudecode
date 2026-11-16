@@ -13,16 +13,18 @@
  * line, so the point resolves once per question (Noul, Score); both calls
  * share the same twin decision and iteration state.
  */
-import { recordJudgment } from '../jev/index.js';
+import { isJevStateOmitIdsEnabled, noulAnswerIsYes, recordJudgment } from '../jev/index.js';
 /**
  * Iteration metadata only: mode/session/iteration context, tool names, and
- * the continuation-message excerpt (bounded by OMC_JEV_EXCERPT_CHARS in the
- * resolver before send/log). Never whole file contents.
+ * the continuation-message excerpt (bounded by the point's excerpt limit in the
+ * resolver before send/log: 2000 characters by default, or
+ * OMC_JEV_EXCERPT_CHARS_LOOP_CONTINUATION). Never whole file contents. Without
+ * session_id under OMC_JEV_STATE_OMIT_IDS=1.
  */
 function buildLoopContinuationState(result, sessionId) {
     return {
         mode_name: result.mode,
-        session_id: sessionId ?? null,
+        ...(isJevStateOmitIdsEnabled() ? {} : { session_id: sessionId ?? null }),
         iteration: result.metadata?.iteration ?? null,
         phase: result.metadata?.phase ?? null,
         should_block: result.shouldBlock,
@@ -47,10 +49,10 @@ export async function applyLoopContinuationShadow(args) {
     if (result.mode === 'none')
         return result;
     const state = buildLoopContinuationState(result, args.sessionId);
-    // For active mode, map Jev's Noul answer (task complete?) to a boolean
+    // For active mode, map Jev's Noul answer (task complete?) to the continuation decision
     const mapTaskCompletionAnswer = (answer) => {
-        // Jev Noul answer: noul=true means task is complete, noul=false/undefined means not complete
-        const taskComplete = answer.noul === true;
+        // Jev Noul answer: noul is the probability of "yes" (0-1); "yes" means the task is complete
+        const taskComplete = noulAnswerIsYes(answer);
         if (taskComplete) {
             // Task is complete, exit the loop
             return { ...result, shouldBlock: false, message: '[jev-completion] task complete; exiting loop' };
@@ -60,17 +62,36 @@ export async function applyLoopContinuationShadow(args) {
             return result;
         }
     };
+    const mapHeuristicForLoopContinuation = (r, questionSet) => {
+        if (questionSet === 1) {
+            // Score question (iteration progress): shouldBlock does not reliably indicate
+            // actual progress made. Continuing (shouldBlock=true) does not mean we made
+            // progress; stopping (shouldBlock=false) does not mean zero progress. Without
+            // actual progress metrics, return null to make this comparison non-comparable.
+            return null;
+        }
+        // Question set 0 (Noul): "Is the task complete?"
+        // Blocking the stop is an explicit "not complete" judgment. Releasing the stop
+        // is not evidence of completion in any mode: failures, cancellations, circuit
+        // breakers, diagnostics and exhausted runtimes all release without finishing.
+        // The result carries no explicit completion signal, so a release is non-comparable.
+        return r.shouldBlock ? false : null;
+    };
     const results = await Promise.all([
         recordJudgment('loop-continuation', {
             state,
             twin: () => result,
             mapAnswer: mapTaskCompletionAnswer,
+            mapHeuristic: mapHeuristicForLoopContinuation,
+            logContext: { session_id: args.sessionId },
             fetchFn: args.fetchFn,
         }),
         recordJudgment('loop-continuation', {
             state,
             twin: () => result,
             questionSet: 1,
+            mapHeuristic: mapHeuristicForLoopContinuation,
+            logContext: { session_id: args.sessionId },
             fetchFn: args.fetchFn,
         }),
     ]);

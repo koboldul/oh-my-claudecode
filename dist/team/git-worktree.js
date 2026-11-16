@@ -194,6 +194,32 @@ function isDetached(wtPath) {
 function isWorktreeDirty(wtPath) {
     return isWorktreeDirtyExcept(wtPath).dirty;
 }
+function commitExists(repoRoot, sha) {
+    try {
+        git(repoRoot, ['cat-file', '-e', `${sha}^{commit}`]);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+// Only non-worker branches, tags, and remotes keep a commit safe: a stash or detached HEAD is fragile, and
+// any worker branch may be deleted by its own team's cleanup. The base is excluded so a worker with no
+// commits stays removable when its base left every branch, as after a leader amend.
+function hasCommitsOnlyOnWorkerRefs(repoRoot, wtPath, ownBranch, baseCommit) {
+    const tips = ownBranch ? [git(repoRoot, ['for-each-ref', '--format=%(objectname)', `refs/heads/${ownBranch}`])] : [];
+    if (existsSync(wtPath) && isRegisteredWorktreePath(repoRoot, wtPath))
+        tips.push(git(repoRoot, ['rev-parse', 'HEAD'], wtPath));
+    const commits = tips.filter(Boolean);
+    if (commits.length === 0)
+        return false;
+    const excludedBase = baseCommit && commitExists(repoRoot, baseCommit) ? [baseCommit] : [];
+    return git(repoRoot, [
+        'rev-list', '--max-count=1', ...commits,
+        '--not', ...excludedBase,
+        '--exclude=omc-team/*', '--branches', '--tags', '--remotes',
+    ]).length > 0;
+}
 function normalizeStatusPath(rawPath) {
     const trimmed = rawPath.trim();
     if (trimmed.startsWith('\"') && trimmed.endsWith('\"')) {
@@ -504,6 +530,7 @@ function ensureWorkerWorktreeScoped(teamName, workerName, repoRoot, options) {
             detached: isDetached(wtPath),
             created: false,
             reused: true,
+            baseCommit: readMetadata(repoRoot, teamName).find((entry) => entry.workerName === workerName)?.baseCommit,
         };
         recordMetadata(repoRoot, teamName, info);
         return info;
@@ -527,6 +554,7 @@ function ensureWorkerWorktreeScoped(teamName, workerName, repoRoot, options) {
         reused: false,
     };
     try {
+        info.baseCommit = git(repoRoot, ['rev-parse', 'HEAD'], wtPath);
         recordMetadata(repoRoot, teamName, info);
     }
     catch (publicationError) {
@@ -650,7 +678,7 @@ function worktreeRemovalReceiptFromInfo(info) {
         reused: info.reused,
     };
 }
-/** Remove an owned worker worktree or restore a borrowed worktree's managed overlay. */
+/** Remove an owned safe worktree or restore a borrowed worktree's managed overlay. */
 export function removeWorkerWorktree(teamName, workerName, repoRoot, authority) {
     return withTeamStatePathScope(repoRoot, () => removeWorkerWorktreeScoped(teamName, workerName, repoRoot, authority));
 }
@@ -688,6 +716,12 @@ function removeWorkerWorktreeScoped(teamName, workerName, repoRoot, authority) {
         }
         if (receipt) {
             assertWorkerWorktreeRemovalReceiptBinding(teamName, workerName, repoRoot, receipt);
+            const branch = receipt.mode === 'named' ? receipt.branch : null;
+            if (hasCommitsOnlyOnWorkerRefs(repoRoot, wtPath, branch, persisted?.baseCommit)) {
+                const error = new Error(`worktree_unmerged: preserving worker worktree at ${wtPath} and branch ${receipt.branch} because they hold commits that only worker branches have; merge or discard the commits, then retry`);
+                error.code = 'worktree_unmerged';
+                throw error;
+            }
             const expectedBranch = receipt.mode === 'named' ? getBranchName(teamName, workerName) : 'HEAD';
             const registeredBranch = getRegisteredWorktreeBranch(repoRoot, wtPath);
             if (registeredBranch && registeredBranch !== expectedBranch) {
@@ -766,7 +800,7 @@ export function inspectTeamWorktreeCleanupSafety(teamName, repoRoot) {
         ],
     };
 }
-/** Remove owned clean worktrees and retire restored borrowed worktree receipts. */
+/** Remove owned safe worktrees and retire restored borrowed worktree receipts. */
 export function cleanupTeamWorktrees(teamName, repoRoot) {
     return withTeamStatePathScope(repoRoot, () => cleanupTeamWorktreesScoped(teamName, repoRoot));
 }

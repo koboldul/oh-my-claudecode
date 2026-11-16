@@ -704,6 +704,63 @@ describe('transactional PreToolUse foundation', () => {
     });
   });
 
+  it('applies Jev model, effort, prompt and slop overrides in the canonical plan', () => {
+    const envelope = claudeEnvelope('Agent', {
+      subagent_type: 'general-purpose',
+      prompt: 'use opus high\nBuild the feature',
+    }, 'jev-marker');
+    const plan = planPreToolBatch(envelope, makeSnapshot(), {
+      'jev-marker': {
+        model: 'opus',
+        effort: 'high',
+        prompt: 'Build the feature',
+        slopWarning: true,
+      },
+    });
+
+    expect(plan.evaluations[0].mutation).toMatchObject({
+      requirement: 'required',
+      input: { model: 'opus', effort: 'high', prompt: 'Build the feature' },
+      retryHint: { patch: { model: 'opus', effort: 'high', prompt: 'Build the feature' } },
+    });
+    expect(plan.calls[0].advisoryCandidate?.message).toContain('[SLOP WARNING]');
+  });
+
+  it('keeps force-inherit model safety while applying an effort override', () => {
+    const envelope = claudeEnvelope('Agent', {
+      subagent_type: 'general-purpose',
+      prompt: 'Build the feature',
+    }, 'jev-inherit');
+    const snapshot = makeSnapshot({
+      modelRouting: { ...makeSnapshot().modelRouting, forceInherit: true, useBedrock: true },
+    });
+    const plan = planPreToolBatch(envelope, snapshot, {
+      'jev-inherit': { model: 'opus', effort: 'medium' },
+    });
+
+    expect(plan.evaluations[0].mutation?.input).toEqual({
+      subagent_type: 'general-purpose',
+      prompt: 'Build the feature',
+      effort: 'medium',
+    });
+  });
+
+  it('does not apply Claude Jev marker or effort overrides to Copilot calls', () => {
+    const input = {
+      agent_type: 'oh-my-claudecode:executor',
+      model: 'gpt-6.1-sol',
+      reasoning_effort: 'max',
+      prompt: 'use opus high\nBuild the feature',
+    };
+    const envelope = copilotEnvelope([{ id: 'native-marker', name: 'agent', args: input }]);
+    const plan = planPreToolBatch(envelope, makeSnapshot(), {
+      'native-marker': { model: 'opus', effort: 'high', prompt: 'Build the feature' },
+    });
+
+    expect(plan.evaluations[0].mutation).toBeUndefined();
+    expect(envelope.toolCalls[0].input).toEqual(input);
+  });
+
   it.each([
     {
       name: 'explicit provider model',

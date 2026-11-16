@@ -29,7 +29,7 @@ import {
 import { readStdin } from './lib/stdin.mjs';
 import { resolveOmcStateRoot } from './lib/state-root.mjs';
 import { BOUNDED_GIT_TIMEOUT_MS } from './lib/bounded-git-timeout.mjs';
-import { recordJevShadow } from './lib/jev-shadow.mjs';
+import { jevNoulOf, jevStateIds, recordJevApplied, recordJevShadow, setJevHookContext, setJevSessionId } from './lib/jev-shadow.mjs';
 
 const DEFAULT_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs'];
 const DEFAULT_MAX_FILES = 10;
@@ -44,6 +44,14 @@ const SIMPLIFIER_TRIGGER_QUESTIONS = {
     },
   },
 };
+
+// OMC_JEV_SIMPLIFIER_APPLY=1 lets an active `simplifier-trigger` answer skip the reminder
+// when the probability of "yes" is below this value. Off by default.
+const SIMPLIFIER_SKIP_BELOW = 0.5;
+
+function isSimplifierApplyEnabled(env = process.env) {
+  return ['1', 'true'].includes(String(env.OMC_JEV_SIMPLIFIER_APPLY ?? '').trim().toLowerCase());
+}
 
 function readJsonFile(filePath) {
   try {
@@ -117,6 +125,8 @@ function buildMessage(files) {
 }
 
 async function processCodeSimplifierStop(data) {
+  setJevSessionId(data.sessionId, data.agentId);
+  await setJevHookContext({ ...data, agent_type: data.agentName });
   const cwd = data.cwd || data.directory || process.cwd();
   const stateDir = join(await resolveOmcStateRoot(cwd), 'state');
   const config = readOmcConfig();
@@ -145,13 +155,23 @@ async function processCodeSimplifierStop(data) {
     return { continue: true };
   }
 
-  recordJevShadow({
+  const jevResult = recordJevShadow({
     point: 'simplifier-trigger',
-    state: { cwd, files, source: 'code-simplifier-stop' },
+    state: { ...jevStateIds({ cwd }), files, source: 'code-simplifier-stop' },
     questions: SIMPLIFIER_TRIGGER_QUESTIONS,
     heuristic: true,
     permissionMode: data.permission_mode,
   });
+
+  if (isSimplifierApplyEnabled()) {
+    const noul = jevNoulOf(jevResult, 'simplification_worthy');
+    if (noul !== undefined && noul < SIMPLIFIER_SKIP_BELOW) {
+      recordJevApplied('simplifier-trigger', {
+        action: { from: 'remind', to: 'skip', noul },
+      });
+      return { continue: true };
+    }
+  }
 
   // Write trigger marker to prevent re-triggering within this turn cycle
   try {

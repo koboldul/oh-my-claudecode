@@ -61,7 +61,7 @@ export interface PreToolModelRoutingSnapshot {
     readonly copilotDefaults: PreToolCopilotDefaultsSnapshot;
     readonly tierEnvironment: Readonly<Record<string, string>>;
 }
-export type PreToolJevModelTier = 'haiku' | 'sonnet' | 'opus';
+export type PreToolJevModelTier = 'haiku' | 'sonnet' | 'opus' | 'fable';
 export interface PreToolJevModelRoutingObservation {
     readonly originalInput: Readonly<Record<string, unknown>>;
     readonly modifiedInput: Readonly<Record<string, unknown>>;
@@ -72,7 +72,13 @@ export interface PreToolJevObservations {
     readonly slopWarning?: boolean;
     readonly modelRouting?: PreToolJevModelRoutingObservation;
 }
-export type PreToolModelRoutingOverrides = Readonly<Record<string, PreToolJevModelTier>>;
+export interface PreToolJevOverride {
+    readonly model?: PreToolJevModelTier;
+    readonly effort?: string;
+    readonly prompt?: string;
+    readonly slopWarning?: boolean;
+}
+export type PreToolModelRoutingOverrides = Readonly<Record<string, PreToolJevModelTier | PreToolJevOverride>>;
 export interface ForceDelegationThreshold {
     readonly count?: number;
     readonly windowSeconds?: number;

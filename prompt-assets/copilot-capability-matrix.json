@@ -445,9 +445,11 @@
       "aliases": [],
       "bodyStrategy": "canonical",
       "transformations": [
+        "plugin-root",
         "task-tool",
         "model-routing",
-        "skill-tool"
+        "skill-tool",
+        "shell-tool"
       ]
     },
     {
@@ -706,6 +708,512 @@
       "bodyStrategy": "canonical",
       "transformations": [
         "model-routing"
+      ]
+    },
+    {
+      "id": "architect",
+      "source": "skills/architect/SKILL.md",
+      "output": "skills-copilot/architect/SKILL.md",
+      "intendedOutcome": "Compare competing designs and record their invariants and rejected alternatives.",
+      "claudeMechanism": "Canonical design workflow with architect subagents.",
+      "copilotMechanism": "Generated prompt using independent Copilot architect Task agents.",
+      "automatedEvidence": "generator drift, semantic scan, support-file parity, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "copilot-team-reference"
+      ]
+    },
+    {
+      "id": "arena",
+      "source": "skills/arena/SKILL.md",
+      "output": "skills-copilot/arena/SKILL.md",
+      "intendedOutcome": "Compare isolated candidates, cross-judge when possible, and verify the synthesized result.",
+      "claudeMechanism": "Canonical in-session or multi-provider candidate and cross-judge workflow.",
+      "copilotMechanism": "Generated prompt using independent Copilot Task agents or external CLI workers with honest diversity reporting.",
+      "automatedEvidence": "generator drift, semantic scan, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "copilot-team-reference"
+      ]
+    },
+    {
+      "id": "babysit",
+      "source": "skills/babysit/SKILL.md",
+      "output": "skills-copilot/babysit/SKILL.md",
+      "intendedOutcome": "Watch a pull request and drive its checks and reviews toward merge-readiness without merging.",
+      "claudeMechanism": "Canonical PR monitoring with plugin-root ledger writer.",
+      "copilotMechanism": "Generated prompt resolving the Copilot plugin root or installed package for the ledger writer.",
+      "automatedEvidence": "generator drift, semantic scan, support-file parity, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "plugin-root"
+      ]
+    },
+    {
+      "id": "benchmark-checklist",
+      "source": "skills/benchmark-checklist/SKILL.md",
+      "output": "skills-copilot/benchmark-checklist/SKILL.md",
+      "intendedOutcome": "Vet benchmark claims using representative measurements and variance.",
+      "claudeMechanism": "Canonical measurement discipline.",
+      "copilotMechanism": "Generated canonical prompt.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "blast-radius",
+      "source": "skills/blast-radius/SKILL.md",
+      "output": "skills-copilot/blast-radius/SKILL.md",
+      "intendedOutcome": "Map change impacts and report evidence for affected dependents.",
+      "claudeMechanism": "Canonical search and verification workflow.",
+      "copilotMechanism": "Generated canonical prompt using available search and checks.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "bro",
+      "source": "skills/bro/SKILL.md",
+      "output": "skills-copilot/bro/SKILL.md",
+      "intendedOutcome": "Restate the last technical message in plain language without losing facts.",
+      "claudeMechanism": "Canonical plain-language restatement.",
+      "copilotMechanism": "Generated canonical prompt.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "correct",
+      "source": "skills/correct/SKILL.md",
+      "output": "skills-copilot/correct/SKILL.md",
+      "intendedOutcome": "Turn recurring agent mistakes into proven structural enforcement.",
+      "claudeMechanism": "Canonical evidence and enforcement workflow.",
+      "copilotMechanism": "Generated canonical prompt preserving state-root and ledger contracts.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "create-formal-verification-skill",
+      "source": "skills/create-formal-verification-skill/SKILL.md",
+      "output": "skills-copilot/create-formal-verification-skill/SKILL.md",
+      "intendedOutcome": "Formally verify a high-risk invariant and create a rerunnable project skill.",
+      "claudeMechanism": "Canonical formal-verification workflow writing a Claude project skill.",
+      "copilotMechanism": "Generated prompt writing the project skill to the shared agent-skills directory.",
+      "automatedEvidence": "generator drift, semantic scan, project-skill path contract, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "host-terminology"
+      ]
+    },
+    {
+      "id": "create-verification-skill",
+      "source": "skills/create-verification-skill/SKILL.md",
+      "output": "skills-copilot/create-verification-skill/SKILL.md",
+      "intendedOutcome": "Discover verification commands and create a rerunnable project verification skill.",
+      "claudeMechanism": "Canonical verification workflow writing a Claude project skill.",
+      "copilotMechanism": "Generated prompt writing a shared agent skill while respecting existing verification skills.",
+      "automatedEvidence": "generator drift, semantic scan, project-skill path contract, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "host-terminology"
+      ]
+    },
+    {
+      "id": "figure-it-out",
+      "source": "skills/figure-it-out/SKILL.md",
+      "output": "skills-copilot/figure-it-out/SKILL.md",
+      "intendedOutcome": "Design, validate, and dry-run a task-specific playbook.",
+      "claudeMechanism": "Canonical playbook workflow resolving the Claude plugin root.",
+      "copilotMechanism": "Generated prompt resolving the Copilot plugin root or installed CLI for the real checker.",
+      "automatedEvidence": "generator drift, semantic scan, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "plugin-root"
+      ]
+    },
+    {
+      "id": "fix-ci",
+      "source": "skills/fix-ci/SKILL.md",
+      "output": "skills-copilot/fix-ci/SKILL.md",
+      "intendedOutcome": "Classify failing CI checks, repair real failures, and rerun with evidence.",
+      "claudeMechanism": "Canonical CI triage and delegated repair workflow.",
+      "copilotMechanism": "Generated canonical prompt using available debugger or executor roles.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "fix-merge-conflicts",
+      "source": "skills/fix-merge-conflicts/SKILL.md",
+      "output": "skills-copilot/fix-merge-conflicts/SKILL.md",
+      "intendedOutcome": "Resolve approved merge conflicts while preserving both sides' intent.",
+      "claudeMechanism": "Canonical Git conflict-resolution workflow.",
+      "copilotMechanism": "Generated canonical prompt.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "get-pr-comments",
+      "source": "skills/get-pr-comments/SKILL.md",
+      "output": "skills-copilot/get-pr-comments/SKILL.md",
+      "intendedOutcome": "Fetch and triage pull-request review threads with evidence.",
+      "claudeMechanism": "Canonical GitHub review-triage workflow.",
+      "copilotMechanism": "Generated canonical prompt preserving untrusted-comment handling.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "hillclimb",
+      "source": "skills/hillclimb/SKILL.md",
+      "output": "skills-copilot/hillclimb/SKILL.md",
+      "intendedOutcome": "Improve one measured metric through bounded hypothesis and verification rounds.",
+      "claudeMechanism": "Canonical metric-improvement loop.",
+      "copilotMechanism": "Generated canonical prompt preserving baseline and decision-trail evidence.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "how",
+      "source": "skills/how/SKILL.md",
+      "output": "skills-copilot/how/SKILL.md",
+      "intendedOutcome": "Explain a subsystem using a cited exploration map.",
+      "claudeMechanism": "Canonical explorer and lead explanation workflow.",
+      "copilotMechanism": "Generated prompt using an independent Copilot explorer Task.",
+      "automatedEvidence": "generator drift, semantic scan, support-file parity, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "copilot-team-reference"
+      ]
+    },
+    {
+      "id": "in-your-own-words",
+      "source": "skills/in-your-own-words/SKILL.md",
+      "output": "skills-copilot/in-your-own-words/SKILL.md",
+      "intendedOutcome": "Play back an ambiguous goal, problem, and success check for correction.",
+      "claudeMechanism": "Canonical ambiguity playback.",
+      "copilotMechanism": "Generated canonical prompt.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "interrogate",
+      "source": "skills/interrogate/SKILL.md",
+      "output": "skills-copilot/interrogate/SKILL.md",
+      "intendedOutcome": "Run an evidence-backed adversarial review panel with a blocking verdict.",
+      "claudeMechanism": "Canonical multi-provider or in-session review panel.",
+      "copilotMechanism": "Generated prompt using independent Copilot reviewers or external CLI workers without assuming model diversity.",
+      "automatedEvidence": "generator drift, semantic scan, support-file parity, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "copilot-team-reference"
+      ]
+    },
+    {
+      "id": "ketchup",
+      "source": "skills/ketchup/SKILL.md",
+      "output": "skills-copilot/ketchup/SKILL.md",
+      "intendedOutcome": "Summarize session progress, action items, and outstanding decisions.",
+      "claudeMechanism": "Canonical session catch-up prompt.",
+      "copilotMechanism": "Generated canonical prompt.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "ketchup-video",
+      "source": "skills/ketchup-video/SKILL.md",
+      "output": "skills-copilot/ketchup-video/SKILL.md",
+      "intendedOutcome": "Present a session catch-up as an evidence-based subtitled video.",
+      "claudeMechanism": "Canonical video catch-up workflow referencing ketchup.",
+      "copilotMechanism": "Generated canonical prompt referencing the projected ketchup skill.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "maintain-formal-verification-skill",
+      "source": "skills/maintain-formal-verification-skill/SKILL.md",
+      "output": "skills-copilot/maintain-formal-verification-skill/SKILL.md",
+      "intendedOutcome": "Resynchronize a formal model, assumptions, and verification evidence.",
+      "claudeMechanism": "Canonical formal-verification maintenance workflow.",
+      "copilotMechanism": "Generated canonical prompt preserving the ledger writer contract.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "maintain-verification-skill",
+      "source": "skills/maintain-verification-skill/SKILL.md",
+      "output": "skills-copilot/maintain-verification-skill/SKILL.md",
+      "intendedOutcome": "Rerun and update a project's verification skill when checks drift.",
+      "claudeMechanism": "Canonical verification-skill maintenance workflow.",
+      "copilotMechanism": "Generated canonical prompt preserving the ledger writer contract.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "models",
+      "source": "skills/models/SKILL.md",
+      "output": "skills-copilot/models/SKILL.md",
+      "intendedOutcome": "Interactively configure role routing for external OMC CLI teams.",
+      "claudeMechanism": "Canonical role-routing configuration wizard.",
+      "copilotMechanism": "Generated prompt distinguishing CLI team routing from Copilot Task agent profiles.",
+      "automatedEvidence": "generator drift, semantic scan, routing path contracts, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "host-terminology"
+      ]
+    },
+    {
+      "id": "personal-mode",
+      "source": "skills/personal-mode/SKILL.md",
+      "output": "skills-copilot/personal-mode/SKILL.md",
+      "intendedOutcome": "Create a user-approved personal behavior profile from session evidence.",
+      "claudeMechanism": "Canonical profile workflow writing to the Claude user skill directory.",
+      "copilotMechanism": "Generated prompt writing the separate profile to the shared personal agent-skills directory.",
+      "automatedEvidence": "generator drift, semantic scan, personal-skill path contract, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "host-terminology"
+      ]
+    },
+    {
+      "id": "principles",
+      "source": "skills/principles/SKILL.md",
+      "output": "skills-copilot/principles/SKILL.md",
+      "intendedOutcome": "Apply cross-cutting engineering principles to design, execution, and verification.",
+      "claudeMechanism": "Canonical engineering-principles reference.",
+      "copilotMechanism": "Generated canonical prompt.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "recall",
+      "source": "skills/recall/SKILL.md",
+      "output": "skills-copilot/recall/SKILL.md",
+      "intendedOutcome": "Recover working context from durable state, evidence, and session history.",
+      "claudeMechanism": "Canonical context-recovery workflow.",
+      "copilotMechanism": "Generated canonical prompt preserving OMC state-root semantics.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "reflect",
+      "source": "skills/reflect/SKILL.md",
+      "output": "skills-copilot/reflect/SKILL.md",
+      "intendedOutcome": "Review a long session and propose user-approved skill improvements.",
+      "claudeMechanism": "Canonical transcript-review panel and Claude personal skill path.",
+      "copilotMechanism": "Generated prompt using independent Copilot reviewers and the shared personal skill directory.",
+      "automatedEvidence": "generator drift, semantic scan, support-file parity, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "copilot-team-reference",
+        "host-terminology"
+      ]
+    },
+    {
+      "id": "sdd",
+      "source": "skills/sdd/SKILL.md",
+      "output": "skills-copilot/sdd/SKILL.md",
+      "intendedOutcome": "Drive approved specification, criteria, plan, and test-first execution phases.",
+      "claudeMechanism": "Canonical SDD workflow with structured question tool and six phase documents.",
+      "copilotMechanism": "Generated prompt and phase documents asking questions directly through the conversation.",
+      "automatedEvidence": "generator drift, semantic scan, support-file parity, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "interactive-prompts"
+      ]
+    },
+    {
+      "id": "sharpen",
+      "source": "skills/sharpen/SKILL.md",
+      "output": "skills-copilot/sharpen/SKILL.md",
+      "intendedOutcome": "Clarify a task's consumer, observable outcome, done-check, and non-goals.",
+      "claudeMechanism": "Canonical task-sharpening prompt.",
+      "copilotMechanism": "Generated canonical prompt with neutral terminology for a human colleague.",
+      "automatedEvidence": "generator drift, semantic scan, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "copilot-team-reference"
+      ]
+    },
+    {
+      "id": "show-me-your-work",
+      "source": "skills/show-me-your-work/SKILL.md",
+      "output": "skills-copilot/show-me-your-work/SKILL.md",
+      "intendedOutcome": "Record an append-only, evidence-backed decision trail.",
+      "claudeMechanism": "Canonical decision-trail workflow.",
+      "copilotMechanism": "Generated canonical prompt preserving state-root, locking, and cell-safety rules.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "stacked-delivery",
+      "source": "skills/stacked-delivery/SKILL.md",
+      "output": "skills-copilot/stacked-delivery/SKILL.md",
+      "intendedOutcome": "Verify and report a dependent pull-request stack without taking human landing authority.",
+      "claudeMechanism": "Canonical stacked-delivery workflow.",
+      "copilotMechanism": "Generated canonical prompt preserving bottom-up landing and verification rules.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "statechart",
+      "source": "skills/statechart/SKILL.md",
+      "output": "skills-copilot/statechart/SKILL.md",
+      "intendedOutcome": "Model and check state transitions and report counterexamples as a statechart.",
+      "claudeMechanism": "Canonical statechart prompt with executable launcher, implementation, and test corpus.",
+      "copilotMechanism": "Generated prompt invoking the real launcher through a POSIX shell and preserving support assets and fixture bytes.",
+      "automatedEvidence": "generator drift, semantic scan, support-file byte and mode parity, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "shell-tool"
+      ],
+      "supportFileModes": {
+        "scripts/statechart": "100755",
+        "scripts/test/java.ts": "100755"
+      },
+      "verbatimSupportDirectories": [
+        "scripts/test/corpus"
+      ]
+    },
+    {
+      "id": "teach",
+      "source": "skills/teach/SKILL.md",
+      "output": "skills-copilot/teach/SKILL.md",
+      "intendedOutcome": "Teach a subsystem by composing cited how and why explanations.",
+      "claudeMechanism": "Canonical learner-oriented explanation workflow.",
+      "copilotMechanism": "Generated canonical prompt using projected how and why skills.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "technical-writing",
+      "source": "skills/technical-writing/SKILL.md",
+      "output": "skills-copilot/technical-writing/SKILL.md",
+      "intendedOutcome": "Apply a layered evidence-backed standard to shipped technical prose.",
+      "claudeMechanism": "Canonical technical-writing discipline.",
+      "copilotMechanism": "Generated canonical prompt.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "typescript-best-practices",
+      "source": "skills/typescript-best-practices/SKILL.md",
+      "output": "skills-copilot/typescript-best-practices/SKILL.md",
+      "intendedOutcome": "Apply TypeScript boundary and domain-model type discipline.",
+      "claudeMechanism": "Canonical TypeScript guidance and pattern reference.",
+      "copilotMechanism": "Generated canonical prompt and support reference.",
+      "automatedEvidence": "generator drift, support-file parity, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "what-did-i-get-done",
+      "source": "skills/what-did-i-get-done/SKILL.md",
+      "output": "skills-copilot/what-did-i-get-done/SKILL.md",
+      "intendedOutcome": "Summarize authored work with commit and pull-request evidence.",
+      "claudeMechanism": "Canonical authored-work summary workflow.",
+      "copilotMechanism": "Generated canonical prompt.",
+      "automatedEvidence": "generator drift, manifest routing, package surface",
+      "liveEvidenceRequired": false,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": []
+    },
+    {
+      "id": "why",
+      "source": "skills/why/SKILL.md",
+      "output": "skills-copilot/why/SKILL.md",
+      "intendedOutcome": "Explain historical design decisions using cited evidence and explicit uncertainty.",
+      "claudeMechanism": "Canonical historical investigation with explorer delegation.",
+      "copilotMechanism": "Generated prompt using an independent Copilot explorer Task and copied investigation references.",
+      "automatedEvidence": "generator drift, semantic scan, support-file parity, package surface",
+      "liveEvidenceRequired": true,
+      "aliases": [],
+      "bodyStrategy": "canonical",
+      "transformations": [
+        "copilot-team-reference"
       ]
     }
   ],

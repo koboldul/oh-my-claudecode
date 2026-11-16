@@ -44,3 +44,4 @@ native/*.node
 
 # npm pack output
 *.tgz
+.wt/

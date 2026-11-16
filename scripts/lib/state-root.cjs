@@ -146,7 +146,14 @@ async function resolveOmcStateRoot(directory) {
   const workspaceRoot = findWorkspaceRoot(directory);
   if (workspaceRoot && isSafeWorkspaceRoot(workspaceRoot)) return join(workspaceRoot, '.omc');
   const gitRoot = probeGitRoot(directory);
-  if (gitRoot) return join(gitRoot, '.omc');
+  if (gitRoot) {
+    let top = gitRoot;
+    try {
+      const superproject = execFileSync('git', ['rev-parse', '--show-superproject-working-tree'], { cwd: gitRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true, timeout: 5000, env: gitEnv() }).trim();
+      if (superproject) top = superproject;
+    } catch {}
+    return join(top, '.omc');
+  }
   const home = resolve(homedir());
   return join(home, '.omc');
 }
@@ -158,9 +165,10 @@ async function resolveOmcStateRoot(directory) {
  * @param {string} directory - Worktree root directory
  * @param {string} stateName - State name (e.g., "ralph", "ultrawork")
  * @param {string} [sessionId] - Optional session identifier
- * @returns {Promise<{readPath: string, writePath: string}>} Unbranded path pair
+ * @param {{fileName?: string}} [options] - Optional exact JSON filename.
+ * @returns {Promise<{readPath: string, writePath: string, sessionScopedPath: string|null, legacyPath: string}>} Unbranded paths
  */
-async function resolveSessionStatePathsForHook(directory, stateName, sessionId) {
+async function resolveSessionStatePathsForHook(directory, stateName, sessionId, options = {}) {
   const canonicalRoot = resolveCanonicalRoot();
   if (canonicalRoot) {
     try {
@@ -168,8 +176,13 @@ async function resolveSessionStatePathsForHook(directory, stateName, sessionId) 
       const { resolveSessionStatePaths } = await import(
         pathToFileURL(canonicalDistPath(canonicalRoot)).href
       );
-      const result = resolveSessionStatePaths(stateName, sessionId, directory);
-      return { readPath: result.effectiveRead, writePath: result.effectiveWrite };
+      const result = resolveSessionStatePaths(stateName, sessionId, directory, options);
+      return {
+        readPath: result.effectiveRead,
+        writePath: result.effectiveWrite,
+        sessionScopedPath: result.sessionScoped || null,
+        legacyPath: result.legacy,
+      };
     } catch {
       // dist not built or unavailable — fall through to inline fallback
     }
@@ -177,16 +190,21 @@ async function resolveSessionStatePathsForHook(directory, stateName, sessionId) 
 
   // Inline fallback: basic session-scoped path derivation (production always uses dist above)
   const omcRoot = await resolveOmcStateRoot(directory);
-  const normalizedName = stateName.endsWith('-state') ? stateName : `${stateName}-state`;
-  const legacy = join(omcRoot, 'state', `${normalizedName}.json`);
-  if (!sessionId) {
-    return { readPath: legacy, writePath: legacy };
+  if (options.fileName !== undefined
+    && (options.fileName.trim() !== options.fileName || !/^[A-Za-z0-9][A-Za-z0-9_-]*\.json$/.test(options.fileName))) {
+    throw new Error(`Invalid session state filename: ${options.fileName}`);
   }
-  const sessionScoped = join(omcRoot, 'state', 'sessions', sessionId, `${normalizedName}.json`);
+  const normalizedName = stateName.endsWith('-state') ? stateName : `${stateName}-state`;
+  const fileName = options.fileName ?? `${normalizedName}.json`;
+  const legacy = join(omcRoot, 'state', options.fileName ?? `${normalizedName}.json`);
+  if (!sessionId) {
+    return { readPath: legacy, writePath: legacy, sessionScopedPath: null, legacyPath: legacy };
+  }
+  const sessionScoped = join(omcRoot, 'state', 'sessions', sessionId, fileName);
   // effectiveRead probes the session-scoped file first and falls back to the
   // legacy path when it does not exist yet (mirrors resolveSessionStatePaths).
   const readPath = existsSync(sessionScoped) ? sessionScoped : legacy;
-  return { readPath, writePath: sessionScoped };
+  return { readPath, writePath: sessionScoped, sessionScopedPath: sessionScoped, legacyPath: legacy };
 }
 
 module.exports = { resolveOmcStateRoot, resolveSessionStatePathsForHook };

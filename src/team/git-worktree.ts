@@ -36,6 +36,8 @@ export interface WorktreeInfo {
   detached?: boolean;
   created?: boolean;
   reused?: boolean;
+  /** Commit the worktree started from. Absent on metadata written before this field existed. */
+  baseCommit?: string;
 }
 
 export interface EnsureWorkerWorktreeOptions {
@@ -296,6 +298,31 @@ function isDetached(wtPath: string): boolean {
 
 function isWorktreeDirty(wtPath: string): boolean {
   return isWorktreeDirtyExcept(wtPath).dirty;
+}
+
+function commitExists(repoRoot: string, sha: string): boolean {
+  try {
+    git(repoRoot, ['cat-file', '-e', `${sha}^{commit}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Only non-worker branches, tags, and remotes keep a commit safe: a stash or detached HEAD is fragile, and
+// any worker branch may be deleted by its own team's cleanup. The base is excluded so a worker with no
+// commits stays removable when its base left every branch, as after a leader amend.
+function hasCommitsOnlyOnWorkerRefs(repoRoot: string, wtPath: string, ownBranch: string | null, baseCommit?: string): boolean {
+  const tips = ownBranch ? [git(repoRoot, ['for-each-ref', '--format=%(objectname)', `refs/heads/${ownBranch}`])] : [];
+  if (existsSync(wtPath) && isRegisteredWorktreePath(repoRoot, wtPath)) tips.push(git(repoRoot, ['rev-parse', 'HEAD'], wtPath));
+  const commits = tips.filter(Boolean);
+  if (commits.length === 0) return false;
+  const excludedBase = baseCommit && commitExists(repoRoot, baseCommit) ? [baseCommit] : [];
+  return git(repoRoot, [
+    'rev-list', '--max-count=1', ...commits,
+    '--not', ...excludedBase,
+    '--exclude=omc-team/*', '--branches', '--tags', '--remotes',
+  ]).length > 0;
 }
 
 function normalizeStatusPath(rawPath: string): string {
@@ -671,6 +698,7 @@ function ensureWorkerWorktreeScoped(
       detached: isDetached(wtPath),
       created: false,
       reused: true,
+      baseCommit: readMetadata(repoRoot, teamName).find((entry) => entry.workerName === workerName)?.baseCommit,
     };
     recordMetadata(repoRoot, teamName, info);
     return info;
@@ -697,6 +725,7 @@ function ensureWorkerWorktreeScoped(
     reused: false,
   };
   try {
+    info.baseCommit = git(repoRoot, ['rev-parse', 'HEAD'], wtPath);
     recordMetadata(repoRoot, teamName, info);
   } catch (publicationError) {
     try {
@@ -855,7 +884,7 @@ function worktreeRemovalReceiptFromInfo(info: WorktreeInfo): WorktreeRemovalRece
   };
 }
 
-/** Remove an owned worker worktree or restore a borrowed worktree's managed overlay. */
+/** Remove an owned safe worktree or restore a borrowed worktree's managed overlay. */
 export function removeWorkerWorktree(
   teamName: string,
   workerName: string,
@@ -904,6 +933,12 @@ function removeWorkerWorktreeScoped(
     }
     if (receipt) {
       assertWorkerWorktreeRemovalReceiptBinding(teamName, workerName, repoRoot, receipt);
+      const branch = receipt.mode === 'named' ? receipt.branch : null;
+      if (hasCommitsOnlyOnWorkerRefs(repoRoot, wtPath, branch, persisted?.baseCommit)) {
+        const error = new Error(`worktree_unmerged: preserving worker worktree at ${wtPath} and branch ${receipt.branch} because they hold commits that only worker branches have; merge or discard the commits, then retry`);
+        (error as Error & { code?: string }).code = 'worktree_unmerged';
+        throw error;
+      }
       const expectedBranch = receipt.mode === 'named' ? getBranchName(teamName, workerName) : 'HEAD';
       const registeredBranch = getRegisteredWorktreeBranch(repoRoot, wtPath);
       if (registeredBranch && registeredBranch !== expectedBranch) {
@@ -995,7 +1030,7 @@ export function inspectTeamWorktreeCleanupSafety(
   };
 }
 
-/** Remove owned clean worktrees and retire restored borrowed worktree receipts. */
+/** Remove owned safe worktrees and retire restored borrowed worktree receipts. */
 export function cleanupTeamWorktrees(
   teamName: string,
   repoRoot: string

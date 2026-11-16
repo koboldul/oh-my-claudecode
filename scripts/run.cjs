@@ -305,10 +305,12 @@ function resolveHookTimeoutMsFromRoot(pluginRoot, targetPath, extraArgs) {
       const hooks = Array.isArray(entry?.hooks) ? entry.hooks : [];
       for (const hook of hooks) {
         const command = typeof hook?.command === 'string' ? hook.command : '';
+        const hookArgs = Array.isArray(hook?.args) ? hook.args.filter(arg => typeof arg === 'string') : [];
+        const invocation = [command, ...hookArgs].join(' ');
         const timeout = Number(hook?.timeout);
-        if (!scriptPattern.test(command)) continue;
+        if (!scriptPattern.test(invocation)) continue;
         if (!Number.isFinite(timeout) || timeout <= 0) continue;
-        if (!argNeedles.every(arg => command.includes(` ${arg}`) || command.endsWith(` ${arg}`))) continue;
+        if (!argNeedles.every(arg => invocation.includes(` ${arg}`) || invocation.endsWith(` ${arg}`))) continue;
         return {
           event,
           timeoutMs: Math.floor(timeout * 1000),
@@ -918,18 +920,6 @@ async function runSessionEndFastPath(targetPath, raw, value, childEnv) {
     fastPathMs: monotonicElapsedMs(fastPathStartedAt),
   });
   return output;
-}
-
-function writeTimeoutDiagnostic(targetPath, manifestHook, timeoutMs) {
-  const failureMode = isCriticalManifestHook(manifestHook)
-    ? 'fail-closed'
-    : 'fail-open';
-  const message =
-    `[run.cjs] Hook ${basename(targetPath)} timed out after ${timeoutMs}ms; `
-    + `exiting ${failureMode}.\n`;
-  if (manifestHook?.event !== 'UserPromptSubmit' || isDebugHooksEnabled()) {
-    process.stderr.write(message);
-  }
 }
 
 function writeSpawnErrorDiagnostic(targetPath, manifestHook, error) {
@@ -2424,13 +2414,16 @@ async function main() {
 
   const trustedSessionEndHook = resolveTrustedSessionEndTarget(resolution, extraArgs);
   if (trustedSessionEndHook) {
+    // The resident async path above remains bounded separately; give legacy
+    // synchronous SessionEnd workers time to publish their durable manifest.
+    const manifestTimeoutMs = resolveGenericTimeoutMs(trustedSessionEndHook);
     const requestedTestTimeout = process.env.NODE_ENV === 'test'
       ? Number(process.env.OMC_SESSION_END_TEST_FOREGROUND_TIMEOUT_MS)
       : NaN;
     const budgetMs = Number.isFinite(requestedTestTimeout) && requestedTestTimeout > 0
       ? requestedTestTimeout
-      : 300;
-    const timeoutMs = Math.min(resolveGenericTimeoutMs(trustedSessionEndHook), budgetMs);
+      : Math.max(1000, Math.floor(manifestTimeoutMs * 0.5));
+    const timeoutMs = Math.min(manifestTimeoutMs, budgetMs);
     return runWorker(resolution.targetPath, trustedSessionEndHook, timeoutMs);
   }
 

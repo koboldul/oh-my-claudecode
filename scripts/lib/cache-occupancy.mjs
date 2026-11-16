@@ -44,9 +44,8 @@ function identity(pid, probeTimeoutMs = 3000) {
       if (probeTimeoutMs <= 0) return null;
       const timeout = Math.max(1, Math.min(2000, Math.floor(probeTimeoutMs)));
       const result = spawnSync('ps', ['-p', String(pid), '-o', 'lstart='], { encoding: 'utf8', timeout });
-      if (result.status !== 0) return null;
-      const value = new Date(result.stdout.trim()).getTime();
-      return Number.isFinite(value) ? String(value) : null;
+      const value = new Date(result.stdout?.trim()).getTime();
+      return result.status === 0 && Number.isFinite(value) ? String(value) : null;
     } catch { return null; }
   }
   if (process.platform === 'win32') {
@@ -149,7 +148,7 @@ export function readOccupiedPluginRoots(configDir, options = {}) {
   const dir = registryDir(configDir);
   let names = [];
   let unavailable = false;
-  try { names = readdirSync(dir).filter(name => NAME.test(name)); }
+  try { names = readdirSync(dir).filter(name => typeof name === 'string' && NAME.test(name)); }
   catch (error) { if (error?.code !== 'ENOENT') unavailable = true; }
   const roots = new Set();
   const records = [];

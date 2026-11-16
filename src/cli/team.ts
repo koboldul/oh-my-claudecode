@@ -300,7 +300,10 @@ function isValidPaneArtifact(value: unknown, instanceId: string): value is TeamP
     || !record.paneIds.every((paneId) => typeof paneId === 'string' && paneId.trim().length > 0)
     || new Set(record.paneIds as string[]).size !== (record.paneIds as string[]).length
     || typeof record.leaderPaneId !== 'string'
-    || record.leaderPaneId.trim().length === 0
+    // A Herdr leader started outside a Herdr pane is untracked (''); every
+    // other provider must name its leader pane.
+    || (record.leaderPaneId.trim().length === 0
+      && !(record.leaderPaneId === '' && typeof record.sessionName === 'string' && record.sessionName.startsWith('herdr:')))
     || (record.sessionName !== undefined && (typeof record.sessionName !== 'string' || record.sessionName.trim().length === 0))
     || (record.ownsWindow !== undefined && typeof record.ownsWindow !== 'boolean')
     || !Array.isArray(record.workers)
@@ -990,6 +993,28 @@ export async function teamStatusByTeamName(teamName: string, cwd = process.cwd()
 
 export async function teamResumeByName(teamName: string, cwd = process.cwd()): Promise<Record<string, unknown>> {
   validateTeamName(teamName);
+  const runtimeV2 = await import('../team/runtime-v2.js');
+  if (runtimeV2.isRuntimeV2Enabled()) {
+    const runtime = await runtimeV2.resumeTeamV2(teamName, cwd);
+    if (!runtime) {
+      return {
+        teamName,
+        resumed: false,
+        error: 'Team session is not currently resumable',
+      };
+    }
+    return {
+      teamName,
+      resumed: true,
+      instanceId: runtime.instanceId,
+      sessionName: runtime.sessionName,
+      leaderPaneId: runtime.config.leader_pane_id,
+      workerPaneIds: runtime.config.workers
+        .map((worker) => worker.pane_id)
+        .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0),
+    };
+  }
+
   const runtime = await resumeTeam(teamName, cwd);
   if (!runtime) {
     return {

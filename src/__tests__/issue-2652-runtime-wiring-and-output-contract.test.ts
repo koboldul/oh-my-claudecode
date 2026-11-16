@@ -15,7 +15,7 @@ describe('issue #2652 runtime wiring and output contract', () => {
 
     const stopCommands = (hooks.hooks?.Stop ?? [])
       .flatMap((entry) => entry.hooks ?? [])
-      .map((hook) => hook.command ?? '');
+      .map((hook) => [hook.command, ...((hook as { args?: string[] }).args ?? [])].join(' '));
 
     expect(stopCommands.some((command) => command.includes('/scripts/persistent-mode.mjs'))).toBe(true);
     const persistentModeSource = readFileSync(persistentModePath, 'utf-8');

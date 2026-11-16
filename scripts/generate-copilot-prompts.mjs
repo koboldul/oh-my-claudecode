@@ -479,6 +479,18 @@ function rewriteNamedCalls(value, names, rewrite) {
 
 function transformPluginRoot(value) {
   return replaceSemanticTokens(value, [
+    [
+      'validation are enforced. Resolve the installed package root the\n   figure-it-out way: plugin-root variables first, then walk the installed\n   `oh-my-claudecode` package from the working directory — and report the\n   resolution failure instead of skipping the write:',
+      'validation are enforced. Resolve the active plugin root from the loaded\n   `skills-copilot/babysit/SKILL.md` path (or `omc-doctor`\'s active plugin\n   lookup) and set `PLUGIN_ROOT` in the shell environment. The command can\n   also resolve an installed package from the working directory; report\n   resolution failure instead of skipping the write:',
+    ],
+    [
+      '## Storage and validation\n\nResolve the checker',
+      '## Storage and validation\n\nIf `PLUGIN_ROOT` and `OMC_PLUGIN_ROOT` are unset, derive the active plugin root\nfrom the loaded `skills-copilot/figure-it-out/SKILL.md` path (or use\n`omc-doctor`\'s active plugin lookup) and set `PLUGIN_ROOT` before the shell\ncommands.\n\nResolve the checker',
+    ],
+    [
+      'quoting the bundled skill\nverbatim. Then run `node "$checker" .` to validate.',
+      'quoting the generated Copilot skill\nverbatim. Then run `node "$checker" . --skills-root "$(dirname "$(dirname "$checker")")/skills-copilot"` to validate.\nIf a target also has `skill-bodies/<name>/SKILL.md` under the plugin root or\nthe Copilot skills directory, stop and report: the checker would prefer that\narchive to the projected body.',
+    ],
     ['CLAUDE_PLUGIN_ROOT', 'PLUGIN_ROOT'],
   ]);
 }
@@ -563,6 +575,13 @@ function transformModelRouting(value) {
 
 function transformInteractivePrompts(value) {
   return replaceSemanticTokens(value, [
+    [
+      '**AskUserQuestion with concrete options.**',
+      '**Ask the user directly with concrete options.**',
+    ],
+    ['then AskUserQuestion:', 'then ask the user directly:'],
+    ['Show the plan, AskUserQuestion:', 'Show the plan, then ask the user directly:'],
+    ['use AskUserQuestion.', 'ask the user directly.'],
     [
       'Use `AskUserQuestion` with multiSelect',
       'Ask the user directly in the conversation and allow multiple selections',
@@ -662,6 +681,26 @@ function transformShellTool(value) {
     ['Read, Write, Edit, Bash', 'read, edit, and execute tools'],
     ['Bash tool', 'shell execution tool'],
     ['via Bash', 'through the shell execution tool'],
+    [
+      '`OMC_RALPH_AFK_FEEDBACK` and grants only the bare `Bash(omc ralph verify:*)`\n   form, so use `omc` directly there — do not run a discovery probe, it is not\n   granted and is denied in headless mode.',
+      '`OMC_RALPH_AFK_FEEDBACK`; use `omc` directly there without a discovery probe.',
+    ],
+    [
+      'on a plugin-only install there is no `omc`, so use the plugin-shaped\n   form `node "$PLUGIN_ROOT"/bridge/cli.cjs`',
+      'on a plugin-only install resolve the active plugin root and use\n   `node "<plugin-root>/bridge/cli.cjs"`',
+    ],
+    [
+      ' — the same prefix OMC\'s own\n   skill renderer emits, and the same fallback `ultragoal` and `cancel` already\n   document.',
+      ' when that file exists.',
+    ],
+    [
+      '<skill dir>/scripts/statechart SPEC.tla [--config FILE] [--view FILE] [--out DIR]',
+      'sh "<skill dir>/scripts/statechart" SPEC.tla [--config FILE] [--view FILE] [--out DIR]',
+    ],
+    [
+      '`scripts/statechart.ts` is TypeScript, so run it with a runtime that can execute TypeScript.',
+      '`scripts/statechart.ts` is TypeScript, so run it with a runtime that can execute TypeScript.\n\nUse a POSIX `sh` runtime (on Windows, Git Bash, WSL, or MSYS2). Invoking the launcher through `sh` does not depend on its executable bit.',
+    ],
   ]);
 }
 
@@ -808,7 +847,71 @@ export function transformCopilotTeamReference(value) {
     `),
   );
 
+  output = replaceMarkdownSection(
+    output,
+    '## Phase C — Cross-judge',
+    cleanTemplate(`
+      ## Phase C — Cross-judge
+
+      After all candidates finish, use a read-only external \`omc team\` worker
+      from a provider family none of the candidates used when one is available.
+      Wait for its result and retain its resources through judging. In-session
+      Copilot Task agents use their configured profiles; do not override or
+      assume their model families.
+
+      If no cross-family judge can run, skip the judge and pick the base alone
+      in Phase D, saying so. If candidate families cannot be established, an
+      independent judge may still run, but report that diversity was not
+      verified. The judge sees the rubric and candidates by path label, scores
+      each criterion, and recommends a base with rationale.
+    `),
+  );
+
   return replaceSemanticTokens(output, [
+    [
+      'dispatch\n   `oh-my-claudecode:architect` subagents, each producing:',
+      'dispatch\n   independent `Task(agent_type="oh-my-claudecode:architect", prompt="<design brief and invariants>")` calls, each producing:',
+    ],
+    [
+      'parallel `Task` dispatches to `oh-my-claudecode:executor`,\n     one per candidate',
+      'parallel `Task(agent_type="oh-my-claudecode:executor", prompt="<brief and exclusive output location>")` calls,\n     one per candidate',
+    ],
+    [
+      'spawn replacements — each on a\nremaining candidate\'s model, or on the parent\'s model when none remain —\nuntil two produce artifacts, and say so.',
+      'spawn replacements using the same external provider route when known, or the configured Copilot Task profile otherwise, until two produce artifacts, and say so.',
+    ],
+    [
+      'dispatch `oh-my-claudecode:explore` to map',
+      'dispatch `Task(agent_type="oh-my-claudecode:explore", prompt="<subsystem and read-only mapping request>")` to map',
+    ],
+    [
+      '(`oh-my-claudecode:explore`); keep synthesis in the lead.',
+      'using `Task(agent_type="oh-my-claudecode:explore", prompt="<question and assigned source>")`; keep synthesis in the lead.',
+    ],
+    [
+      '2. **Seat the panel**: three read-only reviewers in one message, in the\n   background, each with one lens:',
+      '2. **Seat the panel**: launch three independent read-only\n   `Task(agent_type="oh-my-claudecode:code-reviewer", prompt="<transcript path and assigned lens>")` calls, in the background when available, each with one lens:',
+    ],
+    [
+      'or in-session `Task` dispatches to `oh-my-claudecode:code-reviewer` and\n  `oh-my-claudecode:security-reviewer` on different models — the team',
+      'or independent Copilot `Task(agent_type="oh-my-claudecode:code-reviewer", prompt="<target, invariants, and lens>")` and `Task(agent_type="oh-my-claudecode:security-reviewer", prompt="<target, invariants, and lens>")` calls using their configured profiles. Report when cross-family diversity is not established; the team',
+    ],
+    [
+      'Record the verdict with the reviewers\'\n  models named, in the reply.',
+      'Record the verdict with each reviewer\'s model or provider family when known; otherwise state that it was not established.',
+    ],
+    [
+      'After the verdict is delivered, run `omc team shutdown <team-name> --force` (the\nname the startup snapshot printed) unconditionally — on pass, revise,\nblock, and error paths alike.',
+      'If an external CLI team was started, run `omc team shutdown <team-name> --force` (using its startup name) on pass, revise, block, and error paths. If only Copilot Task agents were used, stop any still-running workers through the available host controls instead.',
+    ],
+    [
+      'Do not paper over it.\n\n## Rules',
+      'Do not paper over it.\n\nAfter verification or an error, shut down each external CLI team started for the arena using its recorded team name. Stop any still-running Copilot Task workers through the available host controls.\n\n## Rules',
+    ],
+    [
+      'an end user, a teammate, a',
+      'an end user, a colleague, a',
+    ],
     [
       'Agents form their own analysis first, then spawn Claude Task agents for cross-validation',
       'Each review agent forms its own analysis before the lead launches any additional Copilot Task cross-check',
@@ -874,6 +977,50 @@ function transformCopilotCron(value) {
 function transformHostTerminology(value) {
   return replaceSemanticTokens(value, [
     ['Claude Code', 'GitHub Copilot CLI'],
+    [
+      'a repo has no `.claude/skills/verify/` and work will be verified here',
+      'the repo has no project verification skill and work will be verified here',
+    ],
+    [
+      '4. **Generate** `.claude/skills/verify/SKILL.md`',
+      '4. **Generate** `.agents/skills/verify/SKILL.md`',
+    ],
+    [
+      'already exists at the canonical root (`.omc/skills/verify/SKILL.md` or\n   `.claude/skills/verify/SKILL.md`)',
+      'already exists at `.agents/skills/verify/SKILL.md`, `.github/skills/verify/SKILL.md`,\n   `.omc/skills/verify/SKILL.md`, or `.claude/skills/verify/SKILL.md`',
+    ],
+    [
+      '`.claude/skills/verify-formal-<property>/SKILL.md` containing:',
+      '`.agents/skills/verify-formal-<property>/SKILL.md` (or update an existing project skill for the same property under `.github/skills/`, `.agents/skills/`, or `.claude/skills/`) containing:',
+    ],
+    [
+      '`${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/personal-mode-profile/SKILL.md`',
+      '`~/.agents/skills/personal-mode-profile/SKILL.md`',
+    ],
+    [
+      "the user's `.claude/skills/<name>/` copy",
+      "the user's `~/.agents/skills/<name>/` copy",
+    ],
+    [
+      'Setup wizard for role-based model routing. OMC resolves each agent role to a\nprovider, model, and reasoning effort through `team.roleRouting` in the',
+      'Setup wizard for external OMC CLI team role routing. `team.roleRouting` does\nnot configure in-session Copilot Task agents or their local agent profiles. OMC\nresolves each external team role to a provider, model, and reasoning effort\nthrough `team.roleRouting` in the',
+    ],
+    [
+      '`provider`: `claude` | `codex` | `gemini` | `grok` | `cursor` | `antigravity`',
+      '`provider`: `claude` | `codex` | `gemini` | `grok` | `cursor` | `antigravity` | `copilot`',
+    ],
+    [
+      'Gemini, Grok, and Cursor accept no effort field.',
+      'Gemini, Grok, Cursor, and Copilot accept no per-role effort field.',
+    ],
+    [
+      '(`codex`, `gemini`, `grok`,\n   `cursor-agent`, `agy`)',
+      '(`codex`, `gemini`, `grok`,\n   `cursor-agent`, `agy`, `copilot`)',
+    ],
+    [
+      'valid Claude Task routes (including `agentType` and fallback settings)\n  are a separate subsystem and must stay where they are — `team.roleRouting`\n  governs `/team` only, Task delegation is not moved by this skill.',
+      'Claude Task routes are a separate subsystem and must stay where they are.\n  `team.roleRouting` governs external CLI teams only; it does not configure\n  in-session Copilot Task agents or change their profiles.',
+    ],
   ]);
 }
 
@@ -939,8 +1086,7 @@ function renderCopilotTeamBody() {
     1. Use independent \`Task(agent_type="oh-my-claudecode:<role>", ...)\`
        calls for bundled OMC roles such as executor, debugger, designer, planner,
        verifier, or reviewer.
-    2. Use \`omc team N:<provider> "<task>"\` (or the
-       \`/oh-my-claudecode:omc-teams\` compatibility surface) for external CLI
+    2. Use \`omc team N:<provider> "<task>"\` for external CLI
        providers: claude, codex, gemini, antigravity, grok, cursor, or copilot.
     3. Treat Task agents as independent workers. Give each worker a bounded,
        non-overlapping assignment and all context needed to finish it.
@@ -1677,6 +1823,27 @@ function validateInventory(inventory) {
         );
       }
     }
+    if (
+      entry.verbatimSupportDirectories !== undefined &&
+      !Array.isArray(entry.verbatimSupportDirectories)
+    ) {
+      throw new Error(`Skill ${entry.id} verbatimSupportDirectories must be an array`);
+    }
+    for (const directory of entry.verbatimSupportDirectories ?? []) {
+      if (
+        typeof directory !== 'string' ||
+        directory.includes('\\') ||
+        directory.split('/').some((part) => !part || part === '.' || part === '..')
+      ) {
+        throw new Error(`Skill ${entry.id} has invalid verbatim support directory`);
+      }
+      const supportDirectory = join(dirname(join(ROOT, entry.source)), directory);
+      if (!existsSync(supportDirectory) || !statSync(supportDirectory).isDirectory()) {
+        throw new Error(
+          `Skill ${entry.id} verbatim support directory is missing: ${directory}`,
+        );
+      }
+    }
     for (const [relativePath, channel] of Object.entries(
       entry.supportFileChannels ?? {},
     )) {
@@ -1866,7 +2033,10 @@ function buildExpectedFiles(inventory) {
       const supportOutput = resolve(outputDir, relativePath);
       const sourceBuffer = readFileSync(supportPath);
       const mode = supportFileMode(entry, relativePath, supportPath);
-      if (supportPath.endsWith('.md')) {
+      const verbatim = (entry.verbatimSupportDirectories ?? []).some(
+        (directory) => toPosixPath(relativePath).startsWith(`${directory}/`),
+      );
+      if (supportPath.endsWith('.md') && !verbatim) {
         const normalized = normalizeNewlines(sourceBuffer.toString('utf8'));
         const transformed = applyTransforms(
           normalized,
@@ -1886,6 +2056,13 @@ function buildExpectedFiles(inventory) {
           expectedFile(Buffer.from(renderedSupport, 'utf8'), mode),
         );
       } else {
+        if (supportPath.endsWith('.md')) {
+          validateCopilotPromptSemantics(
+            repoPath(supportOutput),
+            sourceBuffer.toString('utf8'),
+            validSkillIds,
+          );
+        }
         expected.set(supportOutput, expectedFile(sourceBuffer, mode));
       }
     }

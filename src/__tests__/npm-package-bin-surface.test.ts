@@ -93,7 +93,6 @@ const GENERATED_RUNTIME_ENTRYPOINTS = new Set([
   "bridge/hud-runtime.mjs",
   "bridge/mcp-server.cjs",
   "bridge/runtime-cli.cjs",
-  "bridge/team-bridge.cjs",
   "bridge/team-mcp.cjs",
   "bridge/team.js",
   "dist/hooks/skill-bridge.cjs",

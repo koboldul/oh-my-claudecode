@@ -1513,8 +1513,7 @@ describe('shipped post-tool canonical runtime entrypoints', () => {
           matcher: string;
           hooks: Array<{
             command: string;
-            bash: string;
-            powershell: string;
+            args: string[];
           }>;
         }>
       >;
@@ -1522,7 +1521,7 @@ describe('shipped post-tool canonical runtime entrypoints', () => {
 
     const postToolFiles = manifest.hooks.PostToolUse.flatMap(
       (group) => group.hooks.map((hook) => {
-        const match = hook.command.match(/scripts\/([a-z0-9-]+\.mjs)/i);
+        const match = hook.args.join(' ').match(/scripts\/([a-z0-9-]+\.mjs)/i);
         return match?.[1];
       }),
     );
@@ -1540,13 +1539,11 @@ describe('shipped post-tool canonical runtime entrypoints', () => {
     const failureHook = manifest.hooks.PostToolUseFailure[0];
     expect(failureHook.matcher).toBe('*');
     expect(failureHook.hooks).toHaveLength(1);
-    for (const command of [
-      failureHook.hooks[0].command,
-      failureHook.hooks[0].bash,
-      failureHook.hooks[0].powershell,
-    ]) {
-      expect(command).toContain('/scripts/post-tool-use-failure.mjs');
-    }
+    expect(failureHook.hooks[0].command).toBe('node');
+    expect(failureHook.hooks[0].args).toEqual([
+      '${CLAUDE_PLUGIN_ROOT}/scripts/run.cjs',
+      '${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-use-failure.mjs',
+    ]);
 
     for (const [name, config] of Object.entries(SCRIPT_CONFIG) as Array<
       [ScriptName, (typeof SCRIPT_CONFIG)[ScriptName]]

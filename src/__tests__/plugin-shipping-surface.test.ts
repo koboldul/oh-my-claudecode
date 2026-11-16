@@ -146,7 +146,8 @@ describe('plugin shipping surface transaction', () => {
           matcher: 'init',
           hooks: [{
             type: 'command',
-            command: 'node "$CLAUDE_PLUGIN_ROOT"/scripts/claude-hook.mjs',
+            command: 'node',
+            args: ['${CLAUDE_PLUGIN_ROOT}/scripts/claude-hook.mjs'],
           }],
         }],
       },

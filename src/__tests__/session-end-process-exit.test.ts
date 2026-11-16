@@ -713,6 +713,38 @@ describe('SessionEnd run.cjs runner/admission latency and detached completion', 
     ['session-end', () => timingSessionEnd],
     ['wiki-session-end', () => timingWikiSessionEnd],
   ] as const)(
+    '%s does not wait for a live manifest lock',
+    async (name, script) => {
+      const cwd = createProject(`manifest-lock-${name}`);
+      const sessionId = `live-manifest-lock-${name}`;
+      const residentEnv = await ensureResident(cwd, sessionId);
+      const jobsDir = join(getOmcRoot(cwd), 'state', 'session-end-jobs');
+      mkdirSync(jobsDir, { recursive: true });
+      writeFileSync(join(jobsDir, `${sessionId}.json.lock`), JSON.stringify({
+        pid: process.pid,
+        processStartIdentity: null,
+        nonce: 'live-owner',
+        createdAt: new Date().toISOString(),
+      }));
+      const receipt = join(cwd, 'runner-timing.json');
+      const result = await runUntilClose(
+        script(),
+        cwd,
+        validSessionEndInput(cwd, sessionId),
+        HOST_PROCESS_WATCHDOG_MS,
+        { ...residentEnv, OMC_SESSION_END_TEST_IPC_RECEIPT: receipt },
+        timingPluginRoot,
+      );
+      expectPromptExit(result);
+      expectRunnerAdmissionDuration(readSessionEndTiming(receipt));
+    },
+    15_000,
+  );
+
+  it.each([
+    ['session-end', () => timingSessionEnd],
+    ['wiki-session-end', () => timingWikiSessionEnd],
+  ] as const)(
     '%s reports <=500ms runner/admission duration on every repeated configured run',
     async (name, script) => {
       const cwd = createProject(`configured-${name}`);

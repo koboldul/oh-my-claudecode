@@ -21,6 +21,7 @@ const JEV_MODEL_TIERS = new Set([
     'haiku',
     'sonnet',
     'opus',
+    'fable',
 ]);
 const TIER_TO_DEFAULT_ENV_KEYS = {
     haiku: [
@@ -115,6 +116,10 @@ const SLOP_BENIGN_TECHNICAL_PATTERNS = [
 ];
 const SLOP_DOC_CONTEXT_PATTERN = /(?:^|[/\\])(?:docs?|documentation|guides?|instructions?|prompts?|\.om[ctx])(?:[/\\]|$)|\.(?:md|mdx|txt|rst)$/i;
 const SLOP_SELF_REFERENCE_PATH_PATTERN = /(?:^|[/\\])(?:pre-tool-enforcer(?:\.mjs)?|pre-tool-enforcer\.test\.ts)(?:$|[/\\])/i;
+const SLOP_WARNING_MESSAGE = '[SLOP WARNING] Detected fallback/workaround language in this tool input. '
+    + 'Do not make potential slop: avoid ad-hoc fallback layers, workaround shims, or environment-specific patches unless explicitly justified. '
+    + 'For architecture concerns, consult the architect for a concrete design first. '
+    + 'If this seems environment-specific, ask the user to confirm constraints before proceeding.';
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -429,7 +434,7 @@ export function evaluateModelRouting(call, envelope, snapshot) {
     return { warning: '' };
 }
 function asJevModelTier(model) {
-    return model === 'haiku' || model === 'sonnet' || model === 'opus'
+    return model === 'haiku' || model === 'sonnet' || model === 'opus' || model === 'fable'
         ? model
         : null;
 }
@@ -462,26 +467,33 @@ function modelRoutingJevObservation(call, snapshot, evaluation) {
         model,
     };
 }
-function applyJevModelRoutingOverride(call, envelope, evaluation, observation, overrides) {
-    const choice = overrides[call.id];
+function applyJevModelRoutingOverride(call, envelope, snapshot, evaluation, observation, overrides) {
+    const override = overrides[call.id];
     if (envelope.host !== 'claude'
         || evaluation.denyReason
-        || !observation
-        || !choice
-        || !JEV_MODEL_TIERS.has(choice)
+        || !AGENT_HEAVY_TOOLS.has(call.canonicalName)
+        || !override
         || !isRecord(call.input)) {
         return evaluation;
     }
-    const updatedInput = evaluation.updatedInput ?? call.input;
-    if (nonEmptyString(updatedInput.model).toLowerCase() === choice) {
+    const patch = typeof override === 'string' ? { model: override } : override;
+    if (typeof override === 'string' && !observation)
         return evaluation;
+    const updatedInput = evaluation.updatedInput ?? call.input;
+    const nextInput = { ...updatedInput };
+    if (patch.model && JEV_MODEL_TIERS.has(patch.model)
+        && (!snapshot.modelRouting.forceInherit || resolveTierAliasToSafeModel(patch.model, snapshot))) {
+        nextInput.model = patch.model;
     }
+    if (typeof patch.effort === 'string')
+        nextInput.effort = patch.effort;
+    if (typeof patch.prompt === 'string')
+        nextInput.prompt = patch.prompt;
+    if (Object.keys(nextInput).every((key) => nextInput[key] === updatedInput[key]))
+        return evaluation;
     return {
         ...evaluation,
-        updatedInput: {
-            ...updatedInput,
-            model: choice,
-        },
+        updatedInput: nextInput,
     };
 }
 function normalizeText(value) {
@@ -793,10 +805,7 @@ function generateSlopWarning(call, envelope) {
         return { warned: false, message: '' };
     return {
         warned: true,
-        message: '[SLOP WARNING] Detected fallback/workaround language in this tool input. '
-            + 'Do not make potential slop: avoid ad-hoc fallback layers, workaround shims, or environment-specific patches unless explicitly justified. '
-            + 'For architecture concerns, consult the architect for a concrete design first. '
-            + 'If this seems environment-specific, ask the user to confirm constraints before proceeding.',
+        message: SLOP_WARNING_MESSAGE,
     };
 }
 function generateAgentMessage(input, snapshot) {
@@ -1051,7 +1060,7 @@ export function evaluatePreToolCall(call, envelope, snapshot, ledger, readBudget
         return deniedCallPlan(call, baseModelRouting.denyReason, effects, ledger);
     }
     const modelRoutingObservation = modelRoutingJevObservation(call, snapshot, baseModelRouting);
-    const modelRouting = applyJevModelRoutingOverride(call, envelope, baseModelRouting, modelRoutingObservation, modelRoutingOverrides);
+    const modelRouting = applyJevModelRoutingOverride(call, envelope, snapshot, baseModelRouting, modelRoutingObservation, modelRoutingOverrides);
     const routingObservations = modelRoutingObservation
         ? { modelRouting: modelRoutingObservation }
         : undefined;
@@ -1083,6 +1092,11 @@ export function evaluatePreToolCall(call, envelope, snapshot, ledger, readBudget
         return deniedCallPlan(call, buildPreflightReason(snapshot), effects, forceDelegation.nextLedger, 'raw-block', mutation, routingObservations);
     }
     const slopWarning = generateSlopWarning(call, envelope);
+    const override = modelRoutingOverrides[call.id];
+    const effectiveSlopWarning = typeof override === 'object'
+        && typeof override.slopWarning === 'boolean'
+        ? override.slopWarning
+        : slopWarning.warned;
     const jevObservations = {
         ...(routingObservations ?? {}),
         slopWarning: slopWarning.warned,
@@ -1094,7 +1108,7 @@ export function evaluatePreToolCall(call, envelope, snapshot, ledger, readBudget
         const baseMessage = call.canonicalName === 'Task' || call.canonicalName === 'Agent'
             ? generateAgentMessage(effectiveInput, snapshot)
             : generateToolMessage(call.canonicalName, snapshot);
-        const message = combineMessages(modelRouting.warning, slopWarning.message, baseMessage);
+        const message = combineMessages(modelRouting.warning, effectiveSlopWarning ? SLOP_WARNING_MESSAGE : '', baseMessage);
         advisoryCandidate = buildAdvisoryCandidate(call, snapshot, message);
         if (advisoryCandidate)
             effects.push(advisoryCandidate.effect);
