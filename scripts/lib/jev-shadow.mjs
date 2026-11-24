@@ -457,8 +457,9 @@ export function jevNoulOf(result, questionName) {
  * Falls back to undefined (caller uses heuristic) on timeout/error/parse-failure.
  * permissionMode is the hook input's permission_mode; it travels in the
  * request so the resolver logs the same mode the caller acted on.
+ * callLogContext overrides hook-wide identifiers only in opt-in logs.
  */
-export function recordJevShadow({ point, state, questions, heuristic, heuristicDetails, permissionMode, toolUseId }) {
+export function recordJevShadow({ point, state, questions, heuristic, heuristicDetails, permissionMode, toolUseId }, callLogContext) {
   const mode = jevModeFor(point, process.env, permissionMode);
   if (mode === "off") return undefined;
   // Opt-in shared breaker: the resolver holds the call back itself and logs
@@ -497,7 +498,7 @@ export function recordJevShadow({ point, state, questions, heuristic, heuristicD
   try {
     tempDir = mkdtempSync(join(tmpdir(), "omc-jev-"));
     requestFile = join(tempDir, "request.json");
-    const logContext = requestLogContext(point);
+    const logContext = requestLogContext(point, callLogContext);
     const startedAt = Date.now();
 
     writeFileSync(
@@ -678,9 +679,9 @@ export async function setJevHookContext(data) {
 }
 
 /** The ids of one request: the hook call's and a new request_id. Undefined without OMC_JEV_LOG_CONTEXT=1. */
-function requestLogContext(point) {
+function requestLogContext(point, callLogContext) {
   if (!isJevLogContextEnabled(process.env)) return undefined;
-  const context = { ...hookLogContext, request_id: randomUUID() };
+  const context = { ...hookLogContext, ...jevLogContextOf(callLogContext), request_id: randomUUID() };
   lastRequestIds.set(point, context.request_id);
   return context;
 }

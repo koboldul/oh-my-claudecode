@@ -262,7 +262,7 @@ function recordSlopWarningShadow(callPlan, permissionMode) {
     questions: SLOP_WARNING_QUESTIONS,
     heuristic: warned,
     permissionMode,
-  });
+  }, { tool_use_id: callPlan.call.id });
 }
 
 function collectJevModelRoutingOverrides(plan, runtime, pending) {

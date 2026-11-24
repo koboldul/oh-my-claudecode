@@ -177,6 +177,32 @@ describe('hook scripts with OMC_JEV_LOG_CONTEXT=1', () => {
     expect(lines[0]).toMatchObject({ ...ids, cwd: context.cwd, request_id: expect.stringMatching(UUID), mode: 'active' });
   }, 60_000);
 
+  it.each(['1', '0'])('pre-tool-enforcer honors OMC_JEV_LOG_CONTEXT=%s for Copilot batch call IDs', async (logContext) => {
+    const context = makeContext();
+    const callIds = ['toolu_batch_first', 'toolu_batch_second'];
+    await runHook(context, 'pre-tool-enforcer.mjs', {
+      sessionId: 'session-pte-batch',
+      cwd: context.cwd,
+      toolCalls: callIds.map((id) => ({
+        id,
+        name: 'view',
+        args: JSON.stringify({ path: join(context.cwd, `${id}.ts`) }),
+      })),
+    }, 'slop-warning', { OMC_HOST: 'copilot', OMC_JEV_LOG_CONTEXT: logContext });
+    const lines = pointLines(context, 'slop-warning');
+    expect(lines.map((line) => line.tool_use_id)).toEqual(logContext === '1' ? callIds : [undefined, undefined]);
+    if (logContext === '0') return;
+    for (const line of lines) {
+      expect(line).toMatchObject({
+        session_id: 'session-pte-batch',
+        cwd: context.cwd,
+        request_id: expect.stringMatching(UUID),
+        mode: 'active',
+      });
+    }
+    expect(lines[0].request_id).not.toBe(lines[1].request_id);
+  }, 60_000);
+
   it.each(CASES)('$hook prints the same output with every log option set as with none', async ({ hook, point, input, setup }) => {
     const ALL_OPTIONS = { OMC_JEV_LOG_CONTEXT: '1', OMC_JEV_APPLIED_LOG: '1', OMC_JEV_STATE_OMIT_IDS: '1', OMC_JEV_LOG_MAX_MB: '50' };
     const outputs = [];
