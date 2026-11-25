@@ -49,10 +49,10 @@ describe('Copilot-specific agent profiles', () => {
       const expectedModel = sourceFile === 'executor.md'
         ? 'gpt-6.1-terra'
         : ['architect.md', 'security-reviewer.md'].includes(sourceFile)
-          ? 'gpt-6-astra'
+          ? 'gpt-6.2-astra'
           : sourceModel.toLowerCase().includes('sonnet')
-            ? 'gpt-6.1-luna'
-            : 'gpt-6.1-sol';
+            ? 'gpt-6-luna'
+            : 'gpt-6.2-sol';
 
       expect(generated).toBe(beforeGeneration[outputFile]);
       expect(generated).toMatch(new RegExp(`^model: ${expectedModel}$`, 'm'));

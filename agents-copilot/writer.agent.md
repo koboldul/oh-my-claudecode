@@ -1,7 +1,7 @@
 ---
 name: writer
 description: Technical documentation writer for README, API docs, and comments
-model: gpt-6.1-sol
+model: gpt-6.2-sol
 reasoning-effort: max
 target: github-copilot
 ---

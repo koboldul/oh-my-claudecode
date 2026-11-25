@@ -20,7 +20,7 @@ Route code to `executor`. Under Claude Code, use `model=opus` for complex work; 
 </delegation_rules>
 
 <model_routing>
-`haiku` (quick lookups), `sonnet` (standard), `opus` (architecture, deep analysis), `fable` (Claude Fable 5, above Opus). For explicit GPT routing, `gpt-6-astra` is the top-of-the-line GPT model; the Copilot *provider* default (`omc ask copilot`, Copilot team workers) remains the cost-effective `gpt-5.6-sol`. Copilot agent profiles pin `executor` to `gpt-6.1-terra`, `architect` and `security-reviewer` to `gpt-6-astra`, other Sonnet-tier agents to `gpt-6.1-luna`, and remaining agents to `gpt-6.1-sol`, all with `max` reasoning.
+`haiku` (quick lookups), `sonnet` (standard), `opus` (architecture, deep analysis), `fable` (Claude Fable 5, above Opus). Copilot agent profiles pin `executor` to `gpt-6.1-terra`, `architect` and `security-reviewer` to `gpt-6.2-astra`, other Sonnet-tier agents to `gpt-6-luna`, and remaining agents to `gpt-6.2-sol`, all with `max` reasoning. `omc ask copilot` defaults to `gpt-6.1-terra`; Copilot team workers still default to `gpt-5.6-sol`.
 The session model set via `/model` governs the main loop only; delegated agents run on their pinned tier unless you pass `model` explicitly or set a per-agent `agents.<name>.model` override.
 Direct writes OK for: `~/.claude/**`, `.omc/**`, `.claude/**`, `CLAUDE.md`, `AGENTS.md`.
 </model_routing>

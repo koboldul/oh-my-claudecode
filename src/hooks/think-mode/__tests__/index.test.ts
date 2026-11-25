@@ -404,6 +404,10 @@ World`);
       'openai/gpt-6-sol',
       'gpt-6.1-sol',
       'openai/gpt-6.1-sol',
+      'gpt-6.2-sol',
+      'openai/gpt-6.2-sol',
+      'gpt-6-2-sol',
+      'openai/gpt-6-2-sol',
     ])('%s', (modelId) => {
       it('should use the existing OpenAI reasoning config without a synthetic high variant', () => {
         expect(getThinkingConfig(providerId, modelId)).toEqual({ reasoning_effort: 'high' });
@@ -449,7 +453,14 @@ World`);
       });
     });
 
-    it.each(['gpt-6-astra', 'openai/gpt-6-astra'])(
+    it.each([
+      'gpt-6-astra',
+      'openai/gpt-6-astra',
+      'gpt-6.2-astra',
+      'openai/gpt-6.2-astra',
+      'gpt-6-2-astra',
+      'openai/gpt-6-2-astra',
+    ])(
       'should preserve already-high-end %s without injecting reasoning config',
       (modelId) => {
         expect(isAlreadyHighVariant(modelId)).toBe(true);

@@ -1,7 +1,7 @@
 ---
 name: planner
 description: Strategic planning consultant with interview workflow
-model: gpt-6.1-sol
+model: gpt-6.2-sol
 reasoning-effort: max
 target: github-copilot
 ---

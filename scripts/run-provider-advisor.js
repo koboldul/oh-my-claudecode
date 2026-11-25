@@ -28,7 +28,7 @@ const PROVIDER_BINARIES = {
 // temp file instead of argv or stdin.
 const PROMPT_FILE_PROVIDERS = new Set(['muse', 'grok']);
 const SHOULD_USE_WINDOWS_SHELL = process.platform === 'win32';
-const COPILOT_DEFAULT_MODEL = 'gpt-5.6-sol';
+const COPILOT_DEFAULT_MODEL = 'gpt-6.1-terra';
 const COPILOT_DEFAULT_REASONING_EFFORT = 'max';
 const COPILOT_REASONING_EFFORTS = new Set([
   'none',

@@ -2682,10 +2682,10 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
 
   it.each([
     ['executor', 'gpt-6.1-terra'],
-    ['test-engineer', 'gpt-6.1-luna'],
-    ['code-reviewer', 'gpt-6.1-sol'],
-    ['architect', 'gpt-6-astra'],
-    ['security-reviewer', 'gpt-6-astra'],
+    ['test-engineer', 'gpt-6-luna'],
+    ['code-reviewer', 'gpt-6.2-sol'],
+    ['architect', 'gpt-6.2-astra'],
+    ['security-reviewer', 'gpt-6.2-astra'],
   ])('defaults %s to its agent profile with max reasoning', (agent, expectedModel) => {
     const output = run({
       tool_name: 'Task',
@@ -2705,8 +2705,8 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
 
   it.each([
     ['deep-executor', 'gpt-6.1-terra'],
-    ['tdd-guide', 'gpt-6.1-luna'],
-    ['api-reviewer', 'gpt-6.1-sol'],
+    ['tdd-guide', 'gpt-6-luna'],
+    ['api-reviewer', 'gpt-6.2-sol'],
   ])('uses the canonical profile for Agent payloads with the %s alias', (agent, expectedModel) => {
     const output = run({
       tool_name: 'Agent',
@@ -2756,11 +2756,11 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     });
     expect(updatedInput(output)).toMatchObject({
       agent_type: 'oh-my-claudecode:explore',
-      model: 'gpt-6.1-sol',
+      model: 'gpt-6.2-sol',
       reasoning_effort: 'max',
     });
     expect(output.additionalContext).toContain(
-      'Spawning agent: oh-my-claudecode:explore (gpt-6.1-sol) [BACKGROUND]',
+      'Spawning agent: oh-my-claudecode:explore (gpt-6.2-sol) [BACKGROUND]',
     );
   });
 
@@ -2782,7 +2782,7 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
 
   it.each([
     ['executor', 'gpt-6.1-terra'],
-    ['test-engineer', 'gpt-6.1-luna'],
+    ['test-engineer', 'gpt-6-luna'],
   ])('fills only the missing field when one explicit choice is present for %s', (agent, expectedModel) => {
     const modelExplicit = run({
       tool_name: 'Task',
@@ -2870,7 +2870,8 @@ describe('pre-tool-enforcer Copilot-host subagent defaults', () => {
     ['executor', 'executor', 'inherit', 'gpt-5.6-terra'],
     ['test-engineer', 'testEngineer', 'gpt-6-astra', 'gpt-6-astra'],
     ['test-engineer', 'testEngineer', 'inherit', 'gpt-5.6-terra'],
-    ['code-reviewer', 'codeReviewer', 'gpt-6.1-luna', 'gpt-6.1-luna'],
+    ['code-reviewer', 'codeReviewer', 'gpt-6-luna', 'gpt-6-luna'],
+    ['code-reviewer', 'codeReviewer', 'gpt-6.1-sol', 'gpt-6.1-sol'],
     ['code-reviewer', 'codeReviewer', 'inherit', 'gpt-5.6-terra'],
   ])('respects %s per-agent model setting agents.%s.model=%s', (agent, configKey, configuredModel, expectedModel) => {
     writeJson(join(tempDir, '.claude', 'omc.jsonc'), {

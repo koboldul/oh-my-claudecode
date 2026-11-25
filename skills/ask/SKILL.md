@@ -57,7 +57,7 @@ muse --version
   > **Platform note:** supported `agy` versions run on Windows without a shell so the prompt remains one argv value; `agy --print` does not read the prompt from stdin.
 - **Gemini CLI** remains supported for enterprise/API-key use cases.
 - **GitHub Copilot CLI**: install and authenticate `copilot`. The wrapper uses
-  headless autonomous mode with default model `gpt-5.6-sol` and reasoning effort `max`.
+  headless autonomous mode with default model `gpt-6.1-terra` and reasoning effort `max`.
 - **Muse and Grok** require versions supporting `--prompt-file`. The wrapper uses private temporary files for prompts, including role files with YAML frontmatter. Muse uses `--approval-mode never` and preserves its configured sandbox behavior.
 
 ## Artifacts

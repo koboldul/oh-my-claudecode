@@ -980,7 +980,7 @@ describe('run-provider-advisor script contract', () => {
       expect(calls.every(call => call.options.shell === false)).toBe(true);
       const launch = calls.find(call => !call.args.includes('--version'));
       expect(launch?.args).toEqual([
-        '--model', 'gpt-5.6-sol',
+        '--model', 'gpt-6.1-terra',
         '--effort', 'max',
         '--allow-all',
         '--no-ask-user',
@@ -1074,7 +1074,7 @@ describe('run-provider-advisor script contract', () => {
       const fileIndex = launch.args.indexOf('-File');
       expect(launch.args[fileIndex + 1]).toBe(ps1Shim);
       expect(launch.args.slice(fileIndex + 2)).toEqual([
-        '--model', 'gpt-5.6-sol',
+        '--model', 'gpt-6.1-terra',
         '--effort', 'max',
         '--allow-all',
         '--no-ask-user',

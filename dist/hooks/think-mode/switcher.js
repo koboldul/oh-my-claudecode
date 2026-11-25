@@ -49,9 +49,10 @@ const HIGH_VARIANT_MAP = {
     'gemini-3-pro': 'gemini-3-pro-high',
     'gemini-3-flash': 'gemini-3-flash-high',
 };
-/** GPT models whose base IDs already select the high-end offering. */
+/** GPT models whose normalized base IDs already select the high-end offering. */
 const GPT_HIGH_END_MODELS = new Set([
     'gpt-6-astra',
+    'gpt-6-2-astra',
 ]);
 /** Set of models already in high variant */
 const ALREADY_HIGH = new Set([

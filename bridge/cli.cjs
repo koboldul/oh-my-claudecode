@@ -130136,7 +130136,8 @@ var HIGH_VARIANT_MAP = {
   "gemini-3-flash": "gemini-3-flash-high"
 };
 var GPT_HIGH_END_MODELS = /* @__PURE__ */ new Set([
-  "gpt-6-astra"
+  "gpt-6-astra",
+  "gpt-6-2-astra"
 ]);
 var ALREADY_HIGH = /* @__PURE__ */ new Set([
   ...Object.values(HIGH_VARIANT_MAP),

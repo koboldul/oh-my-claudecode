@@ -428,7 +428,7 @@ Run local provider CLIs and save a markdown artifact under `.omc/artifacts/ask/`
 ```bash
 # Terminal CLI
 omc ask claude "review this migration plan"
-omc ask copilot --prompt "implement this migration with GPT-5.6 Sol"
+omc ask copilot --prompt "review this implementation plan"
 omc ask codex --prompt "identify architecture risks"
 omc ask gemini --prompt "propose UI polish ideas"
 omc ask antigravity --prompt "propose UI polish ideas"
@@ -450,7 +450,7 @@ Canonical env vars:
 
 - `OMC_ASK_ADVISOR_SCRIPT`
 - `OMC_ASK_ORIGINAL_TASK`
-- `OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL` (default `gpt-5.6-sol`)
+- `OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL` (fallback for `omc ask copilot`: `gpt-6.1-terra`)
 - `OMC_COPILOT_REASONING_EFFORT` (default `max`)
 
 Phase-1 aliases `OMX_ASK_ADVISOR_SCRIPT` and `OMX_ASK_ORIGINAL_TASK` are accepted with deprecation warnings.
@@ -651,7 +651,7 @@ OMC can optionally orchestrate external AI providers for cross-validation and de
 | [Antigravity CLI](https://antigravity.google) (`agy`)                   | Install per the [official instructions](https://antigravity.google) (provides the `agy` binary) | Design review, UI consistency — Google's successor to the Gemini CLI |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli)               | `npm install -g @google/gemini-cli`                          | Design review, UI consistency (1M token context) — enterprise/API-key access unaffected |
 | [Codex CLI](https://github.com/openai/codex)                            | `npm install -g @openai/codex`                               | Architecture validation, code review cross-check                          |
-| [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli) | `winget install GitHub.Copilot`, `brew install --cask copilot-cli`, or `npm install -g @github/copilot` | GPT-5.6 Sol advisor and Team workers through an active Copilot subscription |
+| [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/set-up/install-copilot-cli) | `winget install GitHub.Copilot`, `brew install --cask copilot-cli`, or `npm install -g @github/copilot` | GPT-6.1 Terra advisor and GPT-5.6 Sol team workers through an active Copilot subscription |
 | [Grok Build](https://build.grok.com)                                    | Download from build.grok.com (`grok` at `~/.grok/bin/grok`) | Code review, analysis cross-check                                         |
 
 > **Migrating from Gemini CLI:** Per Google's announcement, the Gemini CLI is being superseded by the Antigravity CLI (`agy`); see the [official Antigravity docs](https://antigravity.google). Use `omc team N:antigravity` and `omc ask antigravity` wherever you previously used `gemini`. Windows headless support for `agy` is unknown/untested — report issues upstream.
