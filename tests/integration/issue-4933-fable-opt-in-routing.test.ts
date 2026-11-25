@@ -1,6 +1,6 @@
 /**
  * Test for issue #4933: opt-in model-routing for Agent/Task calls naming fable
- * 
+ *
  * Subprocess tests that run scripts/pre-tool-enforcer.mjs directly with
  * OMC_JEV_MODEL_ROUTING_FABLE on and off, inspecting the actual Jev request criteria.
  * Proves that Fable is only included in model choices when opt-in is enabled,
@@ -255,7 +255,7 @@ describe("issue #4933: opt-in fable model routing (subprocess)", () => {
     // Validate subprocess success and output are present before parsing
     expect(result.exitCode, `subprocess failed with stderr: ${result.stderr}`).toBe(0);
     expect(result.stdout, "subprocess must produce valid JSON output").toBeTruthy();
-    
+
     // Parse and validate the output to check if fable was rejected
     const output = JSON.parse(result.stdout);
     const routedModel = output.hookSpecificOutput?.updatedInput?.model;
@@ -271,7 +271,7 @@ describe("issue #4933: opt-in fable model routing (subprocess)", () => {
     // Validate subprocess success and output are present before parsing
     expect(result.exitCode, `subprocess failed with stderr: ${result.stderr}`).toBe(0);
     expect(result.stdout, "subprocess must produce valid JSON output").toBeTruthy();
-    
+
     // Parse and validate the output to check if fable was accepted
     const output = JSON.parse(result.stdout);
     const routedModel = output.hookSpecificOutput?.updatedInput?.model;
@@ -288,7 +288,7 @@ describe("issue #4933: opt-in fable model routing (subprocess)", () => {
     // Validate subprocess success and output are present before parsing
     expect(result.exitCode, `subprocess failed with stderr: ${result.stderr}`).toBe(0);
     expect(result.stdout, "subprocess must produce valid JSON output").toBeTruthy();
-    
+
     // Parse and validate that explicit fable is accepted when opt-in is enabled
     const output = JSON.parse(result.stdout);
     const routedModel = output.hookSpecificOutput?.updatedInput?.model;
@@ -305,7 +305,7 @@ describe("issue #4933: opt-in fable model routing (subprocess)", () => {
     // Validate subprocess success and output are present before parsing
     expect(result.exitCode, `subprocess failed with stderr: ${result.stderr}`).toBe(0);
     expect(result.stdout, "subprocess must produce valid JSON output").toBeTruthy();
-    
+
     // Parse and validate that explicit fable is rejected when opt-in is disabled
     const output = JSON.parse(result.stdout);
     const routedModel = output.hookSpecificOutput?.updatedInput?.model;

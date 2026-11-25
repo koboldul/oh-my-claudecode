@@ -252,8 +252,8 @@ function resolveSuperprojectRoot(cwd: string): string | null {
       completed = true;
       break;
     }
-    anchor = superRoot;
-    probeCwd = superRoot;
+    anchor = canonicalizeExistingPath(superRoot) ?? superRoot;
+    probeCwd = anchor;
   }
 
   if (completed) {
@@ -900,11 +900,7 @@ function cacheGitTopLevel(key: string, root: string, cwd: string): void {
   });
 }
 
-/**
- * Resolve a literal Git top-level with positive, metadata-validated caching.
- * Security-sensitive containment decisions must call probeGitTopLevel() instead.
- */
-export function getGitTopLevel(cwd?: string): string | null {
+function resolveGitTopLevel(cwd?: string, stateLocationOnly = false): string | null {
   const effectiveCwd = cwd || process.cwd();
   const key = canonicalizeExistingPath(effectiveCwd) ?? resolve(effectiveCwd);
   const cached = gitTopLevelCacheMap.get(key);
@@ -918,9 +914,26 @@ export function getGitTopLevel(cwd?: string): string | null {
   }
 
   const probe = probeGitTopLevel(effectiveCwd);
-  if (probe.status !== 'ok') return null;
+  if (probe.status !== 'ok') {
+    return stateLocationOnly && probe.status === 'git_missing'
+      ? findGitMetadataDir(key)
+      : null;
+  }
   cacheGitTopLevel(key, probe.root, effectiveCwd);
   return probe.root;
+}
+
+/**
+ * Resolve a literal Git top-level with positive, metadata-validated caching.
+ * Security-sensitive containment decisions must call probeGitTopLevel() instead.
+ */
+export function getGitTopLevel(cwd?: string): string | null {
+  return resolveGitTopLevel(cwd);
+}
+
+/** Filesystem discovery is for state location only, never repository authorization. */
+function getStateGitTopLevel(cwd?: string): string | null {
+  return resolveGitTopLevel(cwd, true);
 }
 
 
@@ -965,7 +978,7 @@ export function getWorktreeRoot(cwd?: string): string | null {
 
   // Prefer the superproject working tree when cwd is inside a submodule (#3349);
   // otherwise the literal git toplevel.
-  const root = resolveSuperprojectRoot(effectiveCwd) || getGitTopLevel(effectiveCwd);
+  const root = resolveSuperprojectRoot(effectiveCwd) || getStateGitTopLevel(effectiveCwd);
   if (!root) {
     // Not in a git repository - do NOT cache fallback
     // so that if directory becomes a git repo later, we re-detect
@@ -1163,7 +1176,7 @@ export function getProjectIdentifier(worktreeRoot?: string): string {
   // getGitTopLevel() (literal toplevel, no climb) so a process launched inside a
   // submodule still resolves the submodule's own identity, and findWorkspaceRoot
   // below sees the unclimbed root so an inner `.omc-workspace` marker is honored.
-  const root = worktreeRoot || getGitTopLevel() || process.cwd();
+  const root = worktreeRoot || getStateGitTopLevel() || process.cwd();
   const operationScope = projectIdentifierOperationScope.getStore();
   const operationScopeKey = operationScope ? canonicalizeExistingPath(root) ?? resolve(root) : null;
   if (operationScope && operationScopeKey) {
@@ -1273,9 +1286,9 @@ export function getOmcRoot(worktreeRoot?: string): string {
     // (getGitTopLevel) for the no-arg fallback so a submodule launched without
     // an explicit worktreeRoot keeps its own centralized id rather than merging
     // into the parent project's (preserves submodule identity).
-    const root = worktreeRoot || getGitTopLevel() || process.cwd();
+    const root = worktreeRoot || getStateGitTopLevel() || process.cwd();
     const workspaceRoot = findWorkspaceRoot(root);
-    const gitTopLevel = getGitTopLevel(root);
+    const gitTopLevel = getStateGitTopLevel(root);
     const projectId = !gitTopLevel && !workspaceRoot ? 'non-git' : getProjectIdentifier(root);
     const centralizedPath = join(customDir, projectId);
 
@@ -1328,7 +1341,7 @@ export function getOmcRoot(worktreeRoot?: string): string {
   }
 
   const root = resolveStateAnchorRoot(worktreeRoot);
-  if (!getGitTopLevel(root)) {
+  if (!getStateGitTopLevel(root)) {
     return join(resolveNonGitStateAnchor(root), OmcPaths.ROOT);
   }
   // Symmetric diagnostic for git-anchored projects: the legacy branch was

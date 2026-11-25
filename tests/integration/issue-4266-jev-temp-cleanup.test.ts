@@ -425,7 +425,7 @@ describe("issue #4266: Jev temp directory cleanup", () => {
       });
       console.log(JSON.stringify({ result }));
     `;
-    
+
     try {
       // Spawn with invalid executable to trigger error handling
       const badNodePath = "/nonexistent/node/path";
@@ -444,13 +444,13 @@ describe("issue #4266: Jev temp directory cleanup", () => {
         encoding: "utf8",
         timeout: 1000,
       });
-      
+
       // The outer spawn fails because badNodePath doesn't exist, but that's expected.
       // The test verifies that when recordJevShadow encounters a spawn error,
       // it cleans up its temp directory. Since we can't directly test the spawn error
       // in recordJevShadow here, we verify the logic path through context logging.
       expect(result.status).not.toBe(0);
-      
+
       // Verify temp directories were cleaned up
       const tempDirs = readdirSync(tempRoot).filter((entry) => entry.startsWith("omc-jev-"));
       expect(tempDirs).toHaveLength(0);

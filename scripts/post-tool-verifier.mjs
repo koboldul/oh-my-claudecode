@@ -592,7 +592,7 @@ async function maybeBuildPreemptiveCompactionMessage(toolName, data, directory) 
   }
 
   let action = percentUsed >= criticalThreshold ? 'compact' : 'warn';
-  const rawResponse = data.tool_response || data.toolOutput || '';
+  const rawResponse = data.toolOutput || '';
   const toolResponse = typeof rawResponse === 'string' ? rawResponse : JSON.stringify(rawResponse);
   const firstLine = toolResponse.split(/\r?\n/, 1)[0] || '';
 

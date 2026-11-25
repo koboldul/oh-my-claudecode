@@ -173,8 +173,8 @@ function resolveSuperprojectRoot(cwd) {
       completed = true;
       break;
     }
-    anchor = superRoot;
-    probeCwd = superRoot;
+    anchor = canonicalizeExistingPath(superRoot) ?? superRoot;
+    probeCwd = anchor;
   }
   if (completed) {
     if (superprojectCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
@@ -664,7 +664,7 @@ function cacheGitTopLevel(key, root, cwd) {
     environmentSignature: gitProbeEnvironmentSignature()
   });
 }
-function getGitTopLevel(cwd) {
+function resolveGitTopLevel(cwd, stateLocationOnly = false) {
   const effectiveCwd = cwd || process.cwd();
   const key = canonicalizeExistingPath(effectiveCwd) ?? (0, import_path2.resolve)(effectiveCwd);
   const cached = gitTopLevelCacheMap.get(key);
@@ -677,9 +677,17 @@ function getGitTopLevel(cwd) {
     gitTopLevelCacheMap.delete(key);
   }
   const probe = probeGitTopLevel(effectiveCwd);
-  if (probe.status !== "ok") return null;
+  if (probe.status !== "ok") {
+    return stateLocationOnly && probe.status === "git_missing" ? findGitMetadataDir(key) : null;
+  }
   cacheGitTopLevel(key, probe.root, effectiveCwd);
   return probe.root;
+}
+function getGitTopLevel(cwd) {
+  return resolveGitTopLevel(cwd);
+}
+function getStateGitTopLevel(cwd) {
+  return resolveGitTopLevel(cwd, true);
 }
 function getWorktreeRoot(cwd) {
   const effectiveCwd = cwd || process.cwd();
@@ -692,7 +700,7 @@ function getWorktreeRoot(cwd) {
     }
     worktreeCacheMap.delete(effectiveCwd);
   }
-  const root = resolveSuperprojectRoot(effectiveCwd) || getGitTopLevel(effectiveCwd);
+  const root = resolveSuperprojectRoot(effectiveCwd) || getStateGitTopLevel(effectiveCwd);
   if (!root) {
     return null;
   }
@@ -738,7 +746,7 @@ function discoverCentralizedDirFromSettings() {
   return null;
 }
 function getProjectIdentifier(worktreeRoot) {
-  const root = worktreeRoot || getGitTopLevel() || process.cwd();
+  const root = worktreeRoot || getStateGitTopLevel() || process.cwd();
   const operationScope = projectIdentifierOperationScope.getStore();
   const operationScopeKey = operationScope ? canonicalizeExistingPath(root) ?? (0, import_path2.resolve)(root) : null;
   if (operationScope && operationScopeKey) {
@@ -810,9 +818,9 @@ function getProjectIdentifier(worktreeRoot) {
 function getOmcRoot(worktreeRoot) {
   const customDir = process.env.OMC_STATE_DIR;
   if (customDir) {
-    const root2 = worktreeRoot || getGitTopLevel() || process.cwd();
+    const root2 = worktreeRoot || getStateGitTopLevel() || process.cwd();
     const workspaceRoot = findWorkspaceRoot(root2);
-    const gitTopLevel = getGitTopLevel(root2);
+    const gitTopLevel = getStateGitTopLevel(root2);
     const projectId = !gitTopLevel && !workspaceRoot ? "non-git" : getProjectIdentifier(root2);
     const centralizedPath = (0, import_path2.join)(customDir, projectId);
     const legacyPath = (0, import_path2.join)(root2, OmcPaths.ROOT);
@@ -853,7 +861,7 @@ function getOmcRoot(worktreeRoot) {
     return (0, import_path2.join)(workspaceAnchor, OmcPaths.ROOT);
   }
   const root = resolveStateAnchorRoot(worktreeRoot);
-  if (!getGitTopLevel(root)) {
+  if (!getStateGitTopLevel(root)) {
     return (0, import_path2.join)(resolveNonGitStateAnchor(root), OmcPaths.ROOT);
   }
   try {

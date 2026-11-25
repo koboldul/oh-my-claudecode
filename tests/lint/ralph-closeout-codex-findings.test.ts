@@ -25,7 +25,7 @@ describe('Ralph Closeout Codex Findings', () => {
     tmpDir = `/tmp/ralph-test-${randomUUID()}`;
     sessionId = randomUUID();
     mkdirSync(tmpDir, { recursive: true });
-    
+
     // Create a minimal OMC state structure
     stateRoot = join(tmpDir, '.omc');
     mkdirSync(join(stateRoot, 'state', 'sessions', sessionId), { recursive: true });
@@ -89,7 +89,7 @@ describe('Ralph Closeout Codex Findings', () => {
         deslop: 'completed',
         criteriaRevision: 'test-hash-v1',
       });
-      
+
       expect(written).toBe(true);
       expect(existsSync(path)).toBe(true);
     });
@@ -151,7 +151,7 @@ describe('Ralph Closeout Codex Findings', () => {
       // Create a valid, anchored PRD with required fields and a completed story
       const prdPath = join(stateRoot, 'state', 'sessions', sessionId, 'prd.json');
       mkdirSync(join(stateRoot, 'state', 'sessions', sessionId), { recursive: true });
-      
+
       writeFileSync(prdPath, JSON.stringify({
         version: 1,
         project: 'test-project',
@@ -204,7 +204,7 @@ describe('Ralph Closeout Codex Findings', () => {
       // Create the same valid PRD
       const prdPath = join(stateRoot, 'state', 'sessions', sessionId, 'prd.json');
       mkdirSync(join(stateRoot, 'state', 'sessions', sessionId), { recursive: true });
-      
+
       writeFileSync(prdPath, JSON.stringify({
         version: 1,
         project: 'test-project',

@@ -530,11 +530,7 @@ async function main() {
   try {
     const input = await readStdin();
     const runtime = loadHookRuntime();
-    try {
-      const data = JSON.parse(input);
-      setJevSessionId(data.session_id || data.sessionId, data.agent_id || data.agentId);
-      await setJevHookContext(data);
-    } catch { /* canonical input handling below owns malformed input */ }
+    let jevContextInitialized = false;
     let shellChecks;
     if (process.env.OMC_SHELL_CHECKS === '1') {
       try { shellChecks = await import('./lib/shell-checks.mjs'); } catch { /* fail open */ }
@@ -594,7 +590,19 @@ async function main() {
     const result = await runtime.runHookJson(
       'pre-tool-use',
       input,
-      (unit, envelope) => {
+      async (unit, envelope) => {
+        if (!jevContextInitialized) {
+          jevContextInitialized = true;
+          const data = runtime.buildLegacyProcessorInput(envelope, unit);
+          setJevSessionId(envelope.sessionId, envelope.agent?.id);
+          await setJevHookContext({
+            ...data,
+            tool_use_id: envelope.toolCalls.length === 1 ? unit.call?.id : undefined,
+            toolUseId: undefined,
+            agent_id: envelope.agent?.id,
+            agent_type: envelope.agent?.name,
+          });
+        }
         const currentPlan = ensurePlan(envelope);
         const evaluation = currentPlan.evaluations.find(
           (candidate) => candidate.callId === unit.callId,

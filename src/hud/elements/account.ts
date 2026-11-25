@@ -67,17 +67,17 @@ function validateEmail(value: unknown): EmailValidationResult {
   // Check for control characters and bidi controls
   for (let i = 0; i < value.length; i += 1) {
     const code = value.charCodeAt(i);
-    
+
     // C0 controls (U+0000–U+001F), including TAB (0x09), LF (0x0A), CR (0x0D), ESC (0x1B)
     if (code <= 0x1f) {
       return { valid: false };
     }
-    
+
     // C1 controls (U+0080–U+009F)
     if (code >= 0x80 && code <= 0x9f) {
       return { valid: false };
     }
-    
+
     // Bidi/direction controls: U+200E–U+200F (LRM, RLM), U+202A–U+202E (LRE, RLE, PDF, LRO, RLO),
     // U+2066–U+2069 (LRI, RLI, FSI, PDI)
     if ((code >= 0x200e && code <= 0x200f) ||
@@ -85,7 +85,7 @@ function validateEmail(value: unknown): EmailValidationResult {
         (code >= 0x2066 && code <= 0x2069)) {
       return { valid: false };
     }
-    
+
     // Whitespace (common variants)
     if (code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d || code === 0x0b || code === 0x0c) {
       return { valid: false };

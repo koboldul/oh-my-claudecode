@@ -171,8 +171,8 @@ function resolveSuperprojectRoot(cwd) {
       completed = true;
       break;
     }
-    anchor = superRoot;
-    probeCwd = superRoot;
+    anchor = canonicalizeExistingPath(superRoot) ?? superRoot;
+    probeCwd = anchor;
   }
   if (completed) {
     if (superprojectCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
@@ -665,7 +665,7 @@ function cacheGitTopLevel(key, root, cwd) {
     environmentSignature: gitProbeEnvironmentSignature()
   });
 }
-function getGitTopLevel(cwd) {
+function resolveGitTopLevel(cwd, stateLocationOnly = false) {
   const effectiveCwd = cwd || process.cwd();
   const key = canonicalizeExistingPath(effectiveCwd) ?? (0, import_path2.resolve)(effectiveCwd);
   const cached = gitTopLevelCacheMap.get(key);
@@ -678,9 +678,14 @@ function getGitTopLevel(cwd) {
     gitTopLevelCacheMap.delete(key);
   }
   const probe = probeGitTopLevel(effectiveCwd);
-  if (probe.status !== "ok") return null;
+  if (probe.status !== "ok") {
+    return stateLocationOnly && probe.status === "git_missing" ? findGitMetadataDir(key) : null;
+  }
   cacheGitTopLevel(key, probe.root, effectiveCwd);
   return probe.root;
+}
+function getStateGitTopLevel(cwd) {
+  return resolveGitTopLevel(cwd, true);
 }
 function getWorktreeRoot(cwd) {
   const effectiveCwd = cwd || process.cwd();
@@ -693,7 +698,7 @@ function getWorktreeRoot(cwd) {
     }
     worktreeCacheMap.delete(effectiveCwd);
   }
-  const root = resolveSuperprojectRoot(effectiveCwd) || getGitTopLevel(effectiveCwd);
+  const root = resolveSuperprojectRoot(effectiveCwd) || getStateGitTopLevel(effectiveCwd);
   if (!root) {
     return null;
   }
@@ -731,7 +736,7 @@ function discoverCentralizedDirFromSettings() {
   return null;
 }
 function getProjectIdentifier(worktreeRoot) {
-  const root = worktreeRoot || getGitTopLevel() || process.cwd();
+  const root = worktreeRoot || getStateGitTopLevel() || process.cwd();
   const operationScope = projectIdentifierOperationScope.getStore();
   const operationScopeKey = operationScope ? canonicalizeExistingPath(root) ?? (0, import_path2.resolve)(root) : null;
   if (operationScope && operationScopeKey) {
@@ -803,9 +808,9 @@ function getProjectIdentifier(worktreeRoot) {
 function getOmcRoot(worktreeRoot) {
   const customDir = process.env.OMC_STATE_DIR;
   if (customDir) {
-    const root2 = worktreeRoot || getGitTopLevel() || process.cwd();
+    const root2 = worktreeRoot || getStateGitTopLevel() || process.cwd();
     const workspaceRoot = findWorkspaceRoot(root2);
-    const gitTopLevel = getGitTopLevel(root2);
+    const gitTopLevel = getStateGitTopLevel(root2);
     const projectId = !gitTopLevel && !workspaceRoot ? "non-git" : getProjectIdentifier(root2);
     const centralizedPath = (0, import_path2.join)(customDir, projectId);
     const legacyPath = (0, import_path2.join)(root2, OmcPaths.ROOT);
@@ -846,7 +851,7 @@ function getOmcRoot(worktreeRoot) {
     return (0, import_path2.join)(workspaceAnchor, OmcPaths.ROOT);
   }
   const root = resolveStateAnchorRoot(worktreeRoot);
-  if (!getGitTopLevel(root)) {
+  if (!getStateGitTopLevel(root)) {
     return (0, import_path2.join)(resolveNonGitStateAnchor(root), OmcPaths.ROOT);
   }
   try {
@@ -8429,6 +8434,9 @@ async function readTeamScaleUpWorktreeRecoveryEvidence(binding, operationId) {
   return state.value;
 }
 async function listTeamScaleUpWorktreeRecoveryEvidence(input) {
+  return withTeamStatePathScope(input.cwd, () => listTeamScaleUpWorktreeRecoveryEvidenceOwned(input));
+}
+async function listTeamScaleUpWorktreeRecoveryEvidenceOwned(input) {
   const binding = bindingFromBoundInput(input);
   const root = scaleUpRecoveryPaths(binding, "probe").root;
   await assertTeamStatePathSafe(binding.cwd, root);
@@ -20860,9 +20868,6 @@ async function spawnV2Worker(opts) {
     launchProvider,
     tmuxServerIdentity,
     void 0,
-    // Allocate worker tabs in the persisted team workspace; never derive the
-    // workspace from the split target, which for the first worker is the
-    // leader pane living in a different workspace.
     launchProvider === "herdr" ? herdrWorkspaceIdFromSessionTarget(opts.sessionName) : void 0
   );
   const ownershipResult = proveWorkerPaneOwnership(split, {
@@ -25522,6 +25527,9 @@ async function cleanupStaleReservations(teamName, cwd) {
   }
 }
 async function shutdownTeamV2(teamName, cwd, options = {}) {
+  return withTeamStatePathScope(cwd, () => shutdownTeamV2Owned(teamName, cwd, options));
+}
+async function shutdownTeamV2Owned(teamName, cwd, options = {}) {
   const logEventFailure = createSwallowedErrorLogger(
     "team.runtime-v2.shutdownTeamV2 appendTeamEvent failed"
   );

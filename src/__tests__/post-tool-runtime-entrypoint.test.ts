@@ -1356,9 +1356,11 @@ describe('shipped post-tool canonical runtime entrypoints', () => {
     ) as HookPayload;
     expect(claudeState).toMatchObject({
       tool_name: 'Bash',
-      error: '<tool-error>',
+      error: 'Tool execution failed (details omitted for privacy).',
       retry_count: 1,
     });
+    expect(claudeState).not.toHaveProperty('tool_input_preview');
+    expect(JSON.stringify(claudeState)).not.toContain('<tool-error>');
 
     expectExactOutput(
       runHook(
@@ -1393,11 +1395,12 @@ describe('shipped post-tool canonical runtime entrypoints', () => {
     ) as HookPayload;
     expect(copilotState).toMatchObject({
       tool_name: 'Glob',
-      tool_input_preview:
-        '{"pattern":"<glob-pattern>","paths":"<path>"}',
-      error: 'glob failed',
+      error: 'Tool execution failed (details omitted for privacy).',
       retry_count: 1,
     });
+    expect(copilotState).not.toHaveProperty('tool_input_preview');
+    expect(JSON.stringify(copilotState)).not.toContain('glob failed');
+    expect(JSON.stringify(copilotState)).not.toContain('<glob-pattern>');
   });
 
   it.each(
@@ -1559,7 +1562,13 @@ describe('shipped post-tool canonical runtime entrypoints', () => {
       expect(source, name).toContain(
         'runtime.buildLegacyProcessorInput(envelope, unit)',
       );
-      expect(source, name).toContain('runtime.encodeHookOutput(');
+      expect(source, name).toContain(
+        name === 'post-tool-rules-injector'
+          ? 'encodeLegacyCompatibleHookOutput(runtime, result, legacyOutput)'
+          : name === 'post-tool-use-failure'
+            ? 'runtime.encodeLegacyCompatibleHookOutput('
+            : 'runtime.encodeHookOutput(',
+      );
       expect(source, name).toContain('surfaceOptionalHookFailure(');
       expect(source, name).not.toContain('normalizeLegacyHookInput');
       expect(source, name).not.toMatch(/JSON\.parse\(\s*input\s*\)/);

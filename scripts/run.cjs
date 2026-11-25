@@ -1553,7 +1553,8 @@ function createProtocolSink(hooks = {}) {
   function settleOutputs(timeoutMs, idleMs = PROTOCOL_SOURCE_IDLE_MS, reapIdleSources = true) {
     const active = [...bindings.stdout, ...bindings.stderr];
     if (active.length === 0) return Promise.resolve(true);
-    const deadline = Date.now() + Math.max(1, timeoutMs);
+    const settlingStartedAt = Date.now();
+    const deadline = settlingStartedAt + Math.max(1, timeoutMs);
     return new Promise(resolve => {
       let settled = false;
       const finish = (complete) => {
@@ -1576,7 +1577,7 @@ function createProtocolSink(hooks = {}) {
         const now = Date.now();
         for (const binding of active) {
           if (binding.completed || binding.writer.destroyed) continue;
-          if (now - binding.lastProgressAt < idleMs) continue;
+          if (now - Math.max(binding.lastProgressAt, settlingStartedAt) < idleMs) continue;
           const sourceEnded = binding.source.readableEnded || binding.source.destroyed;
           const bufferedBytes = binding.source.readableLength + binding.tap.readableLength +
             binding.writer.writableLength + (binding.dest.writableLength || 0);

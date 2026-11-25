@@ -104,7 +104,7 @@ describe('applyLoopContinuationShadow', () => {
       heuristic: boolean | number | null;
       jev: { type: string } | null;
     });
-    // heuristics are extracted by mapHeuristic: 
+    // heuristics are extracted by mapHeuristic:
     // - noul=!shouldBlock (task complete question)
     // - score=null (no reliable progress data, make non-comparable)
     // logs may be written in any order since both are async (non-blocking points)
@@ -166,7 +166,7 @@ describe('applyLoopContinuationShadow', () => {
     process.env.TYPESAFE_API_KEY = 'test-key-123';
     process.env.OMC_JEV = 'loop-continuation';
     const { fetchFn, calls } = stubFetch();
-    
+
     // Team pipeline failure: shouldBlock=false (allow stopping) but task is NOT complete
     const teamFailed: PersistentModeResult = {
       shouldBlock: false,
@@ -182,7 +182,7 @@ describe('applyLoopContinuationShadow', () => {
     const lines = await readLogLines();
     expect(lines).toHaveLength(2);
     const parsed = lines.map((line) => JSON.parse(line) as { point: string; jev: { type: string } | null; heuristic: boolean | null });
-    
+
     // When team mode fails/cancels, the noul (task complete) heuristic should be null
     // not !shouldBlock (which would be true), because shouldBlock=false here means
     // "stop for safety" not "task is complete"
@@ -194,7 +194,7 @@ describe('applyLoopContinuationShadow', () => {
     process.env.TYPESAFE_API_KEY = 'test-key-123';
     process.env.OMC_JEV = 'loop-continuation';
     const { fetchFn, calls } = stubFetch();
-    
+
     // Ralplan circuit breaker: shouldBlock=false (allow stopping) but task is NOT complete
     const ralplanTripped: PersistentModeResult = {
       shouldBlock: false,
@@ -217,7 +217,7 @@ describe('applyLoopContinuationShadow', () => {
     process.env.TYPESAFE_API_KEY = 'test-key-123';
     process.env.OMC_JEV = 'loop-continuation';
     const { fetchFn, calls } = stubFetch();
-    
+
     // Autoresearch failure: shouldBlock=false (allow stopping) but task is NOT complete
     const autoresearchFailed: PersistentModeResult = {
       shouldBlock: false,

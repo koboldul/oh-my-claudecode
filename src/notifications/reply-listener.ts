@@ -436,15 +436,15 @@ const APPROVAL_DENY_WORDS = new Set([
 export function parseApprovalReply(text: string): "approved" | "denied" | null {
   const trimmed = text.trim().toLowerCase();
   if (!trimmed) return null;
-  
+
   // Question marks indicate uncertainty, so reject immediately
   if (trimmed.includes("?") || trimmed.includes("？")) return null;
-  
+
   // Extract the first word as a sequence of non-whitespace, non-punctuation characters.
   // This handles cases like "Yes, ship it" → "yes" and "拒绝，先修测试" → "拒绝".
   const match = trimmed.match(/^([^\s.!,、，。?？]+)/u);
   if (!match) return null;
-  
+
   const cleanedWord = match[1];
   if (APPROVAL_APPROVE_WORDS.has(cleanedWord)) return "approved";
   if (APPROVAL_DENY_WORDS.has(cleanedWord)) return "denied";

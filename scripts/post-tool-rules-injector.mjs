@@ -459,7 +459,7 @@ async function main() {
             additionalContext: legacyContext,
           },
         }
-      : { continue: true };
+      : { continue: true, suppressOutput: true };
     const output = encodeLegacyCompatibleHookOutput(runtime, result, legacyOutput);
     const deliveredRecords = emittedDeliveries;
 

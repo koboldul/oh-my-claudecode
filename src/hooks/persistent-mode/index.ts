@@ -1240,12 +1240,12 @@ function checkArchitectRejectionInTranscript(
         continue;
       }
 
+      // Same pattern set the detector uses, so the prefilter cannot reject
+      // wording that detectArchitectRejection() would have accepted.
       const outputs = collectReviewerOutputs(
         candidate,
         verificationState,
         TRANSCRIPT_APPROVAL_SCAN_BYTES,
-        // Same pattern set the detector uses, so the prefilter cannot reject
-        // wording that detectArchitectRejection() would have accepted.
         (content) => hasRejectionSignal(content),
       );
       for (const output of outputs) {

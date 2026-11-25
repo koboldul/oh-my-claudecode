@@ -655,7 +655,7 @@ describe("jev active-mode subprocess repro", () => {
       cwd,
       session_id: "test-sess-keyword",
     };
-    
+
     // Baseline: Run without Jev to see default behavior
     requests = [];
     const baseline = await runScript(
@@ -669,7 +669,7 @@ describe("jev active-mode subprocess repro", () => {
     // Default should include both 'ralph' and 'autopilot' since they're in the prompt
     expect(baselineOutput).toContain("ralph");
     expect(baselineOutput).toContain("autopilot");
-    
+
     // Run with task-size:active returning 'small'
     // Heavy keywords should be filtered out
     requests = [];
@@ -685,7 +685,7 @@ describe("jev active-mode subprocess repro", () => {
     expect(smallParsed.suppressOutput).toBe(true);
     expect(withSmall.stdout).not.toContain("ralph");
     expect(withSmall.stdout).not.toContain("autopilot");
-    
+
     // Verify task-size request was made
     const taskSizeRequest = requests.find((entry) => "task-size" in entry.body.questions);
     expect(taskSizeRequest).toBeDefined();
@@ -795,7 +795,7 @@ describe("jev active-mode subprocess repro", () => {
       cwd,
       session_id: "test-sess-keyword",
     };
-    
+
     // Run with task-size:active returning 'opus' (not 'small')
     requests = [];
     choice = "opus";
@@ -809,7 +809,7 @@ describe("jev active-mode subprocess repro", () => {
     const opusOutput = JSON.parse(withOpus.stdout).hookSpecificOutput.additionalContext;
     // When task-size returns 'opus' (not 'small'), 'ralph' should still be there
     expect(opusOutput).toContain("ralph");
-    
+
     // Verify task-size request was made
     const taskSizeRequest = requests.find((entry) => "task-size" in entry.body.questions);
     expect(taskSizeRequest).toBeDefined();
@@ -1010,7 +1010,7 @@ describe("jev active-mode subprocess repro", () => {
       createAutopilotState(sessionId),
     );
     const input = persistentModeInput(sessionId);
-    
+
     requests = [];
     noulAnswer = 0.95;
     const result = await runScript(
@@ -1019,7 +1019,7 @@ describe("jev active-mode subprocess repro", () => {
       { ...env, OMC_JEV: "loop-continuation:active" },
       cwd,
     );
-    
+
     expect(result.exitCode, result.stderr).toBe(0);
     expectJevCompletionRelease(result.stdout, "autopilot");
 
@@ -1041,7 +1041,7 @@ describe("jev active-mode subprocess repro", () => {
     expect(req.body.state.last_assistant_message).toBe(
       "The implementation is complete.",
     );
-    
+
     // Read the resulting state file and verify BOTH phase fields are set to 'complete'
     const resultingState = JSON.parse(readFileSync(autopilotStatePath, "utf8")) as Record<string, unknown>;
     expect(resultingState.active).toBe(false);
@@ -1204,4 +1204,3 @@ describe("jev active-mode subprocess repro", () => {
     15000,
   );
 });
-

@@ -2076,6 +2076,9 @@ async function spawnV2Worker(
     }))
   )
     throw new Error("worker_pane_split_target_unverified");
+  // Allocate worker tabs in the persisted team workspace; never derive the
+  // workspace from the split target, which for the first worker is the
+  // leader pane living in a different workspace.
   const split = await splitTeamWorkerPaneWithEvidence(
     splitTarget,
     splitDirection,
@@ -2083,9 +2086,6 @@ async function spawnV2Worker(
     launchProvider,
     tmuxServerIdentity,
     undefined,
-    // Allocate worker tabs in the persisted team workspace; never derive the
-    // workspace from the split target, which for the first worker is the
-    // leader pane living in a different workspace.
     launchProvider === "herdr"
       ? herdrWorkspaceIdFromSessionTarget(opts.sessionName)
       : undefined,
@@ -8742,6 +8742,14 @@ function ownerMatchesCurrent(
  * 5. Clean up state
  */
 export async function shutdownTeamV2(
+  teamName: string,
+  cwd: string,
+  options: ShutdownOptionsV2 = {},
+): Promise<ShutdownTeamV2Result> {
+  return withTeamStatePathScope(cwd, () => shutdownTeamV2Owned(teamName, cwd, options));
+}
+
+async function shutdownTeamV2Owned(
   teamName: string,
   cwd: string,
   options: ShutdownOptionsV2 = {},

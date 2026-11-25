@@ -1215,11 +1215,10 @@ async function spawnV2Worker(opts) {
             ...(tmuxServerIdentity ? { tmuxServerIdentity } : {}),
         })))
         throw new Error("worker_pane_split_target_unverified");
-    const split = await splitTeamWorkerPaneWithEvidence(splitTarget, splitDirection, opts.workerCwd ?? opts.cwd, launchProvider, tmuxServerIdentity, undefined, 
     // Allocate worker tabs in the persisted team workspace; never derive the
     // workspace from the split target, which for the first worker is the
     // leader pane living in a different workspace.
-    launchProvider === "herdr"
+    const split = await splitTeamWorkerPaneWithEvidence(splitTarget, splitDirection, opts.workerCwd ?? opts.cwd, launchProvider, tmuxServerIdentity, undefined, launchProvider === "herdr"
         ? herdrWorkspaceIdFromSessionTarget(opts.sessionName)
         : undefined);
     const ownershipResult = proveWorkerPaneOwnership(split, {
@@ -6024,6 +6023,9 @@ function ownerMatchesCurrent(owner) {
  * 5. Clean up state
  */
 export async function shutdownTeamV2(teamName, cwd, options = {}) {
+    return withTeamStatePathScope(cwd, () => shutdownTeamV2Owned(teamName, cwd, options));
+}
+async function shutdownTeamV2Owned(teamName, cwd, options = {}) {
     const logEventFailure = createSwallowedErrorLogger("team.runtime-v2.shutdownTeamV2 appendTeamEvent failed");
     const force = options.force === true;
     const ralph = options.ralph === true;

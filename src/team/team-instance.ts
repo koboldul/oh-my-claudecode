@@ -808,6 +808,12 @@ async function readTeamScaleUpWorktreeRecoveryEvidence(
 export async function listTeamScaleUpWorktreeRecoveryEvidence(
   input: BoundTeamInstance,
 ): Promise<TeamScaleUpWorktreeRecoveryEvidence[]> {
+  return withTeamStatePathScope(input.cwd, () => listTeamScaleUpWorktreeRecoveryEvidenceOwned(input));
+}
+
+async function listTeamScaleUpWorktreeRecoveryEvidenceOwned(
+  input: BoundTeamInstance,
+): Promise<TeamScaleUpWorktreeRecoveryEvidence[]> {
   const binding = bindingFromBoundInput(input);
   const root = scaleUpRecoveryPaths(binding, 'probe').root;
   await assertTeamStatePathSafe(binding.cwd, root);

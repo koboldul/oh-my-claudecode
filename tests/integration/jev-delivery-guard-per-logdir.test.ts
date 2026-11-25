@@ -1,6 +1,6 @@
 /**
  * Jev delivery guard: shown acknowledgments keyed by log directory
- * 
+ *
  * When a session has multiple projects with different log directories,
  * each project should track its own "shown" timestamp independently.
  * A report shown in project A should not affect project B's ability
@@ -94,7 +94,7 @@ describe('jev-delivery-guard per-logdir acknowledgments', () => {
     // Simulate two projects with delivery results
     const ts1 = now - 3600000; // 1 hour ago
     const ts2 = now - 1800000; // 30 minutes ago
-    
+
     // Create delivery report for project 1 (shown earlier, with bad delivery rate)
     const file1 = dailyFile(deliveryDir, logDir1, 'delivery.json');
     writeFileSync(file1, JSON.stringify({ ts: ts1, windowHours: 24, decisions: 100, withAgent: 100, delivered: 90, deliveredPercent: 90, deliveredPercentFull: 90.5, interruptedAgentHooks: 0, interruptedOtherHooks: 0 }), 'utf8');
@@ -137,7 +137,7 @@ describe('jev-delivery-guard per-logdir acknowledgments', () => {
       logDir: logDir2,
       cwd,
     });
-    
+
     // Project 2 report should be displayed since it hasn't been shown before and has bad delivery
     expect(result2).not.toBeNull();
     expect(result2!.text).toContain('85');

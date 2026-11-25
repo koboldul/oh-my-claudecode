@@ -210,7 +210,7 @@ describe('Builtin Skills', () => {
         'what-did-i-get-done',
         'why',
         'wiki',
-    
+
       ];
 
       const actualSkillNames = skills.map((s) => s.name);

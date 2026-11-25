@@ -228,8 +228,8 @@ function resolveSuperprojectRoot(cwd) {
             completed = true;
             break;
         }
-        anchor = superRoot;
-        probeCwd = superRoot;
+        anchor = canonicalizeExistingPath(superRoot) ?? superRoot;
+        probeCwd = anchor;
     }
     if (completed) {
         if (superprojectCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
@@ -841,11 +841,7 @@ function cacheGitTopLevel(key, root, cwd) {
         environmentSignature: gitProbeEnvironmentSignature(),
     });
 }
-/**
- * Resolve a literal Git top-level with positive, metadata-validated caching.
- * Security-sensitive containment decisions must call probeGitTopLevel() instead.
- */
-export function getGitTopLevel(cwd) {
+function resolveGitTopLevel(cwd, stateLocationOnly = false) {
     const effectiveCwd = cwd || process.cwd();
     const key = canonicalizeExistingPath(effectiveCwd) ?? resolve(effectiveCwd);
     const cached = gitTopLevelCacheMap.get(key);
@@ -858,10 +854,24 @@ export function getGitTopLevel(cwd) {
         gitTopLevelCacheMap.delete(key);
     }
     const probe = probeGitTopLevel(effectiveCwd);
-    if (probe.status !== 'ok')
-        return null;
+    if (probe.status !== 'ok') {
+        return stateLocationOnly && probe.status === 'git_missing'
+            ? findGitMetadataDir(key)
+            : null;
+    }
     cacheGitTopLevel(key, probe.root, effectiveCwd);
     return probe.root;
+}
+/**
+ * Resolve a literal Git top-level with positive, metadata-validated caching.
+ * Security-sensitive containment decisions must call probeGitTopLevel() instead.
+ */
+export function getGitTopLevel(cwd) {
+    return resolveGitTopLevel(cwd);
+}
+/** Filesystem discovery is for state location only, never repository authorization. */
+function getStateGitTopLevel(cwd) {
+    return resolveGitTopLevel(cwd, true);
 }
 function formatGitProbeFailedMessage(workingDirectory) {
     return (`workingDirectory '${workingDirectory}' git probe failed and was not used. ` +
@@ -897,7 +907,7 @@ export function getWorktreeRoot(cwd) {
     }
     // Prefer the superproject working tree when cwd is inside a submodule (#3349);
     // otherwise the literal git toplevel.
-    const root = resolveSuperprojectRoot(effectiveCwd) || getGitTopLevel(effectiveCwd);
+    const root = resolveSuperprojectRoot(effectiveCwd) || getStateGitTopLevel(effectiveCwd);
     if (!root) {
         // Not in a git repository - do NOT cache fallback
         // so that if directory becomes a git repo later, we re-detect
@@ -1090,7 +1100,7 @@ export function getProjectIdentifier(worktreeRoot) {
     // getGitTopLevel() (literal toplevel, no climb) so a process launched inside a
     // submodule still resolves the submodule's own identity, and findWorkspaceRoot
     // below sees the unclimbed root so an inner `.omc-workspace` marker is honored.
-    const root = worktreeRoot || getGitTopLevel() || process.cwd();
+    const root = worktreeRoot || getStateGitTopLevel() || process.cwd();
     const operationScope = projectIdentifierOperationScope.getStore();
     const operationScopeKey = operationScope ? canonicalizeExistingPath(root) ?? resolve(root) : null;
     if (operationScope && operationScopeKey) {
@@ -1205,9 +1215,9 @@ export function getOmcRoot(worktreeRoot) {
         // (getGitTopLevel) for the no-arg fallback so a submodule launched without
         // an explicit worktreeRoot keeps its own centralized id rather than merging
         // into the parent project's (preserves submodule identity).
-        const root = worktreeRoot || getGitTopLevel() || process.cwd();
+        const root = worktreeRoot || getStateGitTopLevel() || process.cwd();
         const workspaceRoot = findWorkspaceRoot(root);
-        const gitTopLevel = getGitTopLevel(root);
+        const gitTopLevel = getStateGitTopLevel(root);
         const projectId = !gitTopLevel && !workspaceRoot ? 'non-git' : getProjectIdentifier(root);
         const centralizedPath = join(customDir, projectId);
         // Log notice if both legacy .omc/ and new centralized dir exist
@@ -1254,7 +1264,7 @@ export function getOmcRoot(worktreeRoot) {
         return join(workspaceAnchor, OmcPaths.ROOT);
     }
     const root = resolveStateAnchorRoot(worktreeRoot);
-    if (!getGitTopLevel(root)) {
+    if (!getStateGitTopLevel(root)) {
         return join(resolveNonGitStateAnchor(root), OmcPaths.ROOT);
     }
     // Symmetric diagnostic for git-anchored projects: the legacy branch was

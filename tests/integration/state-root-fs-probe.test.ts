@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -11,7 +11,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 // Long-path form of the temp root: mkdtempSync can inherit an 8.3 short
 // name from tmpdir(), which makes exact path comparisons flaky on Windows.
-const longTmp = realpathSync(tmpdir());
+const longTmp = realpathSync.native(tmpdir());
 
 const fixtures: string[] = [];
 
@@ -26,8 +26,8 @@ function freshGitRepo(): string {
   return dir;
 }
 
-// Force the inline-fallback path (no dist delegation) and strip git from
-// PATH for the duration of the async resolution, restoring afterwards.
+// The script uses package-relative dist; the standalone template uses its
+// inline fallback. Strip git without changing which adapter branch is selected.
 async function resolveWithoutGit(resolveFn: (dir: string) => Promise<string>, dir: string): Promise<string> {
   const savedPath = process.env.PATH;
   const savedPluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
@@ -38,9 +38,12 @@ async function resolveWithoutGit(resolveFn: (dir: string) => Promise<string>, di
   try {
     return await resolveFn(dir);
   } finally {
-    if (savedPath !== undefined) process.env.PATH = savedPath;
-    if (savedPluginRoot !== undefined) process.env.CLAUDE_PLUGIN_ROOT = savedPluginRoot;
-    if (savedStateDir !== undefined) process.env.OMC_STATE_DIR = savedStateDir;
+    if (savedPath === undefined) delete process.env.PATH;
+    else process.env.PATH = savedPath;
+    if (savedPluginRoot === undefined) delete process.env.CLAUDE_PLUGIN_ROOT;
+    else process.env.CLAUDE_PLUGIN_ROOT = savedPluginRoot;
+    if (savedStateDir === undefined) delete process.env.OMC_STATE_DIR;
+    else process.env.OMC_STATE_DIR = savedStateDir;
   }
 }
 
@@ -62,6 +65,28 @@ describe('state-root resolver git probe', () => {
     expect(resolved).toBe(join(dir, '.omc'));
   });
 
+  it('keeps canonical and standalone state discovery separate from strict Git authorization', async () => {
+    const canonical = await import('../../dist/lib/worktree-paths.js');
+    const mirror = await import('../../templates/hooks/lib/state-root.mjs');
+    const dir = freshGitRepo();
+    await resolveWithoutGit(async () => {
+      expect(canonical.probeGitTopLevel(dir)).toEqual({ status: 'git_missing' });
+      expect(canonical.getGitTopLevel(dir)).toBeNull();
+      expect(canonical.getOmcRoot(dir)).toBe(join(dir, '.omc'));
+      expect(await mirror.resolveOmcStateRoot(dir)).toBe(join(dir, '.omc'));
+      const stateDir = join(dir, 'centralized');
+      try {
+        process.env.OMC_STATE_DIR = stateDir;
+        const expected = join(stateDir, canonical.getProjectIdentifier(dir));
+        expect(canonical.getOmcRoot(dir)).toBe(expected);
+        expect(await mirror.resolveOmcStateRoot(dir)).toBe(expected);
+      } finally {
+        delete process.env.OMC_STATE_DIR;
+      }
+      return '';
+    }, dir);
+  });
+
   it('still falls back to the home anchor for genuinely non-git directories', async () => {
     const { resolveOmcStateRoot } = await import('../../scripts/lib/state-root.mjs');
     const { homedir } = await import('node:os');
@@ -74,7 +99,6 @@ describe('state-root resolver git probe', () => {
   it('keeps both mirrors behaviorally identical on a git repo', async () => {
     const script = await import('../../scripts/lib/state-root.mjs');
     const mirror = await import('../../templates/hooks/lib/state-root.mjs');
-    const { realpathSync } = await import('node:fs');
     const dir = freshGitRepo();
     const a = await (script.resolveOmcStateRoot as (d: string) => Promise<string>)(dir);
     const b = await (mirror.resolveOmcStateRoot as (d: string) => Promise<string>)(dir);

@@ -31837,8 +31837,8 @@ function resolveSuperprojectRoot(cwd2) {
       completed = true;
       break;
     }
-    anchor = superRoot;
-    probeCwd = superRoot;
+    anchor = canonicalizeExistingPath(superRoot) ?? superRoot;
+    probeCwd = anchor;
   }
   if (completed) {
     if (superprojectCacheMap.size >= MAX_WORKTREE_CACHE_SIZE) {
@@ -32351,7 +32351,7 @@ function cacheGitTopLevel(key, root2, cwd2) {
     environmentSignature: gitProbeEnvironmentSignature()
   });
 }
-function getGitTopLevel(cwd2) {
+function resolveGitTopLevel(cwd2, stateLocationOnly = false) {
   const effectiveCwd = cwd2 || process.cwd();
   const key = canonicalizeExistingPath(effectiveCwd) ?? (0, import_path19.resolve)(effectiveCwd);
   const cached2 = gitTopLevelCacheMap.get(key);
@@ -32364,9 +32364,17 @@ function getGitTopLevel(cwd2) {
     gitTopLevelCacheMap.delete(key);
   }
   const probe = probeGitTopLevel(effectiveCwd);
-  if (probe.status !== "ok") return null;
+  if (probe.status !== "ok") {
+    return stateLocationOnly && probe.status === "git_missing" ? findGitMetadataDir(key) : null;
+  }
   cacheGitTopLevel(key, probe.root, effectiveCwd);
   return probe.root;
+}
+function getGitTopLevel(cwd2) {
+  return resolveGitTopLevel(cwd2);
+}
+function getStateGitTopLevel(cwd2) {
+  return resolveGitTopLevel(cwd2, true);
 }
 function formatGitProbeFailedMessage(workingDirectory) {
   return `workingDirectory '${workingDirectory}' git probe failed and was not used. Cross-repository access is not permitted; pass a path inside the current repository or start the session there.`;
@@ -32382,7 +32390,7 @@ function getWorktreeRoot(cwd2) {
     }
     worktreeCacheMap.delete(effectiveCwd);
   }
-  const root2 = resolveSuperprojectRoot(effectiveCwd) || getGitTopLevel(effectiveCwd);
+  const root2 = resolveSuperprojectRoot(effectiveCwd) || getStateGitTopLevel(effectiveCwd);
   if (!root2) {
     return null;
   }
@@ -32428,7 +32436,7 @@ function discoverCentralizedDirFromSettings() {
   return null;
 }
 function getProjectIdentifier(worktreeRoot) {
-  const root2 = worktreeRoot || getGitTopLevel() || process.cwd();
+  const root2 = worktreeRoot || getStateGitTopLevel() || process.cwd();
   const operationScope = projectIdentifierOperationScope.getStore();
   const operationScopeKey = operationScope ? canonicalizeExistingPath(root2) ?? (0, import_path19.resolve)(root2) : null;
   if (operationScope && operationScopeKey) {
@@ -32500,9 +32508,9 @@ function getProjectIdentifier(worktreeRoot) {
 function getOmcRoot(worktreeRoot) {
   const customDir = process.env.OMC_STATE_DIR;
   if (customDir) {
-    const root3 = worktreeRoot || getGitTopLevel() || process.cwd();
+    const root3 = worktreeRoot || getStateGitTopLevel() || process.cwd();
     const workspaceRoot = findWorkspaceRoot(root3);
-    const gitTopLevel = getGitTopLevel(root3);
+    const gitTopLevel = getStateGitTopLevel(root3);
     const projectId = !gitTopLevel && !workspaceRoot ? "non-git" : getProjectIdentifier(root3);
     const centralizedPath = (0, import_path19.join)(customDir, projectId);
     const legacyPath = (0, import_path19.join)(root3, OmcPaths.ROOT);
@@ -32543,7 +32551,7 @@ function getOmcRoot(worktreeRoot) {
     return (0, import_path19.join)(workspaceAnchor, OmcPaths.ROOT);
   }
   const root2 = resolveStateAnchorRoot(worktreeRoot);
-  if (!getGitTopLevel(root2)) {
+  if (!getStateGitTopLevel(root2)) {
     return (0, import_path19.join)(resolveNonGitStateAnchor(root2), OmcPaths.ROOT);
   }
   try {
@@ -60219,8 +60227,6 @@ function checkArchitectRejectionInTranscript(sessionId, verificationState, trans
         candidate,
         verificationState,
         TRANSCRIPT_APPROVAL_SCAN_BYTES,
-        // Same pattern set the detector uses, so the prefilter cannot reject
-        // wording that detectArchitectRejection() would have accepted.
         (content) => hasRejectionSignal(content)
       );
       for (const output of outputs) {
@@ -68323,6 +68329,9 @@ async function readTeamScaleUpWorktreeRecoveryEvidence(binding, operationId) {
   return state.value;
 }
 async function listTeamScaleUpWorktreeRecoveryEvidence(input) {
+  return withTeamStatePathScope(input.cwd, () => listTeamScaleUpWorktreeRecoveryEvidenceOwned(input));
+}
+async function listTeamScaleUpWorktreeRecoveryEvidenceOwned(input) {
   const binding = bindingFromBoundInput(input);
   const root2 = scaleUpRecoveryPaths(binding, "probe").root;
   await assertTeamStatePathSafe(binding.cwd, root2);
@@ -81903,9 +81912,6 @@ async function spawnV2Worker(opts) {
     launchProvider,
     tmuxServerIdentity,
     void 0,
-    // Allocate worker tabs in the persisted team workspace; never derive the
-    // workspace from the split target, which for the first worker is the
-    // leader pane living in a different workspace.
     launchProvider === "herdr" ? herdrWorkspaceIdFromSessionTarget(opts.sessionName) : void 0
   );
   const ownershipResult = proveWorkerPaneOwnership(split, {
@@ -86632,6 +86638,9 @@ function ownerMatchesCurrent2(owner) {
   return processStartedAt !== null && owner.pid === process.pid && processStartedAt === owner.process_started_at;
 }
 async function shutdownTeamV2(teamName, cwd2, options = {}) {
+  return withTeamStatePathScope(cwd2, () => shutdownTeamV2Owned(teamName, cwd2, options));
+}
+async function shutdownTeamV2Owned(teamName, cwd2, options = {}) {
   const logEventFailure = createSwallowedErrorLogger(
     "team.runtime-v2.shutdownTeamV2 appendTeamEvent failed"
   );

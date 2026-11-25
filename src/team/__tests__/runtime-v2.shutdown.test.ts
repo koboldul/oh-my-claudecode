@@ -101,6 +101,7 @@ const tmuxMocks = vi.hoisted(() => {
     killOwnedWorkerPane: vi.fn(async () => undefined),
     verifyTeamTargetOwnership: vi.fn(async (): Promise<{ kind: 'owned' | 'unavailable' | 'foreign' | 'provider_mismatch' }> => ({ kind: 'owned' })),
     observeTeamSessionTargetPresence: vi.fn(async (): Promise<{ kind: 'owned' | 'absent' | 'present_unowned' | 'unknown' }> => ({ kind: 'owned' })),
+    workerPaneBelongsToOwnedProviderTarget: vi.fn(async () => true),
   };
 });
 
@@ -128,6 +129,7 @@ vi.mock('../tmux-session.js', async (importOriginal) => {
     killOwnedWorkerPane: tmuxMocks.killOwnedWorkerPane,
     verifyTeamTargetOwnership: tmuxMocks.verifyTeamTargetOwnership,
     observeTeamSessionTargetPresence: tmuxMocks.observeTeamSessionTargetPresence,
+    workerPaneBelongsToOwnedProviderTarget: tmuxMocks.workerPaneBelongsToOwnedProviderTarget,
   };
 
 
@@ -260,7 +262,7 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
     tmuxMocks.verifyTeamTargetOwnership.mockResolvedValue({ kind: 'owned' });
     tmuxMocks.observeTeamSessionTargetPresence.mockReset();
     tmuxMocks.observeTeamSessionTargetPresence.mockResolvedValue({ kind: 'owned' });
-    repoDir = mkdtempSync(join(tmpdir(), 'omc-runtime-v2-shutdown-'));
+    repoDir = realpathSync.native(mkdtempSync(join(tmpdir(), 'omc-runtime-v2-shutdown-')));
     execFileSync('git', ['init'], { cwd: repoDir, stdio: 'pipe' });
     execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir, stdio: 'pipe' });
     execFileSync('git', ['config', 'user.name', 'Test User'], { cwd: repoDir, stdio: 'pipe' });
@@ -343,12 +345,14 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
       state_revision: 0,
       worktree_mode: 'named',
       next_worker_index: 1,
-      leader_pane_id: null,
+      leader_pane_id: '%0',
       hud_pane_id: null,
       resize_hook_name: null,
       resize_hook_target: null,
       next_task_id: 1,
     }, null, 2), 'utf-8');
+    await teamInstanceModule.withTeamInstanceLifecycleLock(repoDir, teamName, () =>
+      teamInstanceModule.activateTeamInstanceUnderLock(binding));
 
     const worktreePath = getWorktreePath(repoDir, teamName, workerName);
     const branch = getBranchName(teamName, workerName);
@@ -441,12 +445,14 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
       state_revision: 0,
       worktree_mode: 'named',
       next_worker_index: 1,
-      leader_pane_id: null,
+      leader_pane_id: '%0',
       hud_pane_id: null,
       resize_hook_name: null,
       resize_hook_target: null,
       next_task_id: 1,
     }, null, 2), 'utf-8');
+    await teamInstanceModule.withTeamInstanceLifecycleLock(repoDir, teamName, () =>
+      teamInstanceModule.activateTeamInstanceUnderLock(binding));
 
     const worktreePath = getWorktreePath(repoDir, teamName, workerName);
     const branch = getBranchName(teamName, workerName);
@@ -606,7 +612,7 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
   });
 
   it('preserves detached cleanup evidence and a named replacement instance', async () => {
-    const teamName = 'disposal-detached-config-receipt';
+    const teamName = 'disposal-config-receipt';
     const workerName = 'worker-2';
     const old = await reserveTeamInstance({
       teamName,
@@ -780,8 +786,9 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
     expect(existsSync(join(teamRoot, 'worktrees.json'))).toBe(true);
   });
 
-  it('uses the canonical team state root in worktree shutdown ack instructions', async () => {
+  it.each(['local', 'centralized'] as const)('uses the canonical team state root in worktree shutdown ack instructions (%s)', async (storage) => {
     const teamName = 'shutdown-worktree-ack-team';
+    if (storage === 'local') delete process.env.OMC_STATE_DIR;
     await reserveFixtureInstance(teamName, repoDir);
     const teamRoot = fixtureTeamRoot(repoDir, teamName);
     mkdirSync(teamRoot, { recursive: true });
@@ -821,7 +828,9 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
     await shutdownTeamV2(teamName, repoDir, { timeoutMs: 0 });
 
     const inbox = readFileSync(join(teamRoot, 'workers', 'worker-wt', 'inbox.md'), 'utf-8');
-    expect(inbox).toContain('$OMC_TEAM_STATE_ROOT/workers/worker-wt/shutdown-ack.json');
+    expect(inbox).toContain(process.platform === 'win32'
+      ? `${teamRoot}/workers/worker-wt/shutdown-ack.json`
+      : '$OMC_TEAM_STATE_ROOT/workers/worker-wt/shutdown-ack.json');
     expect(inbox).not.toContain(`Write your ack to: .omc/state/team/${teamName}`);
   });
 
@@ -1539,7 +1548,9 @@ describe('shutdownTeamV2 detached worktree cleanup', () => {
         // interrupted attempt "live" and block adoption.
         process_started_at: process.platform === 'darwin'
           ? 'darwin:1700000000:123456'
-          : 'linux:424242',
+          : process.platform === 'win32'
+            ? 'win32:424242'
+            : 'linux:424242',
         state_revision: 1,
         created_at: new Date().toISOString(),
       },

@@ -101,7 +101,7 @@ describe("jev-shadow: resolver spawn failure logging", () => {
     // Check that shadow log exists and contains a degraded entry
     const shadowPath = join(cwd, "jev-logs", "shadow.jsonl");
     const lines = readFileSync(shadowPath, "utf-8").trim().split("\n").filter(Boolean);
-    
+
     // Find degraded entry
     const degraded = lines.find((line) => {
       const entry = JSON.parse(line);
@@ -147,7 +147,7 @@ describe("jev-shadow: resolver spawn failure logging", () => {
     const lines = existsSync(shadowPath)
       ? readFileSync(shadowPath, "utf-8").trim().split("\n").filter(Boolean)
       : [];
-    
+
     const degraded = lines.find((line) => {
       const entry = JSON.parse(line);
       return entry.mode === "degraded" && entry.reason === "resolver-spawn";

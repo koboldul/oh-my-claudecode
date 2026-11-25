@@ -617,6 +617,9 @@ async function readTeamScaleUpWorktreeRecoveryEvidence(binding, operationId) {
     return state.value;
 }
 export async function listTeamScaleUpWorktreeRecoveryEvidence(input) {
+    return withTeamStatePathScope(input.cwd, () => listTeamScaleUpWorktreeRecoveryEvidenceOwned(input));
+}
+async function listTeamScaleUpWorktreeRecoveryEvidenceOwned(input) {
     const binding = bindingFromBoundInput(input);
     const root = scaleUpRecoveryPaths(binding, 'probe').root;
     await assertTeamStatePathSafe(binding.cwd, root);

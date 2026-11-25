@@ -21,7 +21,7 @@
  */
 
 import { join, basename, dirname, resolve } from 'path';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, realpathSync } from 'fs';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { homedir } from 'os';
@@ -152,6 +152,7 @@ function isSafeWorkspaceRoot(workspaceRoot) {
  * @returns {Promise<string>} Absolute path to the .omc root
  */
 export async function resolveOmcStateRoot(directory) {
+  directory = existsSync(directory) ? realpathSync.native(directory) : directory;
   const canonicalRoot = resolveCanonicalRoot();
   if (canonicalRoot) {
     try {
@@ -208,6 +209,7 @@ export async function resolveOmcStateRoot(directory) {
  * @returns {Promise<{readPath: string, writePath: string, sessionScopedPath: string|null, legacyPath: string}>} Unbranded paths
  */
 export async function resolveSessionStatePathsForHook(directory, stateName, sessionId, options = {}) {
+  directory = existsSync(directory) ? realpathSync.native(directory) : directory;
   const canonicalRoot = resolveCanonicalRoot();
   if (canonicalRoot) {
     try {

@@ -77,7 +77,7 @@ describe("git top-level memoization", () => {
   const originalCwd = process.cwd();
 
   beforeEach(() => {
-    tempDir = mkdtempSync(join(tmpdir(), "omc-toplevel-cache-"));
+    tempDir = mkdtempSync(join(realpathSync.native(tmpdir()), "omc-toplevel-cache-"));
     process.chdir(originalCwd);
     clearWorktreeCache();
     mockedExecFileSync.mockClear();

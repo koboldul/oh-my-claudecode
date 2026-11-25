@@ -1821,6 +1821,9 @@ export async function scaleUpOwned(
           // Allocate an empty pane through the guarded provider API so the exact
           // server incarnation remains bound from split through launch.
           const scaleUpProvider = providerForTeamTarget(config.tmux_session);
+          // Allocate worker tabs in the persisted team workspace; never
+          // derive the workspace from the split target, which for the
+          // first scale-up worker is the leader pane living elsewhere.
           const splitEvidence = await splitTeamWorkerPaneWithEvidence(
             splitTarget,
             splitDirection === "-h" ? "right" : "down",
@@ -1828,9 +1831,6 @@ export async function scaleUpOwned(
             scaleUpProvider,
             config.tmux_server_identity,
             undefined,
-            // Allocate worker tabs in the persisted team workspace; never
-            // derive the workspace from the split target, which for the
-            // first scale-up worker is the leader pane living elsewhere.
             scaleUpProvider === "herdr"
               ? herdrWorkspaceIdFromSessionTarget(config.tmux_session)
               : undefined,

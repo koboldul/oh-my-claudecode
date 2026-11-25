@@ -347,6 +347,16 @@ describe('shell checks: logs', () => {
   });
 });
 
+describe('shell checks: bash -n spawn failures', () => {
+  it('does not classify a missing executable as an executed Bash check', () => {
+    const result = lib.bashSyntaxCheck('echo ok', {
+      bashPath: join(ROOT, 'tests', 'fixtures', 'missing-bash-executable'),
+    });
+    expect(result).toMatchObject({ ran: false, reason: 'ENOENT' });
+    expect(result).not.toHaveProperty('code');
+  });
+});
+
 describe.skipIf(!bashPath)('shell checks: bash -n handling', () => {
   it('does not deny when bash itself fails (not exit 2): allow with syntax.reason bash-failure, a here-document is still found', () => {
     const unclosed = cases.find((c) => c.id === 'S02')!.command;
@@ -361,7 +371,7 @@ describe.skipIf(!bashPath)('shell checks: bash -n handling', () => {
   });
 
   it('reports a bash that exits before reading its input as bash-failure, not as a check that did not run', () => {
-    // Far more than a pipe buffer, so the write always hits EPIPE once the crashing "bash" has exited.
+    // Far more than a pipe buffer, so the write sees early input closure after the crashing "bash" exits.
     const long = `echo "unclosed ${'x'.repeat(512 * 1024)}`;
     const crashed = lib.checkBashCommand(long, { platform: 'linux', bashPath: process.execPath, timeoutMs: 15000 });
     expect(crashed.decision).toBe('allow');

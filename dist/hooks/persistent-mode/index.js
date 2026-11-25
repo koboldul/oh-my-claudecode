@@ -921,10 +921,9 @@ function checkArchitectRejectionInTranscript(sessionId, verificationState, trans
                 }
                 continue;
             }
-            const outputs = collectReviewerOutputs(candidate, verificationState, TRANSCRIPT_APPROVAL_SCAN_BYTES, 
             // Same pattern set the detector uses, so the prefilter cannot reject
             // wording that detectArchitectRejection() would have accepted.
-            (content) => hasRejectionSignal(content));
+            const outputs = collectReviewerOutputs(candidate, verificationState, TRANSCRIPT_APPROVAL_SCAN_BYTES, (content) => hasRejectionSignal(content));
             for (const output of outputs) {
                 // An output with no timestamp cannot be placed relative to the request,
                 // so it is not treated as this request's verdict.

@@ -164,12 +164,12 @@ describe('issue #4806: plugin hook heuristic format', () => {
     // After the fix, skill-trigger heuristics for ultragoal, ai-slop-cleaner, and wiki
     // should be valid choices in SKILL_TRIGGER_QUESTIONS.criteria, making them comparable.
     // Before the fix, these would have comparable=0 and nonComparable=3.
-    
+
     // Assert the production criteria actually contains these keywords (regression test for issue #4806)
     expect(KEYWORD_PRIORITY).toContain('ultragoal');
     expect(KEYWORD_PRIORITY).toContain('ai-slop-cleaner');
     expect(KEYWORD_PRIORITY).toContain('wiki');
-    
+
     const shadowLog = [
       {
         ts: '2026-11-02T11:00:00.000Z',
@@ -213,11 +213,11 @@ describe('issue #4806: plugin hook heuristic format', () => {
     // With the fix, these heuristics should be comparable (in the criteria)
     expect(report.points).toBeDefined();
     expect(report.points.length).toBeGreaterThan(0);
-    
+
     // Find the skill-trigger point (entries are aggregated by point name)
     const skillTriggerPoint = report.points.find((p: any) => p.point === 'skill-trigger');
     expect(skillTriggerPoint).toBeDefined();
-    
+
     // With the fix: all 3 entries should be comparable (not nonComparable)
     // comparable=3, nonComparable=0
     expect(skillTriggerPoint.comparable).toBe(3);

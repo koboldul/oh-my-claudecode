@@ -1127,8 +1127,10 @@ describe('shipped PreToolUse canonical runtime entrypoint', () => {
     expect(readFileSync(countPath, 'utf8')).toBe('1');
   });
 
-  it('keeps the shipped wrapper parser-free and side-effect-free', () => {
+  it('keeps the shipped entrypoint parser-free with controlled side effects', () => {
     const source = readFileSync(SCRIPT_PATH, 'utf8');
+    const entrypoint = source.slice(source.indexOf('async function main()'));
+    expect(entrypoint.startsWith('async function main()')).toBe(true);
 
     expect(source).toMatch(
       /runtime\.runHookJson\(\s*['"]pre-tool-use['"]/,
@@ -1140,19 +1142,26 @@ describe('shipped PreToolUse canonical runtime entrypoint', () => {
     expect(source).toContain('runtime.encodePreToolEnforcerOutput(');
     expect(source.match(/process\.stdout\.write/g)).toHaveLength(1);
 
-    expect(source).not.toMatch(/\bJSON\.parse\s*\(/);
-    expect(source).not.toMatch(/\bconsole\.(?:log|error|warn)\s*\(/);
+    expect(entrypoint).not.toMatch(/\bJSON\.parse\s*\(/);
+    expect(entrypoint).not.toMatch(/\bconsole\.(?:log|error|warn)\s*\(/);
     expect(source).not.toMatch(
-      /from ['"](?:node:)?(?:fs|crypto|child_process|path|os)['"]/,
+      /from ['"](?:node:)?child_process['"]/,
     );
-    expect(source).not.toMatch(
+    expect(entrypoint).not.toMatch(
       /\b(?:writeFileSync|renameSync|mkdirSync|appendFileSync|atomicWriteJsonSync)\b/,
     );
-    expect(source).not.toMatch(
+    expect(entrypoint).not.toMatch(
       /\b(?:notify|recordSkillInvoked|dispatchNotificationInBackground)\b/,
     );
-    expect(source).not.toMatch(
-      /extractJsonField|isCopilotHost|toolCalls|tool_name|toolName\s*=/,
+    // The canonical envelope may expose toolCalls after the host input has been parsed.
+    expect(entrypoint).not.toMatch(
+      /extractJsonField|isCopilotHost|(?<!\benvelope\.)\btoolCalls\b|(?:\.|\[\s*['"])tool_name\b|\btoolName\s*=/,
+    );
+    expect(entrypoint).toContain(
+      'const data = runtime.buildLegacyProcessorInput(envelope, unit);',
+    );
+    expect(entrypoint.indexOf('runtime.runHookJson(')).toBeLessThan(
+      entrypoint.indexOf('setJevSessionId('),
     );
     expect(source).not.toMatch(
       /pre-tool-enforcer-preflight|force-agent-delegation-preflight|state-root|agent-model-config/,
