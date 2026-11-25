@@ -61,10 +61,12 @@ export interface LegacyProcessorInput extends CanonicalHookEventPayload {
   user_prompt?: string;
   initial_prompt?: string;
   prompt_id?: string;
+  context_window?: unknown;
   reason?: string;
   agent?: CanonicalAgentRef;
   agentId?: string;
   agentName?: string;
+  agent_type?: string;
   agentDisplayName?: string;
   agentDescription?: string;
   callId?: string;
@@ -226,6 +228,9 @@ export function buildLegacyProcessorInput(
     ...(eventPayload.promptId !== undefined
       ? { prompt_id: eventPayload.promptId }
       : {}),
+    ...(eventPayload.contextWindow !== undefined
+      ? { context_window: eventPayload.contextWindow }
+      : {}),
     ...(eventPayload.sessionEndReason !== undefined
       || eventPayload.reason !== undefined
       ? { reason: eventPayload.sessionEndReason ?? eventPayload.reason }
@@ -237,7 +242,10 @@ export function buildLegacyProcessorInput(
             ? { agentId: envelope.agent.id }
             : {}),
           ...(envelope.agent.name !== undefined
-            ? { agentName: envelope.agent.name }
+            ? {
+                agentName: envelope.agent.name,
+                agent_type: envelope.agent.name,
+              }
             : {}),
           ...(envelope.agent.displayName !== undefined
             ? { agentDisplayName: envelope.agent.displayName }

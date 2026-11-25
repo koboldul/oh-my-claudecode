@@ -84,6 +84,106 @@ describe('canonical hook protocol normalization', () => {
     });
   });
 
+  it.each([
+    ['claude', 'SubagentStart', 'agent_type'],
+    ['copilot-1.0.72-1', 'subagentStart', 'agentName'],
+  ] as const)('accepts a type-checked agentType fallback without overriding %s agent names', (host, fixture, nativeField) => {
+    const raw = {
+      ...loadFixture(host, fixture),
+      agent_type: undefined,
+      agent_name: undefined,
+      agentName: undefined,
+    };
+    expect(normalizeHookEnvelope({ ...raw, agentType: 'planner' }).agent?.name).toBe('planner');
+    expect(normalizeHookEnvelope({
+      ...raw,
+      agentType: 'planner',
+      [nativeField]: 'executor',
+    }).agent?.name).toBe('executor');
+    for (const agentType of [undefined, null, '', 42, {}]) {
+      expect(normalizeHookEnvelope({ ...raw, agentType }).agent?.name).toBeUndefined();
+    }
+  });
+
+  it('retains competing legacy inputs for policy checks without changing the executed input or its identity', () => {
+    const primary = { file_path: '.omc/plans/plan.md' };
+    const alternate = { file_path: 'src/code.ts', nested_key: { keep_snake_case: true } };
+    const raw = { tool_name: 'Write', tool_input: primary };
+    const baseline = normalizeHookEnvelope(raw, 'pre-tool-use').toolCalls[0];
+    const call = normalizeHookEnvelope({ ...raw, toolInput: alternate }, 'pre-tool-use').toolCalls[0];
+
+    expect(call.input).toBe(primary);
+    expect(call.rawArgs).toBe(primary);
+    expect(call.inputAliases).toEqual([alternate]);
+    expect(call.inputAliases?.[0]).toBe(alternate);
+    expect(call.fingerprint).toBe(baseline.fingerprint);
+    expect(call.status).toBe('valid');
+    expect(normalizeHookEnvelope({ ...raw, toolInput: primary }, 'pre-tool-use').toolCalls[0].inputAliases).toBeUndefined();
+  });
+
+  it.each([{ primary: [] }, { primary: 'unparsed' }, { primary: 42 }])('retains a usable alternate when the preferred input is $primary', ({ primary }) => {
+    const alternate = { file_path: 'src/code.ts' };
+    const call = normalizeHookEnvelope({
+      tool_name: 'Write',
+      tool_input: primary,
+      toolInput: alternate,
+    }, 'pre-tool-use').toolCalls[0];
+
+    expect(call.input).toBe(primary);
+    expect(call.inputAliases).toEqual([alternate]);
+    expect(call.status).toBe('valid');
+  });
+
+  it('retains invalid alternate inputs without treating them as malformed executed arguments', () => {
+    const primary = { file_path: '.omc/plans/plan.md' };
+    for (const alternate of [null, [], 42, 'unparsed']) {
+      const call = normalizeHookEnvelope({
+        tool_name: 'Write',
+        tool_input: primary,
+        toolInput: alternate,
+      }, 'pre-tool-use').toolCalls[0];
+      expect(call.inputAliases).toEqual([alternate]);
+      expect(call.input).toBe(primary);
+      expect(call.issues).toEqual([]);
+    }
+  });
+
+  it.each([
+    ['claude', 'SubagentStart', 'snake-name', ['camel-type', 'legacy-name', 'camel-name']],
+    ['copilot-1.0.72-1', 'subagentStart', 'camel-name', ['camel-type', 'legacy-name']],
+  ] as const)('retains competing agent names while preserving %s precedence', (host, fixture, name, aliases) => {
+    const envelope = normalizeHookEnvelope({
+      ...loadFixture(host, fixture),
+      ...(host === 'claude' ? { agent_type: 'snake-name' } : {}),
+      agentType: 'camel-type',
+      agent_name: 'legacy-name',
+      agentName: 'camel-name',
+    });
+    expect(envelope.agent?.name).toBe(name);
+    expect(envelope.agent?.nameAliases).toEqual(aliases);
+  });
+
+  it('omits empty, invalid and repeated agent-name alternatives', () => {
+    const base = { tool_name: 'Write', tool_input: {}, agent_type: 'planner' };
+    expect(normalizeHookEnvelope({
+      ...base, agentType: 'executor', agentName: 'executor', agent_name: '   ',
+    }).agent?.nameAliases).toEqual(['executor']);
+    expect(normalizeHookEnvelope({
+      ...base, agentType: 42, agentName: 'planner', agent_name: null,
+    }).agent?.nameAliases).toBeUndefined();
+  });
+
+  it('does not project wrapper input aliases into Copilot batch calls', () => {
+    const input = { file_path: '.omc/plans/plan.md' };
+    const envelope = normalizeHookEnvelope({
+      sessionId: 'session',
+      toolInput: { file_path: 'src/code.ts' },
+      toolCalls: [{ id: 'call-1', name: 'create', args: JSON.stringify(input) }],
+    }, 'pre-tool-use');
+    expect(envelope.toolCalls[0].input).toEqual(input);
+    expect(envelope.toolCalls[0].inputAliases).toBeUndefined();
+  });
+
   it.each([1, 2, 20])('normalizes every unique call in a %i-call Copilot batch', (count) => {
     const envelope = normalizeHookEnvelope({
       sessionId: 'session',

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
+import { hasExtendedContextSuffix, isProviderSpecificModelId, isSubagentSafeModelId, } from '../../config/models.js';
 import { MODE_CONFIRMATION_SKILL_MAP } from '../../lib/mode-names.js';
 import { evaluateReadBudgetObservation, READ_BUDGET_WARNING_RETENTION_SECONDS, } from '../../../scripts/lib/read-budget-preflight.mjs';
 import { PRE_TOOL_EFFECT_PAYLOAD_VERSION, } from './types.js';
@@ -197,21 +198,6 @@ function skillProtection(skillName, rawSkillName) {
 function isBundledOmcSubagent(agentType) {
     return /^oh-my-claudecode:[a-zA-Z0-9_-]+$/.test(agentType);
 }
-function isProviderSpecificModelId(modelId) {
-    if (/^((us|eu|ap|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
-        return true;
-    }
-    if (/^arn:aws(-[^:]+)?:bedrock:/i.test(modelId))
-        return true;
-    return modelId.toLowerCase().startsWith('vertex_ai/');
-}
-function hasExtendedContextSuffix(modelId) {
-    return /\[\d+[mk]\]$/i.test(modelId);
-}
-function isSubagentSafeModelId(modelId) {
-    return isProviderSpecificModelId(modelId)
-        && !hasExtendedContextSuffix(modelId);
-}
 function isTierAlias(modelId) {
     return TIER_ALIASES.has(modelId.toLowerCase());
 }
@@ -232,7 +218,7 @@ function isBedrockProvider(snapshot) {
         return true;
     const modelId = snapshot.modelRouting.claudeModel
         || snapshot.modelRouting.anthropicModel;
-    if (/^((us|eu|ap|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
+    if (/^((us|eu|ap|apac|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
         return true;
     }
     return /^arn:aws(-[^:]+)?:bedrock:/i.test(modelId)
@@ -253,9 +239,17 @@ function isNonClaudeProvider(snapshot) {
         || snapshot.modelRouting.anthropicModel;
     if (modelId && !modelId.toLowerCase().includes('claude'))
         return true;
-    if (snapshot.modelRouting.anthropicBaseUrl
-        && !snapshot.modelRouting.anthropicBaseUrl.includes('anthropic.com')) {
-        return true;
+    if (snapshot.modelRouting.anthropicBaseUrl) {
+        try {
+            const value = snapshot.modelRouting.anthropicBaseUrl.trim();
+            const host = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`)
+                .hostname.toLowerCase().replace(/\.$/, '');
+            if (host !== 'anthropic.com' && !host.endsWith('.anthropic.com'))
+                return true;
+        }
+        catch {
+            return true;
+        }
     }
     const activeModels = [
         snapshot.modelRouting.claudeModel,
@@ -266,7 +260,10 @@ function isNonClaudeProvider(snapshot) {
     return snapshot.modelRouting.forceInherit && !hasNormalClaude;
 }
 function resolveTierAliasToSafeModel(tierAlias, snapshot) {
-    const keys = TIER_TO_DEFAULT_ENV_KEYS[tierAlias.toLowerCase()];
+    const tier = tierAlias.toLowerCase();
+    const keys = Object.hasOwn(TIER_TO_DEFAULT_ENV_KEYS, tier)
+        ? TIER_TO_DEFAULT_ENV_KEYS[tier]
+        : undefined;
     if (!keys)
         return '';
     for (const key of keys) {
@@ -1061,9 +1058,10 @@ export function evaluatePreToolCall(call, envelope, snapshot, ledger, readBudget
     }
     const modelRoutingObservation = modelRoutingJevObservation(call, snapshot, baseModelRouting);
     const modelRouting = applyJevModelRoutingOverride(call, envelope, snapshot, baseModelRouting, modelRoutingObservation, modelRoutingOverrides);
+    // Later denials retain routing eligibility even when no model tier was pinned.
     const routingObservations = modelRoutingObservation
         ? { modelRouting: modelRoutingObservation }
-        : undefined;
+        : {};
     const mutation = modelRouting.updatedInput
         ? requiredMutation(call, modelRouting.updatedInput, Object.fromEntries(Object.entries(modelRouting.updatedInput).filter(([key, value]) => !isRecord(call.input) || call.input[key] !== value)))
         : undefined;

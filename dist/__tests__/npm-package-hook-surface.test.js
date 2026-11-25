@@ -1,0 +1,75 @@
+import { describe, expect, it } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { COPILOT_HOOKS_JSON_PATH, COPILOT_NATIVE_HOOK_EVENTS, COPILOT_PLUGIN_JSON_PATH, MCP_JSON_PATH, PACKAGE_ROOT, PLUGIN_JSON_PATH, listSourceControlledPackageFiles, readPluginMcpServers, referencesCopilotHooksManifest, referencesRootMcpConfig, referencesStandardHooksManifest, } from './npm-package-surface-helpers.js';
+const COMMITTED_HOOK_ENTRYPOINTS = [
+    'context-guard-stop.mjs',
+    'session-end.mjs',
+    'wiki-session-end.mjs',
+];
+describe('npm package hook surface regression', () => {
+    it.each(COMMITTED_HOOK_ENTRYPOINTS)('keeps the committed %s entrypoint valid Node syntax', (entrypoint) => {
+        const result = spawnSync(process.execPath, ['--check', join(PACKAGE_ROOT, 'scripts', entrypoint)], {
+            encoding: 'utf-8',
+            windowsHide: true,
+        });
+        expect(result.status, result.stderr || result.error?.message).toBe(0);
+    });
+    it('builds generated hook runtimes for packaging without mutating ordinary test entrypoints', () => {
+        const packageJson = JSON.parse(readFileSync(join(PACKAGE_ROOT, 'package.json'), 'utf-8'));
+        expect(packageJson.scripts?.build).toMatch(/npm run compose-docs && npm run generate:prompt-projections && npm run build:claude-md-coordinator/);
+        expect(packageJson.scripts?.build?.indexOf('npm run compose-docs')).toBeLessThan(packageJson.scripts?.build?.indexOf('npm run generate:prompt-projections') ?? -1);
+        expect(packageJson.scripts?.build?.indexOf('npm run generate:prompt-projections')).toBeLessThan(packageJson.scripts?.build?.indexOf('npm run build:claude-md-coordinator') ?? -1);
+        expect(packageJson.scripts?.build).toContain('npm run build:hook-runtime');
+        expect(packageJson.scripts?.['build:hook-runtime']).toBe('node scripts/build-hook-runtime.mjs');
+        expect(existsSync(join(PACKAGE_ROOT, 'scripts', 'build-hook-runtime.mjs'))).toBe(true);
+        expect(existsSync(join(PACKAGE_ROOT, 'scripts', 'lib', 'hook-runtime-loader.mjs'))).toBe(true);
+        expect(existsSync(join(PACKAGE_ROOT, 'src', 'hooks', 'hook-runtime-entry.ts'))).toBe(true);
+        for (const entrypoint of ['test', 'test:ui', 'test:run', 'test:coverage']) {
+            expect(packageJson.scripts?.[entrypoint], entrypoint).not.toContain('build:claude-md-coordinator');
+            expect(packageJson.scripts?.[entrypoint], entrypoint).not.toContain('build:hook-runtime');
+        }
+        expect(packageJson.scripts?.prepack).toBe('npm run build');
+        expect(packageJson.scripts?.prepublishOnly).toBe('npm run build');
+        expect(packageJson.files).toEqual(expect.arrayContaining([
+            '.claude-plugin',
+            '.mcp.json',
+            'bridge',
+            'hooks',
+            'scripts',
+            'templates',
+        ]));
+    });
+    it('keeps the source-controlled plugin and MCP manifests wired to exact standard entrypoints', () => {
+        expect(existsSync(PLUGIN_JSON_PATH)).toBe(true);
+        expect(existsSync(COPILOT_PLUGIN_JSON_PATH)).toBe(true);
+        expect(existsSync(COPILOT_HOOKS_JSON_PATH)).toBe(true);
+        expect(existsSync(MCP_JSON_PATH)).toBe(true);
+        const claudePluginJson = JSON.parse(readFileSync(PLUGIN_JSON_PATH, 'utf-8'));
+        const copilotPluginJson = JSON.parse(readFileSync(COPILOT_PLUGIN_JSON_PATH, 'utf-8'));
+        const copilotHooksJson = JSON.parse(readFileSync(COPILOT_HOOKS_JSON_PATH, 'utf-8'));
+        expect(referencesStandardHooksManifest(claudePluginJson.hooks)).toBe(true);
+        expect(referencesCopilotHooksManifest(copilotPluginJson.hooks)).toBe(true);
+        expect(referencesRootMcpConfig(claudePluginJson.mcpServers)).toBe(true);
+        expect(referencesRootMcpConfig(copilotPluginJson.mcpServers)).toBe(true);
+        expect(copilotHooksJson.version).toBe(1);
+        expect(Object.keys(copilotHooksJson.hooks ?? {})).toEqual(COPILOT_NATIVE_HOOK_EVENTS);
+        expect(Object.values(copilotHooksJson.hooks ?? {})
+            .flat()
+            .some((entry) => Array.isArray(entry.hooks))).toBe(false);
+        expect(Object.values(readPluginMcpServers())).toEqual([
+            {
+                command: 'node',
+                args: ['${CLAUDE_PLUGIN_ROOT}/bridge/mcp-server.cjs'],
+            },
+        ]);
+    });
+    it('keeps the complete hook dependency and template payload source-controlled', () => {
+        const requiredFiles = listSourceControlledPackageFiles();
+        expect(requiredFiles).toContain('commands/omc-setup.md');
+        expect(requiredFiles).not.toHaveLength(0);
+        expect(requiredFiles.filter((file) => !existsSync(join(PACKAGE_ROOT, file)))).toEqual([]);
+    });
+});
+//# sourceMappingURL=npm-package-hook-surface.test.js.map

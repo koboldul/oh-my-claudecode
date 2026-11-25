@@ -27,10 +27,14 @@ vi.mock('../worker.js', async () => {
     : null;
   return { ...actual, spawnSessionEndWorker: observed.spawnSessionEndWorker };
 });
-vi.mock('../../../platform/process-utils.js', () => ({
-  getProcessStartIdentity: vi.fn(async () => 'test-process-start'),
-  isProcessIdentityLive: vi.fn(async () => 'dead' as const),
-}));
+vi.mock('../../../platform/process-utils.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../platform/process-utils.js')>();
+  return {
+    ...actual,
+    getProcessStartIdentity: vi.fn(async () => 'test-process-start'),
+    isProcessIdentityLive: vi.fn(async () => 'dead' as const),
+  };
+});
 vi.mock('../action-runner.js', () => ({
   runSessionEndAction: vi.fn(async (_context: unknown, execute: () => Promise<void>) => {
     await execute();

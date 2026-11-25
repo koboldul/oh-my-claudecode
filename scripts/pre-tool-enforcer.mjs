@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { appendFileSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { appendFileSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs';
+import { basename, delimiter, dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { getClaudeConfigDir } from './lib/config-dir.mjs';
 import {
   loadHookRuntime,
@@ -13,14 +13,17 @@ import {
 import {
   isJevAppliedLogEnabled,
   isJevShadowOptedIn,
+  jevLastRequestId,
   jevNoulOf,
   recordJevApplied,
   recordJevShadow,
   setJevHookContext,
   setJevSessionId,
 } from './lib/jev-shadow.mjs';
+import { pointerSecretPath } from './lib/jev-pointer-secret-path.mjs';
 import { readStdin } from './lib/stdin.mjs';
-import { resolveExcerptChars, resolveJevLogMaxBytes, rotateJevLog } from './jev-resolve.mjs';
+import { loadContextText } from './lib/context-text-loader.mjs';
+import { isJevLogContextEnabled, isJevRowTelemetryEnabled, JEV_ROW_NO_ANSWER, jevLogContextOf, resolveExcerptChars, resolveJevLogMaxBytes, rotateJevLog } from './jev-resolve.mjs';
 
 const SLOP_WARNING_QUESTIONS = {
   slop_advisory: {
@@ -104,6 +107,135 @@ function jevFlag(name) {
   return ['1', 'true'].includes(String(process.env[name] ?? '').trim().toLowerCase());
 }
 
+function modelTier(model) {
+  if (typeof model !== 'string') return undefined;
+  const lower = model.toLowerCase();
+  return ['opus', 'sonnet', 'haiku', 'fable'].find((tier) => lower.includes(tier));
+}
+
+function providerModel(model) {
+  return /^((us|eu|ap|apac|global)\.anthropic\.|anthropic\.claude)/i.test(model)
+    || /^arn:aws(-[^:]+)?:bedrock:/i.test(model)
+    || model.toLowerCase().startsWith('vertex_ai/');
+}
+
+function providerDetectionModels(routing) {
+  const session = [routing.claudeModel, routing.anthropicModel]
+    .map((value) => value.trim()).find(Boolean);
+  if (session) return [session];
+  return [...JEV_MODEL_TIERS].map((tier) =>
+    [`CLAUDE_CODE_BEDROCK_${tier.toUpperCase()}_MODEL`, `ANTHROPIC_DEFAULT_${tier.toUpperCase()}_MODEL`]
+      .map((key) => (routing.tierEnvironment[key] || '').trim()).find(Boolean),
+  ).filter(Boolean);
+}
+
+function cloudProvider(routing, namedGate = false) {
+  const model = routing.claudeModel || routing.anthropicModel;
+  return routing.useBedrock || routing.useVertex
+    || /^((us|eu|ap|apac|global)\.anthropic\.|anthropic\.claude)/i.test(model)
+    || (/^arn:aws(-[^:]+)?:bedrock:/i.test(model)
+      && /:(inference-profile|application-inference-profile)\//i.test(model)
+      && model.toLowerCase().includes('claude'))
+    || model.toLowerCase().startsWith('vertex_ai/')
+    || (namedGate && providerDetectionModels(routing).some((value) =>
+      providerModel(value.replace(/\[\d+[mk]\]$/i, ''))));
+}
+
+function nonClaudeProvider(snapshot, namedGate = false) {
+  const routing = snapshot.modelRouting;
+  if (cloudProvider(routing, namedGate)) return true;
+  const model = routing.claudeModel || routing.anthropicModel;
+  if (namedGate) {
+    if (providerDetectionModels(routing).some((value) => {
+      const name = value.trim().replace(/\[\d+[mk]\]$/i, '').toLowerCase();
+      return name && (providerModel(name) || (!name.includes('claude') && !JEV_MODEL_TIERS.has(name)));
+    })) return true;
+  } else if (model && !model.toLowerCase().includes('claude')) return true;
+  if (routing.anthropicBaseUrl) {
+    try {
+      const value = routing.anthropicBaseUrl.trim();
+      const host = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`)
+        .hostname.toLowerCase().replace(/\.$/, '');
+      if (host !== 'anthropic.com' && !host.endsWith('.anthropic.com')) return true;
+    } catch { return true; }
+  }
+  const normalClaude = [routing.claudeModel, routing.anthropicModel]
+    .some((value) => value && value.toLowerCase().includes('claude') && !providerModel(value));
+  return snapshot.omcConfig?.routing?.forceInherit === true && !normalClaude;
+}
+
+// Jev and prompt markers may use a tier only when Claude Code itself can
+// resolve it; OMC_SUBAGENT_MODEL is not a native tier mapping.
+function nativeTierResolves(tier, snapshot, namedGate = false) {
+  if (!JEV_MODEL_TIERS.has(tier)) return false;
+  const routing = snapshot.modelRouting;
+  const keys = [`CLAUDE_CODE_BEDROCK_${tier.toUpperCase()}_MODEL`, `ANTHROPIC_DEFAULT_${tier.toUpperCase()}_MODEL`];
+  for (const key of keys) {
+    const value = (routing.tierEnvironment[key] || '').trim();
+    if (!value) continue;
+    const family = value.toLowerCase().startsWith('vertex_ai/') ? 'vertex' : providerModel(value) ? 'bedrock' : null;
+    const session = [routing.claudeModel, routing.anthropicModel].map((item) => item.trim()).find(Boolean) || '';
+    const sessionModel = session.replace(/\[\d+[mk]\]$/i, '');
+    const sessionFamily = sessionModel.toLowerCase().startsWith('vertex_ai/') ? 'vertex' : providerModel(sessionModel) ? 'bedrock' : null;
+    const active = [
+      (routing.useBedrock || sessionFamily === 'bedrock') && 'bedrock',
+      (routing.useVertex || sessionFamily === 'vertex') && 'vertex',
+    ].filter(Boolean);
+    if (family && active.length && !active.includes(family)) return false;
+    return providerModel(value)
+      || (key.startsWith('ANTHROPIC_DEFAULT_')
+        && nonClaudeProvider(snapshot, namedGate)
+        && !cloudProvider(routing, namedGate));
+  }
+  return false;
+}
+
+// OMC_AGENT_TYPE_DENY_MODE is off by default; shadow and deny both record
+// each Task/Agent decision, while deny blocks matching agent types.
+const AGENT_TYPE_DENY_MODES = ['off', 'shadow', 'deny'];
+function evaluateForbiddenAgentType(toolName, data, stateDir) {
+  const rawMode = String(process.env.OMC_AGENT_TYPE_DENY_MODE ?? '').trim();
+  let mode = rawMode.toLowerCase();
+  if (!rawMode) mode = 'off';
+  else if (!AGENT_TYPE_DENY_MODES.includes(mode)) {
+    if (process.env.OMC_JEV_QUIET !== '1') {
+      console.error('[omc] agent-type: OMC_AGENT_TYPE_DENY_MODE=' + rawMode.slice(0, 40) + ' is not one of ' + AGENT_TYPE_DENY_MODES.join(', ') + '; using shadow');
+    }
+    mode = 'shadow';
+  }
+  if (mode === 'off') return null;
+
+  const input = data?.tool_input ?? data?.toolInput;
+  const inputOk = isRecord(input);
+  const typeValue = inputOk ? (input.subagent_type ?? input.agent_type) : undefined;
+  const parsed = inputOk && (typeValue === undefined || typeof typeValue === 'string');
+  const rawType = typeof typeValue === 'string' ? typeValue.trim() : '';
+  const type = rawType || 'general-purpose';
+  const denyList = String(process.env.OMC_AGENT_TYPE_DENY ?? '').split(',').map((entry) => entry.trim()).filter(Boolean);
+  const forbidden = denyList.some((entry) =>
+    entry.startsWith('=') ? entry.slice(1).trim() === type : entry.toLowerCase() === type.toLowerCase());
+  const decision = !parsed ? 'unparsed' : !forbidden ? 'allow' : mode === 'deny' ? 'deny' : 'would-deny';
+  try {
+    const dir = process.env.OMC_JEV_LOG_DIR || join(stateDir, 'jev');
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, 'agent-type.jsonl');
+    rotateJevLog(path, resolveJevLogMaxBytes(process.env));
+    appendFileSync(path, JSON.stringify({
+      ts: new Date().toISOString(),
+      point: 'agent-type',
+      ...(isJevLogContextEnabled(process.env) ? jevLogContextOf(data) : {}),
+      tool_name: toolName,
+      subagent_type: rawType ? rawType.slice(0, 200) : null,
+      mode,
+      ...(!AGENT_TYPE_DENY_MODES.includes(rawMode.toLowerCase()) && rawMode ? { mode_raw: rawMode.slice(0, 40) } : {}),
+      decision,
+    }) + '\n', 'utf8');
+  } catch { /* logging never affects the call */ }
+  return decision === 'deny'
+    ? `[AGENT TYPE] "${rawType || '(no subagent_type)'}" is not allowed by OMC_AGENT_TYPE_DENY; choose another agent type.`
+    : null;
+}
+
 let maxEffortWarned = false;
 function maxEffort() {
   const raw = String(process.env.OMC_JEV_MAX_EFFORT ?? '').trim().toLowerCase();
@@ -180,6 +312,78 @@ function recordModelRoutingOverride(stateDir, row) {
   } catch { /* best-effort */ }
 }
 
+function recordJevForkSkipRow(data, toolInput, stateDir) {
+  try {
+    const dir = process.env.OMC_JEV_LOG_DIR || join(stateDir, 'jev');
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, 'shadow.jsonl');
+    rotateJevLog(path, resolveJevLogMaxBytes(process.env));
+    appendFileSync(path, JSON.stringify({
+      ts: new Date().toISOString(),
+      point: 'model-routing',
+      ...(isJevLogContextEnabled(process.env) ? jevLogContextOf(data) : {}),
+      subagent_type: typeof toolInput.subagent_type === 'string' ? toolInput.subagent_type.slice(0, 200) : null,
+      skipped: 'fork',
+      ...(isJevRowTelemetryEnabled(process.env) ? JEV_ROW_NO_ANSWER : {}),
+      durationMs: 0,
+    }) + '\n', 'utf8');
+  } catch { /* logging never affects the call */ }
+}
+
+// Pointer expansion is opt-in and reads only canonical paths under the
+// configured allowlist, excluding secret paths and configured secret roots.
+const POINTER_PATH_RE = /(?<![\w.\-/:~\\])(?:[A-Za-z]:[\\/]|\\\\|\/)[\w.~\-/\\\p{L}]+\.md(?![.\w])/u;
+function pointerDirList(value) {
+  return String(value ?? '').split(delimiter).map((dir) => dir.trim()).filter(Boolean)
+    .flatMap((dir) => {
+      try { return [realpathSync.native(dir)]; } catch { return []; }
+    });
+}
+
+function isPathInDirectory(canonicalPath, directory) {
+  const rel = relative(directory, canonicalPath);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function expandTaskPointer(prompt, pointer) {
+  if (!pointer || typeof prompt !== 'string' || prompt.length === 0 || prompt.length >= 600) return prompt;
+  const named = prompt.match(POINTER_PATH_RE)?.[0];
+  if (!named) return prompt;
+  try {
+    const stat = statSync(named);
+    if (!stat.isFile()) {
+      pointer.unexpanded = 'directory';
+      return prompt;
+    }
+    if (stat.size > 1024 * 1024) {
+      pointer.unexpanded = 'too-large';
+      return prompt;
+    }
+    const real = realpathSync.native(named);
+    const secretDirs = pointerDirList(process.env.OMC_JEV_POINTER_EXPAND_SECRET_DIRS);
+    if (pointerSecretPath(real) || /^settings.*\.json$/i.test(basename(real))
+      || secretDirs.some((dir) => isPathInDirectory(real, dir))) {
+      pointer.unexpanded = 'secret-path';
+      return prompt;
+    }
+    const roots = pointerDirList(process.env.OMC_JEV_POINTER_EXPAND_DIRS);
+    if (!roots.some((root) => isPathInDirectory(real, root))) {
+      pointer.unexpanded = 'outside-allowed-dirs';
+      return prompt;
+    }
+    const content = readFileSync(real);
+    if (content.subarray(0, 8192).includes(0)) {
+      pointer.unexpanded = 'binary';
+      return prompt;
+    }
+    pointer.expanded = true;
+    return prompt + '\n\n[source file: ' + real + ', head of file]\n' + content.toString('utf8').slice(0, 8000);
+  } catch (error) {
+    pointer.unexpanded = error?.code === 'ENOENT' ? 'missing' : 'read-error';
+    return prompt;
+  }
+}
+
 function readAgentField(agentType, directory, field, pluginFirst = false, pluginOnly = false) {
   if (typeof agentType !== 'string') return null;
   const bare = agentType.replace(/^oh-my-claudecode:/, '');
@@ -188,16 +392,16 @@ function readAgentField(agentType, directory, field, pluginFirst = false, plugin
   const nativeDirs = /^[a-zA-Z0-9_-]+$/.test(agentType)
     ? [join(directory, '.claude', 'agents'), join(getClaudeConfigDir(), 'agents')] : [];
   const pluginDirs = pluginRoots.map((root) => join(root, 'agents'));
-  const dirs = pluginOnly ? pluginDirs : pluginFirst ? [...pluginDirs, ...nativeDirs] : [...nativeDirs, ...pluginDirs];
-  for (const dir of dirs) {
-    const path = join(dir, `${bare}.md`);
-    if (!existsSync(path)) continue;
+  const groups = pluginOnly ? [pluginDirs] : pluginFirst ? [pluginDirs, nativeDirs] : [nativeDirs, pluginDirs];
+  for (const dirs of groups) {
+    const path = dirs.map((dir) => join(dir, `${bare}.md`)).find((candidate) => existsSync(candidate));
+    if (!path) continue;
     try {
       const frontmatter = readFileSync(path, 'utf8').replace(/^\uFEFF/, '').match(/^---[\r\n]+([\s\S]*?)[\r\n]+---/);
       const match = frontmatter?.[1].match(new RegExp(`^${field}:\\s*(\\S+)`, 'm'));
       if (match) return match[1].trim().replace(/^["']|["']$/g, '');
-    } catch { /* use the next candidate when resolving native models */ }
-    if (!pluginFirst || pluginOnly) return null;
+    } catch { /* a missing plugin model may still resolve from native definitions */ }
+    if (!pluginFirst || pluginOnly || dirs === nativeDirs) return null;
   }
   return null;
 }
@@ -276,9 +480,22 @@ function collectJevModelRoutingOverrides(plan, runtime, pending) {
     const { call } = callPlan;
     const input = isRecord(call.input) ? call.input : {};
     const override = {};
-    if (['Task', 'Agent'].includes(call.canonicalName) && isRecord(call.input)
-      && (isJevShadowOptedIn('model-routing', process.env, permissionMode)
-        || jevFlag('OMC_JEV_MODEL_ROUTING_MARKER')
+    const routingOptedIn = isJevShadowOptedIn('model-routing', process.env, permissionMode);
+    const routingCall = ['Task', 'Agent'].includes(call.canonicalName)
+      && isRecord(call.input)
+      && (callPlan.evaluation.decision !== 'deny' || callPlan.jevObservations !== undefined);
+    if (routingCall && input.subagent_type === 'fork' && routingOptedIn) {
+      const data = runtime.buildLegacyProcessorInput(plan.envelope, {
+        call, callId: call.id, originalIndex: call.originalIndex, input: call.input,
+      });
+      recordJevForkSkipRow({
+        ...data,
+        tool_use_id: call.id,
+        agent_id: plan.envelope.agent?.id,
+        agent_type: plan.envelope.agent?.name,
+      }, input, plan.snapshot.stateDir);
+    } else if (routingCall
+      && (routingOptedIn || jevFlag('OMC_JEV_MODEL_ROUTING_MARKER')
         || jevFlag('OMC_JEV_MAX_EFFORT_ALWAYS'))) {
       const observation = callPlan.jevObservations?.modelRouting;
       const modified = observation?.modifiedInput
@@ -287,27 +504,31 @@ function collectJevModelRoutingOverrides(plan, runtime, pending) {
       const definitionModel = readAgentField(input.subagent_type, directory, 'model', true, true);
       let marker = canApplyActiveChoice && jevFlag('OMC_JEV_MODEL_ROUTING_MARKER')
         ? parseModelRoutingMarker(input.prompt) : null;
+      const markerHadModel = Boolean(marker?.model);
       const safeTier = (tier) => !plan.snapshot.modelRouting.forceInherit
-        || !runtime.evaluateModelRouting({ ...call, input: { ...input, model: tier } }, plan.envelope, plan.snapshot).denyReason;
+        || nativeTierResolves(tier, plan.snapshot);
       if (marker?.model && !safeTier(marker.model)) {
         marker.rejected.push('force-inherit');
         marker.model = undefined;
       }
       const markerApplies = Boolean(marker && (marker.model || marker.effort));
-      const original = boundModelRoutingInput(markerApplies ? { ...input, prompt: marker.prompt } : input);
+      const original = boundModelRoutingInput(markerApplies || markerHadModel ? { ...input, prompt: marker.prompt } : input);
       const selectedModel = marker?.model || modified.model || definitionModel;
-      const normalizedModel = typeof selectedModel === 'string'
-        ? [...JEV_MODEL_TIERS].find((tier) => selectedModel.toLowerCase().includes(tier)) : undefined;
+      const normalizedModel = modelTier(selectedModel);
       const knownTier = normalizedModel && (normalizedModel !== 'fable' || jevFlag('OMC_JEV_MODEL_ROUTING_FABLE'));
       const nativeModel = selectedModel || readAgentField(input.subagent_type, directory, 'model', true);
       const unpinned = !knownTier && jevFlag('OMC_JEV_MODEL_ROUTING_ALL_AGENTS')
         && (!nativeModel || String(nativeModel).trim().toLowerCase() === 'inherit');
+      const namedModel = jevFlag('OMC_JEV_MODEL_ROUTING_NAMED_MODELS') ? nativeModel : null;
+      const named = !knownTier && namedModel && String(namedModel).trim()
+        && String(namedModel).trim().toLowerCase() !== 'inherit'
+        && !['haiku', 'sonnet', 'opus'].includes(modelTier(namedModel));
       const questions = modelRoutingQuestions();
-      if (marker?.model) delete questions['model-tier'];
+      if (marker?.model || (markerHadModel && named)) delete questions['model-tier'];
       if (marker?.effort) delete questions.effort;
-      const askJev = isJevShadowOptedIn('model-routing', process.env, permissionMode)
-        && (knownTier || unpinned) && Object.keys(questions).length > 0;
+      const askJev = routingOptedIn && (knownTier || unpinned || named) && Object.keys(questions).length > 0;
       let result;
+      let requestId;
       if (askJev) {
         const context = {};
         if (jevFlag('OMC_JEV_MODEL_ROUTING_CONTEXT')) {
@@ -315,12 +536,15 @@ function collectJevModelRoutingOverrides(plan, runtime, pending) {
           const parent = readParentLastUserMessage(plan.envelope.transcriptPath, plan.envelope.sessionId);
           if (parent) context.parent_last_user_message = parent;
         }
+        const pointer = String(process.env.OMC_JEV_POINTER_EXPAND ?? '').trim() === '1'
+          ? { expanded: false, unexpanded: null } : undefined;
+        const previousRequestId = jevLastRequestId('model-routing');
         result = recordJevShadow({
           point: 'model-routing',
           state: {
             tool_name: call.nativeName,
             subagent_type: original.subagent_type || '',
-            task: original.prompt || '',
+            task: expandTaskPointer(original.prompt || '', pointer),
             ...context,
           },
           questions,
@@ -334,15 +558,21 @@ function collectJevModelRoutingOverrides(plan, runtime, pending) {
             : undefined,
           permissionMode,
           toolUseId: call.id,
-        });
+          pointer,
+        }, { tool_use_id: call.id });
+        const lastRequestId = jevLastRequestId('model-routing');
+        if (lastRequestId !== previousRequestId) requestId = lastRequestId;
       }
       const answers = result?.mode === 'active' ? result.answers : undefined;
       if (canApplyActiveChoice && answers && typeof answers === 'object') {
         const tierChoice = answers['model-tier']?.choice;
         const choice = typeof tierChoice === 'string' ? tierChoice.toLowerCase() : undefined;
+        const keepsNamed = named && (markerHadModel
+          || ((nonClaudeProvider(plan.snapshot, true) || plan.snapshot.modelRouting.forceInherit)
+            && !nativeTierResolves(choice, plan.snapshot, true)));
         if (choice && JEV_MODEL_TIERS.has(choice)
           && (choice !== 'fable' || jevFlag('OMC_JEV_MODEL_ROUTING_FABLE'))
-          && safeTier(choice)) override.model = choice;
+          && !keepsNamed && safeTier(choice)) override.model = choice;
         const score = answers.effort?.type === 'score' ? answers.effort.score : undefined;
         if (typeof score === 'number' && Number.isFinite(score) && score >= 0 && score <= 4) {
           override.effort = effortFromScore(score);
@@ -350,8 +580,9 @@ function collectJevModelRoutingOverrides(plan, runtime, pending) {
           const capped = capEffort(modified.effort);
           if (capped !== modified.effort) override.effort = capped;
         }
-        pending.routing.push({ callId: call.id, input, modified, selectedModel, normalizedModel, unpinned, answers, override: { ...override }, directory });
       }
+      const jevOverride = { ...override };
+      let markerRow;
       if (marker) {
         const row = {
           ...(plan.envelope.sessionId ? { session_id: plan.envelope.sessionId } : {}),
@@ -376,6 +607,7 @@ function collectJevModelRoutingOverrides(plan, runtime, pending) {
           override.prompt = marker.prompt;
         }
         recordModelRoutingOverride(plan.snapshot.stateDir, row);
+        markerRow = row;
       }
       if (canApplyActiveChoice && jevFlag('OMC_JEV_MAX_EFFORT_ALWAYS')) {
         const effort = override.effort ?? modified.effort;
@@ -384,9 +616,21 @@ function collectJevModelRoutingOverrides(plan, runtime, pending) {
           if (capped !== effort) override.effort = capped;
         }
       }
+      if ((canApplyActiveChoice && answers && typeof answers === 'object')
+        || (marker && isJevRowTelemetryEnabled(process.env) && isJevAppliedLogEnabled())) {
+        pending.routing.push({
+          callId: call.id, input, modified, selectedModel, normalizedModel, knownTier,
+          unpinned, namedModel, answers, jevOverride, marker, markerApplies, markerRow,
+          directory, stateDir: plan.snapshot.stateDir, requestId, jevModel: result?.jevModel,
+          inheritedModel: plan.snapshot.modelRouting.claudeModel || plan.snapshot.modelRouting.anthropicModel,
+        });
+      }
     }
 
+    const previousSlopRequestId = jevLastRequestId('slop-warning');
     const slopResult = recordSlopWarningShadow(callPlan, permissionMode);
+    const lastSlopRequestId = jevLastRequestId('slop-warning');
+    const slopRequestId = lastSlopRequestId !== previousSlopRequestId ? lastSlopRequestId : undefined;
     if (jevFlag('OMC_JEV_SLOP_WARNING_APPLY')) {
       const noul = jevNoulOf(slopResult, 'slop_advisory');
       if (noul !== undefined) {
@@ -399,7 +643,7 @@ function collectJevModelRoutingOverrides(plan, runtime, pending) {
         const warned = noul >= threshold;
         if (warned !== callPlan.jevObservations?.slopWarning) {
           override.slopWarning = warned;
-          pending.slop.push({ callId: call.id, action: { from: warned ? 'none' : 'warn', to: warned ? 'warn' : 'none', noul } });
+          pending.slop.push({ callId: call.id, requestId: slopRequestId, action: { from: warned ? 'none' : 'warn', to: warned ? 'warn' : 'none', noul } });
         }
       }
     }
@@ -409,9 +653,10 @@ function collectJevModelRoutingOverrides(plan, runtime, pending) {
 }
 
 function recordAppliedDecisions(pending, output, reduction) {
-  if (reduction.decision !== 'pass' && reduction.decision !== 'allow') return;
+  const accepted = reduction.decision === 'pass' || reduction.decision === 'allow';
   const sent = output?.hookSpecificOutput?.updatedInput;
-  if (isRecord(sent) && isJevAppliedLogEnabled()) {
+  const telemetry = isJevRowTelemetryEnabled(process.env);
+  if (isJevAppliedLogEnabled()) {
     const builtins = {
       haiku: 'claude-haiku-4-5', sonnet: 'claude-sonnet-5',
       opus: 'claude-opus-4-8', fable: 'claude-fable-5',
@@ -425,34 +670,91 @@ function recordAppliedDecisions(pending, output, reduction) {
     };
     for (const item of pending.routing) {
       const applied = {};
-      const choice = item.answers['model-tier']?.choice;
-      const baselineModel = item.unpinned
-        ? process.env.CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || item.modified.model
-        : item.selectedModel || item.modified.model;
-      if (typeof choice === 'string' && item.override.model === choice.toLowerCase()
-        && sent.model === item.override.model
-        && resolvedModel(sent.model) !== resolvedModel(baselineModel)) {
-        applied.model = { from: baselineModel ?? null, to: sent.model };
+      if (accepted && isRecord(sent)) {
+        const choice = item.answers?.['model-tier']?.choice;
+        const baselineModel = item.unpinned
+          ? item.inheritedModel || item.modified.model
+          : item.selectedModel || item.namedModel || item.modified.model;
+        if (typeof choice === 'string' && item.jevOverride.model === choice.toLowerCase()
+          && sent.model === item.jevOverride.model
+          && resolvedModel(sent.model) !== resolvedModel(baselineModel)) {
+          applied.model = { from: baselineModel ?? null, to: sent.model };
+        }
+        const score = item.answers?.effort?.type === 'score' ? item.answers.effort.score : undefined;
+        const explicitEffort = typeof item.modified.effort === 'string' && jevFlag('OMC_JEV_MAX_EFFORT_ALWAYS')
+          ? capEffort(item.modified.effort) : item.modified.effort;
+        const baselineEffort = explicitEffort
+          || readAgentField(item.input.subagent_type, item.directory, 'effort')
+          || process.env.CLAUDE_CODE_EFFORT_LEVEL;
+        if (typeof score === 'number' && Number.isFinite(score) && score >= 0 && score <= 4
+          && item.jevOverride.effort === sent.effort && sent.effort !== baselineEffort) {
+          const confidence = item.answers.effort.confidence;
+          applied.effort = {
+            from: baselineEffort ?? null,
+            to: sent.effort,
+            score,
+            confidence: typeof confidence === 'number' && confidence >= 0 && confidence <= 1 ? confidence : null,
+            ...(typeof item.input.name === 'string' && item.input.name.trim() ? { delivered: 'unknown-team-member' } : {}),
+          };
+        }
       }
-      const score = item.answers.effort?.type === 'score' ? item.answers.effort.score : undefined;
-      const explicitEffort = typeof item.modified.effort === 'string' && jevFlag('OMC_JEV_MAX_EFFORT_ALWAYS')
-        ? capEffort(item.modified.effort) : item.modified.effort;
-      const baselineEffort = explicitEffort
-        || readAgentField(item.input.subagent_type, item.directory, 'effort')
-        || process.env.CLAUDE_CODE_EFFORT_LEVEL;
-      if (typeof score === 'number' && Number.isFinite(score) && score >= 0 && score <= 4
-        && item.override.effort === sent.effort && sent.effort !== baselineEffort) {
-        applied.effort = { from: baselineEffort ?? null, to: sent.effort, score };
-      }
-      if (applied.model || applied.effort) {
-        recordJevApplied('model-routing', { subagent_type: item.input.subagent_type || null, ...applied });
+      const extra = {
+        ...(isJevLogContextEnabled(process.env) ? { tool_use_id: item.callId } : {}),
+        ...(telemetry && item.jevModel ? { jev_model: item.jevModel } : {}),
+      };
+      const subagent_type = item.input.subagent_type || null;
+      const rejected = item.marker?.rejected.join(',');
+      if (telemetry && item.markerApplies) {
+        if (!accepted || !isRecord(sent)
+          || (item.marker.model && sent.model !== item.marker.model)
+          || (item.marker.effort && sent.effort !== item.markerRow.effort.to)) continue;
+        const model = item.marker.model
+          ? { ...item.markerRow.model, source: 'marker' }
+          : applied.model ? { ...applied.model, source: 'jev' }
+            : item.modified.model ? { from: item.modified.model, to: item.modified.model, source: 'explicit' }
+              : item.knownTier ? { from: null, to: item.normalizedModel, source: 'heuristic' } : undefined;
+        const effort = item.marker.effort
+          ? { ...item.markerRow.effort, source: 'marker' }
+          : applied.effort ? { ...applied.effort, source: 'jev' }
+            : typeof item.modified.effort === 'string'
+              ? { from: item.modified.effort, to: item.modified.effort, source: 'explicit' } : undefined;
+        if (effort && typeof item.input.name === 'string' && item.input.name.trim()) {
+          effort.delivered = 'unknown-team-member';
+        }
+        recordJevApplied('model-routing', {
+          subagent_type,
+          cause: 'marker',
+          override: item.markerRow.override,
+          marker: item.marker.line,
+          ...(rejected ? { override_rejected: rejected } : {}),
+          ...(model ? { model } : {}),
+          ...(effort ? { effort } : {}),
+        }, item.requestId ?? null, extra, join(item.stateDir, 'jev'));
+      } else if (applied.model || applied.effort) {
+        recordJevApplied('model-routing', {
+          subagent_type,
+          ...applied,
+          ...(telemetry ? {
+            cause: 'jev',
+            ...(rejected ? { marker: item.marker.line, override_rejected: rejected } : {}),
+          } : {}),
+        }, item.requestId ?? null, extra, join(item.stateDir, 'jev'));
+      } else if (telemetry && rejected) {
+        recordJevApplied('model-routing', {
+          subagent_type,
+          cause: 'marker',
+          marker: item.marker.line,
+          override_rejected: rejected,
+        }, item.requestId ?? null, extra, join(item.stateDir, 'jev'));
       }
     }
   }
+  if (!accepted) return;
   const rendered = JSON.stringify(output);
   for (const item of pending.slop) {
     if (item.action.to === 'none' || rendered.includes('[SLOP WARNING]')) {
-      recordJevApplied('slop-warning', { action: item.action });
+      recordJevApplied('slop-warning', { action: item.action }, item.requestId ?? null,
+        isJevLogContextEnabled(process.env) ? { tool_use_id: item.callId } : {});
     }
   }
 }
@@ -513,6 +815,120 @@ function findCriticalCommitFailure(reduction, report) {
   );
 }
 
+// With OMC_PLANNER_WRITE_GUARD=1, guarded agents may write only Markdown
+// plans. Resolve the raw and normalized paths through every symlink.
+const PLAN_WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
+const PLAN_WRITE_DIR = join('.omc', 'plans');
+const PLAN_WRITE_PATH_FIELDS = ['file_path', 'filePath', 'notebook_path', 'path', 'file'];
+const PLAN_WRITE_MAX_LINKS = 40;
+
+function walkKernelPath(filePath, cwd, followLast = true) {
+  try {
+    const root = isAbsolute(filePath) ? parse(filePath).root : '';
+    let current = realpathSync.native(root || cwd);
+    let missing = 0;
+    const parts = filePath.slice(root.length).split(process.platform === 'win32' ? /[\\/]+/ : /\/+/).filter((part) => part !== '' && part !== '.');
+    for (const [index, part] of parts.entries()) {
+      if (missing === 0 && !statSync(current).isDirectory()) return null;
+      if (part === '..') {
+        current = dirname(current);
+        if (missing > 0) missing -= 1;
+        continue;
+      }
+      const next = join(current, part);
+      if (missing === 0) {
+        try {
+          lstatSync(next);
+        } catch (error) {
+          if (error?.code !== 'ENOENT') return null;
+          missing = 1;
+          current = next;
+          continue;
+        }
+        current = followLast || index < parts.length - 1 ? realpathSync.native(next) : next;
+      } else {
+        missing += 1;
+        current = next;
+      }
+    }
+    return current;
+  } catch {
+    return null;
+  }
+}
+
+function planEntryAllowed(entry, nativePlansDir) {
+  let current = entry;
+  for (let hop = 0; hop <= PLAN_WRITE_MAX_LINKS; hop += 1) {
+    if (current === null) return false;
+    const rel = relative(nativePlansDir, current);
+    if (rel === '' || rel.split(sep)[0] === '..' || isAbsolute(rel) || !current.endsWith('.md')) return false;
+    let stat;
+    try {
+      stat = lstatSync(current);
+    } catch (error) {
+      return hop === 0 && error?.code === 'ENOENT';
+    }
+    if (!stat.isSymbolicLink()) return stat.isFile();
+    try {
+      current = walkKernelPath(readlinkSync(current), dirname(current), false);
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function planWritePathAllowed(filePath, cwd) {
+  const plansDir = resolve(cwd, PLAN_WRITE_DIR);
+  const target = resolve(cwd, filePath);
+  const rel = relative(plansDir, target);
+  if (rel === '' || rel.split(sep)[0] === '..' || isAbsolute(rel) || !rel.endsWith('.md')) return false;
+  const nativePlansDir = walkKernelPath(plansDir, cwd);
+  if (nativePlansDir === null) return false;
+  return planEntryAllowed(walkKernelPath(filePath, cwd, false), nativePlansDir)
+    && planEntryAllowed(walkKernelPath(target, cwd, false), nativePlansDir);
+}
+
+function evaluatePlanWriteGuard(toolName, data, directory, stateDir) {
+  if (process.env.OMC_PLANNER_WRITE_GUARD !== '1' || !PLAN_WRITE_TOOLS.has(toolName)) return null;
+  try {
+    const configured = String(process.env.OMC_PLANNER_WRITE_GUARD_TYPES ?? '').split(',').map((name) => name.trim()).filter(Boolean);
+    const guardedTypes = configured.length > 0 ? configured : ['oh-my-claudecode:planner'];
+    const agentTypes = [data?.agent_type, data?.agentType, data?.agentName, ...(data?.agentTypeAliases ?? [])]
+      .filter((value) => typeof value === 'string').map((value) => value.trim()).filter(Boolean);
+    const agentType = agentTypes.find((name) => guardedTypes.includes(name)) ?? agentTypes[0] ?? '';
+    let row;
+    let reason = null;
+    if (!agentType || !guardedTypes.includes(agentType)) {
+      row = { agent_type: agentType ? agentType.slice(0, 200) : null, decision: 'allow', reason: agentType ? 'agent_type not guarded' : 'no agent_type' };
+    } else {
+      const filePaths = [data.tool_input, data.toolInput, ...(data.toolInputAliases ?? [])]
+        .filter(isRecord)
+        .flatMap((input) => PLAN_WRITE_PATH_FIELDS.map((field) => input[field]))
+        .filter((value) => typeof value === 'string' && value.trim() !== '');
+      if (filePaths.length === 0) return null;
+      const cwd = typeof data.cwd === 'string' && data.cwd !== '' ? data.cwd : directory;
+      const deniedPath = filePaths.find((candidate) => !planWritePathAllowed(candidate, cwd));
+      const filePath = deniedPath ?? filePaths[0];
+      row = { agent_type: agentType.slice(0, 200), path: filePath.slice(0, 300), decision: deniedPath === undefined ? 'allow' : 'deny' };
+      if (deniedPath !== undefined) {
+        reason = `[PLAN WRITE GUARD] The planner may write only Markdown files under ${PLAN_WRITE_DIR}${sep} (denied: "${filePath.slice(0, 200)}"). Write the plan to ${PLAN_WRITE_DIR}${sep}<name>.md instead.`;
+      }
+    }
+    try {
+      const logDir = process.env.OMC_JEV_LOG_DIR || join(stateDir, 'jev');
+      mkdirSync(logDir, { recursive: true });
+      const logPath = join(logDir, 'plan-write-guard.jsonl');
+      rotateJevLog(logPath, resolveJevLogMaxBytes(process.env));
+      appendFileSync(logPath, JSON.stringify({ ts: new Date().toISOString(), point: 'plan-write-guard', ...jevLogContextOf(data), tool_name: toolName, ...row }) + '\n', 'utf8');
+    } catch { /* logging never affects the call */ }
+    return reason;
+  } catch {
+    return null;
+  }
+}
+
 async function main() {
   const skipHooks = (process.env.OMC_SKIP_HOOKS || '')
     .split(',')
@@ -530,6 +946,7 @@ async function main() {
   try {
     const input = await readStdin();
     const runtime = loadHookRuntime();
+    const contextText = await loadContextText();
     let jevContextInitialized = false;
     let shellChecks;
     if (process.env.OMC_SHELL_CHECKS === '1') {
@@ -537,6 +954,7 @@ async function main() {
     }
     const shellContexts = [];
     const pending = { routing: [], slop: [] };
+    const guardDenials = new Map();
     let plan;
     let processorFailure;
 
@@ -545,9 +963,49 @@ async function main() {
       if (processorFailure) throw processorFailure;
 
       try {
-        const snapshot = runtime.loadPreToolBatchSnapshot(envelope, {
+        const loadedSnapshot = runtime.loadPreToolBatchSnapshot(envelope, {
           pluginRoot: resolveHookPluginRoot(),
         });
+        const rawGoal = loadedSnapshot.ultragoal.goal;
+        const snapshot = contextText
+          ? Object.freeze({
+              ...loadedSnapshot,
+              ultragoal: Object.freeze({
+                ...loadedSnapshot.ultragoal,
+                expectedObjective: contextText.cleanHostText(loadedSnapshot.ultragoal.expectedObjective, Infinity),
+                ...(isRecord(rawGoal) ? {
+                  goal: Object.freeze({
+                    ...rawGoal,
+                    ...(typeof rawGoal.objective === 'string'
+                      ? { objective: contextText.cleanHostText(rawGoal.objective, Infinity) }
+                      : {}),
+                  }),
+                } : {}),
+              }),
+            })
+          : loadedSnapshot;
+        for (const call of envelope.toolCalls.filter((candidate) => !candidate.malformed)) {
+          const unit = { call, callId: call.id, originalIndex: call.originalIndex, input: call.input };
+          const data = runtime.buildLegacyProcessorInput(envelope, unit);
+          const guardData = {
+            ...data,
+            tool_input: call.input,
+            toolInput: call.input,
+            toolInputAliases: call.inputAliases,
+            tool_use_id: call.id,
+            agent_type: data.agentName,
+            agentTypeAliases: envelope.agent?.nameAliases,
+          };
+          const reason = evaluatePlanWriteGuard(call.canonicalName, guardData, snapshot.directory, snapshot.stateDir)
+            || (['Task', 'Agent'].includes(call.canonicalName)
+              ? evaluateForbiddenAgentType(call.canonicalName, guardData, snapshot.stateDir)
+              : null);
+          if (reason) guardDenials.set(call.id, reason);
+        }
+        if (guardDenials.size > 0) {
+          plan = runtime.planPreToolBatch(envelope, snapshot);
+          return plan;
+        }
         const permissionMode = envelope.eventPayload.permissionMode;
         const jevEnabled =
           isJevShadowOptedIn(
@@ -611,6 +1069,16 @@ async function main() {
           throw new Error(
             `PreToolUse planner omitted logical call "${unit.callId ?? '<uncorrelated>'}".`,
           );
+        }
+        if (guardDenials.size > 0) {
+          const reason = guardDenials.get(unit.callId);
+          return {
+            ...evaluation,
+            ...(reason ? { decision: 'deny', reason } : {}),
+            mutation: undefined,
+            contexts: [],
+            effects: [],
+          };
         }
         const call = unit.call;
         const shellName = call?.shellDialect === 'powershell'
@@ -683,7 +1151,7 @@ async function main() {
       result.reduction,
       commitReport,
     );
-    const output = runtime.encodePreToolEnforcerOutput(
+    let output = runtime.encodePreToolEnforcerOutput(
       result.envelope,
       finalized,
     );
@@ -697,6 +1165,26 @@ async function main() {
         additionalContext: [...shellContexts.filter((context) => !existingContext.includes(context)), existingContext].filter(Boolean).join('\n\n'),
       };
       delete output.suppressOutput;
+    }
+    if (contextText) {
+      const expected = finalizedPlan.snapshot.ultragoal.expectedObjective;
+      const actual = finalizedPlan.snapshot.ultragoal.goal?.objective;
+      const substitutions = typeof actual === 'string' && actual
+        ? [[
+            `current Claude /goal appears unrelated: "${actual}".`,
+            `current Claude /goal appears unrelated: "${contextText.cleanHostText(actual)}".`,
+          ]]
+        : [];
+      const options = { whole: expected ? [expected] : [], substitutions };
+      output = contextText.cleanHookOutput(output, options);
+      const flat = Object.fromEntries(
+        ['additionalContext', 'permissionDecisionReason']
+          .filter((field) => typeof output[field] === 'string')
+          .map((field) => [field, output[field]]),
+      );
+      if (Object.keys(flat).length) {
+        Object.assign(output, contextText.cleanHookOutput({ hookSpecificOutput: flat }, options).hookSpecificOutput);
+      }
     }
     writeOutput(
       output,

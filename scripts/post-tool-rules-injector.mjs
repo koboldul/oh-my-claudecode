@@ -30,6 +30,7 @@ import {
   loadHookRuntime,
   surfaceOptionalHookFailure,
 } from './lib/hook-runtime-loader.mjs';
+import { loadContextText } from './lib/context-text-loader.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -240,6 +241,7 @@ function processRulesInjector(
   emittedDeliveries,
   emittedContexts,
   stagedKeys,
+  sanitize,
 ) {
   const toolName = data.toolName || '';
   const toolInput = data.toolInput || {};
@@ -273,8 +275,20 @@ function processRulesInjector(
     if (stagedKeys.has(key)) continue;
     stagedKeys.add(key);
 
-    const context = hook.formatRuleForInjection(rule).trim();
-    const legacyContext = hook.formatRulesForInjection([rule]);
+    const names = [
+      rule.relativePath,
+      ...(String(rule.matchReason).startsWith('glob: ')
+        ? [String(rule.matchReason).slice('glob: '.length)]
+        : []),
+    ];
+    const rawContext = hook.formatRuleForInjection(rule).trim();
+    const rawLegacyContext = hook.formatRulesForInjection([rule]);
+    const context = sanitize
+      ? sanitize.cleanTextBlockKeeping(rawContext, names)
+      : rawContext;
+    const legacyContext = sanitize
+      ? sanitize.cleanTextBlockKeeping(rawLegacyContext, names)
+      : rawLegacyContext;
     if (
       envelope.host === 'claude'
       || appendCompleteBoundedContext(runtime, emittedContexts, context)
@@ -410,6 +424,7 @@ async function main() {
     );
     const runtime = loadHookRuntime();
     const input = await readStdin();
+    const sanitize = await loadContextText();
     const initialized = await storageInitialization;
     if (initialized.error !== undefined) throw initialized.error;
     if (
@@ -442,6 +457,7 @@ async function main() {
           emittedDeliveries,
           emittedContexts,
           stagedKeys,
+          sanitize,
         );
       },
     );

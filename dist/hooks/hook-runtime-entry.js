@@ -106,6 +106,9 @@ export function buildLegacyProcessorInput(envelope, unit, options = {}) {
         ...(eventPayload.promptId !== undefined
             ? { prompt_id: eventPayload.promptId }
             : {}),
+        ...(eventPayload.contextWindow !== undefined
+            ? { context_window: eventPayload.contextWindow }
+            : {}),
         ...(eventPayload.sessionEndReason !== undefined
             || eventPayload.reason !== undefined
             ? { reason: eventPayload.sessionEndReason ?? eventPayload.reason }
@@ -117,7 +120,10 @@ export function buildLegacyProcessorInput(envelope, unit, options = {}) {
                     ? { agentId: envelope.agent.id }
                     : {}),
                 ...(envelope.agent.name !== undefined
-                    ? { agentName: envelope.agent.name }
+                    ? {
+                        agentName: envelope.agent.name,
+                        agent_type: envelope.agent.name,
+                    }
                     : {}),
                 ...(envelope.agent.displayName !== undefined
                     ? { agentDisplayName: envelope.agent.displayName }

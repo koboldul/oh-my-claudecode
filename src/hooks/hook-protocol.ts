@@ -125,6 +125,8 @@ export interface CanonicalToolCall {
   canonicalName: string;
   shellDialect?: ShellDialect;
   input: unknown;
+  /** Other supplied legacy input spellings, retained for policies that must check every candidate. */
+  inputAliases?: readonly unknown[];
   rawArgs?: unknown;
   fingerprint: string;
   status: 'valid' | 'malformed';
@@ -135,6 +137,7 @@ export interface CanonicalToolCall {
 export interface CanonicalAgentRef {
   id?: string;
   name?: string;
+  nameAliases?: readonly string[];
   displayName?: string;
   description?: string;
   correlation: 'host-id' | 'unavailable';

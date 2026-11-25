@@ -32,6 +32,7 @@ const LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
 const DISCOVERY_FILE = 'discovery.json';
 const SESSION_END_ROOT_CACHE_LIMIT = 64;
 const sessionEndRootCache = new Map();
+const WORKER_EXITS_FILE = 'worker-exits.jsonl';
 function canonicalScopeDirectory(directory) {
     let resolved = path.resolve(directory);
     try {
@@ -638,6 +639,13 @@ export function releaseSessionEndJob(directory, sessionId, nonce, generation, re
         }
     });
 }
+/** Evidence for a worker that exits still owning its job: it cannot be written to the manifest it failed to release (#4844). */
+export function recordSessionEndWorkerExit(directory, entry) { try {
+    const file = path.join(sessionEndJobsDirectory(directory), WORKER_EXITS_FILE);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFileSync(file, `${JSON.stringify({ at: nowIso(), ...entry })}\n`);
+}
+catch { /* best effort evidence only */ } }
 export function updateSessionEndJob(directory, sessionId, expectedOwner, mutate) { return mutateLatest(directory, sessionId, (job) => { if (job.owner?.nonce !== expectedOwner || job.phase === 'complete')
     throw new Error('owner-conflict'); mutate(job); }); }
 export function claimSessionEndAction(directory, sessionId, ownerNonce, name, deadlineAt) { return updateSessionEndJob(directory, sessionId, ownerNonce, (job) => { const action = job.actions[name]; if (!action || !['pending', 'retryable'].includes(action.status) || action.claimantNonce)

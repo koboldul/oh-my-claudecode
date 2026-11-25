@@ -6,7 +6,12 @@ import {
   loadHookRuntime,
   surfaceOptionalHookFailure,
 } from './lib/hook-runtime-loader.mjs';
+import { loadContextText } from './lib/context-text-loader.mjs';
 
+// Opt-in text cleaning (OMC_CONTEXT_TEXT_SANITIZE=1 or true): the wiki page metadata is cleaned before it is written. The
+// categories in it are identifiers (the model passes them to wiki_list), so they are written exactly, and the text around
+// them is cleaned (see cleanTextBlockKeeping). The module is loaded only when the switch is on; with the switch off the
+// text is written unchanged.
 async function main() {
   try {
     const runtime = loadHookRuntime();
@@ -21,14 +26,28 @@ async function main() {
     const result = await runtime.runHookJson(
       'pre-compact',
       input,
-      (unit, envelope) => {
-        const processorResult = onPreCompact(
-          runtime.buildLegacyProcessorInput(envelope, unit),
-        );
+      async (unit, envelope) => {
+        const data = runtime.buildLegacyProcessorInput(envelope, unit);
+        const processorResult = onPreCompact(data);
+        const sanitize = processorResult.additionalContext
+          ? await loadContextText()
+          : null;
+        let categories = [];
+        if (sanitize) {
+          try {
+            categories = (await import('../dist/hooks/wiki/storage.js'))
+              .readAllPages(data.cwd || process.cwd())
+              .map((page) => page.frontmatter.category);
+          } catch {
+            // The categories are not known: the text is cleaned as a whole.
+          }
+        }
         legacyOutput = processorResult.additionalContext
           ? {
               continue: true,
-              systemMessage: processorResult.additionalContext,
+              systemMessage: sanitize
+                ? sanitize.cleanTextBlockKeeping(processorResult.additionalContext, categories)
+                : processorResult.additionalContext,
             }
           : { continue: true, suppressOutput: true };
         return legacyOutput;

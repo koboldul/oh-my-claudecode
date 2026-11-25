@@ -203,7 +203,7 @@ export interface WorkerStartupEvidencePolicy {
     engagedPaneRecheckBudgetMs: number;
 }
 export declare function getWorkerStartupEvidencePolicy(agentType: CliAgentType): WorkerStartupEvidencePolicy;
-export declare function waitForStartupEvidenceBudget(hasEvidence: () => Promise<boolean>, budgetMs: number, delayMs?: number): Promise<boolean>;
+export declare function waitForStartupEvidenceBudget(hasEvidence: () => Promise<boolean>, budgetMs: number, delayMs?: number, providerExited?: () => Promise<boolean>): Promise<boolean>;
 /**
  * Settle worker startup evidence under a provider-aware policy.
  *
@@ -224,6 +224,13 @@ export declare function settleStartupEvidence(policy: WorkerStartupEvidencePolic
 /** Last owned-pane line that reports a claim-task failure. Pane text is not startup evidence. */
 export declare function claimErrorLineFromPane(captured: string): string | undefined;
 export declare function promptModeRecoveryRequiresProgressEvidence(promptMode: boolean, continuationCount: number): boolean;
+/**
+ * Written before a recovery splits a pane, removed once that pane is dead or
+ * carried by the worker row. Until then the pane may be alive and tracked
+ * nowhere else, so the owner deadline keeps the recovery active.
+ */
+export declare function recordRecoveryPaneSplit(input: RecoverDeadWorkerOwnerInput, recoveryId: string, paneAttemptId: string): Promise<void>;
+export declare function clearRecoveryPaneSplit(input: RecoverDeadWorkerOwnerInput, recoveryId: string, paneAttemptId: string): Promise<void>;
 interface RecoveryOwnerFinalizationDeps {
     readRevisionedConfig: (teamName: string, cwd: string) => Promise<{
         config: TeamConfig;
@@ -255,7 +262,11 @@ interface BootstrapRecoveryEvidenceWaitOptions {
 }
 /** Establish the exact successor/config binding before a detached owner may execute or maintain. */
 export declare function prepareRecoveryOwnerBootstrap(input: RecoverDeadWorkerOwnerInput, waitOptions?: BootstrapRecoveryEvidenceWaitOptions): Promise<void>;
-/** Private runtime-owner executor. It never calls the public recovery facade. */
+/**
+ * Private runtime-owner executor. It never calls the public recovery facade.
+ * Attempts of one recovery in this process run one at a time, so no attempt
+ * judges state another attempt is still writing.
+ */
 export declare function executeRecoverDeadWorkerV2Owner(input: RecoverDeadWorkerOwnerInput): Promise<RecoverDeadWorkerV2Result>;
 /**
  * Start a team with the v2 event-driven runtime.

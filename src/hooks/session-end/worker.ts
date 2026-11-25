@@ -2,7 +2,7 @@ import { childEnv } from '../../utils/windows-search.js';
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
-import { claimSessionEndAction, claimSessionEndDiscoveryTickets, claimSessionEndJob, failClosedExhaustedForegroundCleanup, failClosedMissingCoreProducer, finishSessionEndAction, markSessionEndActionRunner, readSessionEndJob, reapStaleSessionEndOwner, recoverPreparedCoreProducer, releaseSessionEndDiscoveryTicket, releaseSessionEndJob, renewSessionEndLease, type SessionEndActionName, updateSessionEndActionPayload, type SessionEndActionAuthority } from './cleanup-manifest.js';
+import { claimSessionEndAction, claimSessionEndDiscoveryTickets, claimSessionEndJob, failClosedExhaustedForegroundCleanup, failClosedMissingCoreProducer, finishSessionEndAction, markSessionEndActionRunner, readSessionEndJob, reapStaleSessionEndOwner, recordSessionEndWorkerExit, recoverPreparedCoreProducer, releaseSessionEndDiscoveryTicket, releaseSessionEndJob, renewSessionEndLease, type SessionEndActionName, updateSessionEndActionPayload, type SessionEndActionAuthority } from './cleanup-manifest.js';
 import { runSessionEndAction } from './action-runner.js';
 import { armSessionEndActionWatchdog } from './action-watchdog.js';
 import { getProcessStartIdentity, isProcessIdentityLive } from '../../platform/process-utils.js';
@@ -10,6 +10,10 @@ import { getProcessStartIdentity, isProcessIdentityLive } from '../../platform/p
 const WORKER_ARG = '--omc-session-end-worker';
 const MAX_WORKER_MS = 10_000;
 const WORKER_IDENTITY_BUDGET_MS = process.platform === 'win32' ? 2_500 : 250;
+const RELEASE_RETRY_DELAYS_MS = [0, 250, 1_000];
+const RELEASE_RETRY_BUDGET_MS = 6_000;
+/** Worst-case wait in cleanup-manifest withLock before it gives up; a retry starts only if one more fits the budget. */
+const RELEASE_LOCK_WAIT_MS = 5_000;
 export interface SessionEndWorkerPayload {
   directory: string;
   sessionId: string;
@@ -128,6 +132,34 @@ function retryAfterBoundedRunners(payload: SessionEndWorkerPayload, job: ReturnT
   setTimeout(() => { void processSessionEndWorker(payload); }, Math.max(...deadlines) - now + 1);
 }
 
+/**
+ * A failed release returns null rather than throwing, and a worker that leaves
+ * its own live owner record behind cannot be reaped or reclaimed until the next
+ * SessionStart, so retry from the owner's current generation (#4844).
+ */
+async function releaseOwnedJob(
+  payload: SessionEndWorkerPayload,
+  nonce: string,
+  generation: number,
+  exitReason: string,
+  actionResult?: Parameters<typeof releaseSessionEndJob>[5],
+): Promise<ReturnType<typeof releaseSessionEndJob>> {
+  let leaseGeneration = generation; const giveUpAt = Date.now() + RELEASE_RETRY_BUDGET_MS;
+  for (const delay of [...RELEASE_RETRY_DELAYS_MS, null]) {
+    const released = releaseSessionEndJob(payload.directory, payload.sessionId, nonce, leaseGeneration, exitReason, actionResult);
+    if (released) return released;
+    const job = readSessionEndJob(payload.directory, payload.sessionId);
+    if (job && job.owner?.nonce !== nonce) return null;
+    if (job?.owner) leaseGeneration = job.owner.leaseGeneration;
+    if (delay === null || Date.now() + delay + RELEASE_LOCK_WAIT_MS > giveUpAt) {
+      recordSessionEndWorkerExit(payload.directory, { sessionId: payload.sessionId, pid: process.pid, outcome: 'release-failed', exitReason, ownerNonce: nonce, leaseGeneration, revision: job?.revision, phase: job?.phase });
+      return null;
+    }
+    if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+  }
+  return null;
+}
+
 export async function processSessionEndWorker(payload: SessionEndWorkerPayload): Promise<void> {
   const deadlineAt = Date.now() + MAX_WORKER_MS; const nonce = randomUUID(); const identity = payload.processStartIdentity ?? await getProcessStartIdentity(process.pid, Math.min(deadlineAt, Date.now() + WORKER_IDENTITY_BUDGET_MS));
   if (!identity) return;
@@ -201,14 +233,7 @@ export async function processSessionEndWorker(payload: SessionEndWorkerPayload):
       generation = heartbeat.owner.leaseGeneration;
     }
   } finally {
-    const released = releaseSessionEndJob(
-      payload.directory,
-      payload.sessionId,
-      nonce,
-      generation,
-      exitReason,
-      pendingActionResult,
-    );
+    const released = await releaseOwnedJob(payload, nonce, generation, exitReason, pendingActionResult);
     const terminalized = failClosedExhaustedForegroundCleanup(payload.directory, payload.sessionId);
     reschedulePendingWorker(payload, terminalized ?? released ?? readSessionEndJob(payload.directory, payload.sessionId));
   }

@@ -31,7 +31,8 @@ import {
   surfaceCriticalHookFailure,
 } from "./lib/hook-runtime-loader.mjs";
 import { readStdin } from "./lib/stdin.mjs";
-import { isJevShadowOptedIn, jevNoulOf, jevStateIds, recordJevApplied, recordJevShadow, setJevHookContext, setJevSessionId } from "./lib/jev-shadow.mjs";
+import { isJevShadowOptedIn, jevLastRequestId, jevNoulOf, jevStateIds, recordJevApplied, recordJevShadow, setJevHookContext, setJevSessionId } from "./lib/jev-shadow.mjs";
+import { loadContextText } from './lib/context-text-loader.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -85,6 +86,8 @@ async function releaseOutput(directory, sessionId, hasValidSessionId) {
   if (!markerPath) return SAFE_CONTINUE;
   if (existsSync(markerPath)) return SAFE_CONTINUE;
   if (!writeJsonFile(markerPath, { ts: new Date().toISOString(), noul: learnerHintNoul })) return SAFE_CONTINUE;
+  // OMC_JEV_APPLIED_LOG: the active answer added the hint to this Stop's output.
+  recordJevApplied("learner-extraction", { action: { from: "none", to: "hint", noul: learnerHintNoul } });
   return { ...SAFE_CONTINUE, systemMessage: LEARNER_HINT_MESSAGE };
 }
 
@@ -239,10 +242,18 @@ function isJevLoopReleaseOnly() {
  * see isModeEndedSinceJevRequest); otherwise the
  * completeModeFromJev() outcome.
  */
-function jevCompletionOutcome(result, state, statePath) {
+function jevCompletionOutcome(result, state, statePath, heuristicShouldBlock) {
   if (!jevSaysTaskComplete(result)) return null;
   if (!isJevLoopReleaseOnly()) return completeModeFromJev(state, statePath);
-  if (isStateUnchangedSinceJevRequest(state, statePath)) return "released";
+  if (isStateUnchangedSinceJevRequest(state, statePath)) {
+    // OMC_JEV_APPLIED_LOG: Record only when Jev's "task complete" actually released a Stop the heuristic would have blocked
+    // (a child Ralph under an active autopilot passes false: the autopilot handler decides that Stop).
+    if (heuristicShouldBlock) {
+      const modeName = /([^\\/]+)-state\.json$/.exec(statePath)?.[1] ?? null;
+      recordJevApplied("loop-continuation", { mode: modeName, block: { from: true, to: false }, noul: jevNoulOf(result, "task_complete") });
+    }
+    return "released";
+  }
   return isModeEndedSinceJevRequest(statePath) ? "cancelled" : null;
 }
 
@@ -1520,7 +1531,7 @@ function hasPendingArchitectVerification(prd) {
  * session-scoped file only: falling back to the unscoped legacy file would
  * delegate for a request the bridge deliberately does not read.
  */
-async function readPendingVerificationRequest(directory, omcRoot, sessionId) {
+async function readPendingVerificationRequest(directory, omcRoot, sessionId, { includeSettled = false } = {}) {
   if (sessionId) {
     try {
       const { sessionScopedPath } = await resolveSessionStatePathsForHook(
@@ -1529,14 +1540,14 @@ async function readPendingVerificationRequest(directory, omcRoot, sessionId) {
         sessionId,
       );
       const state = sessionScopedPath ? readJsonFile(sessionScopedPath) : null;
-      return state && state.pending === true ? state : null;
+      return state && (includeSettled || state.pending === true) ? state : null;
     } catch {
       return null;
     }
   }
 
   const state = readJsonFile(join(omcRoot, "ralph-verification.json"));
-  return state && state.pending === true ? state : null;
+  return state && (includeSettled || state.pending === true) ? state : null;
 }
 
 /**
@@ -1657,7 +1668,37 @@ function delegateToBridge(input) {
   return null;
 }
 
+// Opt-in text cleaning (OMC_CONTEXT_TEXT_SANITIZE=1 or true): the Ralph task line and the /goal objective in Stop blocks are
+// cleaned only when the switch is on. The processor loads the module; with the switch off nothing is imported.
+let contextText = null;
+// Texts that a Stop output asks the model to give back exactly (the /goal objective): cleanHookOutput does not cut them.
+const wholeTexts = [];
+
+// The reviewer prompt that the bridge composes quotes the original task, the completion claim and the earlier reviewer feedback
+// verbatim. With the switch on they are cut here, where the hook knows them (the bridge is not changed), and emit() then cleans
+// and bounds the whole message. The story id in the approval tag has to be copied exactly: it is written as a JSON string when
+// it holds a removed character.
+const DELEGATED_QUOTE_LIMITS = [["original_task", 2000], ["completion_claim", 1000], ["architect_feedback", 2000]];
+async function boundDelegated(delegated, { directory, omcRoot, sessionId, task }) {
+  if (!contextText || !delegated) return delegated;
+  // The bridge may have settled the request while it answered (a rejection prompt quotes the same fields), so a settled one counts.
+  const request = await readPendingVerificationRequest(directory, omcRoot, sessionId, { includeSettled: true });
+  const substitutions = [];
+  const quote = (value, limit) => {
+    if (typeof value === "string" && value.length > limit) substitutions.push([value, contextText.cutText(value, limit)]);
+  };
+  for (const [field, limit] of DELEGATED_QUOTE_LIMITS) quote(request?.[field], limit);
+  quote(task, DELEGATED_QUOTE_LIMITS[0][1]);
+  // The story id has to be copied exactly, so emit() does not cut it either, in the form in which it stands in the tag.
+  if (typeof request?.story_id === "string" && request.story_id) wholeTexts.push(contextText.escapeIdentifier(request.story_id));
+  return contextText.cleanHookOutput(delegated, { identifiers: [request?.story_id], substitutions });
+}
+
 async function evaluatePersistentMode(data, console) {
+    contextText = await loadContextText();
+    const emit = (output) => {
+      console.log(JSON.stringify(contextText ? contextText.cleanHookOutput(output, { whole: wholeTexts }) : output));
+    };
     if (shouldSkipPersistentModeHook()) {
       console.log(JSON.stringify(SAFE_CONTINUE));
       return;
@@ -1681,35 +1722,35 @@ async function evaluatePersistentMode(data, console) {
     // Blocking these causes a deadlock where Claude Code cannot compact.
     // See: https://github.com/Yeachan-Heo/oh-my-claudecode/issues/213
     if (isContextLimitStop(data)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      emit({ continue: true, suppressOutput: true });
       return;
     }
 
     const criticalTranscriptPath = data.transcript_path || data.transcriptPath || "";
     if (estimateContextPercent(criticalTranscriptPath) >= CRITICAL_CONTEXT_STOP_PERCENT) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      emit({ continue: true, suppressOutput: true });
       return;
     }
 
     // Respect user abort (Ctrl+C, cancel)
     if (isUserAbort(data)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      emit({ continue: true, suppressOutput: true });
       return;
     }
 
     // Never block auth failures (401/403/expired OAuth): allow re-auth flow.
     if (isAuthenticationError(data)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      emit({ continue: true, suppressOutput: true });
       return;
     }
 
     if (isScheduledWakeupStop(data)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      emit({ continue: true, suppressOutput: true });
       return;
     }
 
     if (hasPendingOwnedAsyncWork(stateDir, sessionId)) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      emit({ continue: true, suppressOutput: true });
       return;
     }
 
@@ -1757,12 +1798,12 @@ async function evaluatePersistentMode(data, console) {
               || afterRalph.state.current_story_id !== beforeStoryId);
           const verificationAdvanced = after.pending && reviewerWorkKey(after) !== beforeKey;
           if (delegated && delegated.decision === "block" && (verificationAdvanced || ralphProgressed)) {
-            console.log(JSON.stringify(delegated));
+            emit(await boundDelegated(delegated, { directory, omcRoot, sessionId, task: ralph.state.prompt }));
             return;
           }
         }
       }
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      emit({ continue: true, suppressOutput: true });
       return;
     }
     const ultragoal = readStateFileWithSession(
@@ -1811,23 +1852,37 @@ async function evaluatePersistentMode(data, console) {
       const reason = transcriptFailure === "workflow_transcript_record_too_large"
         ? `[AUTOPILOT WORKFLOW] ${transcriptFailure}. Run /cancel and re-invoke the workflow.`
         : "[AUTOPILOT WORKFLOW] workflow_descriptor_integrity_failed. Run /cancel and re-invoke the workflow.";
-      console.log(JSON.stringify({ continue: false, decision: "block", reason }));
+      emit({ continue: false, decision: "block", reason });
       return;
     }
     if (currentAutopilot && hasNamedWorkflowMarkers(currentAutopilot) && !isWorkflowRuntimeSupported()) {
-      console.log(JSON.stringify(SAFE_CONTINUE));
+      emit(SAFE_CONTINUE);
       return;
     }
     const cancellation = isSessionCancelInProgress(stateDir, sessionId, autopilot.path, { directory, isGlobal: autopilot.isGlobal, hasValidSessionId });
     if (cancellation.currentAutopilot) autopilot.state = cancellation.currentAutopilot;
     if (cancellation.active) {
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      emit({ continue: true, suppressOutput: true });
       return;
     }
 
     // Swarm uses swarm-summary.json (not swarm-state.json) + marker file
     const swarmMarker = existsSync(join(stateDir, "swarm-active.marker"));
     const swarmSummary = readJsonFile(join(stateDir, "swarm-summary.json"));
+
+    // OMC_JEV_APPLIED_LOG: the noul of a child Ralph that Jev released while its autopilot parent decides the Stop;
+    // its row is written only if the parent then releases the Stop too.
+    let childRalphRelease = null;
+    // The request_id is kept because the parent's later request replaces the point's last one.
+    const takeChildRalphRelease = (result) => {
+      const noul = jevNoulOf(result, "task_complete");
+      return noul === undefined ? null : { noul, requestId: jevLastRequestId("loop-continuation") };
+    };
+    const writeChildRalphRelease = () => {
+      if (childRalphRelease === null) return;
+      recordJevApplied("loop-continuation", { mode: "ralph", block: { from: true, to: false }, noul: childRalphRelease.noul }, childRalphRelease.requestId);
+      childRalphRelease = null;
+    };
 
     // Priority 1: Ralph Loop (explicit persistence mode)
     // Skip if state is stale (older than 2 hours) - prevents blocking new sessions
@@ -1859,17 +1914,15 @@ async function evaluatePersistentMode(data, console) {
           ralph.state.active = false;
           ralph.state.last_checked_at = new Date().toISOString();
           if (!shouldWriteStateBack(ralph.path)) {
-            console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+            emit({ continue: true, suppressOutput: true });
             return;
           }
           writeJsonFile(ralph.path, ralph.state);
 
-          console.log(
-            JSON.stringify({
-              decision: "block",
-              reason: `[RALPH LOOP - HARD LIMIT] Reached hard max iterations (${hardMax}). Mode auto-disabled. Restart with /oh-my-claudecode:ralph if needed.`,
-            }),
-          );
+          emit({
+            decision: "block",
+            reason: `[RALPH LOOP - HARD LIMIT] Reached hard max iterations (${hardMax}). Mode auto-disabled. Restart with /oh-my-claudecode:ralph if needed.`,
+          });
           return;
         }
 
@@ -1881,7 +1934,7 @@ async function evaluatePersistentMode(data, console) {
         if (work.pending) {
           const delegated = delegateToBridge(data);
           if (delegated) {
-            console.log(JSON.stringify(delegated));
+            emit(await boundDelegated(delegated, { directory, omcRoot, sessionId, task: ralph.state.prompt }));
             return;
           }
         }
@@ -1893,12 +1946,12 @@ async function evaluatePersistentMode(data, console) {
           ralph.state.iteration = iteration + 1;
           ralph.state.last_checked_at = new Date().toISOString();
           if (!shouldWriteStateBack(ralph.path)) {
-            console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+            emit({ continue: true, suppressOutput: true });
             return;
           }
           writeJsonFile(ralph.path, ralph.state);
 
-          let reason = `[RALPH LOOP - ITERATION ${iteration + 1}/${maxIter}] Work is NOT done. Continue working.\nWhen FULLY complete (after Architect verification), run /oh-my-claudecode:cancel to cleanly exit ralph mode and clean up all state files. If cancel fails, retry with /oh-my-claudecode:cancel --force.\n${ralph.state.prompt ? `Task: ${ralph.state.prompt}` : ""}`;
+          let reason = `[RALPH LOOP - ITERATION ${iteration + 1}/${maxIter}] Work is NOT done. Continue working.\nWhen FULLY complete (after Architect verification), run /oh-my-claudecode:cancel to cleanly exit ralph mode and clean up all state files. If cancel fails, retry with /oh-my-claudecode:cancel --force.\n${ralph.state.prompt ? `Task: ${contextText ? contextText.cleanHostText(ralph.state.prompt, 500) : ralph.state.prompt}` : ""}`;
           if (errorGuidance) {
             reason = errorGuidance + reason;
           }
@@ -1920,26 +1973,25 @@ async function evaluatePersistentMode(data, console) {
           };
           const jevResult = recordLoopContinuationShadow(judgmentState, heuristic, data.permission_mode);
 
-          const jevCompletion = jevCompletionOutcome(jevResult, ralph.state, ralph.path);
+          const jevCompletion = jevCompletionOutcome(jevResult, ralph.state, ralph.path, heuristic.shouldBlock && !hasActiveAutopilotForSession);
 
           if (jevCompletion) {
             if (!hasActiveAutopilotForSession) {
-              console.log(JSON.stringify(jevCompletionStopOutput(jevCompletion, "ralph")));
+              emit(jevCompletionStopOutput(jevCompletion, "ralph"));
               return;
             }
 
             // Ralph is a child workflow here, completed or cancelled; let the
             // active autopilot handler below decide Stop instead of releasing
             // the turn.
+            if (jevCompletion === "released") childRalphRelease = takeChildRalphRelease(jevResult);
             break ralphPriority;
           }
 
-          console.log(
-            JSON.stringify({
-              decision: "block",
-              reason: reason,
-            }),
-          );
+          emit({
+            decision: "block",
+            reason: reason,
+          });
           return;
         }
 
@@ -1947,7 +1999,7 @@ async function evaluatePersistentMode(data, console) {
         ralph.state.max_iterations = maxIter + 10;
         ralph.state.last_checked_at = new Date().toISOString();
         if (!shouldWriteStateBack(ralph.path)) {
-          console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+          emit({ continue: true, suppressOutput: true });
           return;
         }
         writeJsonFile(ralph.path, ralph.state);
@@ -1967,26 +2019,24 @@ async function evaluatePersistentMode(data, console) {
           iteration: ralph.state.iteration,
           maxIterations: ralph.state.max_iterations,
         }, data.permission_mode);
-
-        const jevCompletionAtExtend = jevCompletionOutcome(jevExtendResult, ralph.state, ralph.path);
+        const jevCompletionAtExtend = jevCompletionOutcome(jevExtendResult, ralph.state, ralph.path, !hasActiveAutopilotForSession);
 
         if (!jevCompletionAtExtend) {
-          console.log(
-            JSON.stringify({
-              decision: "block",
-              reason: ralphExtendedReason,
-            }),
-          );
+          emit({
+            decision: "block",
+            reason: ralphExtendedReason,
+          });
           return;
         }
 
         if (!hasActiveAutopilotForSession) {
-          console.log(JSON.stringify(jevCompletionStopOutput(jevCompletionAtExtend, "ralph")));
+          emit(jevCompletionStopOutput(jevCompletionAtExtend, "ralph"));
           return;
         }
 
         // Completed or cancelled child Ralph: continue into the active
         // autopilot handler below.
+        if (jevCompletionAtExtend === "released") childRalphRelease = takeChildRalphRelease(jevExtendResult);
         break ralphPriority;
       }
     }
@@ -2005,7 +2055,7 @@ async function evaluatePersistentMode(data, console) {
         const maxReinforcements = ultragoal.state.max_reinforcements || 50;
 
         if (newCount > maxReinforcements) {
-          console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+          emit({ continue: true, suppressOutput: true });
           return;
         }
 
@@ -2015,19 +2065,24 @@ async function evaluatePersistentMode(data, console) {
         ultragoal.state.reinforcement_count = newCount;
         ultragoal.state.last_checked_at = new Date().toISOString();
         if (!shouldWriteStateBack(ultragoal.path)) {
-          console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+          emit({ continue: true, suppressOutput: true });
           return;
         }
         writeJsonFile(ultragoal.path, ultragoal.state);
 
         let reason = `[ULTRAGOAL #${newCount}/${maxReinforcements}] Ultragoal mode is active. Continue the durable goal workflow, keep the matching Claude /goal active, and checkpoint .omc/ultragoal/ledger.jsonl before stopping. When all ultragoal stories are complete and the final quality gate passes, run /oh-my-claudecode:cancel to cleanly exit.`;
         const objective = getUltragoalObjective(ultragoal.state, omcRoot);
-        if (objective) reason += `\nClaude /goal objective: ${objective}`;
+        if (objective) {
+          // The objective is a value that the model has to give back in full, so the bound on the output does not cut it.
+          const objectiveText = contextText ? contextText.cleanHostText(objective, Infinity) : objective;
+          if (contextText && objectiveText) wholeTexts.push(objectiveText);
+          reason += `\nClaude /goal objective: ${objectiveText}`;
+        }
         if (errorGuidance) {
           reason = errorGuidance + reason;
         }
 
-        console.log(JSON.stringify({ decision: "block", reason }));
+        emit({ decision: "block", reason });
         return;
       }
     }
@@ -2042,7 +2097,11 @@ async function evaluatePersistentMode(data, console) {
       isStateForCurrentProject(autopilot.state, directory, autopilot.isGlobal)
     ) {
       clearLoadedStateFile(autopilot);
-      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      // Flush deferred Ralph rows on orphan-parent releases: when an autopilot state
+      // contains only the routing echo and is deleted, any deferred child Ralph release
+      // must be written before the orphan handler returns SAFE_CONTINUE.
+      writeChildRalphRelease();
+      emit({ continue: true, suppressOutput: true });
       return;
     }
 
@@ -2057,35 +2116,35 @@ async function evaluatePersistentMode(data, console) {
       if (sessionMatches) {
         if (hasNamedWorkflowMarkers(autopilot.state) && !isValidNamedWorkflowState(autopilot.state, sessionId)) {
           const transcriptFailure = takeWorkflowTranscriptFailure(sessionId);
-          console.log(JSON.stringify({ continue: false, decision: "block", reason: transcriptFailure === 'workflow_transcript_record_too_large' ? '[AUTOPILOT WORKFLOW] workflow_transcript_record_too_large. Run /cancel and re-invoke the workflow.' : "[AUTOPILOT WORKFLOW] workflow_descriptor_integrity_failed. Run /cancel and re-invoke the workflow." }));
+          emit({ continue: false, decision: "block", reason: transcriptFailure === 'workflow_transcript_record_too_large' ? '[AUTOPILOT WORKFLOW] workflow_transcript_record_too_large. Run /cancel and re-invoke the workflow.' : "[AUTOPILOT WORKFLOW] workflow_descriptor_integrity_failed. Run /cancel and re-invoke the workflow." });
           return;
         }
         if (hasNamedWorkflowMarkers(autopilot.state) && !isWorkflowRuntimeSupported()) {
-          console.log(JSON.stringify(SAFE_CONTINUE));
+          emit(SAFE_CONTINUE);
           return;
         }
         const workflowAdvance = advanceWorkflowOnStop(autopilot.state, data, sessionId);
         if (workflowAdvance) {
           const commit = commitWorkflowAdvance(autopilot.path, workflowAdvance);
           if (commit.committed) {
-            console.log(JSON.stringify({ continue: false, decision: "block", reason: workflowAdvance.nextStage
+            emit({ continue: false, decision: "block", reason: workflowAdvance.nextStage
               ? workflowAdvance.nextStagePrompt
-              : "[AUTOPILOT WORKFLOW] All selected stages are complete." }));
+              : "[AUTOPILOT WORKFLOW] All selected stages are complete." });
           } else if (takeWorkflowTranscriptFailure(sessionId) === 'workflow_transcript_record_too_large') {
-            console.log(JSON.stringify({ continue: false, decision: 'block', reason: '[AUTOPILOT WORKFLOW] workflow_transcript_record_too_large. Run /cancel and re-invoke the workflow.' }));
+            emit({ continue: false, decision: 'block', reason: '[AUTOPILOT WORKFLOW] workflow_transcript_record_too_large. Run /cancel and re-invoke the workflow.' });
           } else if (hasNamedWorkflowMarkers(commit.state) && (!isValidWorkflowDescriptor(commit.state.workflow) || !isValidWorkflowTrackingState(commit.state, sessionId))) {
-            console.log(JSON.stringify({ continue: false, decision: "block", reason: "[AUTOPILOT WORKFLOW] workflow_descriptor_integrity_failed. Run /cancel and re-invoke the workflow." }));
+            emit({ continue: false, decision: "block", reason: "[AUTOPILOT WORKFLOW] workflow_descriptor_integrity_failed. Run /cancel and re-invoke the workflow." });
           } else {
-            console.log(JSON.stringify(hasNamedWorkflowMarkers(commit.state) ? workflowStopResponse(commit.state) : SAFE_CONTINUE));
+            emit(hasNamedWorkflowMarkers(commit.state) ? workflowStopResponse(commit.state) : SAFE_CONTINUE);
           }
           return;
         }
         if (takeWorkflowTranscriptFailure(sessionId) === 'workflow_transcript_record_too_large') {
-          console.log(JSON.stringify({ continue: false, decision: 'block', reason: '[AUTOPILOT WORKFLOW] workflow_transcript_record_too_large. Run /cancel and re-invoke the workflow.' }));
+          emit({ continue: false, decision: 'block', reason: '[AUTOPILOT WORKFLOW] workflow_transcript_record_too_large. Run /cancel and re-invoke the workflow.' });
           return;
         }
         if (hasNamedWorkflowMarkers(autopilot.state) && (!isValidWorkflowDescriptor(autopilot.state.workflow) || !isValidWorkflowTrackingState(autopilot.state, sessionId))) {
-          console.log(JSON.stringify({ continue: false, decision: "block", reason: "[AUTOPILOT WORKFLOW] workflow_descriptor_integrity_failed. Run /cancel and re-invoke the workflow." }));
+          emit({ continue: false, decision: "block", reason: "[AUTOPILOT WORKFLOW] workflow_descriptor_integrity_failed. Run /cancel and re-invoke the workflow." });
           return;
         }
         if (hasNamedWorkflowMarkers(autopilot.state)) {
@@ -2100,9 +2159,9 @@ async function evaluatePersistentMode(data, console) {
           };
           const refresh = refreshNamedWorkflowDispatch(autopilot.path, expected);
           if (refresh.integrityFailed || (hasNamedWorkflowMarkers(refresh.state) && (!isValidWorkflowDescriptor(refresh.state.workflow) || !isValidWorkflowTrackingState(refresh.state, sessionId)))) {
-            console.log(JSON.stringify({ continue: false, decision: "block", reason: "[AUTOPILOT WORKFLOW] workflow_descriptor_integrity_failed. Run /cancel and re-invoke the workflow." }));
+            emit({ continue: false, decision: "block", reason: "[AUTOPILOT WORKFLOW] workflow_descriptor_integrity_failed. Run /cancel and re-invoke the workflow." });
           } else {
-            console.log(JSON.stringify(refresh.committed ? workflowStopResponse(refresh.state) : SAFE_CONTINUE));
+            emit(refresh.committed ? workflowStopResponse(refresh.state) : SAFE_CONTINUE);
           }
           return;
         }
@@ -2128,7 +2187,7 @@ async function evaluatePersistentMode(data, console) {
               });
               if (!locked.acquired || !committed) {
                 if (!locked.acquired) reportLockFailure('Autopilot state reinforcement');
-                console.log(JSON.stringify(SAFE_CONTINUE));
+                emit(SAFE_CONTINUE);
                 return;
               }
               autopilot.state = reinforced;
@@ -2173,19 +2232,18 @@ async function evaluatePersistentMode(data, console) {
               if (refreshed) autopilot.state = heartbeat;
             }
 
-            const jevAutopilotCompletion = jevCompletionOutcome(jevAutopilotResult, autopilot.state, autopilot.path);
+            const jevAutopilotCompletion = jevCompletionOutcome(jevAutopilotResult, autopilot.state, autopilot.path, !reinforcementLimitReached);
             if (jevAutopilotCompletion) {
-              console.log(JSON.stringify(jevCompletionStopOutput(jevAutopilotCompletion, "autopilot")));
+              if (jevAutopilotCompletion === "released") writeChildRalphRelease();
+              emit(jevCompletionStopOutput(jevAutopilotCompletion, "autopilot"));
               return;
             }
 
             if (!reinforcementLimitReached || refreshed) {
-              console.log(
-                JSON.stringify({
-                  decision: "block",
-                  reason: reason,
-                }),
-              );
+              emit({
+                decision: "block",
+                reason: reason,
+              });
               return;
             }
           }
@@ -2221,12 +2279,10 @@ async function evaluatePersistentMode(data, console) {
             reason = errorGuidance + reason;
           }
 
-          console.log(
-            JSON.stringify({
-              decision: "block",
-              reason,
-            }),
-          );
+          emit({
+            decision: "block",
+            reason,
+          });
           return;
         }
       }
@@ -2256,12 +2312,10 @@ async function evaluatePersistentMode(data, console) {
             reason = errorGuidance + reason;
           }
 
-          console.log(
-            JSON.stringify({
-              decision: "block",
-              reason,
-            }),
-          );
+          emit({
+            decision: "block",
+            reason,
+          });
           return;
         }
       }
@@ -2293,12 +2347,10 @@ async function evaluatePersistentMode(data, console) {
             reason = errorGuidance + reason;
           }
 
-          console.log(
-            JSON.stringify({
-              decision: "block",
-              reason,
-            }),
-          );
+          emit({
+            decision: "block",
+            reason,
+          });
           return;
         }
       }
@@ -2330,12 +2382,10 @@ async function evaluatePersistentMode(data, console) {
               reason = errorGuidance + reason;
             }
 
-            console.log(
-              JSON.stringify({
-                decision: "block",
-                reason,
-              }),
-            );
+            emit({
+              decision: "block",
+              reason,
+            });
             return;
           }
         }
@@ -2368,7 +2418,7 @@ async function evaluatePersistentMode(data, console) {
               reason = errorGuidance + reason;
             }
 
-            console.log(JSON.stringify({ decision: "block", reason }));
+            emit({ decision: "block", reason });
             return;
           }
         }
@@ -2382,8 +2432,10 @@ async function evaluatePersistentMode(data, console) {
         recordIdleNotificationSent(stateDir);
       }
     }
+    // No mode blocked: a child Ralph that Jev released let this Stop through.
+    writeChildRalphRelease();
     // Copilot agentStop has no non-blocking message output; do not consume its hint marker.
-    console.log(JSON.stringify(await releaseOutput(directory, sessionId, hasValidSessionId && data.host !== "copilot")));
+    emit(await releaseOutput(directory, sessionId, hasValidSessionId && data.host !== "copilot"));
 }
 
 async function processPersistentModeStop(data) {

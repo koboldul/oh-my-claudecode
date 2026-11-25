@@ -82,6 +82,7 @@ const LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
 const DISCOVERY_FILE = 'discovery.json';
 const SESSION_END_ROOT_CACHE_LIMIT = 64;
 const sessionEndRootCache = new Map<string, string>();
+const WORKER_EXITS_FILE = 'worker-exits.jsonl';
 export interface DiscoveryTicket { sessionId: string; claimNonce?: string; leaseExpiresAt?: string; attempts: number; retryAt: string; acknowledgedAt?: string; }
 interface DiscoveryIndex { version: 2; cursor: number; tickets: DiscoveryTicket[]; }
 
@@ -588,6 +589,8 @@ export function releaseSessionEndJob(
     }
   });
 }
+/** Evidence for a worker that exits still owning its job: it cannot be written to the manifest it failed to release (#4844). */
+export function recordSessionEndWorkerExit(directory: string, entry: Record<string, unknown>): void { try { const file = path.join(sessionEndJobsDirectory(directory), WORKER_EXITS_FILE); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.appendFileSync(file, `${JSON.stringify({ at: nowIso(), ...entry })}\n`); } catch { /* best effort evidence only */ } }
 export function updateSessionEndJob(directory: string, sessionId: string, expectedOwner: string, mutate: (job: SessionEndJobV1) => void): SessionEndJobV1 | null { return mutateLatest(directory, sessionId, (job) => { if (job.owner?.nonce !== expectedOwner || job.phase === 'complete') throw new Error('owner-conflict'); mutate(job); }); }
 export function claimSessionEndAction(directory: string, sessionId: string, ownerNonce: string, name: SessionEndActionName, deadlineAt: number): SessionEndJobV1 | null { return updateSessionEndJob(directory, sessionId, ownerNonce, (job) => { const action = job.actions[name]; if (!action || !['pending', 'retryable'].includes(action.status) || action.claimantNonce) throw new Error('action-claim-conflict'); if (action.class === 'best-effort' && action.attempts > 0) { action.status = 'expired'; action.lastOutcomeCode = 'delivery-attempted'; return; } if ((action.class === 'required' && (action.attempts >= REQUIRED_ACTION_MAX_ATTEMPTS || Date.now() >= Date.parse(job.bestEffortDeadlineAt))) || (action.class === 'best-effort' && Date.now() >= Date.parse(job.bestEffortDeadlineAt))) { action.status = 'expired'; action.lastOutcomeCode = action.class === 'required' ? action.attempts >= REQUIRED_ACTION_MAX_ATTEMPTS ? 'required-attempt-limit' : 'required-deadline-expired' : 'deadline-expired'; return; } action.status = 'claimed'; action.attempts++; action.claimantNonce = ownerNonce; action.claimedAt = nowIso(); action.runner = { attempt: action.attempts, runnerNonce: randomUUID(), phase: 'reserved', deadlineAt: new Date(deadlineAt).toISOString() }; }); }
 export function markSessionEndActionRunner(directory: string, sessionId: string, ownerNonce: string, name: SessionEndActionName, runnerNonce: string, phase: 'started' | 'armed' | 'result-recorded'): SessionEndJobV1 | null { return updateSessionEndJob(directory, sessionId, ownerNonce, (job) => { const action = job.actions[name]; if (action.status !== 'claimed' || action.runner?.runnerNonce !== runnerNonce) throw new Error('runner-phase-conflict'); action.runner.phase = phase; }); }

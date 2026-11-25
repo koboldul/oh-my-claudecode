@@ -18,6 +18,7 @@ import {
   resolveHookPluginRoot,
   surfaceOptionalHookFailure,
 } from './lib/hook-runtime-loader.mjs';
+import { loadContextText } from './lib/context-text-loader.mjs';
 
 const SKIP_HOOKS = (process.env.OMC_SKIP_HOOKS || '')
   .split(',')
@@ -48,7 +49,7 @@ function extractFilePath(toolInput) {
   return toolInput.file_path || toolInput.path || null;
 }
 
-function processDirectoryContext(data) {
+async function processDirectoryContext(data) {
   if (HOOK_DISABLED) {
     return { continue: true };
   }
@@ -77,11 +78,23 @@ function processDirectoryContext(data) {
     return { continue: true, suppressOutput: true };
   }
 
+  const sanitize = await loadContextText();
+  let paths = [];
+  if (sanitize && typeof hook.getContextFilesForFile === 'function') {
+    try {
+      paths = hook.getContextFilesForFile(filePath);
+    } catch {
+      // The paths are not known: the text is cleaned as a whole.
+    }
+  }
+
   return {
     continue: true,
     hookSpecificOutput: {
       hookEventName: 'PostToolUse',
-      additionalContext: contextText,
+      additionalContext: sanitize
+        ? sanitize.cleanTextBlockKeeping(contextText, paths)
+        : contextText,
     },
   };
 }
@@ -99,8 +112,8 @@ async function main() {
     const result = await runtime.runHookJson(
       'post-tool-use',
       input,
-      (unit, envelope) => {
-        legacyOutput = processDirectoryContext(
+      async (unit, envelope) => {
+        legacyOutput = await processDirectoryContext(
           runtime.buildLegacyProcessorInput(envelope, unit),
         );
         return legacyOutput;

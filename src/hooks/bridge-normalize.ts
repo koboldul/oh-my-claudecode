@@ -921,6 +921,9 @@ function decodeSingleToolCall(
       : raw.toolInput ?? raw.tool_input;
     rawArgs = input;
   }
+  const inputAliases = ['tool_input', 'toolInput']
+    .filter((key) => hasOwn(raw, key) && !Object.is(raw[key], input))
+    .map((key) => raw[key]);
 
   const fingerprint = safeCallFingerprint(
     nativeName,
@@ -942,6 +945,7 @@ function decodeSingleToolCall(
     canonicalName: canonicalToolName(host, nativeName),
     shellDialect: shellDialectForTool(host, nativeName),
     input,
+    ...(inputAliases.length > 0 ? { inputAliases } : {}),
     rawArgs,
     fingerprint: fingerprint.fingerprint,
     status: malformed ? 'malformed' : 'valid',
@@ -1024,9 +1028,17 @@ export function normalizeHookEnvelope(raw: unknown, hookType?: string): Canonica
     ? stringField(raw, 'agent_type')
       ?? stringField(raw, 'agent_name')
       ?? stringField(raw, 'agentName')
+      ?? stringField(raw, 'agentType')
     : stringField(raw, 'agentName')
       ?? stringField(raw, 'agent_type')
-      ?? stringField(raw, 'agent_name');
+      ?? stringField(raw, 'agent_name')
+      ?? stringField(raw, 'agentType');
+  const nameAliases = [...new Set(
+    ['agent_type', 'agentType', 'agent_name', 'agentName']
+      .map((key) => stringField(raw, key))
+      .filter((name): name is string =>
+        name !== undefined && name.trim() !== '' && name !== agentName),
+  )];
   const agentDisplayName =
     stringField(raw, 'agentDisplayName')
     ?? stringField(raw, 'agent_display_name');
@@ -1039,6 +1051,7 @@ export function normalizeHookEnvelope(raw: unknown, hookType?: string): Canonica
     agent = {
       ...(agentId ? { id: agentId } : {}),
       ...(agentName ? { name: agentName } : {}),
+      ...(nameAliases.length > 0 ? { nameAliases } : {}),
       ...(agentDisplayName ? { displayName: agentDisplayName } : {}),
       ...(agentDescription ? { description: agentDescription } : {}),
       correlation: agentId ? 'host-id' : 'unavailable',

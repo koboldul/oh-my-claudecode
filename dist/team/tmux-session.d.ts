@@ -3,6 +3,8 @@ import type { MailboxNotificationTarget, MailboxTargetOwnership } from "./mailbo
 import type { CliAgentType } from "./model-contract.js";
 import { type TeamInstanceId, type TmuxServerIdentity } from "./types.js";
 import { type ProcessIdentityObservation } from "./team-owner-epoch.js";
+import { detectPaneTrustPromptKind, paneHasActiveTask, paneHasTrustPrompt, paneLooksReady, type PaneTrustPromptKind } from "./pane-readiness.js";
+export { detectPaneTrustPromptKind, paneHasActiveTask, paneHasTrustPrompt, paneLooksReady, type PaneTrustPromptKind, };
 import { type WorkerLaunchAttempt, type WorkerLaunchContext } from "./worker-launch-ack.js";
 export type TmuxServerIdentityObservation = "matching" | "dead" | "unknown";
 export interface TmuxServerIdentityDependencies {
@@ -394,17 +396,6 @@ export declare function captureOwnedTeamPane(ownership: WorkerPaneOwnership, opt
 export declare function sendTeamPaneKey(paneId: string, key: string, tmuxServerIdentity?: TmuxServerIdentity): Promise<void>;
 export declare function killTeamPane(paneId: string): Promise<void>;
 export declare function killOwnedWorkerPane(ownership: WorkerPaneOwnership): Promise<void>;
-/**
- * @internal Exported for testing only.
- */
-export type PaneTrustPromptKind = "directory" | "claude_directory" | "codex_directory" | "codex_hooks" | "cursor_workspace_trust";
-/**
- * @internal Exported for testing only.
- */
-export declare function detectPaneTrustPromptKind(captured: string, provider?: CliAgentType): PaneTrustPromptKind | null;
-export declare function paneHasTrustPrompt(captured: string, provider?: CliAgentType): boolean;
-export declare function paneHasActiveTask(captured: string, provider?: CliAgentType): boolean;
-export declare function paneLooksReady(captured: string, provider?: CliAgentType): boolean;
 export interface WaitForPaneReadyOptions {
     timeoutMs?: number;
     pollIntervalMs?: number;
@@ -421,8 +412,9 @@ export type StartupPaneReadyResult = {
     ok: true;
 } | {
     ok: false;
-    reason: "attempt_inactive" | "ownership_mismatch" | "copy_mode" | "copy_mode_unknown" | "capture_failed" | "selector_unsupported" | "selector_persistent" | "cursor_workspace_untrusted" | "codex_workspace_untrusted" | "pane_busy" | "readiness_timeout";
+    reason: "attempt_inactive" | "ownership_mismatch" | "copy_mode" | "copy_mode_unknown" | "capture_failed" | "selector_unsupported" | "selector_persistent" | "cursor_workspace_untrusted" | "codex_workspace_untrusted" | "claude_bypass_permissions_consent_required" | "claude_onboarding_required" | "pane_busy" | "provider_exited" | "readiness_timeout";
 };
+export declare function startupProviderExited(context: StartupPaneContext): Promise<boolean>;
 export declare function waitForStartupPaneReady(context: StartupPaneContext, opts?: WaitForPaneReadyOptions): Promise<StartupPaneReadyResult>;
 export declare function deliverStartupInbox(context: StartupPaneContext, message: string, options?: {
     attemptAlreadyFenced?: boolean;
@@ -440,7 +432,8 @@ export declare function deliverStartupInbox(context: StartupPaneContext, message
  *   trigger and is working, so resubmitting would duplicate the inbox. Callers
  *   must keep waiting for startup evidence instead of tearing the launch down.
  * - `unavailable` — the pane cannot be re-submitted into (inactive attempt,
- *   copy mode, capture failure, selector, or the trigger text is gone).
+ *   exited provider, copy mode, capture failure, selector, or the trigger
+ *   text is gone).
  */
 export type StartupInboxResubmitOutcome = "resubmitted" | "pane_busy" | "unavailable";
 /**
@@ -531,5 +524,4 @@ export declare function killTeamSession(sessionName: string, workerPaneIds?: str
     sessionMode?: TeamSessionMode;
     tmuxServerIdentity?: TmuxServerIdentity;
 }): Promise<boolean>;
-export {};
 //# sourceMappingURL=tmux-session.d.ts.map

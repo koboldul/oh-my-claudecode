@@ -32,7 +32,12 @@ function startForeground(timeoutMs: number, env: Record<string, string> = {}) {
   runInNewContext(`(function () {\n${source.replace(/^#![^\n]*\n/, '')}\n})();`, {
     require,
     module,
-    process: { argv: ['node', runnerPath, 'session-end.mjs'], env, platform: process.platform },
+    process: {
+      argv: ['node', runnerPath, 'session-end.mjs'],
+      env,
+      platform: process.platform,
+      hrtime: process.hrtime,
+    },
     testManifestHook: { event: 'SessionEnd', timeoutMs },
     testRunWorker: runWorker,
   }, { filename: runnerPath });

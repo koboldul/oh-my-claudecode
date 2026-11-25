@@ -2041,6 +2041,36 @@ function ensureDirSync(dir) {
     throw err;
   }
 }
+function shouldRetryRename(error) {
+  if (process.platform !== "win32") {
+    return false;
+  }
+  const err = error;
+  return err?.code === "EPERM" || err?.code === "EBUSY" || err?.code === "EACCES";
+}
+function renameSyncWithRetry(tempPath, filePath, renameImpl, maxAttempts = 10, delayMs = 3) {
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      renameImpl(tempPath, filePath);
+      return;
+    } catch (error) {
+      if (!shouldRetryRename(error)) {
+        throw error;
+      }
+      lastError = error;
+      if (attempt < maxAttempts - 1) {
+        try {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+        } catch {
+        }
+      }
+    }
+  }
+  if (lastError) {
+    throw lastError;
+  }
+}
 function writeAllSync(fd, content, label) {
   const bytes = Buffer.from(content, "utf-8");
   let offset = 0;
@@ -2164,7 +2194,9 @@ function atomicWriteFileSync(filePath, content, hooks, operations) {
     verifyPrivateTempFile(fd, tempPath, "atomic write", operations);
     backupPath = preservePriorTarget(filePath, operations);
     hooks?.beforeRename?.();
-    (operations?.rename ?? fsSync.renameSync)(tempPath, filePath);
+    renameSyncWithRetry(tempPath, filePath, (src, dst) => {
+      (operations?.rename ?? fsSync.renameSync)(src, dst);
+    });
     let publishedIdentity = null;
     try {
       verifyPublishedFile(fd, filePath, "atomic write", operations);

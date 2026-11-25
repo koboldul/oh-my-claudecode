@@ -408,6 +408,56 @@ describe('shipped PreToolUse canonical runtime entrypoint', () => {
     );
   });
 
+  it('accepts APAC Bedrock model IDs through the native runtime', () => {
+    const staged = stagePlugin();
+    const cwd = makeWorktree('apac-model');
+    expectExactOutput(
+      runHook(
+        staged,
+        claudePayload(cwd, 'Task', {
+          subagent_type: 'executor',
+          model: 'apac.anthropic.claude-sonnet-4-6',
+        }),
+        cwd,
+        { env: { OMC_QUIET: '2', OMC_ROUTING_FORCE_INHERIT: 'true' } },
+      ),
+      { continue: true, suppressOutput: true },
+    );
+  });
+
+  it.each([
+    ['https://anthropic.com.proxy.example/v1', undefined],
+    ['https://proxy.example/anthropic.com', undefined],
+    ['https://API.ANTHROPIC.COM./v1', 'deny'],
+  ] as const)('classifies the provider by the hostname in %s', (baseUrl, decision) => {
+    const staged = stagePlugin();
+    const cwd = makeWorktree('provider-hostname');
+    const result = runHook(
+      staged,
+      claudePayload(cwd, 'Task', {
+        subagent_type: 'executor',
+        model: 'sonnet',
+      }),
+      cwd,
+      {
+        env: {
+          OMC_ROUTING_FORCE_INHERIT: 'true',
+          CLAUDE_MODEL: 'claude-sonnet-4-6',
+          ANTHROPIC_BASE_URL: baseUrl,
+          ANTHROPIC_DEFAULT_SONNET_MODEL: 'proxy-sonnet',
+        },
+      },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    const output: {
+      continue: boolean;
+      hookSpecificOutput?: { permissionDecision?: string };
+    } = JSON.parse(result.stdout);
+    expect(output.continue).toBe(true);
+    expect(output.hookSpecificOutput?.permissionDecision).toBe(decision);
+  });
+
   it('preserves the exact Claude raw-block output', () => {
     const staged = stagePlugin();
     const cwd = makeWorktree('claude-raw-block');

@@ -265,7 +265,7 @@ export function getBuiltinExternalDefaultModel(provider: 'codex' | 'gemini' | 'a
 
 function hasBedrockModelId(modelIds: readonly string[]): boolean {
   for (const modelId of modelIds) {
-    if (/^((us|eu|ap|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
+    if (/^((us|eu|ap|apac|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
       return true;
     }
     if (
@@ -321,7 +321,7 @@ export function isBedrock(): boolean {
  */
 export function isProviderSpecificModelId(modelId: string): boolean {
   // Bedrock prefixed formats (region.anthropic.claude-*, anthropic.claude-*)
-  if (/^((us|eu|ap|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
+  if (/^((us|eu|ap|apac|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
     return true;
   }
   // Bedrock ARN formats

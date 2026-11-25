@@ -8404,6 +8404,10 @@ var init_state_paths = __esm({
       mailbox: (teamName, workerName) => `.omc/state/team/${teamName}/mailbox/${workerName}.json`,
       mailboxLockDir: (teamName, workerName) => `.omc/state/team/${teamName}/mailbox/.lock-${workerName}`,
       dispatchRequests: (teamName) => `.omc/state/team/${teamName}/dispatch/requests.json`,
+      // Not `.lock`: that name holds pre-identity-lock mkdir directories, which the file lock cannot read or reclaim.
+      dispatchLock: (teamName) => `.omc/state/team/${teamName}/dispatch/requests.lock`,
+      dispatchLegacyLockDir: (teamName) => `.omc/state/team/${teamName}/dispatch/.lock`,
+      /** @deprecated Use `dispatchLegacyLockDir` instead. Kept for public API compatibility. */
       dispatchLockDir: (teamName) => `.omc/state/team/${teamName}/dispatch/.lock`,
       mailboxNotificationLock: (teamName, requestId) => `.omc/state/team/${teamName}/dispatch/.mailbox-notification-${(0, import_node_crypto.createHash)("sha256").update(requestId).digest("hex")}.lock`,
       workerStatus: (teamName, workerName) => `.omc/state/team/${teamName}/workers/${workerName}/status.json`,
@@ -8473,6 +8477,9 @@ var init_state_paths = __esm({
       recoveryResultByTeam: (workspaceHash, teamName, recoveryId) => `.omc/state/team-recovery/by-team/${workspaceHash}/${teamName}/${recoveryId}.json`,
       recoveryFinalIndexLock: (workspaceHash, teamName, recoveryId) => `.omc/state/team-recovery/index-locks/${workspaceHash}/${teamName}/${recoveryId}.lock`,
       scalingRollbackFailure: (teamName, recordedAt) => `.omc/state/team/${teamName}/scaling-rollback/${recordedAt}.json`,
+      recoveryPaneRollbackFailures: (teamName, recoveryId) => `.omc/state/team/${teamName}/recovery/rollback-failures/${recoveryId}`,
+      recoveryPaneSplits: (teamName, recoveryId) => `.omc/state/team/${teamName}/recovery/pane-splits/${recoveryId}`,
+      recoveryPaneSplit: (teamName, recoveryId, paneAttemptId) => `.omc/state/team/${teamName}/recovery/pane-splits/${recoveryId}/${paneAttemptId}.json`,
       recoveryPaneRollbackFailure: (teamName, recoveryId, paneAttemptId, recordedAt) => `.omc/state/team/${teamName}/recovery/rollback-failures/${recoveryId}/${paneAttemptId}-${recordedAt}.json`,
       recoveryAuditIndex: () => ".omc/state/team-recovery/audit.jsonl"
     };
@@ -9409,7 +9416,7 @@ function getDefaultTierModels() {
 }
 function hasBedrockModelId(modelIds) {
   for (const modelId of modelIds) {
-    if (/^((us|eu|ap|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
+    if (/^((us|eu|ap|apac|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
       return true;
     }
     if (/^arn:aws(-[^:]+)?:bedrock:/i.test(modelId) && /:(inference-profile|application-inference-profile)\//i.test(modelId) && modelId.toLowerCase().includes("claude")) {
@@ -10607,6 +10614,12 @@ function assertSafeCmdValue(value) {
     throw new Error("Native Windows tmux command values cannot contain NUL, CR, or LF characters");
   }
 }
+function tmuxGlobalArgs() {
+  return process.platform === "win32" ? [] : ["-u"];
+}
+function tmuxShellCommand(command) {
+  return ["tmux", ...tmuxGlobalArgs(), command].join(" ");
+}
 function resolveTmuxInvocation(args) {
   const resolvedBinary = resolveTmuxBinaryPath();
   if (process.platform === "win32" && /\.(cmd|bat)$/i.test(resolvedBinary)) {
@@ -10619,7 +10632,7 @@ function resolveTmuxInvocation(args) {
   }
   return {
     command: resolvedBinary,
-    args
+    args: [...tmuxGlobalArgs(), ...args]
   };
 }
 function tmuxExec(args, opts) {
@@ -10639,11 +10652,11 @@ async function tmuxExecAsync(args, opts) {
 }
 function tmuxShell(command, opts) {
   const { stripTmux: _, ...execOpts } = opts ?? {};
-  return (0, import_child_process2.execSync)(`tmux ${command}`, { encoding: "utf-8", ...execOpts, env: resolveEnv(opts) });
+  return (0, import_child_process2.execSync)(tmuxShellCommand(command), { encoding: "utf-8", ...execOpts, env: resolveEnv(opts) });
 }
 async function tmuxShellAsync(command, opts) {
   const { stripTmux: _, timeout, ...rest } = opts ?? {};
-  return (0, import_util5.promisify)(import_child_process2.exec)(`tmux ${command}`, {
+  return (0, import_util5.promisify)(import_child_process2.exec)(tmuxShellCommand(command), {
     encoding: "utf-8",
     env: resolveEnv(opts),
     ...timeout !== void 0 ? { timeout } : {},
@@ -10711,26 +10724,333 @@ var init_types3 = __esm({
   }
 });
 
-// src/team/pane-readiness.ts
-function paneLineLooksLikeIdlePrompt(line, provider) {
-  if (provider === void 0) return LEGACY_IDLE_PROMPT_LINE.test(line);
-  return PROVIDER_IDLE_PROMPT_LINES[provider].test(line);
+// src/team/ready-timeout.ts
+function parseExactInteger(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed) return void 0;
+  const negative = trimmed.startsWith("-");
+  const magnitude = negative || trimmed.startsWith("+") ? trimmed.slice(1) : trimmed;
+  const match = DECIMAL_INTEGER_TEXT.exec(magnitude);
+  if (!match) return void 0;
+  const integerDigits = match[1] ?? "";
+  const fractionDigits = match[2] ?? match[3] ?? "";
+  const exponent = match[4] === void 0 ? 0 : Number(match[4]);
+  const shift = fractionDigits.length - exponent;
+  if (shift > 0) {
+    const significand = integerDigits + fractionDigits;
+    if (/[1-9]/.test(significand)) {
+      const trailingZeros = significand.length - significand.replace(/0+$/, "").length;
+      if (trailingZeros < shift) return void 0;
+    }
+  }
+  const parsed = (negative ? -1 : 1) * Number(magnitude);
+  return Number.isSafeInteger(parsed) ? parsed : void 0;
 }
-var LEGACY_IDLE_PROMPT_LINE, CURSOR_IDLE_PROMPT_LINE, PROVIDER_IDLE_PROMPT_LINES;
+function parseReadyTimeoutMs(env) {
+  const raw = env[READY_TIMEOUT_ENV];
+  return raw == null ? void 0 : parseExactInteger(String(raw));
+}
+function resolveStartupReadyTimeoutMs(env) {
+  const parsed = parseReadyTimeoutMs(env);
+  if (parsed === void 0) return STARTUP_READY_TIMEOUT_MIN_MS;
+  return Math.min(
+    Math.max(STARTUP_READY_TIMEOUT_MIN_MS, parsed),
+    STARTUP_READY_TIMEOUT_MAX_MS
+  );
+}
+function displayValue(raw) {
+  if (/^[\x21-\x7e]{1,32}$/.test(raw)) return raw;
+  const quoted = JSON.stringify(raw.slice(0, DISPLAY_MAX_CHARS)).replace(
+    UNSAFE_DISPLAY_CHARS,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
+  );
+  return raw.length > DISPLAY_MAX_CHARS ? `${quoted}... (truncated, ${raw.length} chars)` : quoted;
+}
+function describeStartupReadyTimeout(env, effectiveMs) {
+  const raw = env[READY_TIMEOUT_ENV];
+  const setting = raw == null ? `${READY_TIMEOUT_ENV} unset` : `${READY_TIMEOUT_ENV}=${displayValue(raw)}`;
+  return `${setting} (effective ${effectiveMs}ms; startup wait is clamped to ${STARTUP_READY_TIMEOUT_MIN_MS}..${STARTUP_READY_TIMEOUT_MAX_MS}ms)`;
+}
+var READY_TIMEOUT_ENV, STARTUP_READY_TIMEOUT_MIN_MS, STARTUP_READY_TIMEOUT_MAX_MS, DECIMAL_INTEGER_TEXT, DISPLAY_MAX_CHARS, UNSAFE_DISPLAY_CHARS;
+var init_ready_timeout = __esm({
+  "src/team/ready-timeout.ts"() {
+    "use strict";
+    READY_TIMEOUT_ENV = "OMC_TEAM_READY_TIMEOUT_MS";
+    STARTUP_READY_TIMEOUT_MIN_MS = 3e4;
+    STARTUP_READY_TIMEOUT_MAX_MS = 12e4;
+    DECIMAL_INTEGER_TEXT = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+    DISPLAY_MAX_CHARS = 32;
+    UNSAFE_DISPLAY_CHARS = /[\u007f-\u009f\u2028\u2029\p{Bidi_Control}]/gu;
+  }
+});
+
+// src/team/pane-readiness.ts
+function patternsFor(provider) {
+  if (provider === void 0) return UNKNOWN_PROVIDER_PATTERNS;
+  return Object.hasOwn(PANE_PATTERNS, provider) ? PANE_PATTERNS[provider] : SHARED_PATTERNS;
+}
+function paneLines(captured) {
+  return captured.split("\n").map((line) => line.replace(/\r/g, "").trim()).filter((line) => line.length > 0);
+}
+function anyLineMatches(lines, patterns) {
+  return lines.some((line) => patterns.some((pattern) => pattern.test(line)));
+}
+function codexTrustQuestionIsActive(lines) {
+  const codexPromptLine = PANE_PATTERNS.codex.idlePromptLine;
+  const promptText = (line) => line.replace(codexPromptLine, "");
+  const isTrustChoice = (text) => /^(?:1(?:\.|$)|2(?:\.|$))/i.test(text);
+  const lastQuestionIndex = lines.findLastIndex(
+    (_, index) => /Trust this folder\?/i.test(lines.slice(index, index + 2).join(" "))
+  );
+  if (lastQuestionIndex < 0) return false;
+  const lastPromptIndex = lines.findLastIndex(
+    (line) => codexPromptLine.test(line)
+  );
+  if (lastPromptIndex < lastQuestionIndex) return true;
+  const activePrompt = promptText(lines[lastPromptIndex]);
+  if (isTrustChoice(activePrompt)) return true;
+  const previousChoiceWasRendered = lines.slice(lastQuestionIndex + 1, lastPromptIndex).some((line) => isTrustChoice(promptText(line)));
+  return activePrompt === "" && !previousChoiceWasRendered;
+}
+function claudeTrustQuestionStartsAt(lines, index) {
+  return /(?:Do you trust the files in this folder|Quick safety check:\s*Is this a project you created or one you trust)\?/i.test(
+    lines.slice(index, index + 3).join(" ")
+  );
+}
+function lineMarksClaudeChoice(lines, index) {
+  const rest = squeeze(lines[index].replace(PANE_PATTERNS.claude.idlePromptLine, "")).replace(/^✔/u, "");
+  if (!rest) return false;
+  const drawn = rest + squeeze(lines.slice(index + 1, index + 4).join(""));
+  return CLAUDE_CHOICES.some((choice) => choice.startsWith(rest) && drawn.startsWith(choice));
+}
+function claudeDialogTail(captured) {
+  const lines = paneLines(captured);
+  const prompt = lines.findLastIndex(
+    (line, index) => PANE_PATTERNS.claude.idlePromptLine.test(line) && !lineMarksClaudeChoice(lines, index)
+  );
+  return squeeze(lines.slice(prompt + 1).join(""));
+}
+function claudeStartupDialogIn(tail, captured) {
+  const footer = tail.includes(CLAUDE_DIALOG_FOOTER);
+  const lastOf = (choices) => Math.max(...choices.map((choice) => tail.lastIndexOf(choice)));
+  const accept = tail.lastIndexOf("Yes,Iaccept");
+  const trust = lastOf(CLAUDE_TRUST_CHOICES);
+  const renderer = lastOf(CLAUDE_STARTUP_CHOICES.claude_fullscreen_renderer);
+  const onboarding = lastOf(CLAUDE_ONBOARDING_TEXT);
+  const latest = Math.max(accept, trust, renderer, onboarding);
+  if (latest < 0) {
+    if (!footer) return null;
+    return tail.includes("No,exit") ? "claude_bypass_permissions" : "claude_startup_dialog_unidentified";
+  }
+  if (latest === onboarding) return "claude_onboarding";
+  if (latest === accept) return "claude_bypass_permissions";
+  if (latest === trust) {
+    return detectTrustPrompt(paneLines(captured), ["claude_directory"]) ? null : "claude_startup_dialog_unidentified";
+  }
+  return footer ? "claude_fullscreen_renderer" : "claude_startup_dialog_unidentified";
+}
+function detectClaudeStartupDialog(captured) {
+  return claudeStartupDialogIn(claudeDialogTail(captured), captured);
+}
+function detectTrustPrompt(lines, kinds) {
+  const tail = lines.slice(-12);
+  const tailHas = (pattern) => tail.some((line) => pattern.test(line));
+  if (kinds.includes("codex_directory") && codexTrustQuestionIsActive(lines)) {
+    return "codex_directory";
+  }
+  if (kinds.includes("cursor_workspace_trust") && tailHas(/Workspace Trust Required/i) && (tailHas(/Pass\s+--trust,\s*--yolo,\s*or\s+-f/i) || tailHas(/Do you trust the contents of this directory\?/i))) {
+    return "cursor_workspace_trust";
+  }
+  const claudeQuestionLines = lines.slice(-20);
+  if (kinds.includes("claude_directory") && claudeQuestionLines.some((_, index) => claudeTrustQuestionStartsAt(claudeQuestionLines, index)) && tailHas(/\bNo,\s*exit\b/i) && tailHas(/\bYes,\s*(?:proceed|I trust this folder)\b/i)) {
+    return "claude_directory";
+  }
+  if (kinds.includes("directory") && tailHas(/Do you trust the contents of this directory\?/i) && tailHas(/Yes,\s*continue|No,\s*quit|Press enter to continue/i)) {
+    return "directory";
+  }
+  if (kinds.includes("codex_hooks") && tailHas(/Hooks need review/i) && tailHas(/Continue without trusting/i) && tailHas(/Press enter to confirm or esc to go back/i)) {
+    return "codex_hooks";
+  }
+  return null;
+}
+function hasStartupBanner(lines, patterns) {
+  const tail = lines.slice(-20);
+  if (tail.some((line) => patterns.idlePromptLine.test(line))) return false;
+  return anyLineMatches(tail, patterns.startupBannerLines);
+}
+function observePane(captured, provider) {
+  const patterns = patternsFor(provider);
+  const lines = paneLines(captured);
+  const startupBanner = hasStartupBanner(lines, patterns);
+  return {
+    trust: detectTrustPrompt(lines, patterns.trustKinds),
+    bootstrapping: startupBanner || anyLineMatches(lines, patterns.loadingLines),
+    startupStatus: startupBanner || anyLineMatches(lines, patterns.startupStatusLines),
+    idlePrompt: lines.some((line) => patterns.idlePromptLine.test(line)),
+    busy: anyLineMatches(lines.slice(-40), patterns.busyLines)
+  };
+}
+function classifyPane(signals) {
+  if (signals.trust) return { kind: "trust", trust: signals.trust };
+  if (signals.busy) return { kind: "busy" };
+  if (signals.startupStatus) return { kind: "bootstrapping" };
+  if (signals.idlePrompt) return { kind: "idle" };
+  return { kind: "unknown" };
+}
+function detectPaneTrustPromptKind(captured, provider) {
+  return detectTrustPrompt(paneLines(captured), patternsFor(provider).trustKinds);
+}
+function claudeDialogFocus(captured, kind) {
+  if (kind !== "claude_directory") {
+    const [first, second] = CLAUDE_STARTUP_CHOICES[kind];
+    const tail = claudeDialogTail(captured);
+    if (claudeStartupDialogIn(tail, captured) !== kind) {
+      const stream = captured.replace(/\s+/g, "");
+      return stream.includes(first) || stream.includes(second) ? "stale" : null;
+    }
+    const copy = tail.slice(Math.max(0, tail.lastIndexOf(CLAUDE_STARTUP_HEADINGS[kind])));
+    const [firstAt, secondAt] = [copy.lastIndexOf(`\u276F${first}`), copy.lastIndexOf(`\u276F${second}`)];
+    if (firstAt < 0 && secondAt < 0 || !copy.includes(CLAUDE_DIALOG_FOOTER)) return null;
+    return secondAt > firstAt ? "second" : "first";
+  }
+  const lines = paneLines(captured);
+  const question = lines.findLastIndex((_, index) => claudeTrustQuestionStartsAt(lines, index));
+  if (question < 0) return null;
+  const no = lines.findIndex((line, index) => index > question && /^\s*(?:❯\s*)?No,\s*exit\b/i.test(line));
+  const yes = no >= 0 ? lines[no + 1] ?? "" : "";
+  if (!/^\s*(?:❯\s*)?Yes,\s*(?:proceed|I trust this folder)\b/i.test(yes)) return null;
+  if (lines.slice(no + 2).some((line) => patternsFor("claude").idlePromptLine.test(line))) return "stale";
+  return /^\s*❯/.test(yes) ? "second" : "first";
+}
+function paneHasTrustPrompt(captured, provider) {
+  return detectPaneTrustPromptKind(captured, provider) !== null;
+}
+function paneHasStartupBanner(captured, provider) {
+  return hasStartupBanner(paneLines(captured), patternsFor(provider));
+}
+function paneHasActiveTask(captured, provider) {
+  return anyLineMatches(
+    paneLines(captured).slice(-40),
+    patternsFor(provider).busyLines
+  );
+}
+function paneLooksReady(captured, provider) {
+  const signals = observePane(captured, provider);
+  if (signals.trust === "cursor_workspace_trust" || signals.trust === "codex_directory")
+    return false;
+  if (signals.trust) return true;
+  if (signals.bootstrapping) return false;
+  return signals.idlePrompt;
+}
+var LEGACY_IDLE_PROMPT_LINE, CURSOR_IDLE_PROMPT_LINE, SHARED_BUSY_LINES, SHARED_PATTERNS, PANE_PATTERNS, UNKNOWN_PROVIDER_PATTERNS, CLAUDE_STARTUP_CHOICES, CLAUDE_TRUST_CHOICES, CLAUDE_THEME_CHOICES, CLAUDE_ONBOARDING_TEXT, CLAUDE_DIALOG_FOOTER, CLAUDE_STARTUP_HEADINGS, CLAUDE_CHOICES, squeeze;
 var init_pane_readiness = __esm({
   "src/team/pane-readiness.ts"() {
     "use strict";
     LEGACY_IDLE_PROMPT_LINE = /^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯]\s*/u;
     CURSOR_IDLE_PROMPT_LINE = /^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯→]\s*/u;
-    PROVIDER_IDLE_PROMPT_LINES = {
-      claude: LEGACY_IDLE_PROMPT_LINE,
-      codex: LEGACY_IDLE_PROMPT_LINE,
-      gemini: LEGACY_IDLE_PROMPT_LINE,
-      cursor: CURSOR_IDLE_PROMPT_LINE,
-      grok: LEGACY_IDLE_PROMPT_LINE,
-      antigravity: LEGACY_IDLE_PROMPT_LINE,
-      copilot: LEGACY_IDLE_PROMPT_LINE
+    SHARED_BUSY_LINES = [
+      /esc to interrupt/i,
+      /\bbackground terminal running\b/i,
+      /^[·✻✢✳✶✽✺✹✸✷*]\s+[A-Za-z][A-Za-z0-9''-]*(?:\s+[A-Za-z][A-Za-z0-9''-]*){0,3}(?:…|\.{3})(?:\s*\(.*\))?$/u
+    ];
+    SHARED_PATTERNS = {
+      idlePromptLine: LEGACY_IDLE_PROMPT_LINE,
+      busyLines: SHARED_BUSY_LINES,
+      startupBannerLines: [
+        /bypass\s+permissions\s+on/i,
+        /shift\+tab\s+to\s+cycle/i,
+        /^⏵⏵\s+/
+      ],
+      loadingLines: [
+        /\b(loading|initializing|starting up)\b/i,
+        /\bconnecting\s+to\b/i
+      ],
+      // A status line starts with the startup word, inside an optional box border.
+      // Behind a spinner it may be any length, since it names what loads or
+      // connects. A spinner is a braille frame or one of Claude's spinner glyphs;
+      // any other leading mark opens output, a list item, quoted text or an input
+      // prompt. Without a spinner the line is short, not counting the padding and
+      // border of a box. Gemini's own status lines are read in their exact form,
+      // with or without its spinner, since they can grow long: "Resuming
+      // session..." alone or opening its MCP progress, which wraps in a narrow pane,
+      // and "Connecting to MCP servers... (n/m)" alone or with the servers it waits for.
+      startupStatusLines: [
+        /^(?:[│┃║▌▐▏▕╎┆┊]\s*)?[\u2800-\u28FF·✻✢✳✶✽✺✹✸✷]\s*(?:model:\s*)?(?:loading|initializing|starting up|connecting\s+to)\b/iu,
+        /^(?:[│┃║▌▐▏▕╎┆┊]\s*)?(?:model:\s*)?(?:loading|initializing|starting up|connecting\s+to)\b.{0,40}?\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?$/iu,
+        /^(?:[│┃║▌▐▏▕╎┆┊]\s*)?(?:[\u2800-\u28FF]\s*)?(?:Resuming session\.\.\.(?: \(|\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?$)|Connecting to MCP servers\.\.\. \(\d+\/\d+\)(?: - Waiting for: .+)?\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?$)/u
+      ],
+      trustKinds: ["directory", "codex_hooks"],
+      verifiedVersion: null
     };
+    PANE_PATTERNS = {
+      claude: {
+        ...SHARED_PATTERNS,
+        trustKinds: ["claude_directory", ...SHARED_PATTERNS.trustKinds],
+        verifiedVersion: "2.1.325"
+      },
+      codex: {
+        ...SHARED_PATTERNS,
+        trustKinds: ["codex_directory", ...SHARED_PATTERNS.trustKinds],
+        verifiedVersion: "0.167.0"
+      },
+      gemini: SHARED_PATTERNS,
+      cursor: {
+        ...SHARED_PATTERNS,
+        idlePromptLine: CURSOR_IDLE_PROMPT_LINE,
+        busyLines: [/ctrl\+c\s+to\s+stop/i, ...SHARED_BUSY_LINES],
+        trustKinds: ["cursor_workspace_trust", ...SHARED_PATTERNS.trustKinds]
+      },
+      grok: SHARED_PATTERNS,
+      antigravity: SHARED_PATTERNS,
+      copilot: SHARED_PATTERNS
+    };
+    UNKNOWN_PROVIDER_PATTERNS = {
+      ...SHARED_PATTERNS,
+      trustKinds: [
+        "codex_directory",
+        "cursor_workspace_trust",
+        "claude_directory",
+        ...SHARED_PATTERNS.trustKinds
+      ]
+    };
+    CLAUDE_STARTUP_CHOICES = {
+      claude_bypass_permissions: ["No,exit", "Yes,Iaccept"],
+      claude_fullscreen_renderer: ["1.Yes,tryit", "2.Notnow"]
+    };
+    CLAUDE_TRUST_CHOICES = ["Yes,Itrustthisfolder", "Yes,proceed"];
+    CLAUDE_THEME_CHOICES = [
+      "Auto(matchterminal)",
+      "Darkmode",
+      "Lightmode",
+      "Darkmode(colorblind-friendly)",
+      "Lightmode(colorblind-friendly)",
+      "Darkmode(ANSIcolorsonly)",
+      "Lightmode(ANSIcolorsonly)"
+    ];
+    CLAUDE_ONBOARDING_TEXT = [
+      "Let'sgetstarted.",
+      "Choosethetextstyle",
+      "Tochangethislater,run/theme",
+      ...CLAUDE_THEME_CHOICES.filter((choice) => choice.includes("(")),
+      "DarkmodeLightmode",
+      "Syntaxtheme:",
+      "(ctrl+ttodisable)",
+      "Securitynotes:",
+      "Claudecanmakemistakes",
+      "Duetopromptinjectionrisks",
+      "PressEntertocontinue"
+    ];
+    CLAUDE_DIALOG_FOOTER = "Entertoconfirm\xB7Esctocancel";
+    CLAUDE_STARTUP_HEADINGS = {
+      claude_bypass_permissions: "WARNING:ClaudeCoderunninginBypassPermissionsmode",
+      claude_fullscreen_renderer: "Trythenewfullscreenrenderer?"
+    };
+    CLAUDE_CHOICES = [
+      ...Object.values(CLAUDE_STARTUP_CHOICES).flat(),
+      ...CLAUDE_TRUST_CHOICES,
+      ...CLAUDE_THEME_CHOICES
+    ];
+    squeeze = (text) => text.replace(/\s+/g, "");
   }
 });
 
@@ -11270,6 +11590,33 @@ function ensureDirSync(dir) {
     throw err;
   }
 }
+function shouldRetryRename(error2) {
+  if (process.platform !== "win32") {
+    return false;
+  }
+  const err = error2;
+  return err?.code === "EPERM" || err?.code === "EBUSY" || err?.code === "EACCES";
+}
+async function renameWithRetry(tempPath, filePath, maxAttempts = 10, delayMs = 3) {
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      await fs.rename(tempPath, filePath);
+      return;
+    } catch (error2) {
+      if (!shouldRetryRename(error2)) {
+        throw error2;
+      }
+      lastError = error2;
+      if (attempt < maxAttempts - 1) {
+        await new Promise((resolve14) => setTimeout(resolve14, delayMs));
+      }
+    }
+  }
+  if (lastError) {
+    throw lastError;
+  }
+}
 function verifyPrivateTempFile(fd, tempPath, label, operations) {
   const fdStats = descriptorStats(fd, operations);
   let pathStats;
@@ -11392,7 +11739,7 @@ async function atomicWriteJson2(filePath, data, hooks) {
       verifyPrivateTempFile(fd.fd, tempPath, "atomic JSON write");
       backupPath = preservePriorTarget(filePath);
       hooks?.beforeRename?.();
-      await fs.rename(tempPath, filePath);
+      await renameWithRetry(tempPath, filePath);
       let publishedIdentity = null;
       try {
         verifyPublishedFile(fd.fd, filePath, "atomic JSON write");
@@ -12250,6 +12597,32 @@ function identityOf(attempt) {
     created_at: attempt.created_at
   };
 }
+function isValidCompletionBinding(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record2 = value;
+  const identityValid = isValidIdentity(record2);
+  const containmentNonce = record2.containment_nonce;
+  const authorityDigest = record2.authority_digest;
+  return identityValid && isExactText(containmentNonce) && typeof authorityDigest === "string" && /^[0-9a-f]{64}$/.test(authorityDigest);
+}
+function parseProviderCompletionExitCode(raw, binding) {
+  if (!binding) {
+    const normalized = raw.trim();
+    if (!/^\d+$/.test(normalized)) return void 0;
+    const exitCode = Number(normalized);
+    return Number.isSafeInteger(exitCode) && exitCode >= 0 ? exitCode : void 0;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return void 0;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return void 0;
+  const record2 = parsed;
+  if (!identityMatches(record2, binding) || record2.kind !== "worker_launch_provider_completion" || record2.containment_nonce !== binding.containment_nonce || record2.authority_digest !== binding.authority_digest || !Number.isSafeInteger(record2.exit_code) || Number(record2.exit_code) < 0) return void 0;
+  return Number(record2.exit_code);
+}
 async function readJson(path4) {
   try {
     return { kind: "value", value: JSON.parse(await (0, import_promises3.readFile)(path4, "utf8")) };
@@ -12294,12 +12667,12 @@ async function writeExclusiveTextAtomic(path4, value) {
     await (0, import_promises3.unlink)(candidate).catch(() => void 0);
   }
 }
-function parseExactInteger(raw) {
+function parseExactInteger2(raw) {
   const trimmed = raw.trim();
   if (!trimmed) return null;
   const negative = trimmed.startsWith("-");
   const magnitude = negative || trimmed.startsWith("+") ? trimmed.slice(1) : trimmed;
-  const match = DECIMAL_INTEGER_TEXT.exec(magnitude);
+  const match = DECIMAL_INTEGER_TEXT2.exec(magnitude);
   if (!match) return null;
   const integerDigits = match[1] ?? "";
   const fractionDigits = match[2] ?? match[3] ?? "";
@@ -12317,7 +12690,7 @@ function parseExactInteger(raw) {
 }
 function resolvePositiveInteger(value, fallback) {
   if (value == null || value.trim() === "") return fallback;
-  const parsed = parseExactInteger(value);
+  const parsed = parseExactInteger2(value);
   return parsed !== null && parsed > 0 ? parsed : fallback;
 }
 async function prepareWorkerLaunchAttempt(input) {
@@ -12614,6 +12987,9 @@ function acknowledgementResult(value, attempt) {
   if (record2.kind !== "worker_launch_ack" || typeof record2.written_at !== "string" || !Number.isFinite(Date.parse(record2.written_at))) return { ok: false, reason: "ack_malformed" };
   return identityMatches(record2, attempt) ? null : { ok: false, reason: "ack_mismatch" };
 }
+function isValidWorkerLaunchAcknowledgement(read, attempt) {
+  return read.kind === "value" && acknowledgementResult(read.value, attempt) === null;
+}
 async function acceptObservedAcknowledgement(attempt, read) {
   if (read.kind === "absent") return null;
   if (read.kind === "malformed") return { ok: false, reason: "ack_malformed" };
@@ -12719,6 +13095,12 @@ async function retireAndCleanupCurrentWorkerLaunchAttempt(attempt, reason, clean
     return false;
   }
 }
+async function readWorkerLaunchRetirementState(attempt) {
+  const retired = await readJson(`${attempt.decisionPath}.retired`);
+  if (retired.kind === "absent") return "absent";
+  if (retired.kind !== "value" || !identityMatches(retired.value, attempt) || retired.value.kind !== "worker_launch_retired" || !isExactText(retired.value.reason) || typeof retired.value.written_at !== "string" || !Number.isFinite(Date.parse(retired.value.written_at))) return "invalid";
+  return "valid";
+}
 async function readWorkerLaunchRetirementCleanupState(attempt) {
   const completed = await readJson(`${attempt.decisionPath}.retired.cleanup-complete`);
   if (completed.kind === "absent") return "absent";
@@ -12749,6 +13131,9 @@ function isValidProcessStartIdentity2(value) {
   const darwin = /^darwin:([1-9]\d*):(\d+)$/.exec(value);
   return darwin !== null && Number(darwin[2]) < 1e6;
 }
+function isPositiveProcessId(value) {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
 async function readWorkerLaunchCleanupProof(attempt, started) {
   const startedPath = "startedPath" in attempt ? attempt.startedPath : attempt.started_path;
   const matchesProcessGroup = (value) => {
@@ -12769,6 +13154,56 @@ async function readWorkerLaunchCleanupProof(attempt, started) {
     if (matchesStarted && identityMatches(value, attempt) && value.kind === "worker_launch_termination_complete" && value.cleanup_verified === true && Number.isSafeInteger(value.pid) && Number(value.pid) > 0 && isValidProcessStartIdentity2(value.process_start_identity) && matchesProcessGroup(value)) return true;
   }
   return false;
+}
+async function readWorkerLaunchProviderCompletionState(attempt, started) {
+  if (started.supervisor_completion_path === void 0) return "absent";
+  if (!isExactText(started.supervisor_completion_path) || !(0, import_node_path5.isAbsolute)(started.supervisor_completion_path)) return "invalid";
+  const bindingReceipt = await readJson(`${attempt.startedPath}.completion-binding`);
+  if (bindingReceipt.kind !== "value" || !bindingReceipt.value || typeof bindingReceipt.value !== "object" || Array.isArray(bindingReceipt.value)) return "invalid";
+  const bindingValue = bindingReceipt.value;
+  if (bindingValue.kind !== "worker_launch_completion_binding" || bindingValue.completion_path !== started.supervisor_completion_path || !identityMatches(bindingValue, attempt) || bindingValue.containment_nonce !== started.containment_nonce || bindingValue.authority_digest !== started.authority_digest || !isExactText(bindingValue.containment_nonce) || !/^[0-9a-f]{64}$/.test(bindingValue.authority_digest ?? "") || typeof bindingValue.written_at !== "string" || !Number.isFinite(Date.parse(bindingValue.written_at))) return "invalid";
+  const completionBinding = {
+    ...identityOf(attempt),
+    containment_nonce: bindingValue.containment_nonce,
+    authority_digest: bindingValue.authority_digest
+  };
+  if (!isValidCompletionBinding(completionBinding)) return "invalid";
+  const absoluteCompletionPath = (0, import_node_path5.resolve)(started.supervisor_completion_path);
+  const trustedTempRoot = (0, import_node_path5.resolve)((0, import_node_os2.tmpdir)());
+  const pathParts = [];
+  let pathPart = (0, import_node_path5.dirname)(absoluteCompletionPath);
+  if (absoluteCompletionPath === trustedTempRoot || absoluteCompletionPath.startsWith(`${trustedTempRoot}${import_node_path5.sep}`)) {
+    while (pathPart !== trustedTempRoot && pathPart !== (0, import_node_path5.dirname)(pathPart)) {
+      pathParts.push(pathPart);
+      pathPart = (0, import_node_path5.dirname)(pathPart);
+    }
+  } else {
+    pathParts.push(pathPart);
+  }
+  for (const parentPath of pathParts) {
+    try {
+      if ((await (0, import_promises3.lstat)(parentPath)).isSymbolicLink()) return "invalid";
+    } catch (error2) {
+      if (error2.code === "ENOENT") return "absent";
+      return "invalid";
+    }
+  }
+  let raw;
+  let handle;
+  try {
+    handle = await (0, import_promises3.open)(
+      started.supervisor_completion_path,
+      import_node_fs6.constants.O_RDONLY | (import_node_fs6.constants.O_NOFOLLOW ?? 0) | (process.platform === "win32" ? 0 : import_node_fs6.constants.O_NONBLOCK ?? 0)
+    );
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1) return "invalid";
+    raw = await handle.readFile("utf8");
+  } catch (error2) {
+    return error2.code === "ENOENT" ? "absent" : "invalid";
+  } finally {
+    await handle?.close().catch(() => void 0);
+  }
+  return parseProviderCompletionExitCode(raw, completionBinding) === void 0 ? "invalid" : "valid";
 }
 async function readWorkerLaunchTerminalState(attempt, started) {
   const terminal = await readJson(`${attempt.startedPath}.terminal`);
@@ -12792,6 +13227,96 @@ async function readWorkerLaunchTerminalState(attempt, started) {
   if (value.child_reaped === true && (value.outcome === "exit" || value.outcome === "cleanup_unverified")) return "reaped";
   if (value.child_reaped === false && value.outcome === "cleanup_unverified" && value.cleanup_verified === false) return "live-unreaped";
   return "invalid";
+}
+async function readWorkerLaunchTerminationProofState(attempt, started) {
+  const completed = await readJson(`${attempt.startedPath}.termination-complete`);
+  if (completed.kind === "absent") return "absent";
+  if (completed.kind !== "value") return "invalid";
+  if (!completed.value || typeof completed.value !== "object" || Array.isArray(completed.value)) return "invalid";
+  const value = completed.value;
+  const processGroupMatches = process.platform === "win32" || Number.isSafeInteger(started.process_group_id) && Number(started.process_group_id) > 0 && value.process_group_id === started.process_group_id;
+  return identityMatches(value, attempt) && value.kind === "worker_launch_termination_complete" && value.cleanup_verified === true && value.pid === started.pid && Number.isSafeInteger(value.pid) && Number(value.pid) > 0 && value.process_start_identity === started.process_start_identity && isValidProcessStartIdentity2(value.process_start_identity) && processGroupMatches ? "valid" : "invalid";
+}
+async function observeWorkerLaunchProvider(attempt) {
+  try {
+    if (!isValidIdentity(attempt)) return "unknown";
+    const expected = await readJson(attempt.expectedPath);
+    if (expected.kind !== "value" || !identityMatches(expected.value, attempt)) return "unknown";
+    const acknowledgement = await readJson(attempt.ackPath);
+    if (!isValidWorkerLaunchAcknowledgement(acknowledgement, attempt)) return "unknown";
+    const current = await readJson(attempt.currentPath);
+    if (current.kind === "malformed" || current.kind === "value" && !identityMatches(current.value, attempt)) return "unknown";
+    const decision = await readJson(attempt.decisionPath);
+    if (decision.kind === "malformed" || decision.kind === "value" && (!identityMatches(decision.value, attempt) || decision.value.kind !== "worker_launch_decision")) {
+      return "unknown";
+    }
+    const retirement = await readWorkerLaunchRetirementState(attempt);
+    if (retirement === "invalid") return "unknown";
+    const retirementCleanup = await readWorkerLaunchRetirementCleanupState(attempt);
+    if (retirementCleanup === "invalid") return "unknown";
+    if (retirementCleanup === "valid") {
+      if (current.kind !== "absent" || decision.kind !== "value" || !identityMatches(decision.value, attempt) || decision.value.kind !== "worker_launch_decision" || decision.value.decision !== "accepted" || !await isWorkerLaunchAttemptAccepted(attempt)) return "unknown";
+      return "dead";
+    }
+    if (retirement === "valid") return "unknown";
+    if (current.kind !== "value" || decision.kind !== "value" || decision.value.decision !== "accepted" || !await isWorkerLaunchAttemptAccepted(attempt)) return "unknown";
+    const started = await readValidProviderStarted(attempt, {
+      allowSupervisorCompletion: true,
+      allowTerminal: true
+    });
+    const startedPid = started?.pid;
+    if (!started || !isPositiveProcessId(startedPid) || !isValidProcessStartIdentity2(started.process_start_identity)) return "unknown";
+    const completionState = await readWorkerLaunchProviderCompletionState(attempt, started);
+    if (completionState === "invalid") return "unknown";
+    const terminalState = await readWorkerLaunchTerminalState(attempt, started);
+    if (terminalState === "invalid") return "unknown";
+    const terminationProof = await readWorkerLaunchTerminationProofState(attempt, started);
+    if (terminationProof === "invalid") return "unknown";
+    if (terminalState === "reaped" || terminationProof === "valid") return "dead";
+    const liveness = await isProcessIdentityLive(startedPid, started.process_start_identity);
+    const finalExpected = await readJson(attempt.expectedPath);
+    if (finalExpected.kind !== "value" || !identityMatches(finalExpected.value, attempt)) return "unknown";
+    const finalAcknowledgement = await readJson(attempt.ackPath);
+    if (!isValidWorkerLaunchAcknowledgement(finalAcknowledgement, attempt)) return "unknown";
+    const finalRetirement = await readWorkerLaunchRetirementState(attempt);
+    if (finalRetirement === "invalid") return "unknown";
+    const finalRetirementCleanup = await readWorkerLaunchRetirementCleanupState(attempt);
+    if (finalRetirementCleanup === "invalid") return "unknown";
+    if (finalRetirementCleanup === "valid") {
+      const finalCurrent2 = await readJson(attempt.currentPath);
+      if (finalCurrent2.kind !== "absent") return "unknown";
+      const finalDecision2 = await readJson(attempt.decisionPath);
+      if (finalDecision2.kind !== "value" || !identityMatches(finalDecision2.value, attempt) || finalDecision2.value.kind !== "worker_launch_decision" || finalDecision2.value.decision !== "accepted" || !await isWorkerLaunchAttemptAccepted(attempt)) return "unknown";
+      return "dead";
+    }
+    if (finalRetirement === "valid") return "unknown";
+    const finalCurrent = await readJson(attempt.currentPath);
+    if (finalCurrent.kind !== "value" || !identityMatches(finalCurrent.value, attempt)) return "unknown";
+    const finalDecision = await readJson(attempt.decisionPath);
+    if (finalDecision.kind !== "value" || !identityMatches(finalDecision.value, attempt) || finalDecision.value.kind !== "worker_launch_decision" || finalDecision.value.decision !== "accepted" || !await isWorkerLaunchAttemptAccepted(attempt)) return "unknown";
+    const finalStarted = await readValidProviderStarted(attempt, {
+      allowSupervisorCompletion: true,
+      allowTerminal: true
+    });
+    const finalStartedPid = finalStarted?.pid;
+    if (!finalStarted || !isPositiveProcessId(finalStartedPid) || finalStartedPid !== startedPid || finalStarted.process_start_identity !== started.process_start_identity) return "unknown";
+    const finalTerminalState = await readWorkerLaunchTerminalState(attempt, finalStarted);
+    if (finalTerminalState === "invalid") return "unknown";
+    const finalTerminationProof = await readWorkerLaunchTerminationProofState(attempt, finalStarted);
+    if (finalTerminationProof === "invalid") return "unknown";
+    if (finalTerminalState === "reaped" || finalTerminationProof === "valid") return "dead";
+    const finalCompletionState = await readWorkerLaunchProviderCompletionState(attempt, finalStarted);
+    if (finalCompletionState === "invalid") return "unknown";
+    if (completionState === "valid" || finalCompletionState === "valid") return "dead";
+    let finalLiveness = liveness;
+    if (liveness === "live") {
+      const recheck = await isProcessIdentityLive(finalStartedPid, finalStarted.process_start_identity);
+      finalLiveness = recheck === "live" || recheck === "dead" ? recheck : "unknown";
+    }
+    return finalLiveness === "live" ? "alive" : finalLiveness === "dead" ? "dead" : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 async function terminateWorkerLaunchProvider(attempt, timeoutMs = 2e3) {
   const started = await readJson(attempt.startedPath);
@@ -12974,7 +13499,7 @@ function buildWindowsBatchProviderLine(providerArgv) {
   if (line.length > WINDOWS_PROVIDER_LINE_MAX) throw new Error("worker_launch_provider_argv_too_long");
   return line;
 }
-var import_node_crypto3, import_node_fs6, import_promises3, import_node_path5, WORKER_LAUNCH_SCHEMA_VERSION, DEFAULT_ACK_TIMEOUT_MS, DEFAULT_POLL_INTERVAL_MS, DEFAULT_DECISION_TIMEOUT_MS, WORKER_LAUNCH_TRANSPORT_OWNER_KIND, WORKER_LAUNCH_TRANSPORT_CLEANUP_KIND, WORKER_LAUNCH_BOOTSTRAP_DESCRIPTOR_FILE, WORKER_LAUNCH_RECOVERY_GATE_CONTAINED_ENV, WORKER_LAUNCH_INTERNAL_ENV_KEYS, WORKER_LAUNCH_AUTHORITY_PROTOCOL, WINDOWS_SUPERVISOR_PROTOCOL, WINDOWS_PROVIDER_LINE_MAX, WINDOWS_PROVIDER_LINE_VAR, WINDOWS_NO_CWD_EXE_SEARCH_VAR, WINDOWS_RESERVED_ENV_KEYS, SAFE_BASELINE_ENV_KEYS, DECIMAL_INTEGER_TEXT;
+var import_node_crypto3, import_node_fs6, import_promises3, import_node_path5, import_node_os2, WORKER_LAUNCH_SCHEMA_VERSION, DEFAULT_ACK_TIMEOUT_MS, DEFAULT_POLL_INTERVAL_MS, DEFAULT_DECISION_TIMEOUT_MS, WORKER_LAUNCH_TRANSPORT_OWNER_KIND, WORKER_LAUNCH_TRANSPORT_CLEANUP_KIND, WORKER_LAUNCH_BOOTSTRAP_DESCRIPTOR_FILE, WORKER_LAUNCH_RECOVERY_GATE_CONTAINED_ENV, WORKER_LAUNCH_INTERNAL_ENV_KEYS, WORKER_LAUNCH_AUTHORITY_PROTOCOL, WINDOWS_SUPERVISOR_PROTOCOL, WINDOWS_PROVIDER_LINE_MAX, WINDOWS_PROVIDER_LINE_VAR, WINDOWS_NO_CWD_EXE_SEARCH_VAR, WINDOWS_RESERVED_ENV_KEYS, SAFE_BASELINE_ENV_KEYS, DECIMAL_INTEGER_TEXT2;
 var init_worker_launch_ack = __esm({
   "src/team/worker-launch-ack.ts"() {
     "use strict";
@@ -12982,6 +13507,7 @@ var init_worker_launch_ack = __esm({
     import_node_fs6 = require("node:fs");
     import_promises3 = require("node:fs/promises");
     import_node_path5 = require("node:path");
+    import_node_os2 = require("node:os");
     init_process_utils();
     init_types3();
     init_state_paths();
@@ -13009,12 +13535,235 @@ var init_worker_launch_ack = __esm({
     WINDOWS_NO_CWD_EXE_SEARCH_VAR = "NoDefaultCurrentDirectoryInExePath";
     WINDOWS_RESERVED_ENV_KEYS = new Set([...WORKER_LAUNCH_INTERNAL_ENV_KEYS, "SystemRoot"].map((key) => key.toUpperCase()));
     SAFE_BASELINE_ENV_KEYS = ["PATH", "TEMP", "TMP", "TERM", "COLORTERM"];
-    DECIMAL_INTEGER_TEXT = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+    DECIMAL_INTEGER_TEXT2 = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
   }
 });
 
 // src/team/recovery-request-store.ts
-var import_crypto5, import_fs12, import_path12, RETENTION_MS;
+function isSafeRecoveryRequestId(requestId) {
+  return requestId.length > 0 && requestId.length <= 128 && requestId !== "." && requestId !== ".." && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(requestId);
+}
+function assertSafeRecoveryRequestId(requestId) {
+  if (!isSafeRecoveryRequestId(requestId)) throw new Error("invalid_recovery_request_id");
+}
+function canonicalize(value) {
+  if (value === void 0) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
+  const object3 = value;
+  return `{${Object.keys(object3).filter((key) => object3[key] !== void 0).sort().map((key) => `${JSON.stringify(key)}:${canonicalize(object3[key])}`).join(",")}}`;
+}
+function sha256(value) {
+  return (0, import_crypto5.createHash)("sha256").update(canonicalize(value)).digest("hex");
+}
+function parseCanonical(path4) {
+  try {
+    const text = (0, import_fs12.readFileSync)(path4, "utf8");
+    const parsed = JSON.parse(text);
+    return canonicalize(parsed) === text ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function reservationPath(cwd, requestId) {
+  assertSafeRecoveryRequestId(requestId);
+  return absPath(cwd, TeamPaths.recoveryRequestPending(requestId));
+}
+function finalPath(cwd, requestId) {
+  assertSafeRecoveryRequestId(requestId);
+  return absPath(cwd, TeamPaths.recoveryRequestResult(requestId));
+}
+function phaseDirectory(cwd, requestId) {
+  assertSafeRecoveryRequestId(requestId);
+  return (0, import_path12.join)((0, import_path12.dirname)(reservationPath(cwd, requestId)), "phases", requestId);
+}
+function publishImmutable(target, value) {
+  const bytes = canonicalize(value);
+  (0, import_fs12.mkdirSync)((0, import_path12.dirname)(target), { recursive: true, mode: 448 });
+  const temp = (0, import_path12.join)((0, import_path12.dirname)(target), `.${(0, import_crypto5.randomUUID)()}.tmp`);
+  (0, import_fs12.writeFileSync)(temp, bytes, { encoding: "utf8", mode: 384, flush: true });
+  try {
+    (0, import_fs12.linkSync)(temp, target);
+  } catch (error2) {
+    const existing = parseCanonical(target);
+    try {
+      (0, import_fs12.unlinkSync)(temp);
+    } catch {
+    }
+    if (existing && canonicalize(existing) === bytes) return existing;
+    throw error2;
+  }
+  const published = parseCanonical(target);
+  if (!published || canonicalize(published) !== bytes) throw new Error("immutable_recovery_record_verification_failed");
+  (0, import_fs12.unlinkSync)(temp);
+  return published;
+}
+function replaceDerivedIndex(target, value) {
+  const bytes = canonicalize(value);
+  (0, import_fs12.mkdirSync)((0, import_path12.dirname)(target), { recursive: true, mode: 448 });
+  const temp = (0, import_path12.join)((0, import_path12.dirname)(target), `.${(0, import_crypto5.randomUUID)()}.repair.tmp`);
+  (0, import_fs12.writeFileSync)(temp, bytes, { encoding: "utf8", mode: 384, flush: true });
+  try {
+    (0, import_fs12.renameSync)(temp, target);
+  } finally {
+    if ((0, import_fs12.existsSync)(temp)) (0, import_fs12.unlinkSync)(temp);
+  }
+  const repaired = parseCanonical(target);
+  if (!repaired || canonicalize(repaired) !== bytes) throw new Error("immutable_recovery_record_verification_failed");
+  return repaired;
+}
+function canonicalRecoveryPayloadHash(payload) {
+  if (!isValidTeamInstanceId(payload.instanceId)) throw new Error("invalid_recovery_instance_id");
+  return sha256({
+    operation: payload.operation,
+    workspace_hash: payload.workspaceHash,
+    team_name: payload.teamName,
+    worker_name: payload.workerName,
+    instance_id: payload.instanceId.toLowerCase()
+  });
+}
+function readRecoveryRequestReservation(cwd, requestId) {
+  const reservation = parseCanonical(reservationPath(cwd, requestId));
+  if (!reservation || reservation.schema_version !== 1 || reservation.kind !== "reservation" && reservation.kind !== "alias" || reservation.request_id !== requestId || reservation.operation !== "recover-worker" || typeof reservation.payload_hash !== "string" || !/^[a-f0-9]{64}$/.test(reservation.payload_hash) || typeof reservation.workspace_hash !== "string" || !/^[a-f0-9]{64}$/.test(reservation.workspace_hash) || typeof reservation.team_name !== "string" || reservation.team_name.length === 0 || typeof reservation.worker_name !== "string" || reservation.worker_name.length === 0 || !isValidTeamInstanceId(reservation.instance_id) || reservation.payload_hash !== canonicalRecoveryPayloadHash({
+    operation: reservation.operation,
+    workspaceHash: reservation.workspace_hash,
+    teamName: reservation.team_name,
+    workerName: reservation.worker_name,
+    instanceId: reservation.instance_id
+  }) || typeof reservation.recovery_id !== "string" || !isSafeRecoveryRequestId(reservation.recovery_id) || typeof reservation.created_at !== "string" || !Number.isFinite(Date.parse(reservation.created_at)) || typeof reservation.expires_at !== "string" || !Number.isFinite(Date.parse(reservation.expires_at)) || reservation.kind === "alias" && (typeof reservation.alias_of_request_id !== "string" || !isSafeRecoveryRequestId(reservation.alias_of_request_id)) || reservation.kind === "reservation" && reservation.alias_of_request_id !== void 0) return null;
+  return reservation;
+}
+function hasMatchingReservationTuple(left, right) {
+  return left.operation === right.operation && left.payload_hash === right.payload_hash && left.workspace_hash === right.workspace_hash && left.team_name === right.team_name && left.worker_name === right.worker_name && left.instance_id.toLowerCase() === right.instance_id.toLowerCase() && left.recovery_id === right.recovery_id;
+}
+function resolveCanonicalRecoveryRequestId(cwd, requestId) {
+  assertSafeRecoveryRequestId(requestId);
+  const visited = /* @__PURE__ */ new Set();
+  let currentRequestId = requestId;
+  let alias = null;
+  for (let depth = 0; depth < MAX_RECOVERY_ALIAS_DEPTH; depth += 1) {
+    if (visited.has(currentRequestId)) return null;
+    visited.add(currentRequestId);
+    const reservation = readRecoveryRequestReservation(cwd, currentRequestId);
+    if (!reservation) {
+      if (alias || (0, import_fs12.existsSync)(reservationPath(cwd, currentRequestId))) return null;
+      return currentRequestId;
+    }
+    if (alias && !hasMatchingReservationTuple(alias, reservation)) return null;
+    if (reservation.kind === "reservation") return currentRequestId;
+    alias = reservation;
+    currentRequestId = reservation.alias_of_request_id;
+  }
+  return null;
+}
+function hasMatchingRecoveryPhaseTuple(phase, reservation) {
+  return phase.request_id === reservation.request_id && phase.recovery_id === reservation.recovery_id && phase.team_name === reservation.team_name && phase.worker_name === reservation.worker_name;
+}
+function isValidRecoveryPhase(phase, reservation) {
+  return phase?.schema_version === 1 && phase.kind === "phase" && hasMatchingRecoveryPhaseTuple(phase, reservation) && ["reserved", "elected", "requeued", "ready", "active", "services_pending", "adopted"].includes(phase.phase) && ["none", "selected", "reserved", "adopted"].includes(phase.continuation) && ["not_started", "pending", "adopted"].includes(phase.adoption) && ["not_started", "pending", "synced", "repair_required"].includes(phase.services) && ["not_started", "synced", "repair_required"].includes(phase.manifest) && typeof phase.updated_at === "string" && Number.isFinite(Date.parse(phase.updated_at)) && (phase.state_revision === void 0 || Number.isSafeInteger(phase.state_revision) && phase.state_revision >= 0);
+}
+function writeRecoveryFinal(cwd, outcome) {
+  const reservation = readRecoveryRequestReservation(cwd, outcome.request_id);
+  if (!reservation || reservation.kind !== "reservation" || reservation.recovery_id !== outcome.recovery_id || reservation.team_name !== outcome.team_name || reservation.worker_name !== outcome.worker_name) {
+    throw new Error("invalid_persisted_state");
+  }
+  const final = { ...outcome, schema_version: 1, kind: "final" };
+  if (!isMatchingRecoveryFinal(final, {
+    requestId: outcome.request_id,
+    recoveryId: outcome.recovery_id,
+    teamName: outcome.team_name,
+    workerName: outcome.worker_name
+  })) throw new Error("invalid_persisted_state");
+  const published = publishImmutable(finalPath(cwd, outcome.request_id), final);
+  const byTeam = absPath(cwd, TeamPaths.recoveryResultByTeam(reservation.workspace_hash, outcome.team_name, outcome.recovery_id));
+  const indexed = publishImmutable(byTeam, published);
+  if (canonicalize(indexed) !== canonicalize(published)) throw new Error("immutable_recovery_record_verification_failed");
+  return published;
+}
+function latestPhase(cwd, requestId) {
+  const reservation = readRecoveryRequestReservation(cwd, requestId);
+  if (!reservation || reservation.kind !== "reservation") return null;
+  const directory = phaseDirectory(cwd, requestId);
+  try {
+    const candidates = (0, import_fs12.readdirSync)(directory).filter((file) => file.endsWith(".json")).sort().reverse();
+    if (candidates.length === 0) return null;
+    const phase = parseCanonical((0, import_path12.join)(directory, candidates[0]));
+    return isValidRecoveryPhase(phase, reservation) ? phase : null;
+  } catch {
+  }
+  return null;
+}
+function isStringArray(value) {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+function isPlainRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null);
+}
+function hasExactUniqueKeys(values, record2) {
+  if (new Set(values).size !== values.length) return false;
+  const expected = [...values].sort();
+  const actual = Object.keys(record2).sort();
+  return expected.length === actual.length && expected.every((value, index) => value === actual[index]);
+}
+function isValidRecoveryResult(value) {
+  if (!value || typeof value !== "object") return false;
+  const result = value;
+  if (typeof result.requestId !== "string" || typeof result.recoveryId !== "string" || typeof result.teamName !== "string" || typeof result.workerName !== "string" || typeof result.updatedAt !== "string" || !Number.isFinite(Date.parse(result.updatedAt)) || typeof result.committed !== "boolean") return false;
+  if (result.outcome === "recovered" || result.outcome === "already_running") {
+    if (result.committed !== true || typeof result.oldPaneId !== "string" && result.oldPaneId !== null || typeof result.newPaneId !== "string" || !result.newPaneId.trim() || result.outcome === "recovered" && (typeof result.oldPaneId !== "string" || !result.oldPaneId.trim()) || !isStringArray(result.requeuedTaskIds) || !isPlainRecord(result.continuationSequenceByTask) || !hasExactUniqueKeys(result.requeuedTaskIds, result.continuationSequenceByTask) || !Object.values(result.continuationSequenceByTask).every((sequence) => typeof sequence === "number" && Number.isSafeInteger(sequence) && sequence > 0) || typeof result.stateRevision !== "number" || !Number.isSafeInteger(result.stateRevision) || result.activation !== "active" && result.activation !== "services_pending" || result.manifestSync !== "synced" && result.manifestSync !== "repair_required" || result.servicesSync !== "synced" && result.servicesSync !== "repair_required" || !isStringArray(result.warnings) || !result.warnings.every((warning) => RECOVERY_WARNINGS.has(warning))) return false;
+    return result.outcome !== "already_running" || result.requeuedTaskIds.length === 0;
+  }
+  return (result.outcome === "failed" || result.outcome === "commit_unknown") && result.committed === false && typeof result.error === "string" && RECOVERY_ERRORS.has(result.error) && (result.message === void 0 || typeof result.message === "string");
+}
+function readRecoveryFinalState(cwd, requestId) {
+  const path4 = finalPath(cwd, requestId);
+  if (!(0, import_fs12.existsSync)(path4)) return { kind: "missing" };
+  const final = parseCanonical(path4);
+  if (!final || final.schema_version !== 1 || final.kind !== "final" || !isMatchingRecoveryFinal(final, { requestId })) {
+    return { kind: "invalid" };
+  }
+  const reservation = readRecoveryRequestReservation(cwd, requestId);
+  if (!reservation || reservation.kind !== "reservation" || reservation.recovery_id !== final.recovery_id || reservation.team_name !== final.team_name || reservation.worker_name !== final.worker_name) return { kind: "invalid" };
+  const byTeam = absPath(cwd, TeamPaths.recoveryResultByTeam(reservation.workspace_hash, final.team_name, final.recovery_id));
+  try {
+    const expectedBytes = canonicalize(final);
+    const indexed = (0, import_fs12.existsSync)(byTeam) ? parseCanonical(byTeam) : null;
+    if (!indexed || canonicalize(indexed) !== expectedBytes) {
+      const lockPath = absPath(cwd, TeamPaths.recoveryFinalIndexLock(reservation.workspace_hash, final.team_name, final.recovery_id));
+      withProcessIdentityFileLockSync(lockPath, () => {
+        const current = (0, import_fs12.existsSync)(byTeam) ? parseCanonical(byTeam) : null;
+        if (!current || canonicalize(current) !== expectedBytes) replaceDerivedIndex(byTeam, final);
+      });
+    }
+    const verified = parseCanonical(byTeam);
+    if (!verified || canonicalize(verified) !== expectedBytes) return { kind: "invalid" };
+  } catch {
+    return { kind: "invalid" };
+  }
+  return { kind: "valid", final };
+}
+function isMatchingRecoveryFinal(outcome, expected = {}) {
+  if (!outcome || outcome.kind !== "final" || !isValidRecoveryResult(outcome.result) || outcome.request_id !== outcome.result.requestId || outcome.recovery_id !== outcome.result.recoveryId || outcome.team_name !== outcome.result.teamName || outcome.worker_name !== outcome.result.workerName || expected.requestId !== void 0 && outcome.request_id !== expected.requestId || expected.recoveryId !== void 0 && outcome.recovery_id !== expected.recoveryId || expected.teamName !== void 0 && outcome.team_name !== expected.teamName || expected.workerName !== void 0 && outcome.worker_name !== expected.workerName || typeof outcome.completed_at !== "string" || !Number.isFinite(Date.parse(outcome.completed_at)) || typeof outcome.expires_at !== "string" || !Number.isFinite(Date.parse(outcome.expires_at)) || !["none", "selected", "reserved", "adopted"].includes(outcome.continuation) || !["not_started", "pending", "adopted"].includes(outcome.adoption) || !["synced", "repair_required", "terminal_degraded"].includes(outcome.services) || !["synced", "repair_required"].includes(outcome.manifest)) return false;
+  const succeeded = outcome.result.outcome === "recovered" || outcome.result.outcome === "already_running";
+  if (outcome.outcome !== (succeeded ? "succeeded" : outcome.result.outcome === "commit_unknown" ? "commit_unknown" : "failed")) return false;
+  if (succeeded) {
+    const success = outcome.result;
+    const hasContinuations = success.requeuedTaskIds.length > 0;
+    const servicesPending = success.servicesSync === "repair_required";
+    return outcome.error === void 0 && outcome.continuation === (hasContinuations ? "adopted" : "none") && outcome.adoption === (hasContinuations ? "adopted" : "not_started") && outcome.services === success.servicesSync && outcome.manifest === success.manifestSync && success.manifestSync === "synced" && success.activation === (servicesPending ? "services_pending" : "active") && (servicesPending ? success.warnings.length === 1 && success.warnings[0] === "services_pending" : success.warnings.length === 0);
+  }
+  const failure = outcome.result;
+  return outcome.continuation === "none" && outcome.adoption === "not_started" && outcome.error?.code === failure.error && outcome.error?.message === failure.message && outcome.error?.commit_uncertain === (failure.outcome === "commit_unknown") && outcome.services === "terminal_degraded" && outcome.manifest === "repair_required";
+}
+function readRecoveryOutcome(cwd, requestId) {
+  const canonicalRequestId = resolveCanonicalRecoveryRequestId(cwd, requestId);
+  if (!canonicalRequestId) return null;
+  const final = readRecoveryFinalState(cwd, canonicalRequestId);
+  if (final.kind === "valid") return final.final;
+  if (final.kind === "invalid") return null;
+  return latestPhase(cwd, canonicalRequestId);
+}
+var import_crypto5, import_fs12, import_path12, RETENTION_MS, MAX_RECOVERY_ALIAS_DEPTH, RECOVERY_ERRORS, RECOVERY_WARNINGS;
 var init_recovery_request_store = __esm({
   "src/team/recovery-request-store.ts"() {
     "use strict";
@@ -13025,6 +13774,44 @@ var init_recovery_request_store = __esm({
     init_state_paths();
     init_process_identity_lock();
     RETENTION_MS = 7 * 24 * 60 * 60 * 1e3;
+    MAX_RECOVERY_ALIAS_DEPTH = 16;
+    RECOVERY_ERRORS = /* @__PURE__ */ new Set([
+      "invalid_input",
+      "team_not_found",
+      "worker_not_found",
+      "runtime_v2_required",
+      "invalid_persisted_state",
+      "runtime_owner_unavailable",
+      "runtime_owner_fence_lost",
+      "recovery_request_timeout",
+      "recovery_attempt_conflict",
+      "team_mutation_busy",
+      "team_mutation_resume_required",
+      "team_shutting_down",
+      "team_session_dead",
+      "worker_liveness_unknown",
+      "recovery_checkpoint_missing",
+      "recovery_checkpoint_malformed",
+      "recovery_checkpoint_ambiguous",
+      "recovery_checkpoint_stale",
+      "task_requeue_failed",
+      "launch_metadata_incomplete",
+      "launch_descriptor_unresolvable",
+      "spawn_failed",
+      "startup_ack_timeout",
+      "worker_activation_failed",
+      "auto_merge_unavailable",
+      "stale_state_revision",
+      "config_commit_failed",
+      "worker_cleanup_incomplete"
+    ]);
+    RECOVERY_WARNINGS = /* @__PURE__ */ new Set([
+      "projection_repair_required",
+      "identity_repair_required",
+      "services_pending",
+      "event_repair_required",
+      "result_repair_required"
+    ]);
   }
 });
 
@@ -13923,6 +14710,7 @@ __export(tmux_session_exports, {
   spawnWorkerInPane: () => spawnWorkerInPane,
   splitTeamWorkerPane: () => splitTeamWorkerPane,
   splitTeamWorkerPaneWithEvidence: () => splitTeamWorkerPaneWithEvidence,
+  startupProviderExited: () => startupProviderExited,
   strictIdentityUnavailableError: () => strictIdentityUnavailableError,
   tmuxServerGuardCondition: () => tmuxServerGuardCondition,
   tmuxServerGuardConditionPosix: () => tmuxServerGuardConditionPosix,
@@ -15045,12 +15833,12 @@ async function getPaneCurrentCommandStatus(paneId, tmuxServerIdentity) {
 function paneCurrentCommandLooksSubmitted(command) {
   return command.length > 0 && !paneCurrentCommandLooksReady(command);
 }
-function parseExactInteger2(raw) {
+function parseExactInteger3(raw) {
   const trimmed = raw.trim();
   if (!trimmed) return null;
   const negative = trimmed.startsWith("-");
   const magnitude = negative || trimmed.startsWith("+") ? trimmed.slice(1) : trimmed;
-  const match = DECIMAL_INTEGER_TEXT2.exec(magnitude);
+  const match = DECIMAL_INTEGER_TEXT3.exec(magnitude);
   if (!match) return null;
   const integerDigits = match[1] ?? "";
   const fractionDigits = match[2] ?? match[3] ?? "";
@@ -15071,7 +15859,7 @@ function resolveTeamShellReadyTimeoutMs(env = process.env, explicitTimeoutMs) {
     return Number(explicitTimeoutMs);
   }
   const raw = env.OMC_TEAM_SHELL_READY_TIMEOUT_MS;
-  const parsed = raw == null || String(raw).trim() === "" ? null : parseExactInteger2(String(raw));
+  const parsed = raw == null || String(raw).trim() === "" ? null : parseExactInteger3(String(raw));
   return parsed !== null && parsed > 0 ? parsed : 5e3;
 }
 async function waitForShellReady(paneId, opts = {}) {
@@ -15128,7 +15916,7 @@ function resolveTeamStartSubmitTimeoutMs(env = process.env, explicitTimeoutMs) {
     return Number(explicitTimeoutMs);
   }
   const raw = env.OMC_TEAM_START_SUBMIT_TIMEOUT_MS;
-  const parsed = raw == null || String(raw).trim() === "" ? null : parseExactInteger2(String(raw));
+  const parsed = raw == null || String(raw).trim() === "" ? null : parseExactInteger3(String(raw));
   return parsed !== null && parsed > 0 ? parsed : 8e3;
 }
 async function verifyWorkerStartCommandSubmitted(paneId, startCmd, opts = {}) {
@@ -16768,124 +17556,6 @@ async function killOwnedWorkerPane(ownership) {
     throw new Error("owned_pane_tmux_server_guard_failed");
   }
 }
-function detectPaneTrustPromptKind(captured, provider) {
-  const lines = captured.split("\n").map((l) => l.replace(/\r/g, "").trim()).filter((l) => l.length > 0);
-  const tail = lines.slice(-12);
-  const lastCodexPromptIndex = lines.findLastIndex(
-    (line) => paneLineLooksLikeIdlePrompt(line, "codex")
-  );
-  const activeCodexPrompt = lastCodexPromptIndex >= 0 ? lines[lastCodexPromptIndex].replace(
-    /^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯]\s*/,
-    ""
-  ) : "";
-  const lastCodexTrustQuestionIndex = lines.findLastIndex(
-    (line, index) => /Trust this folder\?/i.test(lines.slice(index, index + 2).join(" "))
-  );
-  const previousTrustChoiceWasRendered = lastCodexTrustQuestionIndex >= 0 && lines.slice(lastCodexTrustQuestionIndex + 1, lastCodexPromptIndex).some((line) => {
-    const prompt = line.replace(/^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯]\s*/, "");
-    return /^(?:1(?:\.|$)|2(?:\.|$))/i.test(prompt);
-  });
-  const lastCodexPromptIsTrustChoice = lastCodexPromptIndex >= 0 && (/^(?:1(?:\.|$)|2(?:\.|$))/i.test(activeCodexPrompt) || activeCodexPrompt === "" && !previousTrustChoiceWasRendered);
-  const codexTrustQuestionIsActive = lastCodexTrustQuestionIndex >= 0 && (lastCodexPromptIndex < lastCodexTrustQuestionIndex || lastCodexPromptIsTrustChoice);
-  if ((provider === void 0 || provider === "codex") && codexTrustQuestionIsActive) {
-    return "codex_directory";
-  }
-  const hasCursorTrustBanner = tail.some(
-    (l) => /Workspace Trust Required/i.test(l)
-  );
-  const hasCursorTrustHint = tail.some(
-    (l) => /Pass\s+--trust,\s*--yolo,\s*or\s+-f/i.test(l)
-  );
-  if ((provider === void 0 || provider === "cursor") && hasCursorTrustBanner && (hasCursorTrustHint || tail.some(
-    (l) => /Do you trust the contents of this directory\?/i.test(l)
-  ))) {
-    return "cursor_workspace_trust";
-  }
-  const claudeQuestionLines = lines.slice(-20);
-  const hasClaudeDirectoryQuestion = claudeQuestionLines.some(
-    (_, index) => /(?:Do you trust the files in this folder|Quick safety check:\s*Is this a project you created or one you trust)\?/i.test(
-      claudeQuestionLines.slice(index, index + 3).join(" ")
-    )
-  );
-  const hasClaudeDirectoryNoChoice = tail.some(
-    (l) => /\bNo,\s*exit\b/i.test(l)
-  );
-  const hasClaudeDirectoryYesChoice = tail.some(
-    (l) => /\bYes,\s*(?:proceed|I trust this folder)\b/i.test(l)
-  );
-  if ((provider === void 0 || provider === "claude") && hasClaudeDirectoryQuestion && hasClaudeDirectoryNoChoice && hasClaudeDirectoryYesChoice) {
-    return "claude_directory";
-  }
-  const hasDirectoryQuestion = tail.some(
-    (l) => /Do you trust the contents of this directory\?/i.test(l)
-  );
-  const hasDirectoryChoices = tail.some(
-    (l) => /Yes,\s*continue|No,\s*quit|Press enter to continue/i.test(l)
-  );
-  if (hasDirectoryQuestion && hasDirectoryChoices) return "directory";
-  const hasHookReview = tail.some((l) => /Hooks need review/i.test(l));
-  const hasHookTrustChoice = tail.some(
-    (l) => /Continue without trusting/i.test(l)
-  );
-  const hasHookConfirm = tail.some(
-    (l) => /Press enter to confirm or esc to go back/i.test(l)
-  );
-  if (hasHookReview && hasHookTrustChoice && hasHookConfirm)
-    return "codex_hooks";
-  return null;
-}
-function paneHasTrustPrompt(captured, provider) {
-  return detectPaneTrustPromptKind(captured, provider) !== null;
-}
-function paneHasClaudeStartupBanner(captured, provider) {
-  const lines = captured.split("\n").map((line) => line.replace(/\r/g, "").trim()).filter((line) => line.length > 0).slice(-20);
-  const lastPromptIndex = lines.findLastIndex(
-    (line) => paneLineLooksLikeIdlePrompt(line, provider)
-  );
-  if (lastPromptIndex >= 0) return false;
-  const lastStartupBannerIndex = lines.findLastIndex(
-    (line) => /bypass\s+permissions\s+on/i.test(line) || /shift\+tab\s+to\s+cycle/i.test(line) || /^⏵⏵\s+/.test(line)
-  );
-  return lastStartupBannerIndex >= 0;
-}
-function paneIsBootstrapping(captured, provider) {
-  if (paneHasClaudeStartupBanner(captured, provider)) return true;
-  const lines = captured.split("\n").map((line) => line.replace(/\r/g, "").trim()).filter((line) => line.length > 0);
-  return lines.some(
-    (line) => /\b(loading|initializing|starting up)\b/i.test(line) || /\bmodel:\s*loading\b/i.test(line) || /\bconnecting\s+to\b/i.test(line)
-  );
-}
-function paneHasActiveTask(captured, provider) {
-  const lines = captured.split("\n").map((l) => l.replace(/\r/g, "").trim()).filter((l) => l.length > 0);
-  const tail = lines.slice(-40);
-  if (provider === "cursor" && tail.some((l) => /ctrl\+c\s+to\s+stop/i.test(l)))
-    return true;
-  if (tail.some((l) => /\b\d+\s+background terminal running\b/i.test(l)))
-    return true;
-  if (tail.some((l) => /esc to interrupt/i.test(l))) return true;
-  if (tail.some((l) => /\bbackground terminal running\b/i.test(l))) return true;
-  if (tail.some(
-    (l) => /^[·✻✢✳✶✽✺✹✸✷*]\s+[A-Za-z][A-Za-z0-9''-]*(?:\s+[A-Za-z][A-Za-z0-9''-]*){0,3}(?:…|\.{3})(?:\s*\(.*\))?$/u.test(
-      l
-    )
-  ))
-    return true;
-  return false;
-}
-function paneLooksReady(captured, provider) {
-  const content = captured.trimEnd();
-  if (content === "") return false;
-  const lines = content.split("\n").map((line) => line.replace(/\r/g, "").trimEnd()).filter((line) => line.trim() !== "");
-  if (lines.length === 0) return false;
-  const trustPrompt = detectPaneTrustPromptKind(content, provider);
-  if (trustPrompt === "cursor_workspace_trust" || trustPrompt === "codex_directory")
-    return false;
-  if (paneHasTrustPrompt(content, provider)) return true;
-  if (paneIsBootstrapping(content, provider)) return false;
-  const lastLine = lines[lines.length - 1];
-  if (paneLineLooksLikeIdlePrompt(lastLine, provider)) return true;
-  return lines.some((line) => paneLineLooksLikeIdlePrompt(line, provider));
-}
 async function waitForPaneReady(paneId, opts = {}) {
   if (!isCmuxSurfaceTarget(paneId) && !opts.tmuxServerIdentity) return false;
   const timeoutMs = Number.isFinite(opts.timeoutMs) && (opts.timeoutMs ?? 0) > 0 ? Number(opts.timeoutMs) : 3e4;
@@ -16965,6 +17635,9 @@ async function startupContextIsActive(context, attemptAlreadyFenced = false) {
     return false;
   return context.ownership.paneId === context.attempt.pane_id && context.provider === context.attempt.provider && await isWorkerLaunchAttemptAccepted(context.attempt) && (attemptAlreadyFenced || await isWorkerLaunchAttemptCurrent(context.attempt));
 }
+async function startupProviderExited(context) {
+  return await observeWorkerLaunchProvider(context.attempt) === "dead";
+}
 async function waitForStartupPaneReady(context, opts = {}) {
   if (context.ownership.paneId !== context.attempt.pane_id || context.provider !== context.attempt.provider) {
     return { ok: false, reason: "ownership_mismatch" };
@@ -16973,9 +17646,14 @@ async function waitForStartupPaneReady(context, opts = {}) {
   const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) && (opts.pollIntervalMs ?? 0) > 0 ? Number(opts.pollIntervalMs) : 250;
   const deadline = Date.now() + timeoutMs;
   const handledSelectors = /* @__PURE__ */ new Set();
-  while (Date.now() < deadline) {
+  let claudeTrustDownSentAt = -Infinity;
+  let readAfterTrustAnswer = false;
+  while (Date.now() < deadline || readAfterTrustAnswer) {
+    readAfterTrustAnswer = false;
     if (!await startupContextIsActive(context, opts.attemptAlreadyFenced))
       return { ok: false, reason: "attempt_inactive" };
+    if (await startupProviderExited(context))
+      return { ok: false, reason: "provider_exited" };
     const copyMode = await paneCopyModeObservation(
       context.ownership.paneId,
       context.ownership.tmuxServerIdentity
@@ -16988,24 +17666,43 @@ async function waitForStartupPaneReady(context, opts = {}) {
     });
     if (!observation.ok) return { ok: false, reason: "capture_failed" };
     const captured = observation.captured;
-    const selector = detectPaneTrustPromptKind(captured, context.provider);
+    const selector = (context.provider === "claude" ? detectClaudeStartupDialog(captured) : null) ?? detectPaneTrustPromptKind(captured, context.provider);
     if (selector) {
       if (selector === "codex_directory")
         return { ok: false, reason: "codex_workspace_untrusted" };
       if (selector === "cursor_workspace_trust") {
         return { ok: false, reason: "cursor_workspace_untrusted" };
       }
-      const providerSupportsSelector = selector === "codex_hooks" ? context.provider === "codex" : selector === "claude_directory" ? context.provider === "claude" : context.provider === "codex" || context.provider === "claude";
+      if (selector === "claude_bypass_permissions")
+        return { ok: false, reason: "claude_bypass_permissions_consent_required" };
+      if (selector === "claude_onboarding")
+        return { ok: false, reason: "claude_onboarding_required" };
+      if (selector === "claude_startup_dialog_unidentified") {
+        await sleep3(pollIntervalMs);
+        continue;
+      }
+      const claudeDialog = selector === "claude_directory" || selector === "claude_fullscreen_renderer";
+      const providerSupportsSelector = selector === "codex_hooks" ? context.provider === "codex" : claudeDialog ? context.provider === "claude" : context.provider === "codex" || context.provider === "claude";
       if (!providerSupportsSelector)
         return { ok: false, reason: "selector_unsupported" };
       if (handledSelectors.has(selector))
         return { ok: false, reason: "selector_persistent" };
-      if (selector === "claude_directory") {
-        await sendTeamPaneKey(
-          context.ownership.paneId,
-          "Down",
-          context.ownership.tmuxServerIdentity
-        );
+      if (claudeDialog) {
+        const focus = claudeDialogFocus(captured, selector);
+        if (focus === "stale")
+          return { ok: false, reason: "selector_persistent" };
+        if (focus !== "second") {
+          if (focus === "first" && Date.now() - claudeTrustDownSentAt >= CLAUDE_TRUST_DOWN_RESEND_MS) {
+            await sendTeamPaneKey(
+              context.ownership.paneId,
+              "Down",
+              context.ownership.tmuxServerIdentity
+            );
+            claudeTrustDownSentAt = Date.now();
+          }
+          await sleep3(pollIntervalMs);
+          continue;
+        }
       } else {
         await sendLiteralPaneText(
           context.ownership.paneId,
@@ -17019,6 +17716,7 @@ async function waitForStartupPaneReady(context, opts = {}) {
         context.ownership.tmuxServerIdentity
       );
       handledSelectors.add(selector);
+      readAfterTrustAnswer = claudeDialog;
       await sleep3(pollIntervalMs);
       continue;
     }
@@ -17027,11 +17725,15 @@ async function waitForStartupPaneReady(context, opts = {}) {
     if (paneLooksReady(captured, context.provider)) return { ok: true };
     await sleep3(pollIntervalMs);
   }
+  console.warn(
+    `[tmux-session] waitForStartupPaneReady: pane ${safePaneDiagnosticToken(context.ownership.paneId)} timed out after ${timeoutMs}ms; ${describeStartupReadyTimeout(process.env, timeoutMs)}`
+  );
   return { ok: false, reason: "readiness_timeout" };
 }
 async function startupPaneSubmitBlockReason(context, attemptAlreadyFenced) {
   if (!await startupContextIsActive(context, attemptAlreadyFenced))
     return "attempt_inactive";
+  if (await startupProviderExited(context)) return "provider_exited";
   const copyMode = await paneCopyModeObservation(
     context.ownership.paneId,
     context.ownership.tmuxServerIdentity
@@ -17043,6 +17745,11 @@ async function startupPaneSubmitBlockReason(context, attemptAlreadyFenced) {
     ...context.ownership.provider === "tmux" ? { tmuxServerIdentity: context.ownership.tmuxServerIdentity } : {}
   });
   if (!observation.ok || !observation.captured.trim()) return "capture_failed";
+  const startupDialog = context.provider === "claude" ? detectClaudeStartupDialog(observation.captured) : null;
+  if (startupDialog === "claude_bypass_permissions")
+    return "claude_bypass_permissions_consent_required";
+  if (startupDialog === "claude_onboarding") return "claude_onboarding_required";
+  if (startupDialog) return "claude_startup_dialog_pending";
   const selector = detectPaneTrustPromptKind(
     observation.captured,
     context.provider
@@ -17056,14 +17763,28 @@ async function startupPaneSubmitBlockReason(context, attemptAlreadyFenced) {
 async function deliverStartupInbox(context, message, options = {}) {
   if (message.length > 200) return { ok: false, reason: "message_too_long" };
   const ready = await waitForStartupPaneReady(context, {
+    timeoutMs: resolveStartupReadyTimeoutMs(process.env),
     attemptAlreadyFenced: options.attemptAlreadyFenced
   });
   if (!ready.ok) return { ok: false, reason: ready.reason };
   try {
-    const preInputBlockReason = await startupPaneSubmitBlockReason(
+    let preInputBlockReason = await startupPaneSubmitBlockReason(
       context,
       options.attemptAlreadyFenced ?? false
     );
+    if (preInputBlockReason === "claude_startup_dialog_pending") {
+      const answered = await waitForStartupPaneReady(context, {
+        timeoutMs: resolveStartupReadyTimeoutMs(process.env),
+        attemptAlreadyFenced: options.attemptAlreadyFenced
+      });
+      if (!answered.ok) return { ok: false, reason: answered.reason };
+      preInputBlockReason = await startupPaneSubmitBlockReason(
+        context,
+        options.attemptAlreadyFenced ?? false
+      );
+    }
+    if (preInputBlockReason === "claude_startup_dialog_pending")
+      return { ok: false, reason: "selector_persistent" };
     if (preInputBlockReason) return { ok: false, reason: preInputBlockReason };
     await sendLiteralPaneText(
       context.ownership.paneId,
@@ -17076,6 +17797,8 @@ async function deliverStartupInbox(context, message, options = {}) {
         context,
         options.attemptAlreadyFenced ?? false
       );
+      if (submitBlockReason === "claude_startup_dialog_pending")
+        return { ok: false, reason: "selector_persistent" };
       if (submitBlockReason) return { ok: false, reason: submitBlockReason };
       await sendTeamPaneKey(
         context.ownership.paneId,
@@ -17095,6 +17818,7 @@ async function deliverStartupInbox(context, message, options = {}) {
 async function probeStartupPaneActivity(context, options = {}) {
   if (!await startupContextIsActive(context, options.attemptAlreadyFenced))
     return "unknown";
+  if (await startupProviderExited(context)) return "dead";
   const membership = await verifyTeamTargetOwnership({
     provider: context.ownership.provider,
     providerTarget: context.ownership.providerTarget,
@@ -17123,6 +17847,7 @@ async function probeStartupPaneActivity(context, options = {}) {
 async function retryStartupInboxSubmit(context, message, options = {}) {
   if (!await startupContextIsActive(context, options.attemptAlreadyFenced))
     return "unavailable";
+  if (await startupProviderExited(context)) return "unavailable";
   const copyMode = await paneCopyModeObservation(
     context.ownership.paneId,
     context.ownership.tmuxServerIdentity
@@ -17132,7 +17857,7 @@ async function retryStartupInboxSubmit(context, message, options = {}) {
     operation: "startup-submit-retry",
     ...context.ownership.provider === "tmux" ? { tmuxServerIdentity: context.ownership.tmuxServerIdentity } : {}
   });
-  if (!observation.ok || detectPaneTrustPromptKind(observation.captured, context.provider))
+  if (!observation.ok || context.provider === "claude" && detectClaudeStartupDialog(observation.captured) || detectPaneTrustPromptKind(observation.captured, context.provider))
     return "unavailable";
   if (paneHasActiveTask(observation.captured, context.provider))
     return "pane_busy";
@@ -17186,7 +17911,7 @@ async function sendToWorker(_sessionName, paneId, message, tmuxServerIdentity) {
     if (!initialObservation.ok || !initialObservation.captured.trim())
       return false;
     const initialCapture = initialObservation.captured;
-    if (paneHasClaudeStartupBanner(initialCapture)) {
+    if (paneHasStartupBanner(initialCapture)) {
       return false;
     }
     const paneBusy = paneHasActiveTask(initialCapture);
@@ -17789,7 +18514,7 @@ async function killTeamSession(sessionName2, workerPaneIds, leaderPaneId, option
   if (result.outcome === "executed") return true;
   return await observeTmuxServerIdentity(identity) === "dead";
 }
-var import_fs13, import_crypto6, import_child_process4, import_util7, import_path13, import_os5, sleep3, execFileAsync3, TMUX_SESSION_PREFIX, TMUX_LIVENESS_SERVER_RECHECK_ATTEMPTS, TMUX_LIVENESS_SERVER_RECHECK_DELAY_MS, CMUX_MEMBERSHIP_RETRY_ATTEMPTS, CMUX_MEMBERSHIP_RETRY_INTERVAL_MS, defaultTmuxServerIdentityDependencies, guardMarkerCounter, TMUX_MAILBOX_PANE_ID, TMUX_MAILBOX_TARGET, defaultMailboxTargetOwnershipDependencies, defaultDirectMailboxEffectDependencies, TeamSessionCreationError, SUPPORTED_POSIX_SHELLS, ZSH_CANDIDATES, BASH_CANDIDATES, DECIMAL_INTEGER_TEXT2, DANGEROUS_LAUNCH_BINARY_CHARS;
+var import_fs13, import_crypto6, import_child_process4, import_util7, import_path13, import_os5, sleep3, execFileAsync3, TMUX_SESSION_PREFIX, TMUX_LIVENESS_SERVER_RECHECK_ATTEMPTS, TMUX_LIVENESS_SERVER_RECHECK_DELAY_MS, CMUX_MEMBERSHIP_RETRY_ATTEMPTS, CMUX_MEMBERSHIP_RETRY_INTERVAL_MS, defaultTmuxServerIdentityDependencies, guardMarkerCounter, TMUX_MAILBOX_PANE_ID, TMUX_MAILBOX_TARGET, defaultMailboxTargetOwnershipDependencies, defaultDirectMailboxEffectDependencies, TeamSessionCreationError, SUPPORTED_POSIX_SHELLS, ZSH_CANDIDATES, BASH_CANDIDATES, DECIMAL_INTEGER_TEXT3, DANGEROUS_LAUNCH_BINARY_CHARS, CLAUDE_TRUST_DOWN_RESEND_MS;
 var init_tmux_session = __esm({
   "src/team/tmux-session.ts"() {
     "use strict";
@@ -17806,6 +18531,7 @@ var init_tmux_session = __esm({
     init_types3();
     init_team_owner_epoch();
     init_native_contained_fs();
+    init_ready_timeout();
     init_pane_readiness();
     init_worker_launch_ack();
     init_runtime_owner_client();
@@ -17864,8 +18590,9 @@ var init_tmux_session = __esm({
       "/opt/homebrew/bin/zsh"
     ];
     BASH_CANDIDATES = ["/bin/bash", "/usr/bin/bash"];
-    DECIMAL_INTEGER_TEXT2 = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+    DECIMAL_INTEGER_TEXT3 = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
     DANGEROUS_LAUNCH_BINARY_CHARS = /[;&|`$()<>\n\r\t\0]/;
+    CLAUDE_TRUST_DOWN_RESEND_MS = 1e3;
   }
 });
 
@@ -18601,15 +19328,15 @@ function isValidPersistedMaxWorkers(value) {
 function isTimestamp2(value) {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
 }
-function isStringArray(value) {
+function isStringArray2(value) {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 function isWorkerInfo(value) {
   if (!isRecord2(value) || !isCanonicalWorkerName(value.name) || !isSafeCounter(value.index) || value.index < 1) return false;
-  return (value.role === void 0 || typeof value.role === "string") && (value.assigned_tasks === void 0 || isStringArray(value.assigned_tasks)) && (value.worker_cli === void 0 || ["claude", "codex", "gemini", "cursor", "grok", "antigravity", "copilot"].includes(value.worker_cli)) && (value.pid === void 0 || isSafeCounter(value.pid) && value.pid > 0) && (value.pane_id === void 0 || typeof value.pane_id === "string") && (value.working_dir === void 0 || typeof value.working_dir === "string") && (value.worktree_repo_root === void 0 || typeof value.worktree_repo_root === "string") && (value.worktree_path === void 0 || typeof value.worktree_path === "string") && (value.worktree_branch === void 0 || typeof value.worktree_branch === "string") && (value.worktree_detached === void 0 || typeof value.worktree_detached === "boolean") && (value.worktree_created === void 0 || typeof value.worktree_created === "boolean") && (value.team_state_root === void 0 || typeof value.team_state_root === "string") && (value.output_file === void 0 || typeof value.output_file === "string") && (value.recovery_id === void 0 || isNonEmptyString2(value.recovery_id)) && (value.replacement_generation === void 0 || isSafeCounter(value.replacement_generation)) && (value.pane_attempt_id === void 0 || isNonEmptyString2(value.pane_attempt_id)) && (value.operational_state === void 0 || ["starting", "active", "dead", "stopped"].includes(value.operational_state)) && (value.launch_attempt_id === void 0 || isNonEmptyString2(value.launch_attempt_id)) && (value.launch_descriptor === void 0 || isLaunchDescriptor(value.launch_descriptor));
+  return (value.role === void 0 || typeof value.role === "string") && (value.assigned_tasks === void 0 || isStringArray2(value.assigned_tasks)) && (value.worker_cli === void 0 || ["claude", "codex", "gemini", "cursor", "grok", "antigravity", "copilot"].includes(value.worker_cli)) && (value.pid === void 0 || isSafeCounter(value.pid) && value.pid > 0) && (value.pane_id === void 0 || typeof value.pane_id === "string") && (value.working_dir === void 0 || typeof value.working_dir === "string") && (value.worktree_repo_root === void 0 || typeof value.worktree_repo_root === "string") && (value.worktree_path === void 0 || typeof value.worktree_path === "string") && (value.worktree_branch === void 0 || typeof value.worktree_branch === "string") && (value.worktree_detached === void 0 || typeof value.worktree_detached === "boolean") && (value.worktree_created === void 0 || typeof value.worktree_created === "boolean") && (value.team_state_root === void 0 || typeof value.team_state_root === "string") && (value.output_file === void 0 || typeof value.output_file === "string") && (value.recovery_id === void 0 || isNonEmptyString2(value.recovery_id)) && (value.replacement_generation === void 0 || isSafeCounter(value.replacement_generation)) && (value.pane_attempt_id === void 0 || isNonEmptyString2(value.pane_attempt_id)) && (value.operational_state === void 0 || ["starting", "active", "dead", "stopped"].includes(value.operational_state)) && (value.launch_attempt_id === void 0 || isNonEmptyString2(value.launch_attempt_id)) && (value.launch_descriptor === void 0 || isLaunchDescriptor(value.launch_descriptor));
 }
 function isLaunchDescriptor(value) {
-  return isRecord2(value) && value.schema_version === 1 && ["claude", "codex", "gemini", "cursor", "grok", "antigravity", "copilot"].includes(value.provider) && (value.model === null || typeof value.model === "string") && isNonEmptyString2(value.binary) && isStringArray(value.args);
+  return isRecord2(value) && value.schema_version === 1 && ["claude", "codex", "gemini", "cursor", "grok", "antigravity", "copilot"].includes(value.provider) && (value.model === null || typeof value.model === "string") && isNonEmptyString2(value.binary) && isStringArray2(value.args);
 }
 function isOwnerEpoch(value) {
   return isRecord2(value) && isSafeCounter(value.epoch) && value.epoch > 0 && isNonEmptyString2(value.nonce) && isSafeCounter(value.pid) && value.pid > 0 && isNonEmptyString2(value.process_started_at) && isTimestamp2(value.created_at);
@@ -18639,7 +19366,7 @@ function isScaleUpWorktreeCleanupReceipts(value, teamName, cwd) {
   });
 }
 function isScaleUpAttempt(value, teamName, cwd) {
-  if (!isRecord2(value) || !isSafeScaleUpOperationId(value.operation_id) || !["reserved", "effects", "committed", "failed"].includes(value.phase) || value.instance_id !== void 0 && !isValidTeamInstanceId(value.instance_id) || !isSafeCounter(value.pid) || value.pid <= 0 || !isNonEmptyString2(value.process_started_at) || !isSafeCounter(value.state_revision) || !isTimestamp2(value.created_at) || !isTimestamp2(value.updated_at) || value.failure_reason !== void 0 && typeof value.failure_reason !== "string" || value.cleanup_failures !== void 0 && !isStringArray(value.cleanup_failures) || value.baseline_worker_names !== void 0 && (!Array.isArray(value.baseline_worker_names) || !value.baseline_worker_names.every(isCanonicalWorkerName) || new Set(value.baseline_worker_names).size !== value.baseline_worker_names.length) || value.worktree_cleanup_receipts !== void 0 && (cwd === void 0 || !isScaleUpWorktreeCleanupReceipts(value.worktree_cleanup_receipts, teamName, cwd))) return false;
+  if (!isRecord2(value) || !isSafeScaleUpOperationId(value.operation_id) || !["reserved", "effects", "committed", "failed"].includes(value.phase) || value.instance_id !== void 0 && !isValidTeamInstanceId(value.instance_id) || !isSafeCounter(value.pid) || value.pid <= 0 || !isNonEmptyString2(value.process_started_at) || !isSafeCounter(value.state_revision) || !isTimestamp2(value.created_at) || !isTimestamp2(value.updated_at) || value.failure_reason !== void 0 && typeof value.failure_reason !== "string" || value.cleanup_failures !== void 0 && !isStringArray2(value.cleanup_failures) || value.baseline_worker_names !== void 0 && (!Array.isArray(value.baseline_worker_names) || !value.baseline_worker_names.every(isCanonicalWorkerName) || new Set(value.baseline_worker_names).size !== value.baseline_worker_names.length) || value.worktree_cleanup_receipts !== void 0 && (cwd === void 0 || !isScaleUpWorktreeCleanupReceipts(value.worktree_cleanup_receipts, teamName, cwd))) return false;
   return value.worktree_cleanup_receipts === void 0 || value.baseline_worker_names !== void 0;
 }
 function isScaleDownAttempt(value) {
@@ -19126,6 +19853,13 @@ var init_swallowed_error = __esm({
   }
 });
 
+// src/lib/jsonl.ts
+var init_jsonl = __esm({
+  "src/lib/jsonl.ts"() {
+    "use strict";
+  }
+});
+
 // src/team/mailbox-outstanding.ts
 var import_promises6, import_fs15, import_path15, ZERO_OUTSTANDING;
 var init_mailbox_outstanding = __esm({
@@ -19165,6 +19899,7 @@ var init_events = __esm({
     import_fs16 = require("fs");
     init_state_paths();
     init_swallowed_error();
+    init_jsonl();
     init_mailbox_outstanding();
   }
 });
@@ -20154,11 +20889,41 @@ var init_task_size_detector = __esm({
 });
 
 // src/hooks/keyword-detector/index.ts
-var KEYWORD_PRIORITY, CANONICAL_WORKFLOW_SLASH_SKILLS, WORKFLOW_SLASH_PATTERN, PATH_SEGMENT_CHARS, FILE_PATH_PATTERN;
+var AUTOPILOT_ALIAS_PATTERN, AUTOPILOT_OTHER_PATTERN, KEYWORD_PATTERNS, KEYWORD_PRIORITY, CANONICAL_WORKFLOW_SLASH_SKILLS, WORKFLOW_SLASH_PATTERN, PATH_SEGMENT_CHARS, FILE_PATH_PATTERN, AUTOPILOT_COMMAND_VERBS, AUTOPILOT_HYPHENATED_VERB, AUTOPILOT_COMMAND_WORD, AUTOPILOT_STATUS_CONTINUATION, AUTOPILOT_NOT_A_COMMAND_AFTER, AUTOPILOT_NON_COMMAND_WORDS, AUTOPILOT_LEADING_STATUS, AUTOPILOT_COMMAND_AFTER, AUTOPILOT_COLON_VERB, AUTOPILOT_NON_ENGLISH_LINE;
 var init_keyword_detector = __esm({
   "src/hooks/keyword-detector/index.ts"() {
     "use strict";
     init_task_size_detector();
+    AUTOPILOT_ALIAS_PATTERN = /\b(autopilot|auto[\s-]?pilot|fullsend|full\s+auto)\b/i;
+    AUTOPILOT_OTHER_PATTERN = /\b(?:build|create|make)\s+me\s+(?:an?\s+)?(?:app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension)\b|\bi\s+want\s+an?\s+(?:app|feature|project|tool|plugin|website|api|server|cli|script|system|service|dashboard|bot|extension)\b|(오토파일럿)|(オートパイロット)/i;
+    KEYWORD_PATTERNS = {
+      cancel: /\b(cancelomc|stopomc)\b/i,
+      ralph: /\b(ralph)\b(?!-)|(랄프)(?!로렌)|(ラルフ)(?!・?ローレン)/i,
+      autopilot: new RegExp(`${AUTOPILOT_ALIAS_PATTERN.source}|${AUTOPILOT_OTHER_PATTERN.source}`, "i"),
+      // Team keyword detection disabled — team mode is now explicit-only via /team skill.
+      // This prevents infinite spawning when Claude workers receive prompts containing "team".
+      team: /(?!x)x/,
+      // never-match placeholder (type system requires the key)
+      ralplan: /\b(ralplan)\b|(랄플랜)|(ラルプラン)/i,
+      tdd: /\b(tdd)\b|\btest\s+first\b|(테스트\s?퍼스트)|(テスト\s?ファースト)/i,
+      "code-review": /\b(code\s+review|review\s+code)\b|(코드\s?리뷰)(?!어)|(コード\s?レビュー)(?!ア)/i,
+      "security-review": /\b(security\s+review|review\s+security)\b|(보안\s?리뷰)(?!어)|(セキュリティ[ー]?\s?レビュー)(?!ア)/i,
+      ultrathink: /\b(ultrathink)\b|(울트라씽크)|(ウルトラシンク)/i,
+      deepsearch: /\b(deepsearch)\b|\bsearch\s+the\s+codebase\b|\bfind\s+in\s+(the\s+)?codebase\b|(딥\s?서치)|(ディープ\s?サーチ)/i,
+      analyze: /\b(deep[\s-]?analyze|deepanalyze)\b|(딥\s?분석)|(ディープ\s?アナライズ)/i,
+      "deep-interview": /\b(deep[\s-]interview|ouroboros)\b|(딥인터뷰)|(ディープインタビュー)/i,
+      // Script-only triggers: never-match placeholders (script detects them, TypeScript doesn't)
+      ultragoal: /(?!x)x/,
+      // Script-only detection
+      "ai-slop-cleaner": /(?!x)x/,
+      // Script-only detection
+      wiki: /(?!x)x/,
+      // Script-only detection
+      codex: /\b(ask|use|delegate\s+to)\s+(codex|gpt)\b/i,
+      gemini: /\b(ask|use|delegate\s+to)\s+gemini\b/i,
+      cursor: /\b(ask|use|delegate\s+to)\s+cursor\b/i,
+      antigravity: /\b(ask|use|delegate\s+to)\s+(antigravity|agy)\b/i
+    };
     KEYWORD_PRIORITY = [
       "cancel",
       "ralph",
@@ -20197,6 +20962,16 @@ var init_keyword_detector = __esm({
       "(^|[\\s\"'`(])(?:\\/)?(?:" + PATH_SEGMENT_CHARS + "+\\/)+(?:" + PATH_SEGMENT_CHARS + "*\\.\\w+|[\\w.\\-]+)",
       "gm"
     );
+    AUTOPILOT_COMMAND_VERBS = "fix|debug|investigate|resolve|handle|patch|address|implement|build|create|make|run|start|enable|activate|invoke|trigger|launch|plan|add|write|refactor|update|remove|migrate|finish|continue|do|go|test|review|check|verify|audit|analy[sz]e|inspect|deploy|install|configure|document|explain|find|search|generate|convert|ship|release|merge|prepare|design|draft|upgrade|rename|clean|optimi[sz]e|rewrite|summari[sz]e|compare|bring|ping|seed";
+    AUTOPILOT_HYPHENATED_VERB = "(?:re-(?:run|test|check|build|deploy|install|implement|review|verify|try|apply|start|launch|write|format|generate|create)|double-check|cross-check|un-install)";
+    AUTOPILOT_COMMAND_WORD = `(?:(?:${AUTOPILOT_COMMAND_VERBS})|${AUTOPILOT_HYPHENATED_VERB})`;
+    AUTOPILOT_STATUS_CONTINUATION = "\\s+(?:fails|was|were|is|are|has|had|looks|takes|keeps|hangs|hung|timed\\s+out|succeeds|passes|completes|finishes|works)(?![\\p{L}\\d])|\\s+(?:failed|crashed|errored|ok|okay|done|green|succeeded|passed|completed|finished|worked)(?![\\p{L}\\d])(?=[ \\t]*(?:[.,;:!?)]|\\r?\\n|$)|[ \\t]+(?:on|at|in|with|after|during|for|because|again|twice|and|but|so|before|when|while|since|until|due|once|yesterday|today|overnight|too|earlier|already)(?![\\p{L}\\d]))|\\s+(?:step|phase|exit|status|log|suite|mode|output|report|results?|summary)\\s+(?:\\d+|is|are|was|were|has|had|failed|fails|passed|passes|succeeded|looks|takes|keeps|crashed|errored|ok|okay|red|green)(?![\\p{L}\\d])";
+    AUTOPILOT_NOT_A_COMMAND_AFTER = `(?!${AUTOPILOT_STATUS_CONTINUATION})`;
+    AUTOPILOT_NON_COMMAND_WORDS = "a|an|the|this|that|these|those|my|our|your|his|her|its|their|i|we|you|he|she|it|they|me|us|them|is|are|was|were|be|been|am|has|have|had|do|does|did|will|would|can|could|should|may|might|must|shall|not|no|nor|and|or|but|so|if|then|than|as|at|in|on|of|to|for|from|with|by|about|into|onto|over|under|after|before|during|until|while|when|where|which|who|whom|what|why|how|also|just|only|still|already|always|never|now|currently|ready|idle|off|none|nothing|active|inactive|enabled|disabled|available|unavailable|busy|pending|offline|online|yes|here|there|too|very|really|actually|maybe|perhaps|however|hung|hangs|stuck|ran|went|got|took|broke|broken|froze|frozen|became|seems|seemed|remains|lost|left|hit|began|saw|said|gave|found|kept|knew|thought|told|wrote|made|built|sent|spent|stood|held|fell|drew|drove|chose|came|won|threw|grew|met|paid|rose|sold|taught|understood|wore|sat|slept|spoke|swept|sank";
+    AUTOPILOT_LEADING_STATUS = new RegExp(`^(?:[ \\t]*[:\\uFF1A][ \\t]*(?:(?:${AUTOPILOT_NON_COMMAND_WORDS})|(?!(?:bring|ping|seed|feed|embed|proceed|succeed|speed|need|shred|string|swing|sing|ring|fling|sling|sting|wring|spring|cling)(?![\\p{L}\\d]))\\p{L}*(?:ing|ed))(?![\\p{L}\\d])|[ \\t]+(?:${AUTOPILOT_COMMAND_VERBS})(?![\\p{L}\\d])(?:${AUTOPILOT_STATUS_CONTINUATION}))`, "iu");
+    AUTOPILOT_COMMAND_AFTER = new RegExp(`^(?:[ \\t]*[,;!\\u2014\\u2013][ \\t]*|[ \\t]+-[ \\t]+|[ \\t]+)${AUTOPILOT_COMMAND_WORD}(?![\\p{L}\\d])${AUTOPILOT_NOT_A_COMMAND_AFTER}`, "iu");
+    AUTOPILOT_COLON_VERB = new RegExp(`^[ \\t]*[:\\uFF1A][ \\t]*${AUTOPILOT_COMMAND_WORD}(?![\\p{L}\\d])${AUTOPILOT_NOT_A_COMMAND_AFTER}`, "iu");
+    AUTOPILOT_NON_ENGLISH_LINE = new RegExp("[\\p{Script=Hangul}\\p{Script=Hiragana}\\p{Script=Katakana}\\p{Script=Han}\\p{Script=Thai}]|(?![A-Za-z])\\p{L}", "u");
   }
 });
 
@@ -20529,7 +21304,7 @@ var init_worker_bootstrap = __esm({
 });
 
 // src/team/dispatch-queue.ts
-var import_crypto8, import_fs20, import_promises9, import_path22, LOCK_STALE_MS;
+var import_crypto8, import_fs20, import_promises9, import_path22, LEGACY_LOCK_STALE_MS;
 var init_dispatch_queue = __esm({
   "src/team/dispatch-queue.ts"() {
     "use strict";
@@ -20540,7 +21315,9 @@ var init_dispatch_queue = __esm({
     init_state_paths();
     init_fs_utils();
     init_contracts();
-    LOCK_STALE_MS = 5 * 60 * 1e3;
+    init_process_identity_lock();
+    init_team_owner_epoch();
+    LEGACY_LOCK_STALE_MS = 5 * 60 * 1e3;
   }
 });
 
@@ -20673,7 +21450,7 @@ async function listTasks(teamName, cwd, deps) {
   tasks.sort((a, b) => Number(a.id) - Number(b.id));
   return tasks;
 }
-var import_crypto9, import_path23, import_promises10, logEventAppendFailure, logCompletionMarkerFailure;
+var import_crypto9, import_path23, import_promises10, logEventAppendFailure, logCompletionMarkerFailure, TASK_CLAIM_LEASE_MS;
 var init_tasks = __esm({
   "src/team/state/tasks.ts"() {
     "use strict";
@@ -20688,6 +21465,7 @@ var init_tasks = __esm({
     logCompletionMarkerFailure = createSwallowedErrorLogger(
       "team.state.tasks transitionTaskStatus completion marker failed"
     );
+    TASK_CLAIM_LEASE_MS = 15 * 60 * 1e3;
   }
 });
 
@@ -20715,7 +21493,7 @@ function normalizeTask(task) {
   if (normalized.error === null) delete normalized.error;
   return normalized;
 }
-function isPlainRecord(value) {
+function isPlainRecord2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
 }
 function isNonEmptyText(value) {
@@ -20725,15 +21503,15 @@ function isPositiveSafeInteger(value) {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 function isTaskRecoveryReservation(value) {
-  if (!isPlainRecord(value)) return false;
+  if (!isPlainRecord2(value)) return false;
   return isNonEmptyText(value.recovery_id) && isNonEmptyText(value.request_id) && isPositiveSafeInteger(value.continuation_sequence) && isNonEmptyText(value.checkpoint_path) && isNonEmptyText(value.checkpoint_hash) && isNonEmptyText(value.replacement_worker) && isPositiveSafeInteger(value.replacement_generation) && isNonEmptyText(value.adoption_token_hash) && typeof value.reserved_at === "string" && Number.isFinite(Date.parse(value.reserved_at));
 }
 function isTaskRecoveryAdoption(value) {
-  if (!isPlainRecord(value)) return false;
+  if (!isPlainRecord2(value)) return false;
   return isNonEmptyText(value.recovery_id) && isNonEmptyText(value.request_id) && isPositiveSafeInteger(value.continuation_sequence) && isNonEmptyText(value.checkpoint_path) && isNonEmptyText(value.checkpoint_hash) && isNonEmptyText(value.replacement_worker) && isPositiveSafeInteger(value.replacement_generation) && typeof value.adopted_at === "string" && Number.isFinite(Date.parse(value.adopted_at));
 }
 function isTeamTask(value) {
-  if (!isPlainRecord(value)) return false;
+  if (!isPlainRecord2(value)) return false;
   const v = value;
   if (typeof v.id !== "string" || !TASK_ID_SAFE_PATTERN.test(v.id) || typeof v.subject !== "string" || typeof v.description !== "string" || typeof v.created_at !== "string" || !Number.isFinite(Date.parse(v.created_at)) || typeof v.status !== "string" || !TEAM_TASK_STATUSES.includes(v.status)) {
     return false;
@@ -20748,12 +21526,12 @@ function isTeamTask(value) {
   if (v.completed_at !== void 0 && (typeof v.completed_at !== "string" || !Number.isFinite(Date.parse(v.completed_at)))) return false;
   if (v.result !== void 0 && v.result !== null && typeof v.result !== "string") return false;
   if (v.error !== void 0 && v.error !== null && typeof v.error !== "string") return false;
-  if (v.metadata !== void 0 && !isPlainRecord(v.metadata)) return false;
+  if (v.metadata !== void 0 && !isPlainRecord2(v.metadata)) return false;
   if (v.recovery_reservation !== void 0 && !isTaskRecoveryReservation(v.recovery_reservation)) return false;
   if (v.recovery_adoption !== void 0 && !isTaskRecoveryAdoption(v.recovery_adoption)) return false;
   const claim = v.claim;
   if (claim !== void 0) {
-    if (!isPlainRecord(claim) || typeof claim.owner !== "string" || claim.owner.trim() === "" || typeof claim.token !== "string" || claim.token.trim() === "" || typeof claim.leased_until !== "string" || !Number.isFinite(Date.parse(claim.leased_until)) || claim.launch_attempt_id !== void 0 && typeof claim.launch_attempt_id !== "string") {
+    if (!isPlainRecord2(claim) || typeof claim.owner !== "string" || claim.owner.trim() === "" || typeof claim.token !== "string" || claim.token.trim() === "" || typeof claim.leased_until !== "string" || !Number.isFinite(Date.parse(claim.leased_until)) || claim.launch_attempt_id !== void 0 && typeof claim.launch_attempt_id !== "string") {
       return false;
     }
   }
@@ -20782,6 +21560,37 @@ var init_team_ops = __esm({
   }
 });
 
+// src/team/worker-provider-liveness.ts
+async function getWorkerProviderLiveness(teamName, cwd, instanceId, worker) {
+  if (!instanceId || !worker.pane_id || !worker.launch_attempt_id)
+    return "unknown";
+  const provider = worker.launch_descriptor?.provider ?? worker.worker_cli;
+  if (!provider) return "unknown";
+  try {
+    const attempt = await loadWorkerLaunchAttempt({
+      cwd,
+      teamName,
+      instanceId,
+      workerName: worker.name,
+      paneId: worker.pane_id,
+      provider,
+      attemptId: worker.launch_attempt_id,
+      runtimeCliPath: resolveRuntimeCliPath()
+    });
+    if (!attempt) return "unknown";
+    return await observeWorkerLaunchProvider(attempt);
+  } catch {
+    return "unknown";
+  }
+}
+var init_worker_provider_liveness = __esm({
+  "src/team/worker-provider-liveness.ts"() {
+    "use strict";
+    init_runtime_owner_client();
+    init_worker_launch_ack();
+  }
+});
+
 // src/team/mailbox-notification-guard.ts
 var init_mailbox_notification_guard = __esm({
   "src/team/mailbox-notification-guard.ts"() {
@@ -20791,6 +21600,14 @@ var init_mailbox_notification_guard = __esm({
     init_types3();
     init_team_owner_epoch();
     init_worker_canonicalization();
+    init_worker_provider_liveness();
+  }
+});
+
+// src/team/mcp-dispatch-helpers.ts
+var init_mcp_dispatch_helpers = __esm({
+  "src/team/mcp-dispatch-helpers.ts"() {
+    "use strict";
   }
 });
 
@@ -20805,6 +21622,7 @@ var init_mcp_comm = __esm({
     init_state_paths();
     init_process_identity_lock();
     init_swallowed_error();
+    init_mcp_dispatch_helpers();
   }
 });
 
@@ -21080,6 +21898,7 @@ var init_scaling = __esm({
     init_monitor();
     init_tmux_session();
     init_herdr_session();
+    init_ready_timeout();
     init_state_paths();
     init_worker_bootstrap();
     init_cli_worker_contract();
@@ -21181,6 +22000,100 @@ function configuredPaneOwnership(config2, worker) {
     source: "adopted",
     ...identity ? { tmuxServerIdentity: identity } : {}
   };
+}
+function recoveryError(input, recoveryId, error2, message) {
+  return {
+    outcome: "failed",
+    committed: false,
+    error: error2,
+    message,
+    requestId: input.requestId,
+    recoveryId,
+    teamName: input.teamName,
+    workerName: input.workerName,
+    updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+  };
+}
+function persistRecoveryFinal(input, recoveryId, result) {
+  if (result.requestId !== input.requestId || result.recoveryId !== recoveryId || result.teamName !== input.teamName || result.workerName !== input.workerName) {
+    throw new Error("invalid_persisted_state");
+  }
+  const existingFinalState = readRecoveryFinalState(input.cwd, input.requestId);
+  if (existingFinalState.kind === "invalid")
+    throw new Error("invalid_persisted_state");
+  const existing = readRecoveryOutcome(input.cwd, input.requestId);
+  if (isMatchingRecoveryFinal(existing, {
+    requestId: input.requestId,
+    recoveryId,
+    teamName: input.teamName,
+    workerName: input.workerName
+  }))
+    return existing.result;
+  const succeeded = result.outcome === "recovered" || result.outcome === "already_running";
+  const failureResult = succeeded ? void 0 : result;
+  writeRecoveryFinal(input.cwd, {
+    schema_version: 1,
+    kind: "final",
+    request_id: input.requestId,
+    recovery_id: recoveryId,
+    team_name: input.teamName,
+    worker_name: input.workerName,
+    outcome: succeeded ? "succeeded" : result.outcome === "commit_unknown" ? "commit_unknown" : "failed",
+    result,
+    error: failureResult ? {
+      code: failureResult.error,
+      message: failureResult.message,
+      commit_uncertain: failureResult.outcome === "commit_unknown"
+    } : void 0,
+    continuation: succeeded && result.requeuedTaskIds.length > 0 ? "adopted" : "none",
+    adoption: succeeded && result.requeuedTaskIds.length > 0 ? "adopted" : "not_started",
+    services: succeeded ? result.servicesSync : "terminal_degraded",
+    manifest: succeeded ? result.manifestSync : "repair_required",
+    completed_at: (/* @__PURE__ */ new Date()).toISOString(),
+    expires_at: new Date(Date.now() + 7 * 864e5).toISOString()
+  });
+  return result;
+}
+function recoveryTimeoutError(input, recoveryId) {
+  return recoveryError(
+    input,
+    recoveryId,
+    "recovery_request_timeout",
+    `Recovery owner deadline exceeded: no attempt finished within ${RECOVERY_OWNER_RETRY_DEADLINE_MS} ms of admission.`
+  );
+}
+async function publishSavedRecoveryTimeout(input, recoveryId) {
+  const savedTimeout = async () => {
+    const config2 = (await readRevisionedTeamConfig(input.teamName, input.cwd))?.config;
+    const last = config2?.last_recovery;
+    return config2?.active_recovery?.recovery_id !== recoveryId && last?.recovery_id === recoveryId && last.request_id === input.requestId && last.worker_name === input.workerName && last.phase === "failed" && last.failure_reason === "recovery_request_timeout";
+  };
+  if (!await savedTimeout()) return null;
+  return withTeamConfigMutationLock(
+    input.teamName,
+    input.cwd,
+    async () => await savedTimeout() ? persistRecoveryFinal(
+      input,
+      recoveryId,
+      recoveryTimeoutError(input, recoveryId)
+    ) : null
+  );
+}
+async function publishPendingRecoveryTimeout(teamName, cwd, instanceId) {
+  const saved = (await readRevisionedTeamConfig(teamName, cwd))?.config.last_recovery;
+  if (saved?.failure_reason !== "recovery_request_timeout" || readRecoveryFinalState(cwd, saved.request_id).kind === "valid")
+    return null;
+  await publishSavedRecoveryTimeout(
+    {
+      teamName,
+      cwd,
+      workerName: saved.worker_name,
+      requestId: saved.request_id,
+      instanceId
+    },
+    saved.recovery_id
+  ).catch(() => null);
+  return readRecoveryFinalState(cwd, saved.request_id).kind === "valid" ? null : saved.recovery_id;
 }
 async function shutdownTeamV2(teamName, cwd, options = {}) {
   return withTeamStatePathScope(cwd, () => shutdownTeamV2Owned(teamName, cwd, options));
@@ -21842,6 +22755,17 @@ If you accept, exit your session. If you reject, remain active for task work and
     async () => {
       await assertTeamInstanceUnderLock(shutdownInstance);
       await commitStoppedFenceUnderLock();
+      const unpublished = await publishPendingRecoveryTimeout(
+        sanitized,
+        cwd,
+        shutdownInstance.instance_id
+      );
+      if (unpublished)
+        return {
+          outcome: "failed",
+          reason: "state_cleanup_failed",
+          detail: `recovery_final_unpublished:${unpublished}`
+        };
       let worktreeCleanupFailure = null;
       let preservedWorktrees = 0;
       try {
@@ -21887,7 +22811,7 @@ If you accept, exit your session. If you reject, remain active for task work and
     }
   );
 }
-var import_path27, import_fs23, import_promises14, import_node_crypto6, orchestratorByTeam, cadenceByTeam, TEAM_INSTANCE_FINAL_DISPOSAL_AUTHORIZATION;
+var import_path27, import_fs23, import_promises14, import_node_crypto6, orchestratorByTeam, cadenceByTeam, RECOVERY_OWNER_RETRY_DEADLINE_MS, TEAM_INSTANCE_FINAL_DISPOSAL_AUTHORIZATION;
 var init_runtime_v2 = __esm({
   "src/team/runtime-v2.ts"() {
     "use strict";
@@ -21907,6 +22831,7 @@ var init_runtime_v2 = __esm({
     init_model_contract();
     init_tmux_session();
     init_herdr_session();
+    init_pane_readiness();
     init_worker_bootstrap();
     init_mcp_comm();
     init_git_worktree();
@@ -21935,11 +22860,13 @@ var init_runtime_v2 = __esm({
     init_team_owner_epoch();
     init_worker_activation_gate();
     init_worker_launch_ack();
+    init_worker_provider_liveness();
     init_process_utils();
     init_team_instance();
     init_runtime_flags();
     orchestratorByTeam = /* @__PURE__ */ new Map();
     cadenceByTeam = /* @__PURE__ */ new Map();
+    RECOVERY_OWNER_RETRY_DEADLINE_MS = 3e5;
     TEAM_INSTANCE_FINAL_DISPOSAL_AUTHORIZATION = {
       protocol: "caller-owned-final-state-v1",
       providers: "disposed",
@@ -32948,6 +33875,7 @@ init_runtime_v2();
 init_process_identity_lock();
 
 // src/team/idle-nudge.ts
+init_pane_readiness();
 init_tmux_session();
 init_types3();
 var DEFAULT_NUDGE_CONFIG = {
@@ -32965,7 +33893,7 @@ async function capturePane(ownership) {
 async function isPaneIdle(ownership) {
   const captured = await capturePane(ownership);
   if (!captured) return false;
-  return paneLooksReady(captured) && !paneHasActiveTask(captured);
+  return classifyPane(observePane(captured)).kind === "idle" && paneLooksReady(captured) && !paneHasActiveTask(captured);
 }
 var NudgeTracker = class {
   config;
@@ -32988,7 +33916,7 @@ var NudgeTracker = class {
     if (!authority || typeof authority !== "object") return [];
     const sessionName2 = typeof authority.sessionName === "string" ? authority.sessionName : "";
     const provider = authority.provider ?? providerForTeamTarget(sessionName2);
-    if (!Array.isArray(paneIds) || provider !== "tmux" && provider !== "cmux" && provider !== "herdr" || sessionName2.length === 0 || !isValidTeamInstanceId(authority.instanceId) || sessionName2.trim() !== sessionName2 || authority.provider !== void 0 && authority.provider !== provider || typeof authority.getPaneOwnership !== "function" || typeof authority.executeNudge !== "function" || provider === "tmux" && (!authority.tmuxServerIdentity || !isValidTmuxServerIdentity(authority.tmuxServerIdentity)) || (provider === "cmux" || provider === "herdr") && authority.tmuxServerIdentity !== void 0) {
+    if (!Array.isArray(paneIds) || provider !== "tmux" && provider !== "cmux" && provider !== "herdr" || sessionName2.length === 0 || !isValidTeamInstanceId(authority.instanceId) || sessionName2.trim() !== sessionName2 || authority.provider !== void 0 && authority.provider !== provider || typeof authority.getPaneOwnership !== "function" || typeof authority.getProviderLiveness !== "function" || typeof authority.executeNudge !== "function" || provider === "tmux" && (!authority.tmuxServerIdentity || !isValidTmuxServerIdentity(authority.tmuxServerIdentity)) || (provider === "cmux" || provider === "herdr") && authority.tmuxServerIdentity !== void 0) {
       return [];
     }
     const now = Date.now();
@@ -33012,7 +33940,7 @@ var NudgeTracker = class {
       if (!ownership || ownership.paneId !== paneId || ownership.provider !== provider || ownership.providerTarget !== sessionName2 || provider === "tmux" && (!authority.tmuxServerIdentity || !ownership.tmuxServerIdentity || ownership.tmuxServerIdentity.socket_path !== authority.tmuxServerIdentity.socket_path || ownership.tmuxServerIdentity.server_pid !== authority.tmuxServerIdentity.server_pid || ownership.tmuxServerIdentity.process_started_at !== authority.tmuxServerIdentity.process_started_at) || provider === "cmux" && ownership.tmuxServerIdentity !== void 0) {
         continue;
       }
-      const idle = await isPaneIdle(ownership);
+      const idle = await authority.getProviderLiveness(paneId) !== "dead" && await isPaneIdle(ownership);
       if (!idle) {
         state.firstIdleAt = null;
         continue;
@@ -33230,6 +34158,7 @@ init_platform();
 init_types3();
 init_tmux_session();
 init_monitor();
+init_worker_provider_liveness();
 init_team_instance();
 init_state_paths();
 init_paths();
@@ -33438,12 +34367,14 @@ async function resolveNudgeAuthorityUnderLock(jobId, expected, panes) {
     return null;
   }
   const ownershipByPane = /* @__PURE__ */ new Map();
+  const workerByPane = /* @__PURE__ */ new Map();
   const artifactWorkerNames = /* @__PURE__ */ new Set();
   for (const pane of panes.workers) {
     const worker = config2.workers.find((candidate) => candidate.name === pane.workerName);
     if (!worker || worker.pane_id !== pane.paneId || worker.launch_attempt_id !== pane.launchAttemptId) return null;
     if (artifactWorkerNames.has(pane.workerName)) return null;
     artifactWorkerNames.add(pane.workerName);
+    workerByPane.set(pane.paneId, worker);
     ownershipByPane.set(pane.paneId, {
       provider,
       providerTarget: config2.tmux_session,
@@ -33465,6 +34396,10 @@ async function resolveNudgeAuthorityUnderLock(jobId, expected, panes) {
     provider,
     ...tmuxServerIdentity ? { tmuxServerIdentity } : {},
     getPaneOwnership: (paneId) => ownershipByPane.get(paneId),
+    getProviderLiveness: async (paneId) => {
+      const worker = workerByPane.get(paneId);
+      return worker ? getWorkerProviderLiveness(config2.name, expected.cwd, config2.instance_id, worker) : "unknown";
+    },
     // The live caller replaces this placeholder with the lifecycle-locked
     // final validation + transport operation.
     executeNudge: async () => false
@@ -33501,6 +34436,7 @@ async function executeLockedNudge(jobId, expected, expectedPanes, authority, pan
         if (!current || !sameNudgeAuthority(current, authority)) return false;
         const ownership = current.getPaneOwnership(paneId);
         if (!ownership) return false;
+        if (await current.getProviderLiveness(paneId) === "dead") return false;
         if (!readLockedNudgeJob(jobId, expected)) return false;
         const sent = current.provider === "tmux" ? await sendToWorker(current.sessionName, paneId, message, current.tmuxServerIdentity) : await sendToWorker(current.sessionName, paneId, message);
         if (!sent) return false;

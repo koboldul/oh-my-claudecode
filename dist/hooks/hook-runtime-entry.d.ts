@@ -32,10 +32,12 @@ export interface LegacyProcessorInput extends CanonicalHookEventPayload {
     user_prompt?: string;
     initial_prompt?: string;
     prompt_id?: string;
+    context_window?: unknown;
     reason?: string;
     agent?: CanonicalAgentRef;
     agentId?: string;
     agentName?: string;
+    agent_type?: string;
     agentDisplayName?: string;
     agentDescription?: string;
     callId?: string;

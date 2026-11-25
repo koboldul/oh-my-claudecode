@@ -84,6 +84,7 @@ const AGENT_ADAPTER_CASES: AgentAdapterCase[] = [
 describe('hook runtime entry legacy processor adapter', () => {
   it('builds one canonical legacy processor input for every Copilot batch call', async () => {
     const received: LegacyProcessorInput[] = [];
+    const contextWindow = { used_percentage: 73 };
     const processor = vi.fn((
       unit: HookExecutionUnit,
       envelope: CanonicalHookEnvelope,
@@ -96,6 +97,8 @@ describe('hook runtime entry legacy processor adapter', () => {
       ...loadFixture('copilot-1.0.72-1', 'preToolUse'),
       timestamp: 1700000000000,
       transcriptPath: '<transcript-path>',
+      agentName: 'executor',
+      contextWindow,
     }, processor);
 
     expect(processor).toHaveBeenCalledTimes(2);
@@ -139,7 +142,18 @@ describe('hook runtime entry legacy processor adapter', () => {
         },
       },
     ]);
-    expect(received[0].eventPayload).toEqual({ timestamp: 1700000000000 });
+    for (const input of received) {
+      expect(input).toMatchObject({
+        agentName: 'executor',
+        agent_type: 'executor',
+        contextWindow,
+        context_window: contextWindow,
+      });
+    }
+    expect(received[0].eventPayload).toEqual({
+      timestamp: 1700000000000,
+      contextWindow,
+    });
   });
 
   it('parses serialized Copilot toolArgs before invoking a legacy processor', async () => {
@@ -184,7 +198,7 @@ describe('hook runtime entry legacy processor adapter', () => {
     });
   });
 
-  it('preserves Claude context_window data for post-tool processors', async () => {
+  it.each(['context_window', 'contextWindow'])('preserves Claude %s data under both aliases for post-tool processors', async (field) => {
     const received: LegacyProcessorInput[] = [];
     const contextWindow = {
       used_percentage: 73,
@@ -199,7 +213,7 @@ describe('hook runtime entry legacy processor adapter', () => {
       'post-tool-use',
       {
         ...loadFixture('claude', 'PostToolUse'),
-        context_window: contextWindow,
+        [field]: contextWindow,
       },
       (unit, envelope) => {
         received.push(buildLegacyProcessorInput(envelope, unit));
@@ -210,6 +224,7 @@ describe('hook runtime entry legacy processor adapter', () => {
     expect(result.reduction.decision).toBe('pass');
     expect(received).toHaveLength(1);
     expect(received[0].contextWindow).toEqual(contextWindow);
+    expect(received[0].context_window).toEqual(contextWindow);
     expect(received[0].eventPayload.contextWindow).toEqual(contextWindow);
   });
 
@@ -240,6 +255,9 @@ describe('hook runtime entry legacy processor adapter', () => {
         transcriptPath: '<transcript-path>',
         originalIndex: 0,
         ...expected,
+        ...(expected.agentName !== undefined
+          ? { agent_type: expected.agentName }
+          : {}),
         agent: expect.objectContaining({
           ...(expected.agentId !== undefined ? { id: expected.agentId } : {}),
           ...(expected.agentName !== undefined

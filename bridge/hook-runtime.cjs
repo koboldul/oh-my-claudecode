@@ -1289,6 +1289,312 @@ var init_jsonc = __esm({
   }
 });
 
+// src/utils/ssrf-guard.ts
+function validateUrlForSSRF(urlString) {
+  if (!urlString || typeof urlString !== "string") {
+    return { allowed: false, reason: "URL is empty or invalid" };
+  }
+  let parsed;
+  try {
+    parsed = new URL(urlString);
+  } catch {
+    return { allowed: false, reason: "Invalid URL format" };
+  }
+  if (!ALLOWED_SCHEMES.includes(parsed.protocol)) {
+    return { allowed: false, reason: `Protocol '${parsed.protocol}' is not allowed` };
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  for (const pattern of BLOCKED_HOST_PATTERNS) {
+    if (pattern.test(hostname)) {
+      return {
+        allowed: false,
+        reason: `Hostname '${hostname}' resolves to a blocked internal/private address`
+      };
+    }
+  }
+  if (/^0x[0-9a-f]+$/i.test(hostname)) {
+    return {
+      allowed: false,
+      reason: `Hostname '${hostname}' looks like a hex-encoded IP address`
+    };
+  }
+  if (/^\d+$/.test(hostname) && hostname.length > 3) {
+    return {
+      allowed: false,
+      reason: `Hostname '${hostname}' looks like a decimal-encoded IP address`
+    };
+  }
+  if (/^0\d+\./.test(hostname)) {
+    return {
+      allowed: false,
+      reason: `Hostname '${hostname}' looks like an octal-encoded IP address`
+    };
+  }
+  if (parsed.username || parsed.password) {
+    return { allowed: false, reason: "URLs with embedded credentials are not allowed" };
+  }
+  const dangerousPaths = [
+    "/metadata",
+    "/meta-data",
+    "/latest/meta-data",
+    "/computeMetadata"
+  ];
+  const pathLower = parsed.pathname.toLowerCase();
+  for (const dangerous of dangerousPaths) {
+    if (pathLower.startsWith(dangerous)) {
+      return {
+        allowed: false,
+        reason: `Path '${parsed.pathname}' is blocked (cloud metadata access)`
+      };
+    }
+  }
+  return { allowed: true };
+}
+function validateAnthropicBaseUrl(urlString) {
+  const result = validateUrlForSSRF(urlString);
+  if (!result.allowed) {
+    return result;
+  }
+  let parsed;
+  try {
+    parsed = new URL(urlString);
+  } catch {
+    return { allowed: false, reason: "Invalid URL" };
+  }
+  if (parsed.protocol === "http:") {
+    console.warn("[SSRF Guard] Warning: Using HTTP instead of HTTPS for ANTHROPIC_BASE_URL");
+  }
+  return { allowed: true };
+}
+var BLOCKED_HOST_PATTERNS, ALLOWED_SCHEMES;
+var init_ssrf_guard = __esm({
+  "src/utils/ssrf-guard.ts"() {
+    "use strict";
+    BLOCKED_HOST_PATTERNS = [
+      // Exact matches
+      /^localhost$/i,
+      /^127\.[0-9]+\.[0-9]+\.[0-9]+$/,
+      // Loopback
+      /^10\.[0-9]+\.[0-9]+\.[0-9]+$/,
+      // Class A private
+      /^172\.(1[6-9]|2[0-9]|3[0-1])\.[0-9]+\.[0-9]+$/,
+      // Class B private
+      /^192\.168\.[0-9]+\.[0-9]+$/,
+      // Class C private
+      /^169\.254\.[0-9]+\.[0-9]+$/,
+      // Link-local
+      /^(0|22[4-9]|23[0-9])\.[0-9]+\.[0-9]+\.[0-9]+$/,
+      // Multicast, reserved
+      /^\[?::1\]?$/,
+      // IPv6 loopback
+      /^\[?f[cd][0-9a-f]{2}:/i,
+      // IPv6 unique local FC00::/7 (RFC 4193)
+      /^\[?fe[89ab][0-9a-f]:/i,
+      // IPv6 link-local FE80::/10 (RFC 4291)
+      /^\[?::\]?$/,
+      // IPv6 unspecified
+      /^\[?ff[0-9a-f]{2}:/i,
+      // IPv6 multicast FF00::/8
+      /^\[?::ffff:/i,
+      // IPv6-mapped IPv4 (all private ranges accessible via this prefix)
+      /^\[?0{0,4}:{0,2}ffff:/i
+      // IPv6-mapped IPv4 expanded forms
+    ];
+    ALLOWED_SCHEMES = ["https:", "http:"];
+  }
+});
+
+// src/config/models.ts
+function nonEmpty(value) {
+  const trimmed = value?.trim();
+  return trimmed || void 0;
+}
+function resolveCopilotModel(configured, env = process.env) {
+  return nonEmpty(env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL) ?? nonEmpty(env.OMC_COPILOT_DEFAULT_MODEL) ?? nonEmpty(configured) ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotModel;
+}
+function resolveCopilotReasoningEffort(configured, env = process.env) {
+  const raw = nonEmpty(env.OMC_COPILOT_REASONING_EFFORT) ?? nonEmpty(configured) ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotReasoningEffort;
+  return validateCopilotReasoningEffort(raw);
+}
+function validateCopilotReasoningEffort(raw) {
+  const normalized = raw.toLowerCase();
+  if (!COPILOT_REASONING_EFFORTS2.includes(normalized)) {
+    throw new Error(
+      `[OMC] Copilot reasoning effort: invalid value "${raw}". Allowed: ${COPILOT_REASONING_EFFORTS2.join(", ")}`
+    );
+  }
+  return normalized;
+}
+function readEnvValue(key) {
+  const value = process.env[key]?.trim();
+  return value || void 0;
+}
+function resolveTierModelFromEnv(tier) {
+  for (const key of TIER_ENV_KEYS[tier]) {
+    const value = readEnvValue(key);
+    if (value) {
+      return value;
+    }
+  }
+  return void 0;
+}
+function getDirectModelEnvValue() {
+  for (const key of DIRECT_MODEL_ENV_KEYS) {
+    const value = readEnvValue(key);
+    if (value) {
+      return value;
+    }
+  }
+  return void 0;
+}
+function getDirectProviderDetectionModelEnvValues() {
+  const directModel = getDirectModelEnvValue();
+  return directModel ? [directModel] : [];
+}
+function getDefaultModelHigh() {
+  return resolveTierModelFromEnv("HIGH") || BUILTIN_TIER_MODEL_DEFAULTS.HIGH;
+}
+function getDefaultModelMedium() {
+  return resolveTierModelFromEnv("MEDIUM") || BUILTIN_TIER_MODEL_DEFAULTS.MEDIUM;
+}
+function getDefaultModelLow() {
+  return resolveTierModelFromEnv("LOW") || BUILTIN_TIER_MODEL_DEFAULTS.LOW;
+}
+function getDefaultTierModels() {
+  return {
+    LOW: getDefaultModelLow(),
+    MEDIUM: getDefaultModelMedium(),
+    HIGH: getDefaultModelHigh()
+  };
+}
+function hasBedrockModelId(modelIds) {
+  for (const modelId of modelIds) {
+    if (/^((us|eu|ap|apac|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
+      return true;
+    }
+    if (/^arn:aws(-[^:]+)?:bedrock:/i.test(modelId) && /:(inference-profile|application-inference-profile)\//i.test(modelId) && modelId.toLowerCase().includes("claude")) {
+      return true;
+    }
+  }
+  return false;
+}
+function isProviderSpecificModelId(modelId) {
+  if (/^((us|eu|ap|apac|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
+    return true;
+  }
+  if (/^arn:aws(-[^:]+)?:bedrock:/i.test(modelId)) {
+    return true;
+  }
+  if (modelId.toLowerCase().startsWith("vertex_ai/")) {
+    return true;
+  }
+  return false;
+}
+function hasExtendedContextSuffix(modelId) {
+  return /\[\d+[mk]\]$/i.test(modelId);
+}
+function isSubagentSafeModelId(modelId) {
+  return isProviderSpecificModelId(modelId) && !hasExtendedContextSuffix(modelId);
+}
+function hasVertexModelId(modelIds) {
+  return modelIds.some((modelId) => modelId.toLowerCase().startsWith("vertex_ai/"));
+}
+function hasNonClaudeModelId(modelIds) {
+  for (const modelId of modelIds) {
+    const lower = modelId.toLowerCase();
+    if (!lower.includes("claude") && !CLAUDE_TIER_ALIASES.has(lower)) {
+      return true;
+    }
+  }
+  return false;
+}
+function shouldAutoForceInherit() {
+  if (process.env.OMC_ROUTING_FORCE_INHERIT === "true") {
+    return true;
+  }
+  if (process.env.CLAUDE_CODE_USE_BEDROCK === "1") {
+    return true;
+  }
+  if (process.env.CLAUDE_CODE_USE_VERTEX === "1") {
+    return true;
+  }
+  const directModelValues = getDirectProviderDetectionModelEnvValues();
+  if (hasBedrockModelId(directModelValues) || hasVertexModelId(directModelValues) || hasNonClaudeModelId(directModelValues)) {
+    return true;
+  }
+  const baseUrl = process.env.ANTHROPIC_BASE_URL || "";
+  if (baseUrl) {
+    const validation = validateAnthropicBaseUrl(baseUrl);
+    if (!validation.allowed) {
+      console.error(`[SSRF Guard] Rejecting ANTHROPIC_BASE_URL: ${validation.reason}`);
+      return true;
+    }
+    if (!baseUrl.includes("anthropic.com")) {
+      return true;
+    }
+  }
+  return false;
+}
+var DIRECT_MODEL_ENV_KEYS, CLAUDE_TIER_ALIASES, TIER_ENV_KEYS, CLAUDE_FAMILY_DEFAULTS, BUILTIN_TIER_MODEL_DEFAULTS, CLAUDE_FAMILY_HIGH_VARIANTS, BUILTIN_EXTERNAL_MODEL_DEFAULTS, COPILOT_REASONING_EFFORTS2;
+var init_models = __esm({
+  "src/config/models.ts"() {
+    "use strict";
+    init_ssrf_guard();
+    DIRECT_MODEL_ENV_KEYS = ["CLAUDE_MODEL", "ANTHROPIC_MODEL"];
+    CLAUDE_TIER_ALIASES = /* @__PURE__ */ new Set(["sonnet", "opus", "haiku", "fable"]);
+    TIER_ENV_KEYS = {
+      LOW: [
+        "OMC_MODEL_LOW",
+        "CLAUDE_CODE_BEDROCK_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+      ],
+      MEDIUM: [
+        "OMC_MODEL_MEDIUM",
+        "CLAUDE_CODE_BEDROCK_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL"
+      ],
+      HIGH: [
+        "OMC_MODEL_HIGH",
+        "CLAUDE_CODE_BEDROCK_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL"
+      ]
+    };
+    CLAUDE_FAMILY_DEFAULTS = {
+      HAIKU: "claude-haiku-4-5",
+      SONNET: "claude-sonnet-5",
+      OPUS: "claude-opus-4-8",
+      FABLE: "claude-fable-5"
+    };
+    BUILTIN_TIER_MODEL_DEFAULTS = {
+      LOW: CLAUDE_FAMILY_DEFAULTS.HAIKU,
+      MEDIUM: CLAUDE_FAMILY_DEFAULTS.SONNET,
+      HIGH: CLAUDE_FAMILY_DEFAULTS.OPUS
+    };
+    CLAUDE_FAMILY_HIGH_VARIANTS = {
+      HAIKU: `${CLAUDE_FAMILY_DEFAULTS.HAIKU}-high`,
+      SONNET: `${CLAUDE_FAMILY_DEFAULTS.SONNET}-high`,
+      OPUS: `${CLAUDE_FAMILY_DEFAULTS.OPUS}-high`,
+      FABLE: `${CLAUDE_FAMILY_DEFAULTS.FABLE}-high`
+    };
+    BUILTIN_EXTERNAL_MODEL_DEFAULTS = {
+      codexModel: "gpt-5.3-codex",
+      geminiModel: "gemini-3.1-pro-preview",
+      antigravityModel: "Gemini 3.1 Pro (High)",
+      copilotModel: "gpt-5.6-sol",
+      copilotReasoningEffort: "max"
+    };
+    COPILOT_REASONING_EFFORTS2 = [
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ];
+  }
+});
+
 // src/lib/mode-names.ts
 var MODE_NAMES, MODE_CONFIRMATION_SKILL_MAP, ALL_MODE_NAMES, MODE_STATE_FILE_MAP, SESSION_END_MODE_STATE_FILES, SESSION_METRICS_MODE_FILES;
 var init_mode_names = __esm({
@@ -1386,6 +1692,56 @@ function ensureDirSync(dir) {
       return;
     }
     throw err;
+  }
+}
+function shouldRetryRename(error) {
+  if (process.platform !== "win32") {
+    return false;
+  }
+  const err = error;
+  return err?.code === "EPERM" || err?.code === "EBUSY" || err?.code === "EACCES";
+}
+function renameSyncWithRetry(tempPath, filePath, renameImpl, maxAttempts = 10, delayMs = 3) {
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      renameImpl(tempPath, filePath);
+      return;
+    } catch (error) {
+      if (!shouldRetryRename(error)) {
+        throw error;
+      }
+      lastError = error;
+      if (attempt < maxAttempts - 1) {
+        try {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+        } catch {
+        }
+      }
+    }
+  }
+  if (lastError) {
+    throw lastError;
+  }
+}
+async function renameWithRetry(tempPath, filePath, maxAttempts = 10, delayMs = 3) {
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      await fs.rename(tempPath, filePath);
+      return;
+    } catch (error) {
+      if (!shouldRetryRename(error)) {
+        throw error;
+      }
+      lastError = error;
+      if (attempt < maxAttempts - 1) {
+        await new Promise((resolve9) => setTimeout(resolve9, delayMs));
+      }
+    }
+  }
+  if (lastError) {
+    throw lastError;
   }
 }
 function writeAllSync(fd, content, label) {
@@ -1524,7 +1880,7 @@ async function atomicWriteJson(filePath, data, hooks) {
       verifyPrivateTempFile(fd.fd, tempPath, "atomic JSON write");
       backupPath = preservePriorTarget(filePath);
       hooks?.beforeRename?.();
-      await fs.rename(tempPath, filePath);
+      await renameWithRetry(tempPath, filePath);
       let publishedIdentity = null;
       try {
         verifyPublishedFile(fd.fd, filePath, "atomic JSON write");
@@ -1584,7 +1940,9 @@ function atomicWriteFileSync(filePath, content, hooks, operations) {
     verifyPrivateTempFile(fd, tempPath, "atomic write", operations);
     backupPath = preservePriorTarget(filePath, operations);
     hooks?.beforeRename?.();
-    (operations?.rename ?? fsSync.renameSync)(tempPath, filePath);
+    renameSyncWithRetry(tempPath, filePath, (src, dst) => {
+      (operations?.rename ?? fsSync.renameSync)(src, dst);
+    });
     let publishedIdentity = null;
     try {
       verifyPublishedFile(fd, filePath, "atomic write", operations);
@@ -5523,6 +5881,12 @@ function assertSafeCmdValue(value) {
     throw new Error("Native Windows tmux command values cannot contain NUL, CR, or LF characters");
   }
 }
+function tmuxGlobalArgs() {
+  return process.platform === "win32" ? [] : ["-u"];
+}
+function tmuxShellCommand(command) {
+  return ["tmux", ...tmuxGlobalArgs(), command].join(" ");
+}
 function resolveTmuxInvocation(args) {
   const resolvedBinary = resolveTmuxBinaryPath();
   if (process.platform === "win32" && /\.(cmd|bat)$/i.test(resolvedBinary)) {
@@ -5535,7 +5899,7 @@ function resolveTmuxInvocation(args) {
   }
   return {
     command: resolvedBinary,
-    args
+    args: [...tmuxGlobalArgs(), ...args]
   };
 }
 function tmuxExec(args, opts) {
@@ -5555,11 +5919,11 @@ async function tmuxExecAsync(args, opts) {
 }
 function tmuxShell(command, opts) {
   const { stripTmux: _, ...execOpts } = opts ?? {};
-  return (0, import_child_process4.execSync)(`tmux ${command}`, { encoding: "utf-8", ...execOpts, env: resolveEnv(opts) });
+  return (0, import_child_process4.execSync)(tmuxShellCommand(command), { encoding: "utf-8", ...execOpts, env: resolveEnv(opts) });
 }
 async function tmuxShellAsync(command, opts) {
   const { stripTmux: _, timeout, ...rest } = opts ?? {};
-  return (0, import_util6.promisify)(import_child_process4.exec)(`tmux ${command}`, {
+  return (0, import_util6.promisify)(import_child_process4.exec)(tmuxShellCommand(command), {
     encoding: "utf-8",
     env: resolveEnv(opts),
     ...timeout !== void 0 ? { timeout } : {},
@@ -5750,294 +6114,6 @@ var init_paths = __esm({
       process.platform === "win32" ? ["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR", "EPERM", "EACCES"] : ["EEXIST", "ENOTEMPTY", "ENOTDIR", "EISDIR"]
     );
     STALE_THRESHOLD_MS = 10 * 60 * 1e3;
-  }
-});
-
-// src/utils/ssrf-guard.ts
-function validateUrlForSSRF(urlString) {
-  if (!urlString || typeof urlString !== "string") {
-    return { allowed: false, reason: "URL is empty or invalid" };
-  }
-  let parsed;
-  try {
-    parsed = new URL(urlString);
-  } catch {
-    return { allowed: false, reason: "Invalid URL format" };
-  }
-  if (!ALLOWED_SCHEMES.includes(parsed.protocol)) {
-    return { allowed: false, reason: `Protocol '${parsed.protocol}' is not allowed` };
-  }
-  const hostname = parsed.hostname.toLowerCase();
-  for (const pattern of BLOCKED_HOST_PATTERNS) {
-    if (pattern.test(hostname)) {
-      return {
-        allowed: false,
-        reason: `Hostname '${hostname}' resolves to a blocked internal/private address`
-      };
-    }
-  }
-  if (/^0x[0-9a-f]+$/i.test(hostname)) {
-    return {
-      allowed: false,
-      reason: `Hostname '${hostname}' looks like a hex-encoded IP address`
-    };
-  }
-  if (/^\d+$/.test(hostname) && hostname.length > 3) {
-    return {
-      allowed: false,
-      reason: `Hostname '${hostname}' looks like a decimal-encoded IP address`
-    };
-  }
-  if (/^0\d+\./.test(hostname)) {
-    return {
-      allowed: false,
-      reason: `Hostname '${hostname}' looks like an octal-encoded IP address`
-    };
-  }
-  if (parsed.username || parsed.password) {
-    return { allowed: false, reason: "URLs with embedded credentials are not allowed" };
-  }
-  const dangerousPaths = [
-    "/metadata",
-    "/meta-data",
-    "/latest/meta-data",
-    "/computeMetadata"
-  ];
-  const pathLower = parsed.pathname.toLowerCase();
-  for (const dangerous of dangerousPaths) {
-    if (pathLower.startsWith(dangerous)) {
-      return {
-        allowed: false,
-        reason: `Path '${parsed.pathname}' is blocked (cloud metadata access)`
-      };
-    }
-  }
-  return { allowed: true };
-}
-function validateAnthropicBaseUrl(urlString) {
-  const result = validateUrlForSSRF(urlString);
-  if (!result.allowed) {
-    return result;
-  }
-  let parsed;
-  try {
-    parsed = new URL(urlString);
-  } catch {
-    return { allowed: false, reason: "Invalid URL" };
-  }
-  if (parsed.protocol === "http:") {
-    console.warn("[SSRF Guard] Warning: Using HTTP instead of HTTPS for ANTHROPIC_BASE_URL");
-  }
-  return { allowed: true };
-}
-var BLOCKED_HOST_PATTERNS, ALLOWED_SCHEMES;
-var init_ssrf_guard = __esm({
-  "src/utils/ssrf-guard.ts"() {
-    "use strict";
-    BLOCKED_HOST_PATTERNS = [
-      // Exact matches
-      /^localhost$/i,
-      /^127\.[0-9]+\.[0-9]+\.[0-9]+$/,
-      // Loopback
-      /^10\.[0-9]+\.[0-9]+\.[0-9]+$/,
-      // Class A private
-      /^172\.(1[6-9]|2[0-9]|3[0-1])\.[0-9]+\.[0-9]+$/,
-      // Class B private
-      /^192\.168\.[0-9]+\.[0-9]+$/,
-      // Class C private
-      /^169\.254\.[0-9]+\.[0-9]+$/,
-      // Link-local
-      /^(0|22[4-9]|23[0-9])\.[0-9]+\.[0-9]+\.[0-9]+$/,
-      // Multicast, reserved
-      /^\[?::1\]?$/,
-      // IPv6 loopback
-      /^\[?f[cd][0-9a-f]{2}:/i,
-      // IPv6 unique local FC00::/7 (RFC 4193)
-      /^\[?fe[89ab][0-9a-f]:/i,
-      // IPv6 link-local FE80::/10 (RFC 4291)
-      /^\[?::\]?$/,
-      // IPv6 unspecified
-      /^\[?ff[0-9a-f]{2}:/i,
-      // IPv6 multicast FF00::/8
-      /^\[?::ffff:/i,
-      // IPv6-mapped IPv4 (all private ranges accessible via this prefix)
-      /^\[?0{0,4}:{0,2}ffff:/i
-      // IPv6-mapped IPv4 expanded forms
-    ];
-    ALLOWED_SCHEMES = ["https:", "http:"];
-  }
-});
-
-// src/config/models.ts
-function nonEmpty(value) {
-  const trimmed = value?.trim();
-  return trimmed || void 0;
-}
-function resolveCopilotModel(configured, env = process.env) {
-  return nonEmpty(env.OMC_EXTERNAL_MODELS_DEFAULT_COPILOT_MODEL) ?? nonEmpty(env.OMC_COPILOT_DEFAULT_MODEL) ?? nonEmpty(configured) ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotModel;
-}
-function resolveCopilotReasoningEffort(configured, env = process.env) {
-  const raw = nonEmpty(env.OMC_COPILOT_REASONING_EFFORT) ?? nonEmpty(configured) ?? BUILTIN_EXTERNAL_MODEL_DEFAULTS.copilotReasoningEffort;
-  return validateCopilotReasoningEffort(raw);
-}
-function validateCopilotReasoningEffort(raw) {
-  const normalized = raw.toLowerCase();
-  if (!COPILOT_REASONING_EFFORTS2.includes(normalized)) {
-    throw new Error(
-      `[OMC] Copilot reasoning effort: invalid value "${raw}". Allowed: ${COPILOT_REASONING_EFFORTS2.join(", ")}`
-    );
-  }
-  return normalized;
-}
-function readEnvValue(key) {
-  const value = process.env[key]?.trim();
-  return value || void 0;
-}
-function resolveTierModelFromEnv(tier) {
-  for (const key of TIER_ENV_KEYS[tier]) {
-    const value = readEnvValue(key);
-    if (value) {
-      return value;
-    }
-  }
-  return void 0;
-}
-function getDirectModelEnvValue() {
-  for (const key of DIRECT_MODEL_ENV_KEYS) {
-    const value = readEnvValue(key);
-    if (value) {
-      return value;
-    }
-  }
-  return void 0;
-}
-function getDirectProviderDetectionModelEnvValues() {
-  const directModel = getDirectModelEnvValue();
-  return directModel ? [directModel] : [];
-}
-function getDefaultModelHigh() {
-  return resolveTierModelFromEnv("HIGH") || BUILTIN_TIER_MODEL_DEFAULTS.HIGH;
-}
-function getDefaultModelMedium() {
-  return resolveTierModelFromEnv("MEDIUM") || BUILTIN_TIER_MODEL_DEFAULTS.MEDIUM;
-}
-function getDefaultModelLow() {
-  return resolveTierModelFromEnv("LOW") || BUILTIN_TIER_MODEL_DEFAULTS.LOW;
-}
-function getDefaultTierModels() {
-  return {
-    LOW: getDefaultModelLow(),
-    MEDIUM: getDefaultModelMedium(),
-    HIGH: getDefaultModelHigh()
-  };
-}
-function hasBedrockModelId(modelIds) {
-  for (const modelId of modelIds) {
-    if (/^((us|eu|ap|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
-      return true;
-    }
-    if (/^arn:aws(-[^:]+)?:bedrock:/i.test(modelId) && /:(inference-profile|application-inference-profile)\//i.test(modelId) && modelId.toLowerCase().includes("claude")) {
-      return true;
-    }
-  }
-  return false;
-}
-function hasVertexModelId(modelIds) {
-  return modelIds.some((modelId) => modelId.toLowerCase().startsWith("vertex_ai/"));
-}
-function hasNonClaudeModelId(modelIds) {
-  for (const modelId of modelIds) {
-    const lower = modelId.toLowerCase();
-    if (!lower.includes("claude") && !CLAUDE_TIER_ALIASES.has(lower)) {
-      return true;
-    }
-  }
-  return false;
-}
-function shouldAutoForceInherit() {
-  if (process.env.OMC_ROUTING_FORCE_INHERIT === "true") {
-    return true;
-  }
-  if (process.env.CLAUDE_CODE_USE_BEDROCK === "1") {
-    return true;
-  }
-  if (process.env.CLAUDE_CODE_USE_VERTEX === "1") {
-    return true;
-  }
-  const directModelValues = getDirectProviderDetectionModelEnvValues();
-  if (hasBedrockModelId(directModelValues) || hasVertexModelId(directModelValues) || hasNonClaudeModelId(directModelValues)) {
-    return true;
-  }
-  const baseUrl = process.env.ANTHROPIC_BASE_URL || "";
-  if (baseUrl) {
-    const validation = validateAnthropicBaseUrl(baseUrl);
-    if (!validation.allowed) {
-      console.error(`[SSRF Guard] Rejecting ANTHROPIC_BASE_URL: ${validation.reason}`);
-      return true;
-    }
-    if (!baseUrl.includes("anthropic.com")) {
-      return true;
-    }
-  }
-  return false;
-}
-var DIRECT_MODEL_ENV_KEYS, CLAUDE_TIER_ALIASES, TIER_ENV_KEYS, CLAUDE_FAMILY_DEFAULTS, BUILTIN_TIER_MODEL_DEFAULTS, CLAUDE_FAMILY_HIGH_VARIANTS, BUILTIN_EXTERNAL_MODEL_DEFAULTS, COPILOT_REASONING_EFFORTS2;
-var init_models = __esm({
-  "src/config/models.ts"() {
-    "use strict";
-    init_ssrf_guard();
-    DIRECT_MODEL_ENV_KEYS = ["CLAUDE_MODEL", "ANTHROPIC_MODEL"];
-    CLAUDE_TIER_ALIASES = /* @__PURE__ */ new Set(["sonnet", "opus", "haiku", "fable"]);
-    TIER_ENV_KEYS = {
-      LOW: [
-        "OMC_MODEL_LOW",
-        "CLAUDE_CODE_BEDROCK_HAIKU_MODEL",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL"
-      ],
-      MEDIUM: [
-        "OMC_MODEL_MEDIUM",
-        "CLAUDE_CODE_BEDROCK_SONNET_MODEL",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL"
-      ],
-      HIGH: [
-        "OMC_MODEL_HIGH",
-        "CLAUDE_CODE_BEDROCK_OPUS_MODEL",
-        "ANTHROPIC_DEFAULT_OPUS_MODEL"
-      ]
-    };
-    CLAUDE_FAMILY_DEFAULTS = {
-      HAIKU: "claude-haiku-4-5",
-      SONNET: "claude-sonnet-5",
-      OPUS: "claude-opus-4-8",
-      FABLE: "claude-fable-5"
-    };
-    BUILTIN_TIER_MODEL_DEFAULTS = {
-      LOW: CLAUDE_FAMILY_DEFAULTS.HAIKU,
-      MEDIUM: CLAUDE_FAMILY_DEFAULTS.SONNET,
-      HIGH: CLAUDE_FAMILY_DEFAULTS.OPUS
-    };
-    CLAUDE_FAMILY_HIGH_VARIANTS = {
-      HAIKU: `${CLAUDE_FAMILY_DEFAULTS.HAIKU}-high`,
-      SONNET: `${CLAUDE_FAMILY_DEFAULTS.SONNET}-high`,
-      OPUS: `${CLAUDE_FAMILY_DEFAULTS.OPUS}-high`,
-      FABLE: `${CLAUDE_FAMILY_DEFAULTS.FABLE}-high`
-    };
-    BUILTIN_EXTERNAL_MODEL_DEFAULTS = {
-      codexModel: "gpt-5.3-codex",
-      geminiModel: "gemini-3.1-pro-preview",
-      antigravityModel: "Gemini 3.1 Pro (High)",
-      copilotModel: "gpt-5.6-sol",
-      copilotReasoningEffort: "max"
-    };
-    COPILOT_REASONING_EFFORTS2 = [
-      "none",
-      "minimal",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max"
-    ];
   }
 });
 
@@ -7379,6 +7455,10 @@ var init_state_paths = __esm({
       mailbox: (teamName, workerName) => `.omc/state/team/${teamName}/mailbox/${workerName}.json`,
       mailboxLockDir: (teamName, workerName) => `.omc/state/team/${teamName}/mailbox/.lock-${workerName}`,
       dispatchRequests: (teamName) => `.omc/state/team/${teamName}/dispatch/requests.json`,
+      // Not `.lock`: that name holds pre-identity-lock mkdir directories, which the file lock cannot read or reclaim.
+      dispatchLock: (teamName) => `.omc/state/team/${teamName}/dispatch/requests.lock`,
+      dispatchLegacyLockDir: (teamName) => `.omc/state/team/${teamName}/dispatch/.lock`,
+      /** @deprecated Use `dispatchLegacyLockDir` instead. Kept for public API compatibility. */
       dispatchLockDir: (teamName) => `.omc/state/team/${teamName}/dispatch/.lock`,
       mailboxNotificationLock: (teamName, requestId) => `.omc/state/team/${teamName}/dispatch/.mailbox-notification-${(0, import_node_crypto4.createHash)("sha256").update(requestId).digest("hex")}.lock`,
       workerStatus: (teamName, workerName) => `.omc/state/team/${teamName}/workers/${workerName}/status.json`,
@@ -7448,6 +7528,9 @@ var init_state_paths = __esm({
       recoveryResultByTeam: (workspaceHash, teamName, recoveryId) => `.omc/state/team-recovery/by-team/${workspaceHash}/${teamName}/${recoveryId}.json`,
       recoveryFinalIndexLock: (workspaceHash, teamName, recoveryId) => `.omc/state/team-recovery/index-locks/${workspaceHash}/${teamName}/${recoveryId}.lock`,
       scalingRollbackFailure: (teamName, recordedAt) => `.omc/state/team/${teamName}/scaling-rollback/${recordedAt}.json`,
+      recoveryPaneRollbackFailures: (teamName, recoveryId) => `.omc/state/team/${teamName}/recovery/rollback-failures/${recoveryId}`,
+      recoveryPaneSplits: (teamName, recoveryId) => `.omc/state/team/${teamName}/recovery/pane-splits/${recoveryId}`,
+      recoveryPaneSplit: (teamName, recoveryId, paneAttemptId) => `.omc/state/team/${teamName}/recovery/pane-splits/${recoveryId}/${paneAttemptId}.json`,
       recoveryPaneRollbackFailure: (teamName, recoveryId, paneAttemptId, recordedAt) => `.omc/state/team/${teamName}/recovery/rollback-failures/${recoveryId}/${paneAttemptId}-${recordedAt}.json`,
       recoveryAuditIndex: () => ".omc/state/team-recovery/audit.jsonl"
     };
@@ -7571,26 +7654,326 @@ var init_team_owner_epoch = __esm({
   }
 });
 
-// src/team/pane-readiness.ts
-function paneLineLooksLikeIdlePrompt(line, provider) {
-  if (provider === void 0) return LEGACY_IDLE_PROMPT_LINE.test(line);
-  return PROVIDER_IDLE_PROMPT_LINES[provider].test(line);
+// src/team/ready-timeout.ts
+function parseExactInteger(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed) return void 0;
+  const negative = trimmed.startsWith("-");
+  const magnitude = negative || trimmed.startsWith("+") ? trimmed.slice(1) : trimmed;
+  const match = DECIMAL_INTEGER_TEXT.exec(magnitude);
+  if (!match) return void 0;
+  const integerDigits = match[1] ?? "";
+  const fractionDigits = match[2] ?? match[3] ?? "";
+  const exponent = match[4] === void 0 ? 0 : Number(match[4]);
+  const shift = fractionDigits.length - exponent;
+  if (shift > 0) {
+    const significand = integerDigits + fractionDigits;
+    if (/[1-9]/.test(significand)) {
+      const trailingZeros = significand.length - significand.replace(/0+$/, "").length;
+      if (trailingZeros < shift) return void 0;
+    }
+  }
+  const parsed = (negative ? -1 : 1) * Number(magnitude);
+  return Number.isSafeInteger(parsed) ? parsed : void 0;
 }
-var LEGACY_IDLE_PROMPT_LINE, CURSOR_IDLE_PROMPT_LINE, PROVIDER_IDLE_PROMPT_LINES;
+function parseReadyTimeoutMs(env) {
+  const raw = env[READY_TIMEOUT_ENV];
+  return raw == null ? void 0 : parseExactInteger(String(raw));
+}
+function resolveStartupReadyTimeoutMs(env) {
+  const parsed = parseReadyTimeoutMs(env);
+  if (parsed === void 0) return STARTUP_READY_TIMEOUT_MIN_MS;
+  return Math.min(
+    Math.max(STARTUP_READY_TIMEOUT_MIN_MS, parsed),
+    STARTUP_READY_TIMEOUT_MAX_MS
+  );
+}
+function displayValue(raw) {
+  if (/^[\x21-\x7e]{1,32}$/.test(raw)) return raw;
+  const quoted = JSON.stringify(raw.slice(0, DISPLAY_MAX_CHARS)).replace(
+    UNSAFE_DISPLAY_CHARS,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
+  );
+  return raw.length > DISPLAY_MAX_CHARS ? `${quoted}... (truncated, ${raw.length} chars)` : quoted;
+}
+function describeStartupReadyTimeout(env, effectiveMs) {
+  const raw = env[READY_TIMEOUT_ENV];
+  const setting = raw == null ? `${READY_TIMEOUT_ENV} unset` : `${READY_TIMEOUT_ENV}=${displayValue(raw)}`;
+  return `${setting} (effective ${effectiveMs}ms; startup wait is clamped to ${STARTUP_READY_TIMEOUT_MIN_MS}..${STARTUP_READY_TIMEOUT_MAX_MS}ms)`;
+}
+var READY_TIMEOUT_ENV, STARTUP_READY_TIMEOUT_MIN_MS, STARTUP_READY_TIMEOUT_MAX_MS, DECIMAL_INTEGER_TEXT, DISPLAY_MAX_CHARS, UNSAFE_DISPLAY_CHARS;
+var init_ready_timeout = __esm({
+  "src/team/ready-timeout.ts"() {
+    "use strict";
+    READY_TIMEOUT_ENV = "OMC_TEAM_READY_TIMEOUT_MS";
+    STARTUP_READY_TIMEOUT_MIN_MS = 3e4;
+    STARTUP_READY_TIMEOUT_MAX_MS = 12e4;
+    DECIMAL_INTEGER_TEXT = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+    DISPLAY_MAX_CHARS = 32;
+    UNSAFE_DISPLAY_CHARS = /[\u007f-\u009f\u2028\u2029\p{Bidi_Control}]/gu;
+  }
+});
+
+// src/team/pane-readiness.ts
+function patternsFor(provider) {
+  if (provider === void 0) return UNKNOWN_PROVIDER_PATTERNS;
+  return Object.hasOwn(PANE_PATTERNS, provider) ? PANE_PATTERNS[provider] : SHARED_PATTERNS;
+}
+function paneLines(captured) {
+  return captured.split("\n").map((line) => line.replace(/\r/g, "").trim()).filter((line) => line.length > 0);
+}
+function anyLineMatches(lines, patterns) {
+  return lines.some((line) => patterns.some((pattern) => pattern.test(line)));
+}
+function codexTrustQuestionIsActive(lines) {
+  const codexPromptLine = PANE_PATTERNS.codex.idlePromptLine;
+  const promptText = (line) => line.replace(codexPromptLine, "");
+  const isTrustChoice = (text) => /^(?:1(?:\.|$)|2(?:\.|$))/i.test(text);
+  const lastQuestionIndex = lines.findLastIndex(
+    (_, index) => /Trust this folder\?/i.test(lines.slice(index, index + 2).join(" "))
+  );
+  if (lastQuestionIndex < 0) return false;
+  const lastPromptIndex = lines.findLastIndex(
+    (line) => codexPromptLine.test(line)
+  );
+  if (lastPromptIndex < lastQuestionIndex) return true;
+  const activePrompt = promptText(lines[lastPromptIndex]);
+  if (isTrustChoice(activePrompt)) return true;
+  const previousChoiceWasRendered = lines.slice(lastQuestionIndex + 1, lastPromptIndex).some((line) => isTrustChoice(promptText(line)));
+  return activePrompt === "" && !previousChoiceWasRendered;
+}
+function claudeTrustQuestionStartsAt(lines, index) {
+  return /(?:Do you trust the files in this folder|Quick safety check:\s*Is this a project you created or one you trust)\?/i.test(
+    lines.slice(index, index + 3).join(" ")
+  );
+}
+function lineMarksClaudeChoice(lines, index) {
+  const rest = squeeze(lines[index].replace(PANE_PATTERNS.claude.idlePromptLine, "")).replace(/^✔/u, "");
+  if (!rest) return false;
+  const drawn = rest + squeeze(lines.slice(index + 1, index + 4).join(""));
+  return CLAUDE_CHOICES.some((choice) => choice.startsWith(rest) && drawn.startsWith(choice));
+}
+function claudeDialogTail(captured) {
+  const lines = paneLines(captured);
+  const prompt = lines.findLastIndex(
+    (line, index) => PANE_PATTERNS.claude.idlePromptLine.test(line) && !lineMarksClaudeChoice(lines, index)
+  );
+  return squeeze(lines.slice(prompt + 1).join(""));
+}
+function claudeStartupDialogIn(tail, captured) {
+  const footer = tail.includes(CLAUDE_DIALOG_FOOTER);
+  const lastOf = (choices) => Math.max(...choices.map((choice) => tail.lastIndexOf(choice)));
+  const accept = tail.lastIndexOf("Yes,Iaccept");
+  const trust = lastOf(CLAUDE_TRUST_CHOICES);
+  const renderer = lastOf(CLAUDE_STARTUP_CHOICES.claude_fullscreen_renderer);
+  const onboarding = lastOf(CLAUDE_ONBOARDING_TEXT);
+  const latest = Math.max(accept, trust, renderer, onboarding);
+  if (latest < 0) {
+    if (!footer) return null;
+    return tail.includes("No,exit") ? "claude_bypass_permissions" : "claude_startup_dialog_unidentified";
+  }
+  if (latest === onboarding) return "claude_onboarding";
+  if (latest === accept) return "claude_bypass_permissions";
+  if (latest === trust) {
+    return detectTrustPrompt(paneLines(captured), ["claude_directory"]) ? null : "claude_startup_dialog_unidentified";
+  }
+  return footer ? "claude_fullscreen_renderer" : "claude_startup_dialog_unidentified";
+}
+function detectClaudeStartupDialog(captured) {
+  return claudeStartupDialogIn(claudeDialogTail(captured), captured);
+}
+function detectTrustPrompt(lines, kinds) {
+  const tail = lines.slice(-12);
+  const tailHas = (pattern) => tail.some((line) => pattern.test(line));
+  if (kinds.includes("codex_directory") && codexTrustQuestionIsActive(lines)) {
+    return "codex_directory";
+  }
+  if (kinds.includes("cursor_workspace_trust") && tailHas(/Workspace Trust Required/i) && (tailHas(/Pass\s+--trust,\s*--yolo,\s*or\s+-f/i) || tailHas(/Do you trust the contents of this directory\?/i))) {
+    return "cursor_workspace_trust";
+  }
+  const claudeQuestionLines = lines.slice(-20);
+  if (kinds.includes("claude_directory") && claudeQuestionLines.some((_, index) => claudeTrustQuestionStartsAt(claudeQuestionLines, index)) && tailHas(/\bNo,\s*exit\b/i) && tailHas(/\bYes,\s*(?:proceed|I trust this folder)\b/i)) {
+    return "claude_directory";
+  }
+  if (kinds.includes("directory") && tailHas(/Do you trust the contents of this directory\?/i) && tailHas(/Yes,\s*continue|No,\s*quit|Press enter to continue/i)) {
+    return "directory";
+  }
+  if (kinds.includes("codex_hooks") && tailHas(/Hooks need review/i) && tailHas(/Continue without trusting/i) && tailHas(/Press enter to confirm or esc to go back/i)) {
+    return "codex_hooks";
+  }
+  return null;
+}
+function hasStartupBanner(lines, patterns) {
+  const tail = lines.slice(-20);
+  if (tail.some((line) => patterns.idlePromptLine.test(line))) return false;
+  return anyLineMatches(tail, patterns.startupBannerLines);
+}
+function observePane(captured, provider) {
+  const patterns = patternsFor(provider);
+  const lines = paneLines(captured);
+  const startupBanner = hasStartupBanner(lines, patterns);
+  return {
+    trust: detectTrustPrompt(lines, patterns.trustKinds),
+    bootstrapping: startupBanner || anyLineMatches(lines, patterns.loadingLines),
+    startupStatus: startupBanner || anyLineMatches(lines, patterns.startupStatusLines),
+    idlePrompt: lines.some((line) => patterns.idlePromptLine.test(line)),
+    busy: anyLineMatches(lines.slice(-40), patterns.busyLines)
+  };
+}
+function detectPaneTrustPromptKind(captured, provider) {
+  return detectTrustPrompt(paneLines(captured), patternsFor(provider).trustKinds);
+}
+function claudeDialogFocus(captured, kind) {
+  if (kind !== "claude_directory") {
+    const [first, second] = CLAUDE_STARTUP_CHOICES[kind];
+    const tail = claudeDialogTail(captured);
+    if (claudeStartupDialogIn(tail, captured) !== kind) {
+      const stream = captured.replace(/\s+/g, "");
+      return stream.includes(first) || stream.includes(second) ? "stale" : null;
+    }
+    const copy = tail.slice(Math.max(0, tail.lastIndexOf(CLAUDE_STARTUP_HEADINGS[kind])));
+    const [firstAt, secondAt] = [copy.lastIndexOf(`\u276F${first}`), copy.lastIndexOf(`\u276F${second}`)];
+    if (firstAt < 0 && secondAt < 0 || !copy.includes(CLAUDE_DIALOG_FOOTER)) return null;
+    return secondAt > firstAt ? "second" : "first";
+  }
+  const lines = paneLines(captured);
+  const question = lines.findLastIndex((_, index) => claudeTrustQuestionStartsAt(lines, index));
+  if (question < 0) return null;
+  const no = lines.findIndex((line, index) => index > question && /^\s*(?:❯\s*)?No,\s*exit\b/i.test(line));
+  const yes = no >= 0 ? lines[no + 1] ?? "" : "";
+  if (!/^\s*(?:❯\s*)?Yes,\s*(?:proceed|I trust this folder)\b/i.test(yes)) return null;
+  if (lines.slice(no + 2).some((line) => patternsFor("claude").idlePromptLine.test(line))) return "stale";
+  return /^\s*❯/.test(yes) ? "second" : "first";
+}
+function paneHasTrustPrompt(captured, provider) {
+  return detectPaneTrustPromptKind(captured, provider) !== null;
+}
+function paneHasStartupBanner(captured, provider) {
+  return hasStartupBanner(paneLines(captured), patternsFor(provider));
+}
+function paneHasActiveTask(captured, provider) {
+  return anyLineMatches(
+    paneLines(captured).slice(-40),
+    patternsFor(provider).busyLines
+  );
+}
+function paneLooksReady(captured, provider) {
+  const signals = observePane(captured, provider);
+  if (signals.trust === "cursor_workspace_trust" || signals.trust === "codex_directory")
+    return false;
+  if (signals.trust) return true;
+  if (signals.bootstrapping) return false;
+  return signals.idlePrompt;
+}
+var LEGACY_IDLE_PROMPT_LINE, CURSOR_IDLE_PROMPT_LINE, SHARED_BUSY_LINES, SHARED_PATTERNS, PANE_PATTERNS, UNKNOWN_PROVIDER_PATTERNS, CLAUDE_STARTUP_CHOICES, CLAUDE_TRUST_CHOICES, CLAUDE_THEME_CHOICES, CLAUDE_ONBOARDING_TEXT, CLAUDE_DIALOG_FOOTER, CLAUDE_STARTUP_HEADINGS, CLAUDE_CHOICES, squeeze;
 var init_pane_readiness = __esm({
   "src/team/pane-readiness.ts"() {
     "use strict";
     LEGACY_IDLE_PROMPT_LINE = /^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯]\s*/u;
     CURSOR_IDLE_PROMPT_LINE = /^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯→]\s*/u;
-    PROVIDER_IDLE_PROMPT_LINES = {
-      claude: LEGACY_IDLE_PROMPT_LINE,
-      codex: LEGACY_IDLE_PROMPT_LINE,
-      gemini: LEGACY_IDLE_PROMPT_LINE,
-      cursor: CURSOR_IDLE_PROMPT_LINE,
-      grok: LEGACY_IDLE_PROMPT_LINE,
-      antigravity: LEGACY_IDLE_PROMPT_LINE,
-      copilot: LEGACY_IDLE_PROMPT_LINE
+    SHARED_BUSY_LINES = [
+      /esc to interrupt/i,
+      /\bbackground terminal running\b/i,
+      /^[·✻✢✳✶✽✺✹✸✷*]\s+[A-Za-z][A-Za-z0-9''-]*(?:\s+[A-Za-z][A-Za-z0-9''-]*){0,3}(?:…|\.{3})(?:\s*\(.*\))?$/u
+    ];
+    SHARED_PATTERNS = {
+      idlePromptLine: LEGACY_IDLE_PROMPT_LINE,
+      busyLines: SHARED_BUSY_LINES,
+      startupBannerLines: [
+        /bypass\s+permissions\s+on/i,
+        /shift\+tab\s+to\s+cycle/i,
+        /^⏵⏵\s+/
+      ],
+      loadingLines: [
+        /\b(loading|initializing|starting up)\b/i,
+        /\bconnecting\s+to\b/i
+      ],
+      // A status line starts with the startup word, inside an optional box border.
+      // Behind a spinner it may be any length, since it names what loads or
+      // connects. A spinner is a braille frame or one of Claude's spinner glyphs;
+      // any other leading mark opens output, a list item, quoted text or an input
+      // prompt. Without a spinner the line is short, not counting the padding and
+      // border of a box. Gemini's own status lines are read in their exact form,
+      // with or without its spinner, since they can grow long: "Resuming
+      // session..." alone or opening its MCP progress, which wraps in a narrow pane,
+      // and "Connecting to MCP servers... (n/m)" alone or with the servers it waits for.
+      startupStatusLines: [
+        /^(?:[│┃║▌▐▏▕╎┆┊]\s*)?[\u2800-\u28FF·✻✢✳✶✽✺✹✸✷]\s*(?:model:\s*)?(?:loading|initializing|starting up|connecting\s+to)\b/iu,
+        /^(?:[│┃║▌▐▏▕╎┆┊]\s*)?(?:model:\s*)?(?:loading|initializing|starting up|connecting\s+to)\b.{0,40}?\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?$/iu,
+        /^(?:[│┃║▌▐▏▕╎┆┊]\s*)?(?:[\u2800-\u28FF]\s*)?(?:Resuming session\.\.\.(?: \(|\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?$)|Connecting to MCP servers\.\.\. \(\d+\/\d+\)(?: - Waiting for: .+)?\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?$)/u
+      ],
+      trustKinds: ["directory", "codex_hooks"],
+      verifiedVersion: null
     };
+    PANE_PATTERNS = {
+      claude: {
+        ...SHARED_PATTERNS,
+        trustKinds: ["claude_directory", ...SHARED_PATTERNS.trustKinds],
+        verifiedVersion: "2.1.325"
+      },
+      codex: {
+        ...SHARED_PATTERNS,
+        trustKinds: ["codex_directory", ...SHARED_PATTERNS.trustKinds],
+        verifiedVersion: "0.167.0"
+      },
+      gemini: SHARED_PATTERNS,
+      cursor: {
+        ...SHARED_PATTERNS,
+        idlePromptLine: CURSOR_IDLE_PROMPT_LINE,
+        busyLines: [/ctrl\+c\s+to\s+stop/i, ...SHARED_BUSY_LINES],
+        trustKinds: ["cursor_workspace_trust", ...SHARED_PATTERNS.trustKinds]
+      },
+      grok: SHARED_PATTERNS,
+      antigravity: SHARED_PATTERNS,
+      copilot: SHARED_PATTERNS
+    };
+    UNKNOWN_PROVIDER_PATTERNS = {
+      ...SHARED_PATTERNS,
+      trustKinds: [
+        "codex_directory",
+        "cursor_workspace_trust",
+        "claude_directory",
+        ...SHARED_PATTERNS.trustKinds
+      ]
+    };
+    CLAUDE_STARTUP_CHOICES = {
+      claude_bypass_permissions: ["No,exit", "Yes,Iaccept"],
+      claude_fullscreen_renderer: ["1.Yes,tryit", "2.Notnow"]
+    };
+    CLAUDE_TRUST_CHOICES = ["Yes,Itrustthisfolder", "Yes,proceed"];
+    CLAUDE_THEME_CHOICES = [
+      "Auto(matchterminal)",
+      "Darkmode",
+      "Lightmode",
+      "Darkmode(colorblind-friendly)",
+      "Lightmode(colorblind-friendly)",
+      "Darkmode(ANSIcolorsonly)",
+      "Lightmode(ANSIcolorsonly)"
+    ];
+    CLAUDE_ONBOARDING_TEXT = [
+      "Let'sgetstarted.",
+      "Choosethetextstyle",
+      "Tochangethislater,run/theme",
+      ...CLAUDE_THEME_CHOICES.filter((choice) => choice.includes("(")),
+      "DarkmodeLightmode",
+      "Syntaxtheme:",
+      "(ctrl+ttodisable)",
+      "Securitynotes:",
+      "Claudecanmakemistakes",
+      "Duetopromptinjectionrisks",
+      "PressEntertocontinue"
+    ];
+    CLAUDE_DIALOG_FOOTER = "Entertoconfirm\xB7Esctocancel";
+    CLAUDE_STARTUP_HEADINGS = {
+      claude_bypass_permissions: "WARNING:ClaudeCoderunninginBypassPermissionsmode",
+      claude_fullscreen_renderer: "Trythenewfullscreenrenderer?"
+    };
+    CLAUDE_CHOICES = [
+      ...Object.values(CLAUDE_STARTUP_CHOICES).flat(),
+      ...CLAUDE_TRUST_CHOICES,
+      ...CLAUDE_THEME_CHOICES
+    ];
+    squeeze = (text) => text.replace(/\s+/g, "");
   }
 });
 
@@ -8355,6 +8738,32 @@ function identityOf(attempt) {
     created_at: attempt.created_at
   };
 }
+function isValidCompletionBinding(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value;
+  const identityValid = isValidIdentity(record);
+  const containmentNonce = record.containment_nonce;
+  const authorityDigest = record.authority_digest;
+  return identityValid && isExactText(containmentNonce) && typeof authorityDigest === "string" && /^[0-9a-f]{64}$/.test(authorityDigest);
+}
+function parseProviderCompletionExitCode(raw, binding) {
+  if (!binding) {
+    const normalized = raw.trim();
+    if (!/^\d+$/.test(normalized)) return void 0;
+    const exitCode = Number(normalized);
+    return Number.isSafeInteger(exitCode) && exitCode >= 0 ? exitCode : void 0;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return void 0;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return void 0;
+  const record = parsed;
+  if (!identityMatches(record, binding) || record.kind !== "worker_launch_provider_completion" || record.containment_nonce !== binding.containment_nonce || record.authority_digest !== binding.authority_digest || !Number.isSafeInteger(record.exit_code) || Number(record.exit_code) < 0) return void 0;
+  return Number(record.exit_code);
+}
 async function readJson(path3) {
   try {
     return { kind: "value", value: JSON.parse(await (0, import_promises.readFile)(path3, "utf8")) };
@@ -8399,12 +8808,12 @@ async function writeExclusiveTextAtomic(path3, value) {
     await (0, import_promises.unlink)(candidate).catch(() => void 0);
   }
 }
-function parseExactInteger(raw) {
+function parseExactInteger2(raw) {
   const trimmed = raw.trim();
   if (!trimmed) return null;
   const negative = trimmed.startsWith("-");
   const magnitude = negative || trimmed.startsWith("+") ? trimmed.slice(1) : trimmed;
-  const match = DECIMAL_INTEGER_TEXT.exec(magnitude);
+  const match = DECIMAL_INTEGER_TEXT2.exec(magnitude);
   if (!match) return null;
   const integerDigits = match[1] ?? "";
   const fractionDigits = match[2] ?? match[3] ?? "";
@@ -8422,7 +8831,7 @@ function parseExactInteger(raw) {
 }
 function resolvePositiveInteger(value, fallback) {
   if (value == null || value.trim() === "") return fallback;
-  const parsed = parseExactInteger(value);
+  const parsed = parseExactInteger2(value);
   return parsed !== null && parsed > 0 ? parsed : fallback;
 }
 async function prepareWorkerLaunchAttempt(input) {
@@ -8698,6 +9107,9 @@ function acknowledgementResult(value, attempt) {
   if (record.kind !== "worker_launch_ack" || typeof record.written_at !== "string" || !Number.isFinite(Date.parse(record.written_at))) return { ok: false, reason: "ack_malformed" };
   return identityMatches(record, attempt) ? null : { ok: false, reason: "ack_mismatch" };
 }
+function isValidWorkerLaunchAcknowledgement(read, attempt) {
+  return read.kind === "value" && acknowledgementResult(read.value, attempt) === null;
+}
 async function acceptObservedAcknowledgement(attempt, read) {
   if (read.kind === "absent") return null;
   if (read.kind === "malformed") return { ok: false, reason: "ack_malformed" };
@@ -8803,6 +9215,12 @@ async function retireAndCleanupCurrentWorkerLaunchAttempt(attempt, reason, clean
     return false;
   }
 }
+async function readWorkerLaunchRetirementState(attempt) {
+  const retired = await readJson(`${attempt.decisionPath}.retired`);
+  if (retired.kind === "absent") return "absent";
+  if (retired.kind !== "value" || !identityMatches(retired.value, attempt) || retired.value.kind !== "worker_launch_retired" || !isExactText(retired.value.reason) || typeof retired.value.written_at !== "string" || !Number.isFinite(Date.parse(retired.value.written_at))) return "invalid";
+  return "valid";
+}
 async function readWorkerLaunchRetirementCleanupState(attempt) {
   const completed = await readJson(`${attempt.decisionPath}.retired.cleanup-complete`);
   if (completed.kind === "absent") return "absent";
@@ -8833,6 +9251,9 @@ function isValidProcessStartIdentity(value) {
   const darwin = /^darwin:([1-9]\d*):(\d+)$/.exec(value);
   return darwin !== null && Number(darwin[2]) < 1e6;
 }
+function isPositiveProcessId(value) {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
 async function readWorkerLaunchCleanupProof(attempt, started) {
   const startedPath = "startedPath" in attempt ? attempt.startedPath : attempt.started_path;
   const matchesProcessGroup = (value) => {
@@ -8853,6 +9274,56 @@ async function readWorkerLaunchCleanupProof(attempt, started) {
     if (matchesStarted && identityMatches(value, attempt) && value.kind === "worker_launch_termination_complete" && value.cleanup_verified === true && Number.isSafeInteger(value.pid) && Number(value.pid) > 0 && isValidProcessStartIdentity(value.process_start_identity) && matchesProcessGroup(value)) return true;
   }
   return false;
+}
+async function readWorkerLaunchProviderCompletionState(attempt, started) {
+  if (started.supervisor_completion_path === void 0) return "absent";
+  if (!isExactText(started.supervisor_completion_path) || !(0, import_node_path6.isAbsolute)(started.supervisor_completion_path)) return "invalid";
+  const bindingReceipt = await readJson(`${attempt.startedPath}.completion-binding`);
+  if (bindingReceipt.kind !== "value" || !bindingReceipt.value || typeof bindingReceipt.value !== "object" || Array.isArray(bindingReceipt.value)) return "invalid";
+  const bindingValue = bindingReceipt.value;
+  if (bindingValue.kind !== "worker_launch_completion_binding" || bindingValue.completion_path !== started.supervisor_completion_path || !identityMatches(bindingValue, attempt) || bindingValue.containment_nonce !== started.containment_nonce || bindingValue.authority_digest !== started.authority_digest || !isExactText(bindingValue.containment_nonce) || !/^[0-9a-f]{64}$/.test(bindingValue.authority_digest ?? "") || typeof bindingValue.written_at !== "string" || !Number.isFinite(Date.parse(bindingValue.written_at))) return "invalid";
+  const completionBinding = {
+    ...identityOf(attempt),
+    containment_nonce: bindingValue.containment_nonce,
+    authority_digest: bindingValue.authority_digest
+  };
+  if (!isValidCompletionBinding(completionBinding)) return "invalid";
+  const absoluteCompletionPath = (0, import_node_path6.resolve)(started.supervisor_completion_path);
+  const trustedTempRoot = (0, import_node_path6.resolve)((0, import_node_os2.tmpdir)());
+  const pathParts = [];
+  let pathPart = (0, import_node_path6.dirname)(absoluteCompletionPath);
+  if (absoluteCompletionPath === trustedTempRoot || absoluteCompletionPath.startsWith(`${trustedTempRoot}${import_node_path6.sep}`)) {
+    while (pathPart !== trustedTempRoot && pathPart !== (0, import_node_path6.dirname)(pathPart)) {
+      pathParts.push(pathPart);
+      pathPart = (0, import_node_path6.dirname)(pathPart);
+    }
+  } else {
+    pathParts.push(pathPart);
+  }
+  for (const parentPath of pathParts) {
+    try {
+      if ((await (0, import_promises.lstat)(parentPath)).isSymbolicLink()) return "invalid";
+    } catch (error) {
+      if (error.code === "ENOENT") return "absent";
+      return "invalid";
+    }
+  }
+  let raw;
+  let handle;
+  try {
+    handle = await (0, import_promises.open)(
+      started.supervisor_completion_path,
+      import_node_fs4.constants.O_RDONLY | (import_node_fs4.constants.O_NOFOLLOW ?? 0) | (process.platform === "win32" ? 0 : import_node_fs4.constants.O_NONBLOCK ?? 0)
+    );
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1) return "invalid";
+    raw = await handle.readFile("utf8");
+  } catch (error) {
+    return error.code === "ENOENT" ? "absent" : "invalid";
+  } finally {
+    await handle?.close().catch(() => void 0);
+  }
+  return parseProviderCompletionExitCode(raw, completionBinding) === void 0 ? "invalid" : "valid";
 }
 async function readWorkerLaunchTerminalState(attempt, started) {
   const terminal = await readJson(`${attempt.startedPath}.terminal`);
@@ -8876,6 +9347,96 @@ async function readWorkerLaunchTerminalState(attempt, started) {
   if (value.child_reaped === true && (value.outcome === "exit" || value.outcome === "cleanup_unverified")) return "reaped";
   if (value.child_reaped === false && value.outcome === "cleanup_unverified" && value.cleanup_verified === false) return "live-unreaped";
   return "invalid";
+}
+async function readWorkerLaunchTerminationProofState(attempt, started) {
+  const completed = await readJson(`${attempt.startedPath}.termination-complete`);
+  if (completed.kind === "absent") return "absent";
+  if (completed.kind !== "value") return "invalid";
+  if (!completed.value || typeof completed.value !== "object" || Array.isArray(completed.value)) return "invalid";
+  const value = completed.value;
+  const processGroupMatches = process.platform === "win32" || Number.isSafeInteger(started.process_group_id) && Number(started.process_group_id) > 0 && value.process_group_id === started.process_group_id;
+  return identityMatches(value, attempt) && value.kind === "worker_launch_termination_complete" && value.cleanup_verified === true && value.pid === started.pid && Number.isSafeInteger(value.pid) && Number(value.pid) > 0 && value.process_start_identity === started.process_start_identity && isValidProcessStartIdentity(value.process_start_identity) && processGroupMatches ? "valid" : "invalid";
+}
+async function observeWorkerLaunchProvider(attempt) {
+  try {
+    if (!isValidIdentity(attempt)) return "unknown";
+    const expected = await readJson(attempt.expectedPath);
+    if (expected.kind !== "value" || !identityMatches(expected.value, attempt)) return "unknown";
+    const acknowledgement = await readJson(attempt.ackPath);
+    if (!isValidWorkerLaunchAcknowledgement(acknowledgement, attempt)) return "unknown";
+    const current = await readJson(attempt.currentPath);
+    if (current.kind === "malformed" || current.kind === "value" && !identityMatches(current.value, attempt)) return "unknown";
+    const decision = await readJson(attempt.decisionPath);
+    if (decision.kind === "malformed" || decision.kind === "value" && (!identityMatches(decision.value, attempt) || decision.value.kind !== "worker_launch_decision")) {
+      return "unknown";
+    }
+    const retirement = await readWorkerLaunchRetirementState(attempt);
+    if (retirement === "invalid") return "unknown";
+    const retirementCleanup = await readWorkerLaunchRetirementCleanupState(attempt);
+    if (retirementCleanup === "invalid") return "unknown";
+    if (retirementCleanup === "valid") {
+      if (current.kind !== "absent" || decision.kind !== "value" || !identityMatches(decision.value, attempt) || decision.value.kind !== "worker_launch_decision" || decision.value.decision !== "accepted" || !await isWorkerLaunchAttemptAccepted(attempt)) return "unknown";
+      return "dead";
+    }
+    if (retirement === "valid") return "unknown";
+    if (current.kind !== "value" || decision.kind !== "value" || decision.value.decision !== "accepted" || !await isWorkerLaunchAttemptAccepted(attempt)) return "unknown";
+    const started = await readValidProviderStarted(attempt, {
+      allowSupervisorCompletion: true,
+      allowTerminal: true
+    });
+    const startedPid = started?.pid;
+    if (!started || !isPositiveProcessId(startedPid) || !isValidProcessStartIdentity(started.process_start_identity)) return "unknown";
+    const completionState = await readWorkerLaunchProviderCompletionState(attempt, started);
+    if (completionState === "invalid") return "unknown";
+    const terminalState = await readWorkerLaunchTerminalState(attempt, started);
+    if (terminalState === "invalid") return "unknown";
+    const terminationProof = await readWorkerLaunchTerminationProofState(attempt, started);
+    if (terminationProof === "invalid") return "unknown";
+    if (terminalState === "reaped" || terminationProof === "valid") return "dead";
+    const liveness = await isProcessIdentityLive(startedPid, started.process_start_identity);
+    const finalExpected = await readJson(attempt.expectedPath);
+    if (finalExpected.kind !== "value" || !identityMatches(finalExpected.value, attempt)) return "unknown";
+    const finalAcknowledgement = await readJson(attempt.ackPath);
+    if (!isValidWorkerLaunchAcknowledgement(finalAcknowledgement, attempt)) return "unknown";
+    const finalRetirement = await readWorkerLaunchRetirementState(attempt);
+    if (finalRetirement === "invalid") return "unknown";
+    const finalRetirementCleanup = await readWorkerLaunchRetirementCleanupState(attempt);
+    if (finalRetirementCleanup === "invalid") return "unknown";
+    if (finalRetirementCleanup === "valid") {
+      const finalCurrent2 = await readJson(attempt.currentPath);
+      if (finalCurrent2.kind !== "absent") return "unknown";
+      const finalDecision2 = await readJson(attempt.decisionPath);
+      if (finalDecision2.kind !== "value" || !identityMatches(finalDecision2.value, attempt) || finalDecision2.value.kind !== "worker_launch_decision" || finalDecision2.value.decision !== "accepted" || !await isWorkerLaunchAttemptAccepted(attempt)) return "unknown";
+      return "dead";
+    }
+    if (finalRetirement === "valid") return "unknown";
+    const finalCurrent = await readJson(attempt.currentPath);
+    if (finalCurrent.kind !== "value" || !identityMatches(finalCurrent.value, attempt)) return "unknown";
+    const finalDecision = await readJson(attempt.decisionPath);
+    if (finalDecision.kind !== "value" || !identityMatches(finalDecision.value, attempt) || finalDecision.value.kind !== "worker_launch_decision" || finalDecision.value.decision !== "accepted" || !await isWorkerLaunchAttemptAccepted(attempt)) return "unknown";
+    const finalStarted = await readValidProviderStarted(attempt, {
+      allowSupervisorCompletion: true,
+      allowTerminal: true
+    });
+    const finalStartedPid = finalStarted?.pid;
+    if (!finalStarted || !isPositiveProcessId(finalStartedPid) || finalStartedPid !== startedPid || finalStarted.process_start_identity !== started.process_start_identity) return "unknown";
+    const finalTerminalState = await readWorkerLaunchTerminalState(attempt, finalStarted);
+    if (finalTerminalState === "invalid") return "unknown";
+    const finalTerminationProof = await readWorkerLaunchTerminationProofState(attempt, finalStarted);
+    if (finalTerminationProof === "invalid") return "unknown";
+    if (finalTerminalState === "reaped" || finalTerminationProof === "valid") return "dead";
+    const finalCompletionState = await readWorkerLaunchProviderCompletionState(attempt, finalStarted);
+    if (finalCompletionState === "invalid") return "unknown";
+    if (completionState === "valid" || finalCompletionState === "valid") return "dead";
+    let finalLiveness = liveness;
+    if (liveness === "live") {
+      const recheck = await isProcessIdentityLive(finalStartedPid, finalStarted.process_start_identity);
+      finalLiveness = recheck === "live" || recheck === "dead" ? recheck : "unknown";
+    }
+    return finalLiveness === "live" ? "alive" : finalLiveness === "dead" ? "dead" : "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 async function terminateWorkerLaunchProvider(attempt, timeoutMs = 2e3) {
   const started = await readJson(attempt.startedPath);
@@ -9058,7 +9619,7 @@ function buildWindowsBatchProviderLine(providerArgv) {
   if (line.length > WINDOWS_PROVIDER_LINE_MAX) throw new Error("worker_launch_provider_argv_too_long");
   return line;
 }
-var import_node_crypto5, import_node_fs4, import_promises, import_node_path6, WORKER_LAUNCH_SCHEMA_VERSION, DEFAULT_ACK_TIMEOUT_MS, DEFAULT_POLL_INTERVAL_MS, DEFAULT_DECISION_TIMEOUT_MS, WORKER_LAUNCH_TRANSPORT_OWNER_KIND, WORKER_LAUNCH_TRANSPORT_CLEANUP_KIND, WORKER_LAUNCH_BOOTSTRAP_DESCRIPTOR_FILE, WORKER_LAUNCH_RECOVERY_GATE_CONTAINED_ENV, WORKER_LAUNCH_INTERNAL_ENV_KEYS, WORKER_LAUNCH_AUTHORITY_PROTOCOL, WINDOWS_SUPERVISOR_PROTOCOL, WINDOWS_PROVIDER_LINE_MAX, WINDOWS_PROVIDER_LINE_VAR, WINDOWS_NO_CWD_EXE_SEARCH_VAR, WINDOWS_RESERVED_ENV_KEYS, SAFE_BASELINE_ENV_KEYS, DECIMAL_INTEGER_TEXT;
+var import_node_crypto5, import_node_fs4, import_promises, import_node_path6, import_node_os2, WORKER_LAUNCH_SCHEMA_VERSION, DEFAULT_ACK_TIMEOUT_MS, DEFAULT_POLL_INTERVAL_MS, DEFAULT_DECISION_TIMEOUT_MS, WORKER_LAUNCH_TRANSPORT_OWNER_KIND, WORKER_LAUNCH_TRANSPORT_CLEANUP_KIND, WORKER_LAUNCH_BOOTSTRAP_DESCRIPTOR_FILE, WORKER_LAUNCH_RECOVERY_GATE_CONTAINED_ENV, WORKER_LAUNCH_INTERNAL_ENV_KEYS, WORKER_LAUNCH_AUTHORITY_PROTOCOL, WINDOWS_SUPERVISOR_PROTOCOL, WINDOWS_PROVIDER_LINE_MAX, WINDOWS_PROVIDER_LINE_VAR, WINDOWS_NO_CWD_EXE_SEARCH_VAR, WINDOWS_RESERVED_ENV_KEYS, SAFE_BASELINE_ENV_KEYS, DECIMAL_INTEGER_TEXT2;
 var init_worker_launch_ack = __esm({
   "src/team/worker-launch-ack.ts"() {
     "use strict";
@@ -9066,6 +9627,7 @@ var init_worker_launch_ack = __esm({
     import_node_fs4 = require("node:fs");
     import_promises = require("node:fs/promises");
     import_node_path6 = require("node:path");
+    import_node_os2 = require("node:os");
     init_process_utils();
     init_types3();
     init_state_paths();
@@ -9093,7 +9655,7 @@ var init_worker_launch_ack = __esm({
     WINDOWS_NO_CWD_EXE_SEARCH_VAR = "NoDefaultCurrentDirectoryInExePath";
     WINDOWS_RESERVED_ENV_KEYS = new Set([...WORKER_LAUNCH_INTERNAL_ENV_KEYS, "SystemRoot"].map((key) => key.toUpperCase()));
     SAFE_BASELINE_ENV_KEYS = ["PATH", "TEMP", "TMP", "TERM", "COLORTERM"];
-    DECIMAL_INTEGER_TEXT = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+    DECIMAL_INTEGER_TEXT2 = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
   }
 });
 
@@ -9285,6 +9847,7 @@ __export(tmux_session_exports, {
   spawnWorkerInPane: () => spawnWorkerInPane,
   splitTeamWorkerPane: () => splitTeamWorkerPane,
   splitTeamWorkerPaneWithEvidence: () => splitTeamWorkerPaneWithEvidence,
+  startupProviderExited: () => startupProviderExited,
   strictIdentityUnavailableError: () => strictIdentityUnavailableError,
   tmuxServerGuardCondition: () => tmuxServerGuardCondition,
   tmuxServerGuardConditionPosix: () => tmuxServerGuardConditionPosix,
@@ -10407,12 +10970,12 @@ async function getPaneCurrentCommandStatus(paneId, tmuxServerIdentity) {
 function paneCurrentCommandLooksSubmitted(command) {
   return command.length > 0 && !paneCurrentCommandLooksReady(command);
 }
-function parseExactInteger2(raw) {
+function parseExactInteger3(raw) {
   const trimmed = raw.trim();
   if (!trimmed) return null;
   const negative = trimmed.startsWith("-");
   const magnitude = negative || trimmed.startsWith("+") ? trimmed.slice(1) : trimmed;
-  const match = DECIMAL_INTEGER_TEXT2.exec(magnitude);
+  const match = DECIMAL_INTEGER_TEXT3.exec(magnitude);
   if (!match) return null;
   const integerDigits = match[1] ?? "";
   const fractionDigits = match[2] ?? match[3] ?? "";
@@ -10433,7 +10996,7 @@ function resolveTeamShellReadyTimeoutMs(env = process.env, explicitTimeoutMs) {
     return Number(explicitTimeoutMs);
   }
   const raw = env.OMC_TEAM_SHELL_READY_TIMEOUT_MS;
-  const parsed = raw == null || String(raw).trim() === "" ? null : parseExactInteger2(String(raw));
+  const parsed = raw == null || String(raw).trim() === "" ? null : parseExactInteger3(String(raw));
   return parsed !== null && parsed > 0 ? parsed : 5e3;
 }
 async function waitForShellReady(paneId, opts = {}) {
@@ -10490,7 +11053,7 @@ function resolveTeamStartSubmitTimeoutMs(env = process.env, explicitTimeoutMs) {
     return Number(explicitTimeoutMs);
   }
   const raw = env.OMC_TEAM_START_SUBMIT_TIMEOUT_MS;
-  const parsed = raw == null || String(raw).trim() === "" ? null : parseExactInteger2(String(raw));
+  const parsed = raw == null || String(raw).trim() === "" ? null : parseExactInteger3(String(raw));
   return parsed !== null && parsed > 0 ? parsed : 8e3;
 }
 async function verifyWorkerStartCommandSubmitted(paneId, startCmd, opts = {}) {
@@ -12130,124 +12693,6 @@ async function killOwnedWorkerPane(ownership) {
     throw new Error("owned_pane_tmux_server_guard_failed");
   }
 }
-function detectPaneTrustPromptKind(captured, provider) {
-  const lines = captured.split("\n").map((l) => l.replace(/\r/g, "").trim()).filter((l) => l.length > 0);
-  const tail = lines.slice(-12);
-  const lastCodexPromptIndex = lines.findLastIndex(
-    (line) => paneLineLooksLikeIdlePrompt(line, "codex")
-  );
-  const activeCodexPrompt = lastCodexPromptIndex >= 0 ? lines[lastCodexPromptIndex].replace(
-    /^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯]\s*/,
-    ""
-  ) : "";
-  const lastCodexTrustQuestionIndex = lines.findLastIndex(
-    (line, index) => /Trust this folder\?/i.test(lines.slice(index, index + 2).join(" "))
-  );
-  const previousTrustChoiceWasRendered = lastCodexTrustQuestionIndex >= 0 && lines.slice(lastCodexTrustQuestionIndex + 1, lastCodexPromptIndex).some((line) => {
-    const prompt = line.replace(/^\s*(?:[│┃║▌▐▏▕╎┆┊]\s*)?[›>❯]\s*/, "");
-    return /^(?:1(?:\.|$)|2(?:\.|$))/i.test(prompt);
-  });
-  const lastCodexPromptIsTrustChoice = lastCodexPromptIndex >= 0 && (/^(?:1(?:\.|$)|2(?:\.|$))/i.test(activeCodexPrompt) || activeCodexPrompt === "" && !previousTrustChoiceWasRendered);
-  const codexTrustQuestionIsActive = lastCodexTrustQuestionIndex >= 0 && (lastCodexPromptIndex < lastCodexTrustQuestionIndex || lastCodexPromptIsTrustChoice);
-  if ((provider === void 0 || provider === "codex") && codexTrustQuestionIsActive) {
-    return "codex_directory";
-  }
-  const hasCursorTrustBanner = tail.some(
-    (l) => /Workspace Trust Required/i.test(l)
-  );
-  const hasCursorTrustHint = tail.some(
-    (l) => /Pass\s+--trust,\s*--yolo,\s*or\s+-f/i.test(l)
-  );
-  if ((provider === void 0 || provider === "cursor") && hasCursorTrustBanner && (hasCursorTrustHint || tail.some(
-    (l) => /Do you trust the contents of this directory\?/i.test(l)
-  ))) {
-    return "cursor_workspace_trust";
-  }
-  const claudeQuestionLines = lines.slice(-20);
-  const hasClaudeDirectoryQuestion = claudeQuestionLines.some(
-    (_, index) => /(?:Do you trust the files in this folder|Quick safety check:\s*Is this a project you created or one you trust)\?/i.test(
-      claudeQuestionLines.slice(index, index + 3).join(" ")
-    )
-  );
-  const hasClaudeDirectoryNoChoice = tail.some(
-    (l) => /\bNo,\s*exit\b/i.test(l)
-  );
-  const hasClaudeDirectoryYesChoice = tail.some(
-    (l) => /\bYes,\s*(?:proceed|I trust this folder)\b/i.test(l)
-  );
-  if ((provider === void 0 || provider === "claude") && hasClaudeDirectoryQuestion && hasClaudeDirectoryNoChoice && hasClaudeDirectoryYesChoice) {
-    return "claude_directory";
-  }
-  const hasDirectoryQuestion = tail.some(
-    (l) => /Do you trust the contents of this directory\?/i.test(l)
-  );
-  const hasDirectoryChoices = tail.some(
-    (l) => /Yes,\s*continue|No,\s*quit|Press enter to continue/i.test(l)
-  );
-  if (hasDirectoryQuestion && hasDirectoryChoices) return "directory";
-  const hasHookReview = tail.some((l) => /Hooks need review/i.test(l));
-  const hasHookTrustChoice = tail.some(
-    (l) => /Continue without trusting/i.test(l)
-  );
-  const hasHookConfirm = tail.some(
-    (l) => /Press enter to confirm or esc to go back/i.test(l)
-  );
-  if (hasHookReview && hasHookTrustChoice && hasHookConfirm)
-    return "codex_hooks";
-  return null;
-}
-function paneHasTrustPrompt(captured, provider) {
-  return detectPaneTrustPromptKind(captured, provider) !== null;
-}
-function paneHasClaudeStartupBanner(captured, provider) {
-  const lines = captured.split("\n").map((line) => line.replace(/\r/g, "").trim()).filter((line) => line.length > 0).slice(-20);
-  const lastPromptIndex = lines.findLastIndex(
-    (line) => paneLineLooksLikeIdlePrompt(line, provider)
-  );
-  if (lastPromptIndex >= 0) return false;
-  const lastStartupBannerIndex = lines.findLastIndex(
-    (line) => /bypass\s+permissions\s+on/i.test(line) || /shift\+tab\s+to\s+cycle/i.test(line) || /^⏵⏵\s+/.test(line)
-  );
-  return lastStartupBannerIndex >= 0;
-}
-function paneIsBootstrapping(captured, provider) {
-  if (paneHasClaudeStartupBanner(captured, provider)) return true;
-  const lines = captured.split("\n").map((line) => line.replace(/\r/g, "").trim()).filter((line) => line.length > 0);
-  return lines.some(
-    (line) => /\b(loading|initializing|starting up)\b/i.test(line) || /\bmodel:\s*loading\b/i.test(line) || /\bconnecting\s+to\b/i.test(line)
-  );
-}
-function paneHasActiveTask(captured, provider) {
-  const lines = captured.split("\n").map((l) => l.replace(/\r/g, "").trim()).filter((l) => l.length > 0);
-  const tail = lines.slice(-40);
-  if (provider === "cursor" && tail.some((l) => /ctrl\+c\s+to\s+stop/i.test(l)))
-    return true;
-  if (tail.some((l) => /\b\d+\s+background terminal running\b/i.test(l)))
-    return true;
-  if (tail.some((l) => /esc to interrupt/i.test(l))) return true;
-  if (tail.some((l) => /\bbackground terminal running\b/i.test(l))) return true;
-  if (tail.some(
-    (l) => /^[·✻✢✳✶✽✺✹✸✷*]\s+[A-Za-z][A-Za-z0-9''-]*(?:\s+[A-Za-z][A-Za-z0-9''-]*){0,3}(?:…|\.{3})(?:\s*\(.*\))?$/u.test(
-      l
-    )
-  ))
-    return true;
-  return false;
-}
-function paneLooksReady(captured, provider) {
-  const content = captured.trimEnd();
-  if (content === "") return false;
-  const lines = content.split("\n").map((line) => line.replace(/\r/g, "").trimEnd()).filter((line) => line.trim() !== "");
-  if (lines.length === 0) return false;
-  const trustPrompt = detectPaneTrustPromptKind(content, provider);
-  if (trustPrompt === "cursor_workspace_trust" || trustPrompt === "codex_directory")
-    return false;
-  if (paneHasTrustPrompt(content, provider)) return true;
-  if (paneIsBootstrapping(content, provider)) return false;
-  const lastLine = lines[lines.length - 1];
-  if (paneLineLooksLikeIdlePrompt(lastLine, provider)) return true;
-  return lines.some((line) => paneLineLooksLikeIdlePrompt(line, provider));
-}
 async function waitForPaneReady(paneId, opts = {}) {
   if (!isCmuxSurfaceTarget(paneId) && !opts.tmuxServerIdentity) return false;
   const timeoutMs = Number.isFinite(opts.timeoutMs) && (opts.timeoutMs ?? 0) > 0 ? Number(opts.timeoutMs) : 3e4;
@@ -12327,6 +12772,9 @@ async function startupContextIsActive(context, attemptAlreadyFenced = false) {
     return false;
   return context.ownership.paneId === context.attempt.pane_id && context.provider === context.attempt.provider && await isWorkerLaunchAttemptAccepted(context.attempt) && (attemptAlreadyFenced || await isWorkerLaunchAttemptCurrent(context.attempt));
 }
+async function startupProviderExited(context) {
+  return await observeWorkerLaunchProvider(context.attempt) === "dead";
+}
 async function waitForStartupPaneReady(context, opts = {}) {
   if (context.ownership.paneId !== context.attempt.pane_id || context.provider !== context.attempt.provider) {
     return { ok: false, reason: "ownership_mismatch" };
@@ -12335,9 +12783,14 @@ async function waitForStartupPaneReady(context, opts = {}) {
   const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) && (opts.pollIntervalMs ?? 0) > 0 ? Number(opts.pollIntervalMs) : 250;
   const deadline = Date.now() + timeoutMs;
   const handledSelectors = /* @__PURE__ */ new Set();
-  while (Date.now() < deadline) {
+  let claudeTrustDownSentAt = -Infinity;
+  let readAfterTrustAnswer = false;
+  while (Date.now() < deadline || readAfterTrustAnswer) {
+    readAfterTrustAnswer = false;
     if (!await startupContextIsActive(context, opts.attemptAlreadyFenced))
       return { ok: false, reason: "attempt_inactive" };
+    if (await startupProviderExited(context))
+      return { ok: false, reason: "provider_exited" };
     const copyMode = await paneCopyModeObservation(
       context.ownership.paneId,
       context.ownership.tmuxServerIdentity
@@ -12350,24 +12803,43 @@ async function waitForStartupPaneReady(context, opts = {}) {
     });
     if (!observation.ok) return { ok: false, reason: "capture_failed" };
     const captured = observation.captured;
-    const selector = detectPaneTrustPromptKind(captured, context.provider);
+    const selector = (context.provider === "claude" ? detectClaudeStartupDialog(captured) : null) ?? detectPaneTrustPromptKind(captured, context.provider);
     if (selector) {
       if (selector === "codex_directory")
         return { ok: false, reason: "codex_workspace_untrusted" };
       if (selector === "cursor_workspace_trust") {
         return { ok: false, reason: "cursor_workspace_untrusted" };
       }
-      const providerSupportsSelector = selector === "codex_hooks" ? context.provider === "codex" : selector === "claude_directory" ? context.provider === "claude" : context.provider === "codex" || context.provider === "claude";
+      if (selector === "claude_bypass_permissions")
+        return { ok: false, reason: "claude_bypass_permissions_consent_required" };
+      if (selector === "claude_onboarding")
+        return { ok: false, reason: "claude_onboarding_required" };
+      if (selector === "claude_startup_dialog_unidentified") {
+        await sleep3(pollIntervalMs);
+        continue;
+      }
+      const claudeDialog = selector === "claude_directory" || selector === "claude_fullscreen_renderer";
+      const providerSupportsSelector = selector === "codex_hooks" ? context.provider === "codex" : claudeDialog ? context.provider === "claude" : context.provider === "codex" || context.provider === "claude";
       if (!providerSupportsSelector)
         return { ok: false, reason: "selector_unsupported" };
       if (handledSelectors.has(selector))
         return { ok: false, reason: "selector_persistent" };
-      if (selector === "claude_directory") {
-        await sendTeamPaneKey(
-          context.ownership.paneId,
-          "Down",
-          context.ownership.tmuxServerIdentity
-        );
+      if (claudeDialog) {
+        const focus = claudeDialogFocus(captured, selector);
+        if (focus === "stale")
+          return { ok: false, reason: "selector_persistent" };
+        if (focus !== "second") {
+          if (focus === "first" && Date.now() - claudeTrustDownSentAt >= CLAUDE_TRUST_DOWN_RESEND_MS) {
+            await sendTeamPaneKey(
+              context.ownership.paneId,
+              "Down",
+              context.ownership.tmuxServerIdentity
+            );
+            claudeTrustDownSentAt = Date.now();
+          }
+          await sleep3(pollIntervalMs);
+          continue;
+        }
       } else {
         await sendLiteralPaneText(
           context.ownership.paneId,
@@ -12381,6 +12853,7 @@ async function waitForStartupPaneReady(context, opts = {}) {
         context.ownership.tmuxServerIdentity
       );
       handledSelectors.add(selector);
+      readAfterTrustAnswer = claudeDialog;
       await sleep3(pollIntervalMs);
       continue;
     }
@@ -12389,11 +12862,15 @@ async function waitForStartupPaneReady(context, opts = {}) {
     if (paneLooksReady(captured, context.provider)) return { ok: true };
     await sleep3(pollIntervalMs);
   }
+  console.warn(
+    `[tmux-session] waitForStartupPaneReady: pane ${safePaneDiagnosticToken(context.ownership.paneId)} timed out after ${timeoutMs}ms; ${describeStartupReadyTimeout(process.env, timeoutMs)}`
+  );
   return { ok: false, reason: "readiness_timeout" };
 }
 async function startupPaneSubmitBlockReason(context, attemptAlreadyFenced) {
   if (!await startupContextIsActive(context, attemptAlreadyFenced))
     return "attempt_inactive";
+  if (await startupProviderExited(context)) return "provider_exited";
   const copyMode = await paneCopyModeObservation(
     context.ownership.paneId,
     context.ownership.tmuxServerIdentity
@@ -12405,6 +12882,11 @@ async function startupPaneSubmitBlockReason(context, attemptAlreadyFenced) {
     ...context.ownership.provider === "tmux" ? { tmuxServerIdentity: context.ownership.tmuxServerIdentity } : {}
   });
   if (!observation.ok || !observation.captured.trim()) return "capture_failed";
+  const startupDialog = context.provider === "claude" ? detectClaudeStartupDialog(observation.captured) : null;
+  if (startupDialog === "claude_bypass_permissions")
+    return "claude_bypass_permissions_consent_required";
+  if (startupDialog === "claude_onboarding") return "claude_onboarding_required";
+  if (startupDialog) return "claude_startup_dialog_pending";
   const selector = detectPaneTrustPromptKind(
     observation.captured,
     context.provider
@@ -12418,14 +12900,28 @@ async function startupPaneSubmitBlockReason(context, attemptAlreadyFenced) {
 async function deliverStartupInbox(context, message, options = {}) {
   if (message.length > 200) return { ok: false, reason: "message_too_long" };
   const ready = await waitForStartupPaneReady(context, {
+    timeoutMs: resolveStartupReadyTimeoutMs(process.env),
     attemptAlreadyFenced: options.attemptAlreadyFenced
   });
   if (!ready.ok) return { ok: false, reason: ready.reason };
   try {
-    const preInputBlockReason = await startupPaneSubmitBlockReason(
+    let preInputBlockReason = await startupPaneSubmitBlockReason(
       context,
       options.attemptAlreadyFenced ?? false
     );
+    if (preInputBlockReason === "claude_startup_dialog_pending") {
+      const answered = await waitForStartupPaneReady(context, {
+        timeoutMs: resolveStartupReadyTimeoutMs(process.env),
+        attemptAlreadyFenced: options.attemptAlreadyFenced
+      });
+      if (!answered.ok) return { ok: false, reason: answered.reason };
+      preInputBlockReason = await startupPaneSubmitBlockReason(
+        context,
+        options.attemptAlreadyFenced ?? false
+      );
+    }
+    if (preInputBlockReason === "claude_startup_dialog_pending")
+      return { ok: false, reason: "selector_persistent" };
     if (preInputBlockReason) return { ok: false, reason: preInputBlockReason };
     await sendLiteralPaneText(
       context.ownership.paneId,
@@ -12438,6 +12934,8 @@ async function deliverStartupInbox(context, message, options = {}) {
         context,
         options.attemptAlreadyFenced ?? false
       );
+      if (submitBlockReason === "claude_startup_dialog_pending")
+        return { ok: false, reason: "selector_persistent" };
       if (submitBlockReason) return { ok: false, reason: submitBlockReason };
       await sendTeamPaneKey(
         context.ownership.paneId,
@@ -12457,6 +12955,7 @@ async function deliverStartupInbox(context, message, options = {}) {
 async function probeStartupPaneActivity(context, options = {}) {
   if (!await startupContextIsActive(context, options.attemptAlreadyFenced))
     return "unknown";
+  if (await startupProviderExited(context)) return "dead";
   const membership = await verifyTeamTargetOwnership({
     provider: context.ownership.provider,
     providerTarget: context.ownership.providerTarget,
@@ -12485,6 +12984,7 @@ async function probeStartupPaneActivity(context, options = {}) {
 async function retryStartupInboxSubmit(context, message, options = {}) {
   if (!await startupContextIsActive(context, options.attemptAlreadyFenced))
     return "unavailable";
+  if (await startupProviderExited(context)) return "unavailable";
   const copyMode = await paneCopyModeObservation(
     context.ownership.paneId,
     context.ownership.tmuxServerIdentity
@@ -12494,7 +12994,7 @@ async function retryStartupInboxSubmit(context, message, options = {}) {
     operation: "startup-submit-retry",
     ...context.ownership.provider === "tmux" ? { tmuxServerIdentity: context.ownership.tmuxServerIdentity } : {}
   });
-  if (!observation.ok || detectPaneTrustPromptKind(observation.captured, context.provider))
+  if (!observation.ok || context.provider === "claude" && detectClaudeStartupDialog(observation.captured) || detectPaneTrustPromptKind(observation.captured, context.provider))
     return "unavailable";
   if (paneHasActiveTask(observation.captured, context.provider))
     return "pane_busy";
@@ -12548,7 +13048,7 @@ async function sendToWorker(_sessionName, paneId, message, tmuxServerIdentity) {
     if (!initialObservation.ok || !initialObservation.captured.trim())
       return false;
     const initialCapture = initialObservation.captured;
-    if (paneHasClaudeStartupBanner(initialCapture)) {
+    if (paneHasStartupBanner(initialCapture)) {
       return false;
     }
     const paneBusy = paneHasActiveTask(initialCapture);
@@ -13151,7 +13651,7 @@ async function killTeamSession(sessionName2, workerPaneIds, leaderPaneId, option
   if (result.outcome === "executed") return true;
   return await observeTmuxServerIdentity(identity) === "dead";
 }
-var import_fs11, import_crypto5, import_child_process5, import_util7, import_path15, import_os4, sleep3, execFileAsync4, TMUX_SESSION_PREFIX, TMUX_LIVENESS_SERVER_RECHECK_ATTEMPTS, TMUX_LIVENESS_SERVER_RECHECK_DELAY_MS, CMUX_MEMBERSHIP_RETRY_ATTEMPTS, CMUX_MEMBERSHIP_RETRY_INTERVAL_MS, defaultTmuxServerIdentityDependencies, guardMarkerCounter, TMUX_MAILBOX_PANE_ID, TMUX_MAILBOX_TARGET, defaultMailboxTargetOwnershipDependencies, defaultDirectMailboxEffectDependencies, TeamSessionCreationError, SUPPORTED_POSIX_SHELLS, ZSH_CANDIDATES, BASH_CANDIDATES, DECIMAL_INTEGER_TEXT2, DANGEROUS_LAUNCH_BINARY_CHARS;
+var import_fs11, import_crypto5, import_child_process5, import_util7, import_path15, import_os4, sleep3, execFileAsync4, TMUX_SESSION_PREFIX, TMUX_LIVENESS_SERVER_RECHECK_ATTEMPTS, TMUX_LIVENESS_SERVER_RECHECK_DELAY_MS, CMUX_MEMBERSHIP_RETRY_ATTEMPTS, CMUX_MEMBERSHIP_RETRY_INTERVAL_MS, defaultTmuxServerIdentityDependencies, guardMarkerCounter, TMUX_MAILBOX_PANE_ID, TMUX_MAILBOX_TARGET, defaultMailboxTargetOwnershipDependencies, defaultDirectMailboxEffectDependencies, TeamSessionCreationError, SUPPORTED_POSIX_SHELLS, ZSH_CANDIDATES, BASH_CANDIDATES, DECIMAL_INTEGER_TEXT3, DANGEROUS_LAUNCH_BINARY_CHARS, CLAUDE_TRUST_DOWN_RESEND_MS;
 var init_tmux_session = __esm({
   "src/team/tmux-session.ts"() {
     "use strict";
@@ -13168,6 +13668,7 @@ var init_tmux_session = __esm({
     init_types3();
     init_team_owner_epoch();
     init_native_contained_fs();
+    init_ready_timeout();
     init_pane_readiness();
     init_worker_launch_ack();
     init_runtime_owner_client();
@@ -13226,8 +13727,9 @@ var init_tmux_session = __esm({
       "/opt/homebrew/bin/zsh"
     ];
     BASH_CANDIDATES = ["/bin/bash", "/usr/bin/bash"];
-    DECIMAL_INTEGER_TEXT2 = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+    DECIMAL_INTEGER_TEXT3 = /^(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
     DANGEROUS_LAUNCH_BINARY_CHARS = /[;&|`$()<>\n\r\t\0]/;
+    CLAUDE_TRUST_DOWN_RESEND_MS = 1e3;
   }
 });
 
@@ -13339,12 +13841,211 @@ var init_tmux = __esm({
 });
 
 // src/notifications/redact.ts
-function redactTokens(input) {
-  return input.replace(/\b(xox[bpae]-)[A-Za-z0-9-]+/g, "$1****").replace(/\b(xapp-)[A-Za-z0-9-]+/g, "$1****").replace(/\/bot(\d+):[A-Za-z0-9_-]+/g, "/bot$1:****").replace(/\b(\d{8,12}):[A-Za-z0-9_-]{20,}\b/g, "$1:****").replace(/(Bearer\s+)\S+/gi, "$1****").replace(/(Bot\s+)\S+/gi, "$1****").replace(/\b(sk-ant-api)[A-Za-z0-9_-]+/g, "$1****").replace(/\b(ghp_)[A-Za-z0-9]+/g, "$1****").replace(/\b(gho_)[A-Za-z0-9]+/g, "$1****").replace(/\b(ghs_)[A-Za-z0-9]+/g, "$1****").replace(/\b(github_pat_)[A-Za-z0-9_]+/g, "$1****").replace(/\b(AKIA)[A-Z0-9]{16}\b/g, "$1****");
+function keyShapesEnabled() {
+  return process.env.OMC_REDACT_KEY_SHAPES === "1";
 }
+function redactTokens(input) {
+  if (!keyShapesEnabled()) {
+    return TOKEN_RULES.reduce((text2, [pattern, replacement]) => text2.replace(pattern, replacement), input);
+  }
+  const ranges = [];
+  let text = input;
+  for (const [pattern, replacement] of TOKEN_RULES) {
+    text = text.replace(pattern, (match, head, offset) => {
+      const kept = replacement.replace("$1", () => head).length - MASK.length;
+      ranges.push([offset + kept, offset + match.length, MASK]);
+      return match.slice(0, kept) + "*".repeat(match.length - kept);
+    });
+  }
+  for (const range of keyShapeRanges(input)) ranges.push(range);
+  return applyMasks(input, ranges);
+}
+function isWordChar(code) {
+  return code === 95 || code >= 48 && code <= 57 || code >= 65 && code <= 90 || code >= 97 && code <= 122;
+}
+function isTokenChar(code) {
+  return code === 45 || isWordChar(code);
+}
+function assignmentNameEnd(input, i) {
+  const n = input.length;
+  let j = i;
+  while (j < n && isWordChar(input.charCodeAt(j))) j++;
+  if (j - i < 3) return -1;
+  const name = input.slice(i, j).toUpperCase();
+  return REDACT_KEY_SHAPES_PHRASES.some((phrase) => name.includes(phrase)) ? j : -1;
+}
+function isSkippable(c) {
+  return c === '"' || c === "'" || c === "[" || c === "]";
+}
+function separatorsAfter(input, from, tables) {
+  const n = input.length;
+  const found = [];
+  const skipBlanks = (start) => {
+    let k = start;
+    while (k < n && (input[k] === " " || input[k] === "	")) k++;
+    return k;
+  };
+  const first = skipBlanks(from);
+  if (!isSkippable(input[first])) {
+    if (input[first] === "=" || input[first] === ":") found.push(first);
+    return found;
+  }
+  const followed = tables.followed ??= new Uint8Array(n + 1);
+  const stack = [first];
+  while (stack.length > 0) {
+    const entry = stack.pop();
+    if (followed[entry]) continue;
+    followed[entry] = 1;
+    const k = skipBlanks(entry);
+    if (!isSkippable(input[k])) {
+      if (input[k] === "=" || input[k] === ":") found.push(k);
+      continue;
+    }
+    if (input[k] === "[") {
+      const close = (tables.closeFrom ??= closeIndexes(input))[k + 1];
+      if (close >= 0) stack.push(close + 1);
+      const open3 = skipBlanks(k + 1);
+      const quote = input[open3];
+      if (quote === '"' || quote === "'") {
+        for (const escaped of quote === '"' ? [true] : [false, true]) {
+          const map = quote === "'" && escaped ? tables.keyEnds : tables.ends;
+          let table = map.get(quote);
+          if (!table) {
+            table = valueEnds(input, quote, escaped);
+            map.set(quote, table);
+          }
+          const end = table[open3 + 1];
+          if (input[end] !== quote) continue;
+          const after = skipBlanks(end + 1);
+          if (input[after] === "]") stack.push(after + 1);
+        }
+      }
+    }
+    stack.push(k + 1);
+  }
+  return found;
+}
+function closeIndexes(input) {
+  const n = input.length;
+  const closeFrom = new Int32Array(n + 1);
+  closeFrom[n] = -1;
+  for (let p = n - 1; p >= 0; p--) closeFrom[p] = input.charCodeAt(p) === 93 ? p : closeFrom[p + 1];
+  return closeFrom;
+}
+function valueEnds(input, quote, escapes = quote === '"') {
+  const n = input.length;
+  const ends = new Int32Array(n + 1);
+  ends[n] = n;
+  for (let p = n - 1; p >= 0; p--) {
+    const c = input[p];
+    if (quote ? c === quote || c === "\n" : ` 	\r
+"'&;|,)}`.includes(c)) ends[p] = p;
+    else if (quote && escapes && c === "\\" && p + 1 < n && input[p + 1] !== "\n") ends[p] = ends[p + 2];
+    else ends[p] = ends[p + 1];
+  }
+  return ends;
+}
+function keyShapeRanges(input) {
+  const n = input.length;
+  const ranges = [];
+  const tables = { ends: /* @__PURE__ */ new Map(), keyEnds: /* @__PURE__ */ new Map() };
+  let keySkipUntil = 0;
+  let jwtSkipUntil = 0;
+  for (let i = 0; i < n; i++) {
+    if (i > 0 && isWordChar(input.charCodeAt(i - 1))) continue;
+    const nameEnd = assignmentNameEnd(input, i);
+    if (nameEnd >= 0) {
+      for (const separator of separatorsAfter(input, nameEnd, tables)) {
+        let valueStart = separator + 1;
+        while (valueStart < n && (input[valueStart] === " " || input[valueStart] === "	")) valueStart++;
+        const quote = input[valueStart] === '"' || input[valueStart] === "'" ? input[valueStart] : "";
+        if (quote) valueStart++;
+        let table = tables.ends.get(quote);
+        if (!table) tables.ends.set(quote, table = valueEnds(input, quote));
+        if (table[valueStart] > valueStart) ranges.push([valueStart, table[valueStart], MASK]);
+      }
+    }
+    if (i >= keySkipUntil) {
+      for (const [prefix, minLength] of REDACT_KEY_SHAPES_PREFIXES) {
+        if (!input.startsWith(prefix, i)) continue;
+        let j = i + prefix.length;
+        while (j < n && isTokenChar(input.charCodeAt(j))) j++;
+        if (j - (i + prefix.length) >= minLength) {
+          ranges.push([i + prefix.length, j, MASK]);
+          keySkipUntil = j;
+        }
+        break;
+      }
+    }
+    if (i >= jwtSkipUntil && input.startsWith("eyJ", i)) {
+      let j = i + 3;
+      while (j < n && isTokenChar(input.charCodeAt(j))) j++;
+      jwtSkipUntil = j;
+      if (j - i >= 11 && input[j] === ".") {
+        let k = j + 1;
+        while (k < n && isTokenChar(input.charCodeAt(k))) k++;
+        if (k - (j + 1) >= 8 && input[k] === ".") {
+          let m = k + 1;
+          while (m < n && isTokenChar(input.charCodeAt(m))) m++;
+          if (m - (k + 1) >= 8) ranges.push([i + 3, m, "***"]);
+        }
+      }
+    }
+  }
+  return ranges;
+}
+function applyMasks(input, ranges) {
+  if (ranges.length === 0) return input;
+  ranges.sort((a, b) => a[0] - b[0]);
+  let out = "";
+  let pos = 0;
+  for (const [start, end, mask] of ranges) {
+    if (start < pos) {
+      if (end > pos) pos = end;
+      continue;
+    }
+    out += input.slice(pos, start) + mask;
+    pos = end;
+  }
+  return out + input.slice(pos);
+}
+var TOKEN_RULES, MASK, REDACT_KEY_SHAPES_PREFIXES, REDACT_KEY_SHAPES_PHRASES;
 var init_redact = __esm({
   "src/notifications/redact.ts"() {
     "use strict";
+    TOKEN_RULES = [
+      // Slack tokens: xoxb-..., xapp-..., xoxp-..., xoxa-...
+      [/\b(xox[bpae]-)[A-Za-z0-9-]+/g, "$1****"],
+      [/\b(xapp-)[A-Za-z0-9-]+/g, "$1****"],
+      // Telegram bot tokens in URL paths: /bot123456:ABC.../
+      [/\/bot(\d+):[A-Za-z0-9_-]+/g, "/bot$1:****"],
+      // Telegram bot tokens standalone: 123456789:AAHfoo-bar_Baz
+      [/\b(\d{8,12}):[A-Za-z0-9_-]{20,}\b/g, "$1:****"],
+      // Bearer/Bot authorization values in error strings
+      [/(Bearer\s+)\S+/gi, "$1****"],
+      [/(Bot\s+)\S+/gi, "$1****"],
+      // Anthropic API keys: sk-ant-api...
+      [/\b(sk-ant-api)[A-Za-z0-9_-]+/g, "$1****"],
+      // GitHub tokens: ghp_, gho_, ghs_, github_pat_
+      [/\b(ghp_)[A-Za-z0-9]+/g, "$1****"],
+      [/\b(gho_)[A-Za-z0-9]+/g, "$1****"],
+      [/\b(ghs_)[A-Za-z0-9]+/g, "$1****"],
+      [/\b(github_pat_)[A-Za-z0-9_]+/g, "$1****"],
+      // AWS access key IDs: AKIA...
+      [/\b(AKIA)[A-Z0-9]{16}\b/g, "$1****"]
+    ];
+    MASK = "****";
+    REDACT_KEY_SHAPES_PREFIXES = [
+      ["sk-", 8],
+      ["sk_live_", 16],
+      ["sk_test_", 16],
+      ["rk_", 16],
+      ["AIza", 20],
+      ["gsk_", 20],
+      ["xai-", 20],
+      ["hf_", 20]
+    ];
+    REDACT_KEY_SHAPES_PHRASES = ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASS", "PWD", "CREDENTIALS"];
   }
 });
 
@@ -19982,6 +20683,7 @@ function decodeSingleToolCall(host, raw) {
     input = host === "claude" ? raw.tool_input ?? raw.toolInput : raw.toolInput ?? raw.tool_input;
     rawArgs = input;
   }
+  const inputAliases = ["tool_input", "toolInput"].filter((key) => hasOwn(raw, key) && !Object.is(raw[key], input)).map((key) => raw[key]);
   const fingerprint = safeCallFingerprint(
     nativeName,
     input,
@@ -20002,6 +20704,7 @@ function decodeSingleToolCall(host, raw) {
     canonicalName: canonicalToolName(host, nativeName),
     shellDialect: shellDialectForTool(host, nativeName),
     input,
+    ...inputAliases.length > 0 ? { inputAliases } : {},
     rawArgs,
     fingerprint: fingerprint.fingerprint,
     status: malformed ? "malformed" : "valid",
@@ -20058,7 +20761,10 @@ function normalizeHookEnvelope(raw, hookType) {
   const transcriptPath = resolveTranscriptPath(rawTranscriptPath, directory);
   const stopReason = detected.host === "claude" ? stringField(raw, "stop_reason") ?? stringField(raw, "stopReason") : stringField(raw, "stopReason") ?? stringField(raw, "stop_reason");
   const agentId = stringField(raw, "agent_id") ?? stringField(raw, "agentId");
-  const agentName = detected.host === "claude" ? stringField(raw, "agent_type") ?? stringField(raw, "agent_name") ?? stringField(raw, "agentName") : stringField(raw, "agentName") ?? stringField(raw, "agent_type") ?? stringField(raw, "agent_name");
+  const agentName = detected.host === "claude" ? stringField(raw, "agent_type") ?? stringField(raw, "agent_name") ?? stringField(raw, "agentName") ?? stringField(raw, "agentType") : stringField(raw, "agentName") ?? stringField(raw, "agent_type") ?? stringField(raw, "agent_name") ?? stringField(raw, "agentType");
+  const nameAliases = [...new Set(
+    ["agent_type", "agentType", "agent_name", "agentName"].map((key) => stringField(raw, key)).filter((name) => name !== void 0 && name.trim() !== "" && name !== agentName)
+  )];
   const agentDisplayName = stringField(raw, "agentDisplayName") ?? stringField(raw, "agent_display_name");
   const agentDescription = stringField(raw, "agentDescription") ?? stringField(raw, "agent_description");
   let agent;
@@ -20066,6 +20772,7 @@ function normalizeHookEnvelope(raw, hookType) {
     agent = {
       ...agentId ? { id: agentId } : {},
       ...agentName ? { name: agentName } : {},
+      ...nameAliases.length > 0 ? { nameAliases } : {},
       ...agentDisplayName ? { displayName: agentDisplayName } : {},
       ...agentDescription ? { description: agentDescription } : {},
       correlation: agentId ? "host-id" : "unavailable"
@@ -22650,6 +23357,7 @@ function loadPreToolBatchSnapshot(envelope, dependencies = {}) {
 // src/hooks/pre-tool-enforcer/evaluate.ts
 var import_node_crypto2 = require("node:crypto");
 var import_node_path3 = require("node:path");
+init_models();
 init_mode_names();
 var BUILT_IN_TASK_LIST_TOOL_NAMES = /* @__PURE__ */ new Set([
   "TaskCreate",
@@ -22820,19 +23528,6 @@ function skillProtection(skillName, rawSkillName) {
 function isBundledOmcSubagent(agentType) {
   return /^oh-my-claudecode:[a-zA-Z0-9_-]+$/.test(agentType);
 }
-function isProviderSpecificModelId(modelId) {
-  if (/^((us|eu|ap|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
-    return true;
-  }
-  if (/^arn:aws(-[^:]+)?:bedrock:/i.test(modelId)) return true;
-  return modelId.toLowerCase().startsWith("vertex_ai/");
-}
-function hasExtendedContextSuffix(modelId) {
-  return /\[\d+[mk]\]$/i.test(modelId);
-}
-function isSubagentSafeModelId(modelId) {
-  return isProviderSpecificModelId(modelId) && !hasExtendedContextSuffix(modelId);
-}
 function isTierAlias(modelId) {
   return TIER_ALIASES.has(modelId.toLowerCase());
 }
@@ -22847,7 +23542,7 @@ function normalizeToCcAlias(model) {
 function isBedrockProvider(snapshot) {
   if (snapshot.modelRouting.useBedrock) return true;
   const modelId = snapshot.modelRouting.claudeModel || snapshot.modelRouting.anthropicModel;
-  if (/^((us|eu|ap|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
+  if (/^((us|eu|ap|apac|global)\.anthropic\.|anthropic\.claude)/i.test(modelId)) {
     return true;
   }
   return /^arn:aws(-[^:]+)?:bedrock:/i.test(modelId) && /:(inference-profile|application-inference-profile)\//i.test(modelId) && modelId.toLowerCase().includes("claude");
@@ -22861,8 +23556,14 @@ function isNonClaudeProvider(snapshot) {
   if (isBedrockProvider(snapshot) || isVertexProvider(snapshot)) return true;
   const modelId = snapshot.modelRouting.claudeModel || snapshot.modelRouting.anthropicModel;
   if (modelId && !modelId.toLowerCase().includes("claude")) return true;
-  if (snapshot.modelRouting.anthropicBaseUrl && !snapshot.modelRouting.anthropicBaseUrl.includes("anthropic.com")) {
-    return true;
+  if (snapshot.modelRouting.anthropicBaseUrl) {
+    try {
+      const value = snapshot.modelRouting.anthropicBaseUrl.trim();
+      const host = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`).hostname.toLowerCase().replace(/\.$/, "");
+      if (host !== "anthropic.com" && !host.endsWith(".anthropic.com")) return true;
+    } catch {
+      return true;
+    }
   }
   const activeModels = [
     snapshot.modelRouting.claudeModel,
@@ -22874,7 +23575,8 @@ function isNonClaudeProvider(snapshot) {
   return snapshot.modelRouting.forceInherit && !hasNormalClaude;
 }
 function resolveTierAliasToSafeModel(tierAlias, snapshot) {
-  const keys = TIER_TO_DEFAULT_ENV_KEYS[tierAlias.toLowerCase()];
+  const tier = tierAlias.toLowerCase();
+  const keys = Object.hasOwn(TIER_TO_DEFAULT_ENV_KEYS, tier) ? TIER_TO_DEFAULT_ENV_KEYS[tier] : void 0;
   if (!keys) return "";
   for (const key of keys) {
     const value = snapshot.modelRouting.tierEnvironment[key]?.trim() ?? "";
@@ -23588,7 +24290,7 @@ function evaluatePreToolCall(call, envelope, snapshot, ledger, readBudgetWarning
     modelRoutingObservation,
     modelRoutingOverrides
   );
-  const routingObservations = modelRoutingObservation ? { modelRouting: modelRoutingObservation } : void 0;
+  const routingObservations = modelRoutingObservation ? { modelRouting: modelRoutingObservation } : {};
   const mutation = modelRouting.updatedInput ? requiredMutation(
     call,
     modelRouting.updatedInput,
@@ -25704,11 +26406,15 @@ function buildLegacyProcessorInput(envelope, unit, options = {}) {
     ...eventPayload.userPrompt !== void 0 ? { user_prompt: eventPayload.userPrompt } : {},
     ...eventPayload.initialPrompt !== void 0 ? { initial_prompt: eventPayload.initialPrompt } : {},
     ...eventPayload.promptId !== void 0 ? { prompt_id: eventPayload.promptId } : {},
+    ...eventPayload.contextWindow !== void 0 ? { context_window: eventPayload.contextWindow } : {},
     ...eventPayload.sessionEndReason !== void 0 || eventPayload.reason !== void 0 ? { reason: eventPayload.sessionEndReason ?? eventPayload.reason } : {},
     ...envelope.agent !== void 0 ? {
       agent: envelope.agent,
       ...envelope.agent.id !== void 0 ? { agentId: envelope.agent.id } : {},
-      ...envelope.agent.name !== void 0 ? { agentName: envelope.agent.name } : {},
+      ...envelope.agent.name !== void 0 ? {
+        agentName: envelope.agent.name,
+        agent_type: envelope.agent.name
+      } : {},
       ...envelope.agent.displayName !== void 0 ? { agentDisplayName: envelope.agent.displayName } : {},
       ...envelope.agent.description !== void 0 ? { agentDescription: envelope.agent.description } : {}
     } : {},

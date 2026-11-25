@@ -2575,6 +2575,36 @@ function ensureDirSync(dir) {
     throw err;
   }
 }
+function shouldRetryRename(error) {
+  if (process.platform !== "win32") {
+    return false;
+  }
+  const err = error;
+  return err?.code === "EPERM" || err?.code === "EBUSY" || err?.code === "EACCES";
+}
+function renameSyncWithRetry(tempPath, filePath, renameImpl, maxAttempts = 10, delayMs = 3) {
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      renameImpl(tempPath, filePath);
+      return;
+    } catch (error) {
+      if (!shouldRetryRename(error)) {
+        throw error;
+      }
+      lastError = error;
+      if (attempt < maxAttempts - 1) {
+        try {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+        } catch {
+        }
+      }
+    }
+  }
+  if (lastError) {
+    throw lastError;
+  }
+}
 function writeAllSync(fd, content, label) {
   const bytes = Buffer.from(content, "utf-8");
   let offset = 0;
@@ -2698,7 +2728,9 @@ function atomicWriteFileSync(filePath, content, hooks, operations) {
     verifyPrivateTempFile(fd, tempPath, "atomic write", operations);
     backupPath = preservePriorTarget(filePath, operations);
     hooks?.beforeRename?.();
-    (operations?.rename ?? fsSync.renameSync)(tempPath, filePath);
+    renameSyncWithRetry(tempPath, filePath, (src, dst) => {
+      (operations?.rename ?? fsSync.renameSync)(src, dst);
+    });
     let publishedIdentity = null;
     try {
       verifyPublishedFile(fd, filePath, "atomic write", operations);
@@ -3513,6 +3545,23 @@ async function withFileLock(lockPath, fn, opts) {
   }
 }
 
+// src/lib/jsonl.ts
+function parseJsonLines(raw) {
+  const out = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let value;
+    try {
+      value = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) out.push(value);
+  }
+  return out;
+}
+
 // src/utils/string-width.ts
 function isCJKCharacter(codePoint) {
   return (
@@ -3717,7 +3766,7 @@ function readJsonSafe(path3) {
 function readJsonLinesSafe(path3) {
   if (!existsSync5(path3)) return [];
   try {
-    return readFileSync6(path3, "utf-8").split("\n").map((line) => line.trim()).filter(Boolean).map((line) => JSON.parse(line));
+    return parseJsonLines(readFileSync6(path3, "utf-8"));
   } catch {
     return [];
   }
@@ -9467,11 +9516,25 @@ function renderPayloadLimitWarning(payloadEstimate) {
 // src/hud/elements/update-hint.ts
 var YELLOW10 = "\x1B[33m";
 var BOLD3 = "\x1B[1m";
+var SEMVER_RE = /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/;
+function resolveOmcUpdateState(omcVersion, latestVersion, unbuiltVersionEnv) {
+  if (!omcVersion) return { updateAvailable: null, unbuiltVersion: null };
+  const unbuiltVersion = unbuiltVersionEnv && SEMVER_RE.test(unbuiltVersionEnv) && compareVersions(omcVersion, unbuiltVersionEnv) < 0 ? unbuiltVersionEnv : null;
+  if (typeof latestVersion === "string" && latestVersion && compareVersions(omcVersion, latestVersion) < 0) {
+    if (!unbuiltVersion || compareVersions(unbuiltVersion, latestVersion) < 0) {
+      return { updateAvailable: latestVersion, unbuiltVersion: null };
+    }
+  }
+  return { updateAvailable: null, unbuiltVersion };
+}
 function renderUpdateHints(input) {
   const lines = [];
   if (input.omcUpdateAvailable) {
     const command = input.omcUpdateSource === "marketplace" ? "claude plugin marketplace update omc && claude plugin update oh-my-claudecode@omc" : "npm i -g oh-my-claude-sisyphus@latest";
     lines.push(`${YELLOW10}${BOLD3}[!] omc ${input.omcUpdateAvailable} - paste: ! ${command}${RESET}`);
+  } else if (input.omcUnbuiltVersion) {
+    const running = input.omcVersion ? ` - HUD is running ${input.omcVersion}` : "";
+    lines.push(`${YELLOW10}${BOLD3}[!] omc ${input.omcUnbuiltVersion} is installed but not built${running}${RESET}`);
   }
   if (input.claudeCodeUpdateAvailable) {
     lines.push(
@@ -9848,7 +9911,9 @@ async function render(context, config) {
     const updateHints = renderUpdateHints({
       omcUpdateAvailable: context.updateAvailable,
       omcUpdateSource: context.omcUpdateSource ?? null,
-      claudeCodeUpdateAvailable: context.claudeCodeUpdateAvailable ?? null
+      claudeCodeUpdateAvailable: context.claudeCodeUpdateAvailable ?? null,
+      omcUnbuiltVersion: context.omcUnbuiltVersion ?? null,
+      omcVersion: context.omcVersion ?? null
     });
     if (updateHints.length > 0) renderedDetail.set("updateHint", updateHints);
   }
@@ -10284,6 +10349,9 @@ var OMC_CONFIG_FILE_REL = ".omc-config.json";
 import { basename as basename10, join as join17 } from "path";
 var CLAUDE_SKILLS_DIR = join17(getClaudeConfigDir(), "skills");
 var OMC_LEARNED_DIR = join17(CLAUDE_SKILLS_DIR, "omc-learned");
+
+// src/lib/env-vars.ts
+var OMC_HUD_UNBUILT_VERSION_ENV = "OMC_HUD_UNBUILT_VERSION";
 
 // src/installer/claude-md-transaction.ts
 var CLAUDE_MD_IMPORT_START = "<!-- OMC:IMPORT:START -->";
@@ -10781,6 +10849,7 @@ async function mainImpl(watchMode = false, skipInit = false) {
     const customBuckets = config.rateLimitsProvider?.type === "custom" ? await executeCustomProvider(config.rateLimitsProvider) : null;
     let omcVersion = null;
     let updateAvailable = null;
+    let omcUnbuiltVersion = null;
     let omcUpdateSource = null;
     const claudeCodeVersion = stdin.version ?? null;
     let claudeCodeUpdateAvailable = null;
@@ -10795,14 +10864,13 @@ async function mainImpl(watchMode = false, skipInit = false) {
         );
       }
     }
+    let cachedLatestVersion = null;
     try {
       const updateCacheFile = getUpdateCheckCachePath();
       await access(updateCacheFile);
       const content = await readFile(updateCacheFile, "utf-8");
       const cached = JSON.parse(content);
-      if (cached?.latestVersion && omcVersion && compareVersions2(omcVersion, cached.latestVersion) < 0) {
-        updateAvailable = cached.latestVersion;
-      }
+      cachedLatestVersion = cached?.latestVersion;
       if (cached?.source === "npm" || cached?.source === "marketplace") {
         omcUpdateSource = cached.source;
       }
@@ -10817,6 +10885,11 @@ async function mainImpl(watchMode = false, skipInit = false) {
         );
       }
     }
+    ({ updateAvailable, unbuiltVersion: omcUnbuiltVersion } = resolveOmcUpdateState(
+      omcVersion,
+      cachedLatestVersion,
+      process.env[OMC_HUD_UNBUILT_VERSION_ENV]
+    ));
     let sessionSummary = null;
     const sessionSummaryEnabled = config.elements.sessionSummary ?? false;
     if (sessionSummaryEnabled && resolvedTranscriptPath && currentSessionId) {
@@ -10868,6 +10941,7 @@ async function mainImpl(watchMode = false, skipInit = false) {
       sessionTotalTokens: transcriptData.sessionTotalTokens ?? null,
       omcVersion,
       updateAvailable,
+      omcUnbuiltVersion,
       omcUpdateSource,
       claudeCodeVersion,
       claudeCodeUpdateAvailable,

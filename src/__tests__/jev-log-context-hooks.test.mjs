@@ -12,15 +12,19 @@ import process from 'node:process';
 import { fileURLToPath, URL } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { stageHookRuntime } from './helpers/staged-hook-runtime.js';
+
 const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const NODE = process.execPath;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CLEANUPS = [];
 let endpoint = '';
 let server;
+let postToolRuntime;
 
 /** A local Jev stub that answers every question of a request with a valid answer of its type. */
 beforeAll(async () => {
+  postToolRuntime = stageHookRuntime(['post-tool-verifier.mjs'], ROOT);
   server = createServer((req, res) => {
     let body = '';
     req.setEncoding('utf8');
@@ -42,6 +46,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise((resolve) => server.close(resolve));
+  postToolRuntime.cleanup();
   for (const path of CLEANUPS.splice(0)) {
     try {
       rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
@@ -87,7 +92,10 @@ function hookEnv(context, point, overrides = {}) {
 /** Run one hook script asynchronously, so the stub in this process can answer its resolver. */
 function runHook(context, script, input, point, overrides = {}) {
   return new Promise((resolve, reject) => {
-    const child = execFile(NODE, [join(ROOT, 'scripts', script)], {
+    const scriptPath = script === 'post-tool-verifier.mjs'
+      ? postToolRuntime.scriptPath(script)
+      : join(ROOT, 'scripts', script);
+    const child = execFile(NODE, [scriptPath], {
       cwd: context.cwd,
       encoding: 'utf8',
       timeout: 30_000,

@@ -30,8 +30,9 @@ import { ABSOLUTE_MAX_WORKERS, isValidTeamInstanceId, isValidTmuxServerIdentity,
 import { validateTeamName } from "./team-name.js";
 import { isCanonicalWorkerName, TASK_ID_SAFE_PATTERN } from "./contracts.js";
 import { buildValidatedWorkerLaunchDescriptor, clearResolvedPathCache, validateWorkerLaunchDescriptor, resolveValidatedBinaryPath, getWorkerEnv as getModelWorkerEnv, isPromptModeAgent, getPromptModeArgs, resolveDefaultWorkerModel, resolveExternalModelsDefaults, assertHeadlessSupported, } from "./model-contract.js";
-import { createTeamSession, spawnOwnedWorkerInPane, deliverStartupInbox, probeStartupPaneActivity, retryStartupInboxSubmit, proveWorkerPaneOwnership, adoptWorkerPaneOwnership, getOwnedWorkerLiveness, captureOwnedTeamPane, workerPaneBelongsToOwnedProviderTarget, observeTmuxServerIdentity, killOwnedWorkerPane, verifyTeamTargetOwnership, observeTeamSessionTargetPresence, redactBoundedDiagnostic, killTeamSession, paneHasActiveTask, paneLooksReady, applyMainVerticalLayout, splitTeamWorkerPaneWithEvidence, TeamSessionCreationError, isHerdrSessionTarget, providerForTeamTarget, } from "./tmux-session.js";
+import { createTeamSession, spawnOwnedWorkerInPane, deliverStartupInbox, probeStartupPaneActivity, startupProviderExited, retryStartupInboxSubmit, proveWorkerPaneOwnership, adoptWorkerPaneOwnership, getOwnedWorkerLiveness, captureOwnedTeamPane, workerPaneBelongsToOwnedProviderTarget, observeTmuxServerIdentity, killOwnedWorkerPane, verifyTeamTargetOwnership, observeTeamSessionTargetPresence, redactBoundedDiagnostic, killTeamSession, applyMainVerticalLayout, splitTeamWorkerPaneWithEvidence, TeamSessionCreationError, isHerdrSessionTarget, providerForTeamTarget, } from "./tmux-session.js";
 import { herdrWorkspaceIdFromSessionTarget, herdrCloseWorkspace, herdrWorkspaceExists } from "./herdr-session.js";
+import { classifyPane, observePane } from "./pane-readiness.js";
 import { composeInitialInbox, ensureWorkerStateDir, writeWorkerOverlay, generateTriggerMessage, generatePromptModeStartupPrompt, renderRecoveryContinuationInstruction, renderCursorWorkerGuidance, renderWorkerExitContract, } from "./worker-bootstrap.js";
 import { queueInboxInstruction } from "./mcp-comm.js";
 import { cleanupTeamWorktrees, inspectTeamWorktreeCleanupSafety, ensureWorkerWorktree, isWorktreeMetadataPublicationFailure, installWorktreeRootAgents, normalizeTeamWorktreeMode, } from "./git-worktree.js";
@@ -72,9 +73,10 @@ export function buildStartupInboxTrigger(cwd, teamName, workerName, attemptId, p
     // Name it in prose so the instruction works with PowerShell, cmd, and Bash.
     return `Read workers/${workerName}/inbox.md under the OMC_TEAM_STATE_ROOT environment variable; execute now, report concrete progress.${suffix}`;
 }
-import { currentProcessStartIdentity, isProcessIdentityDead, publishOwnerEpoch, readLatestOwnerEpoch, requireOwnerFence, requireOwnerProcessIdentity, } from "./team-owner-epoch.js";
+import { checkOwnerFence, currentProcessStartIdentity, isProcessIdentityDead, publishOwnerEpoch, readLatestOwnerEpoch, requireOwnerFence, requireOwnerProcessIdentity, } from "./team-owner-epoch.js";
 import { waitForRecoveryGateRecord, } from "./worker-activation-gate.js";
-import { isWorkerLaunchAttemptCurrent, isWorkerLaunchAttemptAccepted, loadCurrentWorkerLaunchAttempt, loadWorkerLaunchAttempt, observeWorkerLaunchProvider, retireAndCleanupCurrentWorkerLaunchAttempt, withWorkerLaunchAttemptFence, } from "./worker-launch-ack.js";
+import { isWorkerLaunchAttemptCurrent, isWorkerLaunchAttemptAccepted, isValidCurrentWorkerLaunchRecord, loadCurrentWorkerLaunchAttempt, loadWorkerLaunchAttempt, retireAndCleanupCurrentWorkerLaunchAttempt, withWorkerLaunchAttemptFence, } from "./worker-launch-ack.js";
+import { getWorkerProviderLiveness } from "./worker-provider-liveness.js";
 import { isProcessIdentityLive } from "../platform/process-utils.js";
 import { activateTeamInstanceUnderLock, assertTeamInstanceUnderLock, buildTeamInstancePendingConfig, createTeamInstanceBinding, disposeTeamInstanceUnderLock, releaseFailedStartupReservationUnderLock, reserveTeamInstanceUnderLock, retryTeamInstanceDisposal, TeamInstanceError, withTeamInstanceLifecycleLock, } from "./team-instance.js";
 let runtimeOwnerRecoveryClient;
@@ -645,31 +647,6 @@ function configuredPaneOwnership(config, worker) {
     };
 }
 /**
- * Read provider execution health from the exact launch receipt.  A missing or
- * malformed attempt is deliberately unknown; pane liveness is not a provider
- * termination proof.
- */
-async function getWorkerProviderLiveness(teamName, cwd, instanceId, worker) {
-    if (!instanceId || !worker.pane_id || !worker.launch_attempt_id)
-        return "unknown";
-    const provider = worker.launch_descriptor?.provider ?? worker.worker_cli;
-    if (!provider)
-        return "unknown";
-    const attempt = await loadWorkerLaunchAttempt({
-        cwd,
-        teamName,
-        instanceId,
-        workerName: worker.name,
-        paneId: worker.pane_id,
-        provider,
-        attemptId: worker.launch_attempt_id,
-        runtimeCliPath: resolveRuntimeCliPath(),
-    }).catch(() => null);
-    if (!attempt)
-        return "unknown";
-    return observeWorkerLaunchProvider(attempt);
-}
-/**
  * Recovery only treats a positively dead provider as dead.  A live provider
  * remains protected even when its pane has disappeared, and unknown evidence
  * never authorizes replacement.
@@ -952,27 +929,30 @@ export function getWorkerStartupEvidencePolicy(agentType) {
         engagedPaneRecheckBudgetMs: resolveEngagedPaneRecheckBudgetMs(policy.engagedPaneRecheckBudgetMs),
     };
 }
-export async function waitForStartupEvidenceBudget(hasEvidence, budgetMs, delayMs = WORKER_STARTUP_EVIDENCE_POLL_INTERVAL_MS) {
+export async function waitForStartupEvidenceBudget(hasEvidence, budgetMs, delayMs = WORKER_STARTUP_EVIDENCE_POLL_INTERVAL_MS, providerExited) {
     const deadline = Date.now() + Math.max(0, budgetMs);
     for (;;) {
         if (await hasEvidence())
             return true;
+        // An exited provider can write no further evidence. Evidence is read again after the exit is confirmed, since the provider may have written it while that check ran.
+        if (providerExited && (await providerExited()))
+            return hasEvidence();
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0)
             return false;
         await new Promise((resolve) => setTimeout(resolve, Math.min(delayMs, remainingMs)));
     }
 }
-async function waitForWorkerStartupEvidence(teamName, workerName, taskId, cwd, baseline, launchAttemptId, budgetMs, delayMs = WORKER_STARTUP_EVIDENCE_POLL_INTERVAL_MS) {
-    return waitForStartupEvidenceBudget(() => hasCurrentWorkerStartupEvidence(teamName, workerName, taskId, cwd, baseline, launchAttemptId), budgetMs, delayMs);
+async function waitForWorkerStartupEvidence(teamName, workerName, taskId, cwd, baseline, launchAttemptId, budgetMs, providerExited) {
+    return waitForStartupEvidenceBudget(() => hasCurrentWorkerStartupEvidence(teamName, workerName, taskId, cwd, baseline, launchAttemptId), budgetMs, WORKER_STARTUP_EVIDENCE_POLL_INTERVAL_MS, providerExited);
 }
-async function waitForWorkerStatusTransition(teamName, workerName, cwd, baselineFingerprint, launchAttemptId, budgetMs, delayMs = 250) {
+async function waitForWorkerStatusTransition(teamName, workerName, cwd, baselineFingerprint, launchAttemptId, budgetMs, providerExited) {
     return waitForStartupEvidenceBudget(async () => {
         const status = await readWorkerStatus(teamName, workerName, cwd);
         return (status.state !== "unknown" &&
             status.launch_attempt_id === launchAttemptId &&
             workerStatusStartupFingerprint(status) !== baselineFingerprint);
-    }, budgetMs, delayMs);
+    }, budgetMs, 250, providerExited);
 }
 /**
  * Settle worker startup evidence under a provider-aware policy.
@@ -1021,6 +1001,11 @@ function startupEvidenceMissingReason(paneBusy, agentType) {
         ? `${agentType}_startup_evidence_missing`
         : "worker_startup_evidence_missing";
     return paneBusy ? `${base}_pane_busy` : base;
+}
+async function startupEvidenceFailureReason(context, paneBusy, agentType) {
+    return (await startupProviderExited(context))
+        ? "provider_exited"
+        : startupEvidenceMissingReason(paneBusy, agentType);
 }
 const CLAIM_ERROR_CAPTURE_MAX = 16_384;
 const CLAIM_ERROR_JSON_LINES_MAX = 80;
@@ -1339,7 +1324,7 @@ async function spawnV2Worker(opts) {
             throw new Error(`worker_startup_cleanup_unverified:${opts.workerName}:${paneId}`);
     };
     const evidencePolicy = getWorkerStartupEvidencePolicy(opts.agentType);
-    const waitForCurrentEvidence = (budgetMs) => waitForWorkerStartupEvidence(opts.teamName, opts.workerName, opts.taskId, opts.cwd, startupBaseline, startupContext.attempt.attempt_id, budgetMs);
+    const waitForCurrentEvidence = (budgetMs) => waitForWorkerStartupEvidence(opts.teamName, opts.workerName, opts.taskId, opts.cwd, startupBaseline, startupContext.attempt.attempt_id, budgetMs, () => startupProviderExited(startupContext));
     const probeActivity = opts.agentType === "cursor" || opts.agentType === "codex"
         ? () => probeStartupPaneActivity(startupContext, {
             attemptAlreadyFenced: true,
@@ -1393,7 +1378,7 @@ async function spawnV2Worker(opts) {
                                 : {
                                     ok: false,
                                     transport: "prompt_stdin",
-                                    reason: startupEvidenceMissingReason(settlement.paneBusy, opts.agentType),
+                                    reason: await startupEvidenceFailureReason(startupContext, settlement.paneBusy, opts.agentType),
                                 };
                         }
                         const attempted = await deliverStartupInbox(startupContext, triggerMessage, { attemptAlreadyFenced: true });
@@ -1419,7 +1404,7 @@ async function spawnV2Worker(opts) {
                             : {
                                 ok: false,
                                 transport: "tmux_send_keys",
-                                reason: startupEvidenceMissingReason(settlement.paneBusy),
+                                reason: await startupEvidenceFailureReason(startupContext, settlement.paneBusy),
                             };
                     },
                     deps: { writeWorkerInbox },
@@ -1499,6 +1484,40 @@ function validateRecoveryAttemptSecret(value, input, recoveryId, replacementGene
     return secret;
 }
 const pendingRecoveryPanes = new Map();
+/**
+ * Written before a recovery splits a pane, removed once that pane is dead or
+ * carried by the worker row. Until then the pane may be alive and tracked
+ * nowhere else, so the owner deadline keeps the recovery active.
+ */
+export async function recordRecoveryPaneSplit(input, recoveryId, paneAttemptId) {
+    await writeAtomic(recoveryPaneSplitPath(input, recoveryId, paneAttemptId), JSON.stringify({
+        schema_version: 1,
+        request_id: input.requestId,
+        recovery_id: recoveryId,
+        worker_name: input.workerName,
+        pane_attempt_id: paneAttemptId,
+        recorded_at: new Date().toISOString(),
+    }));
+}
+// A record left behind only keeps the deadline from ending the recovery, so
+// an unsafe id or a failed removal leaves it in place.
+export async function clearRecoveryPaneSplit(input, recoveryId, paneAttemptId) {
+    try {
+        await rm(recoveryPaneSplitPath(input, recoveryId, paneAttemptId), {
+            force: true,
+        });
+    }
+    catch {
+        // Left in place.
+    }
+}
+// A pane attempt id restored from a launch record is only known to be text.
+function recoveryPaneSplitPath(input, recoveryId, paneAttemptId) {
+    if (!isSafeRecoveryRequestId(recoveryId) ||
+        !isSafeRecoveryRequestId(paneAttemptId))
+        throw new Error("invalid_recovery_pane_split_id");
+    return absPath(input.cwd, TeamPaths.recoveryPaneSplit(input.teamName, recoveryId, paneAttemptId));
+}
 async function recordRecoveryPaneRollbackFailure(input, recoveryId, pending, reason, liveness) {
     const recordedAt = Date.now();
     const path = absPath(input.cwd, TeamPaths.recoveryPaneRollbackFailure(input.teamName, recoveryId, pending.paneAttemptId, recordedAt));
@@ -1599,6 +1618,7 @@ async function cleanupRecoveryPaneAttempt(input, recoveryId, pending, reason) {
         liveness = await getOwnedWorkerLiveness(pending.ownership).catch(() => "unknown");
         if (liveness === "dead" && providerStopped) {
             pendingRecoveryPanes.delete(recoveryId);
+            await clearRecoveryPaneSplit(input, recoveryId, pending.paneAttemptId);
             return true;
         }
     }
@@ -1802,6 +1822,10 @@ export async function finalizeRecoveryOwnerResult(input, recoveryId, result, dep
             last_recovery: {
                 ...active,
                 phase,
+                ...(result.outcome === "failed" &&
+                    result.error === "recovery_request_timeout"
+                    ? { failure_reason: result.error }
+                    : {}),
                 state_revision: finalRevision,
                 updated_at: new Date().toISOString(),
             },
@@ -1882,6 +1906,136 @@ async function finalizeBoundRecoveryOwnerTerminal(input, recoveryId, result) {
         ...recoveryError(input, recoveryId, "stale_state_revision", "Recovery terminal cleanup could not prove the exact active attempt."),
         outcome: "commit_unknown",
     };
+}
+/** The longest recover-worker client wait, counted from the persisted intent. */
+const RECOVERY_OWNER_RETRY_DEADLINE_MS = 300_000;
+function recoveryTimeoutError(input, recoveryId) {
+    return recoveryError(input, recoveryId, "recovery_request_timeout", `Recovery owner deadline exceeded: no attempt finished within ${RECOVERY_OWNER_RETRY_DEADLINE_MS} ms of admission.`);
+}
+/**
+ * Publishes the final of a deadline timeout whose owner saved it to config
+ * but died before publishing it. The fenced owner already made the decision,
+ * so no election is needed. Returns null when there is no such timeout.
+ */
+async function publishSavedRecoveryTimeout(input, recoveryId) {
+    const savedTimeout = async () => {
+        const config = (await readRevisionedTeamConfig(input.teamName, input.cwd))
+            ?.config;
+        const last = config?.last_recovery;
+        return (config?.active_recovery?.recovery_id !== recoveryId &&
+            last?.recovery_id === recoveryId &&
+            last.request_id === input.requestId &&
+            last.worker_name === input.workerName &&
+            last.phase === "failed" &&
+            last.failure_reason === "recovery_request_timeout");
+    };
+    if (!(await savedTimeout()))
+        return null;
+    return withTeamConfigMutationLock(input.teamName, input.cwd, async () => (await savedTimeout())
+        ? persistRecoveryFinal(input, recoveryId, recoveryTimeoutError(input, recoveryId))
+        : null);
+}
+/**
+ * last_recovery is the only record of a saved timeout until its final is
+ * published, so publish it before anything replaces or deletes the slot.
+ * Returns the recovery id whose final is still unpublished, or null.
+ */
+async function publishPendingRecoveryTimeout(teamName, cwd, instanceId) {
+    const saved = (await readRevisionedTeamConfig(teamName, cwd))?.config
+        .last_recovery;
+    if (saved?.failure_reason !== "recovery_request_timeout" ||
+        readRecoveryFinalState(cwd, saved.request_id).kind === "valid")
+        return null;
+    await publishSavedRecoveryTimeout({
+        teamName,
+        cwd,
+        workerName: saved.worker_name,
+        requestId: saved.request_id,
+        instanceId,
+    }, saved.recovery_id).catch(() => null);
+    return readRecoveryFinalState(cwd, saved.request_id).kind === "valid"
+        ? null
+        : saved.recovery_id;
+}
+/**
+ * Past the deadline, the fenced owner fails a recovery that has nothing to
+ * hand over instead of running another attempt. Returns null to keep today's
+ * retry: before the deadline, without the fence, or once a task reservation,
+ * a committed replacement, or an uncommitted pane exists.
+ */
+async function finalizeRecoveryPastDeadline(input, recoveryId, fence, instance) {
+    let admittedAt;
+    try {
+        const intent = parseRecoveryIntent(await readFile(absPath(input.cwd, TeamPaths.recoveryIntent(input.teamName, recoveryId)), "utf8"));
+        if (intent.request_id !== input.requestId)
+            return null;
+        admittedAt = Date.parse(intent.created_at);
+    }
+    catch {
+        return null;
+    }
+    if (Date.now() < admittedAt + RECOVERY_OWNER_RETRY_DEADLINE_MS)
+        return null;
+    const expired = recoveryTimeoutError(input, recoveryId);
+    return withTeamInstanceLifecycleLock(instance.cwd, instance.team_name, async () => {
+        await assertTeamInstanceUnderLock(instance);
+        if (!checkOwnerFence(input.cwd, input.teamName, fence).ok)
+            return null;
+        const current = await readRevisionedTeamConfig(input.teamName, input.cwd);
+        if (!current ||
+            current.config.runtime_owner_epoch?.epoch !== fence.epoch ||
+            current.config.runtime_owner_epoch.nonce !== fence.nonce ||
+            current.config.workers.some((worker) => worker.recovery_id === recoveryId))
+            return null;
+        // A launch persisted by a predecessor owner outlives its in-memory
+        // pending pane. Only its resume path can settle it.
+        const persistedLaunch = await readFile(absPath(input.cwd, TeamPaths.workerLaunchCurrent(input.teamName, input.workerName)), "utf8").then((text) => {
+            const record = JSON.parse(text);
+            // A record the launch loader rejects cannot rule out the pane.
+            if (!isValidCurrentWorkerLaunchRecord(record))
+                return true;
+            return (record.context?.kind === "recovery" &&
+                record.context.recovery_id === recoveryId);
+        }, (error) => error.code !== "ENOENT").catch(() => true);
+        if (persistedLaunch)
+            return null;
+        // A split pane that nothing above tracks may still be alive, and
+        // shutdown cannot find it, so the recovery must stay active.
+        const untrackedSplit = await readdir(absPath(input.cwd, TeamPaths.recoveryPaneSplits(input.teamName, recoveryId))).then((entries) => entries.length > 0, (error) => error.code !== "ENOENT");
+        if (untrackedSplit)
+            return null;
+        // An owner from a build without split records left only this evidence
+        // for a split pane it could not prove.
+        const rollbackEvidence = await readdir(absPath(input.cwd, TeamPaths.recoveryPaneRollbackFailures(input.teamName, recoveryId))).then((entries) => entries.length > 0, (error) => error.code !== "ENOENT");
+        if (rollbackEvidence)
+            return null;
+        const progress = readRecoveryOutcome(input.cwd, input.requestId);
+        if (progress?.kind === "final" ||
+            (progress?.recovery_id === recoveryId &&
+                (progress.continuation === "reserved" ||
+                    progress.continuation === "adopted")))
+            return null;
+        // Reservations are written before the phase records them. Tasks that
+        // cannot be read leave the decision to the executor.
+        const tasks = await teamListTasks(input.teamName, input.cwd).catch(() => null);
+        if (!tasks ||
+            tasks.some((task) => task.recovery_reservation?.recovery_id === recoveryId ||
+                task.recovery_adoption?.recovery_id === recoveryId))
+            return null;
+        const active = current.config.active_recovery;
+        if (active?.recovery_id === recoveryId) {
+            return active.request_id === input.requestId &&
+                active.worker_name === input.workerName &&
+                active.owner_epoch === fence.epoch &&
+                active.owner_nonce === fence.nonce
+                ? finalizeRecoveryOwnerResult(input, recoveryId, expired)
+                : null;
+        }
+        // Never elected: another recovery holds the slot, so nothing ran.
+        if (!active || current.config.last_recovery?.recovery_id === recoveryId)
+            return null;
+        return persistRecoveryFinal(input, recoveryId, expired);
+    });
 }
 export function selectRecoveryReplayTasks(tasks, workerName, recoveryId, committedPaneLiveness) {
     return tasks.filter((task) => task.recovery_reservation?.recovery_id === recoveryId ||
@@ -2303,6 +2457,9 @@ async function ensureRecoveryOwner(teamName, cwd, input, waitOptions, instance) 
     if (!current)
         throw new Error("invalid_persisted_state");
     await assertTeamInstanceUnderLock(instance);
+    // An election replaces last_recovery when its recovery ends.
+    if (await publishPendingRecoveryTimeout(teamName, cwd, instance.instance_id))
+        throw new Error("recovery_final_unpublished");
     const processStartedAt = currentProcessStartIdentity();
     if (!processStartedAt)
         throw new Error("process_start_identity_unavailable");
@@ -2485,6 +2642,8 @@ export async function prepareRecoveryOwnerBootstrap(input, waitOptions) {
         throw new Error("runtime_owner_bootstrap_fence_lost");
     if (!isValidTeamInstanceId(input.instanceId))
         throw new Error("team_instance_identity_missing");
+    if (await publishSavedRecoveryTimeout(input, bootstrap.recoveryId))
+        return;
     const expectedInstanceId = input.instanceId;
     const initial = await readRevisionedTeamConfig(input.teamName, input.cwd);
     if (!initial?.config.instance_id)
@@ -2514,8 +2673,41 @@ export async function prepareRecoveryOwnerBootstrap(input, waitOptions) {
         throw new Error("runtime_owner_bootstrap_rebind_rejected");
     }
 }
-/** Private runtime-owner executor. It never calls the public recovery facade. */
+const recoveryOwnerAttempts = new Map();
+/**
+ * Private runtime-owner executor. It never calls the public recovery facade.
+ * Attempts of one recovery in this process run one at a time, so no attempt
+ * judges state another attempt is still writing.
+ */
 export async function executeRecoverDeadWorkerV2Owner(input) {
+    const key = JSON.stringify([
+        input.cwd,
+        input.teamName,
+        readRecoveryRequestReservation(input.cwd, input.requestId)?.recovery_id ??
+            input.requestId,
+    ]);
+    const previous = recoveryOwnerAttempts.get(key);
+    const attempt = (previous ?? Promise.resolve())
+        .catch(() => undefined)
+        .then(() => {
+        // An attempt that waited returns the final the one before it published.
+        const settled = previous
+            ? readRecoveryFinalState(input.cwd, input.requestId)
+            : null;
+        return settled?.kind === "valid"
+            ? settled.final.result
+            : runRecoverDeadWorkerV2OwnerAttempt(input);
+    });
+    recoveryOwnerAttempts.set(key, attempt);
+    try {
+        return await attempt;
+    }
+    finally {
+        if (recoveryOwnerAttempts.get(key) === attempt)
+            recoveryOwnerAttempts.delete(key);
+    }
+}
+async function runRecoverDeadWorkerV2OwnerAttempt(input) {
     const reservation = readRecoveryRequestReservation(input.cwd, input.requestId);
     const recoveryId = reservation?.recovery_id ?? randomUUID();
     let ownerBound = false;
@@ -2530,6 +2722,9 @@ export async function executeRecoverDeadWorkerV2Owner(input) {
                     input.instanceId.toLowerCase())) {
             return recoveryError(input, recoveryId, "invalid_persisted_state", "recovery_instance_mismatch");
         }
+        const savedTimeout = await publishSavedRecoveryTimeout(input, recoveryId);
+        if (savedTimeout)
+            return savedTimeout;
         const expectedInstanceId = input.instanceId;
         const beforeOwner = await readRevisionedTeamConfig(input.teamName, input.cwd);
         if (beforeOwner?.config.active_scale_down ||
@@ -2584,6 +2779,9 @@ export async function executeRecoverDeadWorkerV2Owner(input) {
             return electedOwner;
         });
         ownerBound = true;
+        const expired = await finalizeRecoveryPastDeadline(input, recoveryId, owner.fence, instance);
+        if (expired)
+            return expired;
         if (existingAttempt &&
             (existingAttempt.request_id !== input.requestId ||
                 existingAttempt.recovery_id !== recoveryId ||
@@ -3153,6 +3351,12 @@ export async function executeRecoverDeadWorkerV2Owner(input) {
                         ...(tmuxServerIdentity ? { tmuxServerIdentity } : {}),
                     })))
                     return { ok: false, error: "worker_activation_failed" };
+                try {
+                    await recordRecoveryPaneSplit(input, sagaInput.recoveryId, paneAttemptId);
+                }
+                catch {
+                    return { ok: false, error: "runtime_owner_unavailable" };
+                }
                 const split = await splitTeamWorkerPaneWithEvidence(splitTarget, splitDirection, workerCwd, recoveryProvider, tmuxServerIdentity, undefined, recoveryProvider === "herdr"
                     ? herdrWorkspaceIdFromSessionTarget(owner.config.tmux_session)
                     : undefined);
@@ -3184,13 +3388,11 @@ export async function executeRecoverDeadWorkerV2Owner(input) {
                         await applyRequiredLayoutBeforeOwnedLaunch(owner.config.tmux_session, ownershipResult.ownership, sagaInput.workerName);
                     }
                     catch (error) {
-                        return {
-                            ok: false,
-                            error: error instanceof Error &&
-                                error.message.startsWith("worker_layout_cleanup_unverified:")
-                                ? "worker_cleanup_incomplete"
-                                : "spawn_failed",
-                        };
+                        if (error instanceof Error &&
+                            error.message.startsWith("worker_layout_cleanup_unverified:"))
+                            return { ok: false, error: "worker_cleanup_incomplete" };
+                        await clearRecoveryPaneSplit(input, sagaInput.recoveryId, paneAttemptId);
+                        return { ok: false, error: "spawn_failed" };
                     }
                 }
                 let pending;
@@ -3306,6 +3508,7 @@ export async function executeRecoverDeadWorkerV2Owner(input) {
                     throw new Error("worker_activation_failed");
                 if (!persisted.value)
                     throw new Error("stale_state_revision");
+                await clearRecoveryPaneSplit(input, sagaInput.recoveryId, pending.paneAttemptId);
                 const manifestSync = await resolveCommittedRecoveryManifestSync(() => readTeamManifest(input.teamName, input.cwd), {
                     workerName: sagaInput.workerName,
                     paneId,
@@ -3398,8 +3601,8 @@ export async function executeRecoverDeadWorkerV2Owner(input) {
                     workerStatusStartupFingerprint(await readWorkerStatus(input.teamName, sagaInput.workerName, input.cwd));
                 const evidencePolicy = getWorkerStartupEvidencePolicy(pending.agentType);
                 const waitForCurrentEvidence = (budgetMs) => primaryTaskId && startupBaseline
-                    ? waitForWorkerStartupEvidence(input.teamName, sagaInput.workerName, primaryTaskId, input.cwd, startupBaseline, startupAttemptId, budgetMs)
-                    : waitForWorkerStatusTransition(input.teamName, sagaInput.workerName, input.cwd, statusBaseline, startupAttemptId, budgetMs);
+                    ? waitForWorkerStartupEvidence(input.teamName, sagaInput.workerName, primaryTaskId, input.cwd, startupBaseline, startupAttemptId, budgetMs, () => startupProviderExited(startupContext))
+                    : waitForWorkerStatusTransition(input.teamName, sagaInput.workerName, input.cwd, statusBaseline, startupAttemptId, budgetMs, () => startupProviderExited(startupContext));
                 const probeActivity = pending.agentType === "cursor" || pending.agentType === "codex"
                     ? () => probeStartupPaneActivity(startupContext, {
                         attemptAlreadyFenced: true,
@@ -3493,7 +3696,7 @@ export async function executeRecoverDeadWorkerV2Owner(input) {
                         if (!settlement.settled)
                             return {
                                 ok: false,
-                                error: startupEvidenceMissingReason(settlement.paneBusy, pending.agentType),
+                                error: await startupEvidenceFailureReason(startupContext, settlement.paneBusy, pending.agentType),
                             };
                     }
                     else if (pending.promptMode) {
@@ -3539,7 +3742,7 @@ export async function executeRecoverDeadWorkerV2Owner(input) {
                                     : {
                                         ok: false,
                                         transport: "tmux_send_keys",
-                                        reason: startupEvidenceMissingReason(settlement.paneBusy),
+                                        reason: await startupEvidenceFailureReason(startupContext, settlement.paneBusy),
                                     };
                             },
                             deps: { writeWorkerInbox },
@@ -5793,7 +5996,21 @@ export async function monitorTeamV2(teamName, cwd, expectedInstanceId) {
                 recommendations.push(`Reassign task-${t.id} from dead ${w.name}`);
             }
         }
-        const paneSuggestsIdle = alive && paneLooksReady(paneCapture) && !paneHasActiveTask(paneCapture);
+        // A dead provider leaves its shell prompt behind; that is not an idle worker.
+        // A worker stopped at a trust dialog is not working either, and nothing
+        // nudges it. A busy pane is not reported, whatever else is on screen.
+        const paneSignals = observePane(paneCapture);
+        const paneState = classifyPane(paneSignals);
+        const paneWaitsAtTrust = paneState.kind === "trust" && !paneSignals.busy;
+        const paneSuggestsIdle = alive &&
+            providerLiveness !== "dead" &&
+            (paneState.kind === "idle" || paneWaitsAtTrust);
+        // cursor-agent prints its workspace trust notice and exits; there is nothing to answer.
+        const paneWaitsAt = !paneWaitsAtTrust
+            ? "idle at prompt"
+            : paneState.trust === "cursor_workspace_trust"
+                ? "stopped at the Cursor workspace trust notice"
+                : "waiting at a trust dialog";
         const statusFresh = isFreshTimestamp(status.updated_at);
         const heartbeatFresh = isFreshTimestamp(heartbeat?.last_turn_at);
         const hasWorkStartEvidence = expectedTaskId !== "" && hasWorkerStatusProgress(status, expectedTaskId);
@@ -5820,16 +6037,16 @@ export async function monitorTeamV2(teamName, cwd, expectedInstanceId) {
         if (stallReason) {
             nonReportingWorkers.push(w.name);
             if (stallReason === "missing_dependency") {
-                recommendations.push(`Investigate ${w.name}: task-${outstandingTask?.id ?? expectedTaskId} is blocked by missing task ids [${missingDependencyIds.join(", ")}]; pane is idle at prompt`);
+                recommendations.push(`Investigate ${w.name}: task-${outstandingTask?.id ?? expectedTaskId} is blocked by missing task ids [${missingDependencyIds.join(", ")}]; pane is ${paneWaitsAt}`);
             }
             else if (stallReason === "no_work_start_evidence") {
-                recommendations.push(`Investigate ${w.name}: assigned work but no work-start evidence; pane is idle at prompt`);
+                recommendations.push(`Investigate ${w.name}: assigned work but no work-start evidence; pane is ${paneWaitsAt}`);
             }
             else if (stallReason === "stale_or_missing_worker_reports") {
-                recommendations.push(`Investigate ${w.name}: pane is idle while status/heartbeat are stale or missing`);
+                recommendations.push(`Investigate ${w.name}: pane is ${paneWaitsAtTrust ? paneWaitsAt : "idle"} while status/heartbeat are stale or missing`);
             }
             else {
-                recommendations.push(`Investigate ${w.name}: no meaningful turn progress and pane is idle at prompt`);
+                recommendations.push(`Investigate ${w.name}: no meaningful turn progress and pane is ${paneWaitsAt}`);
             }
         }
     }
@@ -6710,6 +6927,14 @@ async function shutdownTeamV2Owned(teamName, cwd, options = {}) {
     return withTeamInstanceLifecycleLock(cwd, sanitized, async () => {
         await assertTeamInstanceUnderLock(shutdownInstance);
         await commitStoppedFenceUnderLock();
+        // Disposal deletes last_recovery.
+        const unpublished = await publishPendingRecoveryTimeout(sanitized, cwd, shutdownInstance.instance_id);
+        if (unpublished)
+            return {
+                outcome: "failed",
+                reason: "state_cleanup_failed",
+                detail: `recovery_final_unpublished:${unpublished}`,
+            };
         let worktreeCleanupFailure = null;
         let preservedWorktrees = 0;
         try {
